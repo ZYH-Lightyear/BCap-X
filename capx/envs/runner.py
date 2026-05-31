@@ -36,8 +36,8 @@ from capx.utils.parallel_eval import run_parallel_with_setup
 # Constants
 # ---------------------------------------------------------------------------
 
-TRIAL_TIMEOUT_SECONDS = 1000
-MAX_TRIAL_RETRIES = 3
+TRIAL_TIMEOUT_SECONDS = int(os.environ.get("CAPX_TRIAL_TIMEOUT_SECONDS", "1000"))
+MAX_TRIAL_RETRIES = int(os.environ.get("CAPX_TRIAL_MAX_RETRIES", "3"))
 
 
 # ---------------------------------------------------------------------------
@@ -310,20 +310,27 @@ def _run_single_trial_with_timeout(
             raise TimeoutError(f"Trial {trial} timed out") from exc
 
         print(f"Trial {trial} timed out after {timeout_seconds} seconds")
-        return _build_timeout_summary(trial, timeout_seconds, partial_artifacts, config, exc)
+        return _build_timeout_summary(
+            env, trial, timeout_seconds, partial_artifacts, config, exc
+        )
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous_handler)
 
 
 def _build_timeout_summary(
+    env: CodeExecutionEnvBase,
     trial: int,
     timeout_seconds: int,
     pa: dict[str, Any],
     config: dict[str, Any],
     exc: BaseException,
 ) -> TrialSummary:
-    """Build a TrialSummary from partial artifacts after a timeout."""
+    """Build a TrialSummary from partial artifacts after a timeout.
+
+    Also flushes any recorded video frames to disk best-effort, so a long-running
+    trial that gets cut short still produces something inspectable.
+    """
     raw_code = pa.get("raw_code", "")
     code_blocks = pa.get("code_blocks", [])
     code_block_metadata = pa.get("code_block_metadata", [])
@@ -361,6 +368,28 @@ def _build_timeout_summary(
         ensemble_data=pa.get("ensemble_data"),
         multiturn_ensemble_data=pa.get("multiturn_ensemble_data", []),
     )
+
+    # Best-effort: flush any recorded frames to disk so we at least have a video
+    # of what the (now-aborted) trial actually did. Failures here must NEVER mask
+    # the original timeout, so we swallow everything.
+    try:
+        from capx.envs.trial import (
+            _save_trial_video,
+            _save_turn_and_combined_videos,
+        )
+
+        turn_frame_ranges = pa.get("turn_frame_ranges") or []
+        recording_frames = pa.get("recording_frames", False)
+        if recording_frames and turn_frame_ranges:
+            _save_turn_and_combined_videos(
+                env, config, trial, info_step, reward, turn_frame_ranges
+            )
+        else:
+            _save_trial_video(env, config, trial, info_step, reward, num_code_blocks)
+    except Exception as video_exc:  # noqa: BLE001
+        print(
+            f"[runner] failed to flush video for timed-out trial {trial}: {video_exc}"
+        )
 
     return TrialSummary(
         trial=trial,

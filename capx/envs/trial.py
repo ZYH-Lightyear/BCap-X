@@ -796,6 +796,8 @@ def _run_single_trial(
                 "reward": reward,
                 "terminated": terminated,
                 "truncated": truncated,
+                "turn_frame_ranges": list(turn_frame_ranges),
+                "recording_frames": recording_frames,
             })
 
         obs = obs_next

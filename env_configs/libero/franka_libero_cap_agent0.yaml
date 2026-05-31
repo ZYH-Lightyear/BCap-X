@@ -64,4 +64,4 @@ use_parallel_ensemble: true
 use_multimodel: true
 
 trials: 50
-num_workers: 10
+num_workers: 3

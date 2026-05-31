@@ -42,6 +42,7 @@ VLM_MODELS = [
     "deepseek/deepseek-r1",
     "qwen/qwen3.5-122b-a10b",
     "moonshotai/kimi-k2",
+    "openrouter/qwen/qwen3.6-plus",
 ]
 CLAUDE_MODELS = ["anthropic/claude-opus-4-5", "anthropic/claude-haiku-4-5"]
 OSS_MODELS = [
@@ -62,6 +63,7 @@ OPENROUTER_MODELS = [
     "openrouter/openai/o4-mini",
     "openrouter/meta-llama/llama-4-maverick",
     "openrouter/qwen/qwen3-235b-a22b",
+    "openrouter/qwen/qwen3.6-plus",
 ]
 OPENROUTER_SERVER_URL = "http://localhost:8110/chat/completions"
 
@@ -70,10 +72,7 @@ OPENROUTER_SERVER_URL = "http://localhost:8110/chat/completions"
 # ---------------------------------------------------------------------------
 
 ENSEMBLE_CONFIGS = [
-    # Gemini-3-Pro only — best single model per CaP-Bench (Figure 1).
-    # 3 temps for diversity; synthesis still uses Gemini-3-Pro.
-    # ~45% faster than full multimodel (no Claude/GPT latency bottleneck).
-    ("openai/gpt-5.4", [0.1, 0.5, 0.9]),
+    ("openrouter/qwen/qwen3.6-plus", [0.1, 0.5, 0.9]),
 ]
 
 # ---------------------------------------------------------------------------
@@ -437,7 +436,7 @@ def query_model_streaming(
 def query_model_ensemble(
     args: "LaunchArgs | ModelQueryArgs",
     prompt: list[dict],
-    synthesis_model: str = "openai/gpt-5.4",
+    synthesis_model: str = "openrouter/qwen/qwen3.6-plus",
     is_multiturn = False
 ) -> dict[str, Any]:
     """Query 9 models (3 models x 3 temperatures) and synthesize final output."""

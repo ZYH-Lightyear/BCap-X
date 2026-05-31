@@ -24,7 +24,8 @@ from capx.integrations.franka.common import (
     solve_ik_with_convergence,
 )
 from capx.integrations.vision.graspnet import init_contact_graspnet, init_contact_graspnet_point_clouds
-from capx.integrations.vision.molmo import init_molmo
+from capx.integrations.vision.molmo import init_molmo  # noqa: F401  # kept for backward compatibility
+from capx.integrations.vision.point_backend import init_point_backend
 from capx.integrations.vision.sam3 import init_sam3, init_sam3_point_prompt
 from capx.integrations.motion.pyroki import init_pyroki
 
@@ -62,7 +63,9 @@ class FrankaLiberoApiReduced(ApiBase):
         self.sam3_point_prompt_fn = init_sam3_point_prompt()
 
         # else:
-        self.molmo_point_fn = init_molmo()
+        # Pointing backend is selected at runtime via CAPX_POINT_BACKEND
+        # (defaults to "molmo"; set to "qwen" to use the generic-VLM adapter).
+        self.molmo_point_fn = init_point_backend()
             # self.sam2_point_prompt_fn = init_sam2_point_prompt()
         self.grasp_net_plan_fn = init_contact_graspnet()
         self.grasp_net_plan_point_clouds_fn = init_contact_graspnet_point_clouds()
