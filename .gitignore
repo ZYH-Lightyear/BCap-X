@@ -13,6 +13,7 @@ env/
 .capx_skills.json
 .pytest_cache/
 .ruff_cache/
+logs/
 
 scripts/nv_*
 # Build
