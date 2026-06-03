@@ -18,9 +18,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from capx.envs.configs.instantiate import instantiate
-from capx.utils.launch_utils import _load_config
-from capx.web.async_trial_runner import LaunchArgsCompat, run_trial_async
 from capx.web.models import (
     ConfigListResponse,
     InjectPromptCommand,
@@ -96,9 +93,19 @@ def create_app() -> FastAPI:
         ``True`` so the frontend can kick off the trial immediately after load.
         """
         default_path = getattr(app.state, "default_config_path", None)
+        default_args = getattr(app.state, "default_launch_args", {})
         return {
             "config_path": default_path,
             "auto_start": default_path is not None,
+            "model": default_args.get("model"),
+            "server_url": default_args.get("server_url"),
+            "temperature": default_args.get("temperature"),
+            "max_tokens": default_args.get("max_tokens"),
+            "reasoning_effort": default_args.get("reasoning_effort"),
+            "use_visual_feedback": default_args.get("use_visual_feedback"),
+            "use_img_differencing": default_args.get("use_img_differencing"),
+            "visual_differencing_model": default_args.get("visual_differencing_model"),
+            "visual_differencing_model_server_url": default_args.get("visual_differencing_model_server_url"),
         }
 
     @app.get("/api/configs", response_model=ConfigListResponse)
@@ -132,14 +139,14 @@ def create_app() -> FastAPI:
             class MinimalArgs:
                 config_path: str
                 server_url: str = "http://127.0.0.1:8110/chat/completions"
-                model: str = "google/gemini-3.1-pro-preview"
+                model: str = "openrouter/qwen/qwen3.6-plus"
                 temperature: float = 1.0
                 max_tokens: int = 20480
                 reasoning_effort: str = "medium"
                 api_key: str | None = None
                 use_visual_feedback: bool | None = None
                 use_img_differencing: bool | None = None
-                visual_differencing_model: str | None = "google/gemini-3.1-pro-preview"
+                visual_differencing_model: str | None = "openrouter/qwen/qwen3.6-plus"
                 visual_differencing_model_server_url: str | None = "http://127.0.0.1:8110/chat/completions"
                 visual_differencing_model_api_key: str | None = None
                 total_trials: int | None = None
@@ -156,7 +163,12 @@ def create_app() -> FastAPI:
                 web_ui_port: int | None = None
 
             args = MinimalArgs(config_path=config_path)
-            env_factory, config, _ = await asyncio.to_thread(_load_config, args)
+
+            def load():
+                from capx.utils.launch_utils import _load_config
+                return _load_config(args)
+
+            env_factory, config, _ = await asyncio.to_thread(load)
 
             # Extract task prompt (no length limit - UI handles display)
             task_prompt = env_factory.get("cfg", {}).get("prompt", "")
@@ -224,12 +236,17 @@ def create_app() -> FastAPI:
                 model=request.model,
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
+                reasoning_effort=request.reasoning_effort,
                 use_visual_feedback=request.use_visual_feedback,
                 use_img_differencing=request.use_img_differencing,
                 visual_differencing_model=request.visual_differencing_model,
                 visual_differencing_model_server_url=request.visual_differencing_model_server_url,
             )
-            env_factory, config, _ = await asyncio.to_thread(_load_config, load_args)
+            def load():
+                from capx.utils.launch_utils import _load_config
+                return _load_config(load_args)
+
+            env_factory, config, _ = await asyncio.to_thread(load)
 
             # Process output_dir like launch.py does - add model name to path and create directory
             if config.get("output_dir"):
@@ -247,16 +264,19 @@ def create_app() -> FastAPI:
             session.config_path = config_path
             session.config = config
             session.env_factory = env_factory
+            session.output_dir = config.get("output_dir")
             session.state = SessionState.LOADING_CONFIG
 
             # Build launch args for trial runner
+            from capx.web.async_trial_runner import LaunchArgsCompat, run_trial_async
+
             trial_args = LaunchArgsCompat(
                 model=request.model,
                 server_url=request.server_url,
                 api_key=None,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature,
-                reasoning_effort="medium",
+                reasoning_effort=request.reasoning_effort,
                 debug=False,
                 visual_differencing_model=request.visual_differencing_model,
                 visual_differencing_model_server_url=request.visual_differencing_model_server_url,
@@ -323,6 +343,56 @@ def create_app() -> FastAPI:
             total_code_blocks=session.total_code_blocks,
             num_regenerations=session.num_regenerations,
         )
+
+    @app.get("/api/artifacts/{session_id}")
+    async def list_artifacts(session_id: str):
+        """List videos and live artifacts produced by a session."""
+        manager = get_session_manager()
+        session = await manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if not session.output_dir:
+            return {"output_dir": None, "videos": [], "line_traces": [], "overlays": []}
+
+        root = Path(session.output_dir).resolve()
+        if not root.exists():
+            return {"output_dir": str(root), "videos": [], "line_traces": [], "overlays": []}
+
+        def item(path: Path) -> dict[str, Any]:
+            rel = path.relative_to(root).as_posix()
+            return {
+                "path": rel,
+                "name": path.name,
+                "url": f"/api/artifacts/{session_id}/file/{rel}",
+                "mtime": path.stat().st_mtime,
+                "size": path.stat().st_size,
+            }
+
+        videos = sorted(root.rglob("video_*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+        line_traces = sorted(root.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        overlays = sorted(root.rglob("*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
+        return {
+            "output_dir": str(root),
+            "videos": [item(path) for path in videos],
+            "line_traces": [item(path) for path in line_traces],
+            "overlays": [item(path) for path in overlays],
+        }
+
+    @app.get("/api/artifacts/{session_id}/file/{artifact_path:path}")
+    async def get_artifact_file(session_id: str, artifact_path: str):
+        """Serve a session artifact file under the session output directory."""
+        manager = get_session_manager()
+        session = await manager.get_session(session_id)
+        if not session or not session.output_dir:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        root = Path(session.output_dir).resolve()
+        target = (root / artifact_path).resolve()
+        if root not in target.parents and target != root:
+            raise HTTPException(status_code=403, detail="Invalid artifact path")
+        if not target.exists() or not target.is_file():
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        return FileResponse(target)
 
     @app.get("/api/sessions")
     async def list_sessions():

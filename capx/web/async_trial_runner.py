@@ -27,6 +27,7 @@ from capx.utils.launch_utils import (
     _parse_multi_turn_decision,
     _save_trial_artifacts,
 )
+from capx.utils.line_trace import save_events_jsonl
 from capx.utils.video_utils import _write_video
 from capx.web.models import (
     CodeExecutionResultEvent,
@@ -34,6 +35,7 @@ from capx.web.models import (
     DecisionType,
     EnvironmentInitEvent,
     ErrorEvent,
+    ExecutionLineEvent,
     ExecutionStepEvent,
     ImageAnalysisEvent,
     ModelResponseEvent,
@@ -55,6 +57,20 @@ from capx.web.session_manager import Session, run_blocking_with_interrupt
 logger = logging.getLogger(__name__)
 
 MULTITURN_LIMIT = 30
+
+
+def _web_trial_live_dir(output_dir: str, trial: int) -> str:
+    return os.path.join(output_dir, f"trial_{trial:02d}_live")
+
+
+def _set_api_debug_context(env: Any, output_dir: str | None, trial: int, block_idx: int) -> None:
+    if not output_dir or not hasattr(env, "_apis"):
+        return
+    debug_root = os.path.join(_web_trial_live_dir(output_dir, trial), "debug_overlays")
+    for api in env._apis.values():
+        setter = getattr(api, "set_debug_context", None)
+        if callable(setter):
+            setter(output_dir=debug_root, block_idx=block_idx)
 
 
 @dataclass
@@ -437,6 +453,8 @@ async def run_trial_async(
             if is_cancelled():
                 raise asyncio.CancelledError("Cancelled before code execution")
 
+            _set_api_debug_context(env, session.config.get("output_dir"), trial, code_block_idx)
+
             await emit(CodeExecutionStartEvent(
                 session_id=session.session_id,
                 block_index=code_block_idx,
@@ -471,6 +489,17 @@ async def run_trial_async(
                 except Exception as e:
                     logger.warning(f"Failed to emit execution step: {e}")
 
+            def emit_execution_line(line_event: dict[str, Any]) -> None:
+                """Sync callback to emit traced source-line events during execution."""
+                try:
+                    event = ExecutionLineEvent(
+                        session_id=session.session_id,
+                        **line_event,
+                    )
+                    asyncio.run_coroutine_threadsafe(session.emit(event), exec_main_loop)
+                except Exception as e:
+                    logger.warning(f"Failed to emit execution line: {e}")
+
             # Initialize execution logger for this code block
             execution_logger.init_execution_context(
                 code_block_index=code_block_idx,
@@ -483,12 +512,19 @@ async def run_trial_async(
                 # thread-local — rendering must happen on the same thread as the
                 # simulation step.
                 def _step_and_render(code):
+                    if hasattr(env, "configure_line_trace"):
+                        env.configure_line_trace(code_block_idx, emit_execution_line)
+                    frame_start = env.get_video_frame_count() if hasattr(env, "get_video_frame_count") else 0
                     result = env.step(code)
+                    frame_end = env.get_video_frame_count() if hasattr(env, "get_video_frame_count") else 0
                     try:
                         frame = env.render() if hasattr(env, "render") else None
                     except Exception:
                         frame = None
-                    return result, frame
+                    line_events = []
+                    if hasattr(env, "consume_line_trace_events"):
+                        line_events = env.consume_line_trace_events()
+                    return result, frame, frame_start, frame_end, line_events
 
                 def _step_render_with_interrupt(code):
                     session.execution_thread_id = threading.get_ident()
@@ -499,7 +535,13 @@ async def run_trial_async(
 
                 exec_timeout = getattr(session, 'execution_timeout', 180)
                 try:
-                    (obs_next, reward, terminated, truncated, info_step), post_step_frame = await asyncio.wait_for(
+                    (
+                        (obs_next, reward, terminated, truncated, info_step),
+                        post_step_frame,
+                        frame_start,
+                        frame_end,
+                        line_events,
+                    ) = await asyncio.wait_for(
                         run_in_env_thread(_step_render_with_interrupt, code),
                         timeout=exec_timeout,
                     )
@@ -525,6 +567,34 @@ async def run_trial_async(
                 exec_history = execution_logger.finalize_execution_context()
                 if exec_history and step_counter[0] > 0:
                     logger.info(f"Code block {code_block_idx} had {len(exec_history.steps)} execution steps")
+
+            output_dir = session.config.get("output_dir")
+            if output_dir:
+                live_dir = _web_trial_live_dir(output_dir, trial)
+                if line_events:
+                    trace_path = os.path.join(
+                        live_dir,
+                        "line_trace",
+                        f"block_{code_block_idx:02d}.jsonl",
+                    )
+                    await asyncio.to_thread(save_events_jsonl, line_events, trace_path)
+                if (
+                    session.config.get("record_video")
+                    and hasattr(env, "get_video_frames_range")
+                    and frame_end > frame_start
+                ):
+                    turn_frames = await run_in_env_thread(
+                        env.get_video_frames_range,
+                        frame_start,
+                        frame_end,
+                    )
+                    if turn_frames:
+                        await asyncio.to_thread(
+                            _write_video,
+                            turn_frames,
+                            live_dir,
+                            suffix=f"partial_turn_{code_block_idx:02d}",
+                        )
 
             # Check for cancellation after executing (might have been stopped during execution)
             if is_cancelled():

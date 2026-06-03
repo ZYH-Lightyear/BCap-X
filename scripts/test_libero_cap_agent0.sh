@@ -15,7 +15,7 @@
 #   BACKEND=molmo bash scripts/test_libero_cap_agent0.sh
 #   MODEL="openrouter/qwen/qwen3.6-plus" bash scripts/test_libero_cap_agent0.sh
 #   OUTPUT_DIR="./outputs/franka_libero_cap_agent0_debug" bash scripts/test_libero_cap_agent0.sh
-#   CUDA_DEVICES=auto bash scripts/test_libero_cap_agent0.sh
+#   CUDA_DEVICES=0 bash scripts/test_libero_cap_agent0.sh
 
 set -euo pipefail
 
@@ -63,7 +63,8 @@ WORKERS="${WORKERS:-1}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-2400}"
 MAX_RETRIES="${MAX_RETRIES:-1}"
 OUTPUT_DIR="${OUTPUT_DIR:-./outputs/franka_libero_cap_agent0_quick_test}"
-CUDA_DEVICES="${CUDA_DEVICES:-auto}"
+CUDA_DEVICES="${CUDA_DEVICES:-0}"
+MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-0}"
 RECORD_VIDEO="${RECORD_VIDEO:-True}"
 USE_VISUAL_FEEDBACK="${USE_VISUAL_FEEDBACK:-False}"
 USE_IMG_DIFFERENCING="${USE_IMG_DIFFERENCING:-True}"
@@ -105,6 +106,7 @@ echo "Trials / workers:       $TRIALS / $WORKERS"
 echo "Trial timeout / retries: ${TIMEOUT_SECONDS}s / $MAX_RETRIES"
 echo "Record video:           $RECORD_VIDEO"
 echo "CUDA devices:           $CUDA_DEVICES"
+echo "MuJoCo EGL device:      $MUJOCO_EGL_DEVICE_ID"
 echo "Output dir:             $OUTPUT_DIR"
 echo "========================================================================"
 echo ""
@@ -180,6 +182,7 @@ CAPX_POINT_BACKEND="$BACKEND" \
 CAPX_TRIAL_TIMEOUT_SECONDS="$TIMEOUT_SECONDS" \
 CAPX_TRIAL_MAX_RETRIES="$MAX_RETRIES" \
 MUJOCO_GL=egl \
+MUJOCO_EGL_DEVICE_ID="$MUJOCO_EGL_DEVICE_ID" \
 TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
 CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" \
 uv run --no-sync --active capx/envs/launch.py \

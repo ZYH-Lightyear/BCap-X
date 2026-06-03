@@ -284,6 +284,58 @@ export function useTrialState(): UseTrialStateReturn {
           });
           break;
 
+        case 'execution_line':
+          setTrialState((prev) => {
+            const messages = [...prev.messages];
+            const execIdx = messages.findLastIndex(
+              (m: ChatMessage) => m.type === 'code_execution' && m.blockIndex === event.block_index
+            );
+            if (execIdx >= 0) {
+              const msg = messages[execIdx];
+              const existingLines = msg.executionLines || [];
+              const line = {
+                blockIndex: event.block_index,
+                lineIndex: event.line_index,
+                lineno: event.lineno,
+                source: event.source,
+                phase: event.phase,
+                frameStart: event.frame_start,
+                frameEnd: event.frame_end,
+                traceTime: event.trace_time,
+                stdoutDelta: event.stdout_delta,
+                stderrDelta: event.stderr_delta,
+                exceptionType: event.exception_type,
+                exceptionMessage: event.exception_message,
+                timestamp: event.timestamp,
+              };
+              const existingLineIdx = existingLines.findIndex(
+                (item) => item.lineIndex === event.line_index
+              );
+              const newLines = [...existingLines];
+              if (existingLineIdx >= 0) {
+                const previousLine = newLines[existingLineIdx];
+                newLines[existingLineIdx] = {
+                  ...previousLine,
+                  ...line,
+                  stdoutDelta: event.phase === 'update'
+                    ? `${previousLine.stdoutDelta || ''}${event.stdout_delta || ''}`
+                    : (event.stdout_delta || previousLine.stdoutDelta || ''),
+                  stderrDelta: event.phase === 'update'
+                    ? `${previousLine.stderrDelta || ''}${event.stderr_delta || ''}`
+                    : (event.stderr_delta || previousLine.stderrDelta || ''),
+                };
+              } else {
+                newLines.push(line);
+              }
+              messages[execIdx] = {
+                ...msg,
+                executionLines: newLines,
+              };
+            }
+            return { ...prev, messages };
+          });
+          break;
+
         case 'code_execution_result':
           // Update the last code execution message
           setTrialState((prev) => {

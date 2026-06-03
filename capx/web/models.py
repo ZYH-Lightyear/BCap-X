@@ -142,6 +142,24 @@ class ExecutionStepEvent(WSEventBase):
     highlight: bool = False  # If True, display with highlighted color scheme
 
 
+class ExecutionLineEvent(WSEventBase):
+    """Emitted for each traced Python source line during code execution."""
+
+    type: str = "execution_line"
+    block_index: int
+    line_index: int
+    lineno: int
+    source: str
+    phase: str  # "start", "update", "complete", or "exception"
+    frame_start: int
+    frame_end: int
+    trace_time: float | None = None
+    stdout_delta: str = ""
+    stderr_delta: str = ""
+    exception_type: str | None = None
+    exception_message: str | None = None
+
+
 class VisualFeedbackEvent(WSEventBase):
     """Emitted when visual feedback is captured."""
 
@@ -253,13 +271,14 @@ class StartTrialRequest(BaseModel):
     """Request to start a trial."""
 
     config_path: str
-    model: str = "google/gemini-3.1-pro-preview"
+    model: str = "openrouter/qwen/qwen3.6-plus"
     server_url: str = "http://127.0.0.1:8110/chat/completions"
     temperature: float = 1.0
     max_tokens: int = 20480
+    reasoning_effort: str = "minimal"
     use_visual_feedback: bool | None = None
     use_img_differencing: bool | None = None
-    visual_differencing_model: str | None = "google/gemini-3.1-pro-preview"
+    visual_differencing_model: str | None = "openrouter/qwen/qwen3.6-plus"
     visual_differencing_model_server_url: str | None = "http://127.0.0.1:8110/chat/completions"
     await_user_input_each_turn: bool = False
     execution_timeout: int = 180  # seconds per code block execution

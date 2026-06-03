@@ -22,7 +22,7 @@ import time
 from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.tasks.base import CodeExecutionEnvBase
@@ -43,6 +43,7 @@ from capx.utils.launch_utils import (
     _parse_multi_turn_decision,
     _save_trial_artifacts,
 )
+from capx.utils.line_trace import save_events_jsonl
 from capx.utils.video_utils import _encode_video_base64, _write_video
 
 # Use TYPE_CHECKING to avoid circular imports for type hints only
@@ -123,6 +124,186 @@ def _trial_video_dir(
     )
 
 
+def _trial_live_dir(config: dict[str, Any], trial: int) -> str:
+    """Stable per-trial debug directory that does not depend on reward/sandbox rc."""
+    return os.path.join(config["output_dir"], f"trial_{trial:02d}_live")
+
+
+def _summarize_code_for_overlay(code: str, *, max_lines: int = 14) -> list[str]:
+    """Return compact, high-signal code lines suitable for video overlays."""
+    interesting = (
+        "point_prompt",
+        "segment_sam",
+        "plan_grasp",
+        "goto_pose",
+        "goto_home",
+        "open_gripper",
+        "close_gripper",
+        "solve_ik",
+        "move_to_joints",
+    )
+    lines = [line.rstrip() for line in code.strip().splitlines()]
+    selected = [
+        line
+        for line in lines
+        if line.strip()
+        and not line.lstrip().startswith("#")
+        and any(token in line for token in interesting)
+    ]
+    if not selected:
+        selected = [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
+    selected = selected[:max_lines]
+    return [line[:110] for line in selected]
+
+
+def _overlay_code_on_frame(
+    frame: np.ndarray,
+    code: str,
+    *,
+    block_idx: int,
+    reward: float | None = None,
+    task_completed: bool | None = None,
+) -> np.ndarray:
+    """Draw a readable code-block summary over an RGB frame."""
+    image = Image.fromarray(np.asarray(frame, dtype=np.uint8)).convert("RGB")
+    draw = ImageDraw.Draw(image, "RGBA")
+    try:
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 13
+        )
+        font_bold = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 14
+        )
+    except OSError:
+        font = ImageFont.load_default()
+        font_bold = font
+
+    width, height = image.size
+    code_lines = _summarize_code_for_overlay(code)
+    header = f"Code block {block_idx}"
+    if reward is not None:
+        header += f" | reward={reward:.3f}"
+    if task_completed is not None:
+        header += f" | task_completed={int(task_completed)}"
+
+    line_h = 17
+    pad = 8
+    box_w = min(width - 20, 620)
+    box_h = pad * 2 + line_h * (len(code_lines) + 1)
+    x0 = 10
+    y0 = max(10, height - box_h - 10)
+    x1 = x0 + box_w
+    y1 = y0 + box_h
+
+    draw.rectangle((x0, y0, x1, y1), fill=(0, 0, 0, 175))
+    draw.text((x0 + pad, y0 + pad), header, fill=(255, 230, 80, 255), font=font_bold)
+    for i, line in enumerate(code_lines):
+        draw.text(
+            (x0 + pad, y0 + pad + line_h * (i + 1)),
+            line,
+            fill=(240, 240, 240, 255),
+            font=font,
+        )
+
+    return np.asarray(image)
+
+
+def _overlay_code_on_frames(
+    frames: list[np.ndarray],
+    code: str,
+    *,
+    block_idx: int,
+    reward: float | None = None,
+    task_completed: bool | None = None,
+) -> list[np.ndarray]:
+    """Annotate a list of frames with the code block currently executing."""
+    return [
+        _overlay_code_on_frame(
+            frame,
+            code,
+            block_idx=block_idx,
+            reward=reward,
+            task_completed=task_completed,
+        )
+        for frame in frames
+    ]
+
+
+def _set_api_debug_context(
+    env: CodeExecutionEnvBase,
+    config: dict[str, Any],
+    trial: int,
+    block_idx: int,
+) -> None:
+    """Pass per-block debug logging context to any API object that supports it."""
+    debug_root = os.path.join(_trial_live_dir(config, trial), "debug_overlays")
+    for api in getattr(env, "_apis", {}).values():
+        setter = getattr(api, "set_debug_context", None)
+        if callable(setter):
+            try:
+                setter(output_dir=debug_root, block_idx=block_idx)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[debug] failed to set API debug context: {exc}")
+
+
+def _set_line_trace_context(
+    env: CodeExecutionEnvBase,
+    block_idx: int,
+) -> None:
+    setter = getattr(env, "configure_line_trace", None)
+    if callable(setter):
+        setter(block_idx)
+
+
+def _save_line_trace_events(
+    env: CodeExecutionEnvBase,
+    config: dict[str, Any],
+    trial: int,
+    block_idx: int,
+) -> None:
+    consumer = getattr(env, "consume_line_trace_events", None)
+    if not callable(consumer):
+        return
+    events = consumer()
+    if not events:
+        return
+    output_path = os.path.join(
+        _trial_live_dir(config, trial),
+        "line_trace",
+        f"block_{block_idx:02d}.jsonl",
+    )
+    save_events_jsonl(events, output_path)
+
+
+def _save_partial_turn_video(
+    env: CodeExecutionEnvBase,
+    config: dict[str, Any],
+    trial: int,
+    block_idx: int,
+    frame_start: int,
+    frame_end: int,
+    code: str,
+    info_step: dict[str, Any],
+    reward: float,
+) -> None:
+    """Write this code block's video immediately without clearing the frame buffer."""
+    if not config["record_video"] or not config["output_dir"]:
+        return
+    if not hasattr(env, "get_video_frames_range"):
+        return
+    frames = env.get_video_frames_range(frame_start, frame_end)
+    if not frames:
+        return
+    frames = _overlay_code_on_frames(
+        frames,
+        code,
+        block_idx=block_idx,
+        reward=reward,
+        task_completed=info_step.get("task_completed", False),
+    )
+    _write_video(frames, _trial_live_dir(config, trial), suffix=f"partial_turn_{block_idx:02d}")
+
+
 def _save_trial_video(
     env: CodeExecutionEnvBase,
     config: dict[str, Any],
@@ -159,6 +340,7 @@ def _save_turn_and_combined_videos(
     info_step: dict[str, Any],
     reward: float,
     turn_frame_ranges: list[tuple[int, int]],
+    code_blocks: list[str] | None = None,
 ) -> None:
     """Save per-turn videos and a combined video of all turns.
 
@@ -188,13 +370,23 @@ def _save_turn_and_combined_videos(
         return
 
     # Per-turn videos
+    combined_frames: list[np.ndarray] = [frame.copy() for frame in all_frames]
     for i, (start, end) in enumerate(turn_frame_ranges):
         turn_frames = all_frames[start:end]
         if turn_frames:
+            if code_blocks is not None and i < len(code_blocks):
+                turn_frames = _overlay_code_on_frames(
+                    turn_frames,
+                    code_blocks[i],
+                    block_idx=i,
+                    reward=reward,
+                    task_completed=info_step.get("task_completed", False),
+                )
+                combined_frames[start:end] = turn_frames
             _write_video(turn_frames, base_dir, suffix=f"turn_{i:02d}")
 
     # Combined video
-    _write_video(all_frames, base_dir, suffix="combined")
+    _write_video(combined_frames, base_dir, suffix="combined")
 
     # Wrist camera videos
     if config.get("use_wrist_camera") and hasattr(env, "get_wrist_video_frames"):
@@ -203,6 +395,14 @@ def _save_turn_and_combined_videos(
             for i, (start, end) in enumerate(turn_frame_ranges):
                 wrist_turn = wrist_frames[start:end]
                 if wrist_turn:
+                    if code_blocks is not None and i < len(code_blocks):
+                        wrist_turn = _overlay_code_on_frames(
+                            wrist_turn,
+                            code_blocks[i],
+                            block_idx=i,
+                            reward=reward,
+                            task_completed=info_step.get("task_completed", False),
+                        )
                     _write_video(wrist_turn, base_dir, suffix=f"turn_{i:02d}_wrist")
             _write_video(wrist_frames, base_dir, suffix="combined_wrist")
 
@@ -779,16 +979,33 @@ def _run_single_trial(
 
     while code_block_idx < len(code_blocks) and code_block_idx <= MULTITURN_LIMIT:
         code = code_blocks[code_block_idx]
+        current_block_idx = code_block_idx
         code_block_idx += 1
+
+        _set_api_debug_context(env, config, trial, current_block_idx)
+        _set_line_trace_context(env, current_block_idx)
 
         # Record frame index before step
         frame_start = env.get_video_frame_count() if recording_frames else 0
 
         obs_next, reward, terminated, truncated, info_step = env.step(code)
+        _save_line_trace_events(env, config, trial, current_block_idx)
 
         # Record frame index after step
         frame_end = env.get_video_frame_count() if recording_frames else 0
         turn_frame_ranges.append((frame_start, frame_end))
+        if recording_frames:
+            _save_partial_turn_video(
+                env,
+                config,
+                trial,
+                current_block_idx,
+                frame_start,
+                frame_end,
+                code,
+                info_step,
+                reward,
+            )
 
         if partial_artifacts is not None:
             partial_artifacts.update({
@@ -798,6 +1015,7 @@ def _run_single_trial(
                 "truncated": truncated,
                 "turn_frame_ranges": list(turn_frame_ranges),
                 "recording_frames": recording_frames,
+                "code_blocks": list(code_blocks),
             })
 
         obs = obs_next
@@ -919,7 +1137,7 @@ def _run_single_trial(
     # Save per-turn and combined videos
     if recording_frames and turn_frame_ranges:
         _save_turn_and_combined_videos(
-            env, config, trial, info_step, reward, turn_frame_ranges,
+            env, config, trial, info_step, reward, turn_frame_ranges, code_blocks,
         )
     else:
         _save_trial_video(env, config, trial, info_step, reward, num_code_blocks)

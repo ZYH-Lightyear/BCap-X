@@ -31,6 +31,12 @@ interface ConfigStartControlProps {
   model: string;
   serverUrl: string;
   temperature: number;
+  maxTokens: number;
+  reasoningEffort: string;
+  useVisualFeedback: boolean;
+  useImgDifferencing: boolean;
+  visualDifferencingModel: string;
+  visualDifferencingServerUrl: string;
   awaitUserInput: boolean;
 }
 
@@ -45,6 +51,12 @@ export function ConfigStartControl({
   model,
   serverUrl,
   temperature,
+  maxTokens,
+  reasoningEffort,
+  useVisualFeedback,
+  useImgDifferencing,
+  visualDifferencingModel,
+  visualDifferencingServerUrl,
   awaitUserInput,
 }: ConfigStartControlProps) {
   const [configs, setConfigs] = useState<string[]>([]);
@@ -92,6 +104,12 @@ export function ConfigStartControl({
       model,
       server_url: serverUrl,
       temperature,
+      max_tokens: maxTokens,
+      reasoning_effort: reasoningEffort,
+      use_visual_feedback: useVisualFeedback,
+      use_img_differencing: useImgDifferencing,
+      visual_differencing_model: visualDifferencingModel,
+      visual_differencing_model_server_url: visualDifferencingServerUrl,
       await_user_input_each_turn: awaitUserInput,
     });
   };

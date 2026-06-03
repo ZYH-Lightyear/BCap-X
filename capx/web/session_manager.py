@@ -76,6 +76,7 @@ class Session:
     config_path: str | None = None
     config: dict[str, Any] = field(default_factory=dict)
     env_factory: dict[str, Any] | None = None
+    output_dir: str | None = None
 
     # Settings that can be changed during a trial
     await_user_input_each_turn: bool = False
@@ -137,6 +138,7 @@ class Session:
         self.event_history = []
         self.task = None
         self.env = None
+        self.output_dir = None
         self.execution_thread_id = None
         self.current_block_index = 0
         self.total_code_blocks = 0

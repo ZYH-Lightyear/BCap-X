@@ -5,6 +5,7 @@ import { CodeBlock } from './CodeBlock';
 import { ThinkingSection } from './ThinkingSection';
 import { ImageViewer } from './ImageViewer';
 import { ExecutionDetailDropdown } from './ExecutionDetailDropdown';
+import { ExecutionTimelinePanel } from './ExecutionTimelinePanel';
 
 // Component for generating message with live timer
 function GeneratingMessage({ message, timestamp }: { message: ChatMessage; timestamp: string }) {
@@ -276,6 +277,7 @@ export function ChatMessageComponent({ message }: ChatMessageComponentProps) {
     case 'code_execution': {
       const hasOutput = message.stdout || message.stderr;
       const hasExecutionSteps = message.executionSteps && message.executionSteps.length > 0;
+      const hasExecutionLines = message.executionLines && message.executionLines.length > 0;
       const execBorderColor = message.isExecuting
         ? 'border-l-accent'
         : message.success
@@ -308,6 +310,13 @@ export function ChatMessageComponent({ message }: ChatMessageComponentProps) {
               )}
               <span className="text-text-muted normal-case tracking-normal">{timestamp}</span>
             </div>
+
+            {hasExecutionLines && (
+              <ExecutionTimelinePanel
+                lines={message.executionLines!}
+                isExecuting={message.isExecuting}
+              />
+            )}
 
             {/* Execution Details Dropdown */}
             {hasExecutionSteps && (

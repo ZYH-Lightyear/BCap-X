@@ -382,7 +382,13 @@ def _build_timeout_summary(
         recording_frames = pa.get("recording_frames", False)
         if recording_frames and turn_frame_ranges:
             _save_turn_and_combined_videos(
-                env, config, trial, info_step, reward, turn_frame_ranges
+                env,
+                config,
+                trial,
+                info_step,
+                reward,
+                turn_frame_ranges,
+                pa.get("code_blocks"),
             )
         else:
             _save_trial_video(env, config, trial, info_step, reward, num_code_blocks)

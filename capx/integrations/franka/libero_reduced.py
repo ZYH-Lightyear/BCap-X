@@ -36,6 +36,7 @@ from capx.utils.depth_utils import (
     depth_to_pointcloud,
     depth_to_rgb,
 )
+from capx.utils.visualization_utils import draw_molmo_point, overlay_segmentation_masks
 
 _curobo_api = None
 
@@ -73,6 +74,9 @@ class FrankaLiberoApiReduced(ApiBase):
         self.camera_name = "agentview"
         self.wrist_camera_name = "robot0_eye_in_hand"
         self.cfg = None
+        self._debug_output_dir: pathlib.Path | None = None
+        self._debug_block_idx = 0
+        self._debug_counter = 0
 
         # JIT warmup: trigger JAX compilation with a dummy IK call
         try:
@@ -82,6 +86,64 @@ class FrankaLiberoApiReduced(ApiBase):
             )
         except Exception:
             pass
+
+    def set_debug_context(self, output_dir: str, block_idx: int) -> None:
+        self._debug_output_dir = pathlib.Path(output_dir)
+        self._debug_block_idx = block_idx
+        self._debug_counter = 0
+
+    def _save_debug_overlay(self, name: str, image: np.ndarray) -> None:
+        if self._debug_output_dir is None:
+            return
+        self._debug_output_dir.mkdir(parents=True, exist_ok=True)
+        path = self._debug_output_dir / (
+            f"block_{self._debug_block_idx:02d}_{self._debug_counter:03d}_{name}.png"
+        )
+        self._debug_counter += 1
+        Image.fromarray(np.asarray(image, dtype=np.uint8)).save(path)
+
+    @staticmethod
+    def _draw_label(image: np.ndarray, text: str) -> np.ndarray:
+        out = Image.fromarray(np.asarray(image, dtype=np.uint8)).convert("RGB")
+        draw = ImageDraw.Draw(out, "RGBA")
+        draw.rectangle((8, 8, min(out.width - 8, 520), 34), fill=(0, 0, 0, 165))
+        draw.text((16, 14), text[:80], fill=(255, 255, 255, 255))
+        return np.asarray(out)
+
+    @staticmethod
+    def _draw_boxes(image: np.ndarray, results: list[dict[str, Any]]) -> np.ndarray:
+        out = Image.fromarray(np.asarray(image, dtype=np.uint8)).convert("RGB")
+        draw = ImageDraw.Draw(out)
+        for result in results[:5]:
+            box = result.get("box")
+            if box is not None:
+                x1, y1, x2, y2 = [int(v) for v in box]
+                draw.rectangle((x1, y1, x2, y2), outline=(255, 220, 0), width=3)
+        return np.asarray(out)
+
+    @staticmethod
+    def _draw_grasp_points(
+        image: np.ndarray,
+        grasp_poses: np.ndarray,
+        grasp_scores: np.ndarray,
+        intrinsics: np.ndarray,
+        *,
+        top_k: int = 8,
+    ) -> np.ndarray:
+        out = Image.fromarray(np.asarray(image, dtype=np.uint8)).convert("RGB")
+        draw = ImageDraw.Draw(out)
+        order = np.argsort(grasp_scores)[::-1][:top_k]
+        for rank, idx in enumerate(order):
+            pose = grasp_poses[idx]
+            xyz = pose[:3, 3]
+            if xyz[2] <= 0:
+                continue
+            uvw = intrinsics @ xyz
+            x, y = int(uvw[0] / uvw[2]), int(uvw[1] / uvw[2])
+            color = (0, 255, 80) if rank == 0 else (255, 180, 0)
+            draw.ellipse((x - 6, y - 6, x + 6, y + 6), outline=color, width=3)
+            draw.text((x + 8, y - 8), f"{rank}:{grasp_scores[idx]:.2f}", fill=color)
+        return np.asarray(out)
 
 
     def functions(self) -> dict[str, Any]:
@@ -161,7 +223,18 @@ class FrankaLiberoApiReduced(ApiBase):
             >>> rgb = obs["agentview"]["images"]["rgb"]
             >>> masks = segment_sam3_point_prompt(rgb, (100, 100))
         """
-        return self.sam3_point_prompt_fn(Image.fromarray(rgb), point_coords)
+        results = self.sam3_point_prompt_fn(Image.fromarray(rgb), point_coords)
+        masks = [r["mask"] for r in results if "mask" in r]
+        overlay = overlay_segmentation_masks(rgb, masks) if masks else rgb.copy()
+        point_overlay = draw_molmo_point(
+            overlay,
+            {"point_prompt": (int(point_coords[0]), int(point_coords[1]))},
+        )
+        self._save_debug_overlay(
+            "sam3_point_prompt",
+            self._draw_label(point_overlay, f"SAM3 point prompt: {point_coords}"),
+        )
+        return results
 
     def segment_sam3_text_prompt(
         self,
@@ -194,7 +267,18 @@ class FrankaLiberoApiReduced(ApiBase):
         results = self.sam3_seg_fn(rgb, text_prompt=text_prompt)
         if len(results) == 0:
             print(f"[segment_sam3_text_prompt] SAM3 returned no results for prompt: '{text_prompt}'")
+            self._save_debug_overlay(
+                "sam3_text_prompt_empty",
+                self._draw_label(rgb, f"SAM3 no result: {text_prompt}"),
+            )
             return []
+        masks = [r["mask"] for r in results if "mask" in r]
+        overlay = overlay_segmentation_masks(rgb, masks) if masks else rgb.copy()
+        overlay = self._draw_boxes(overlay, results)
+        self._save_debug_overlay(
+            "sam3_text_prompt",
+            self._draw_label(overlay, f"SAM3 text prompt: {text_prompt}"),
+        )
         return results
 
     # --------------------------------------------------------------------- #
@@ -215,7 +299,13 @@ class FrankaLiberoApiReduced(ApiBase):
             dict[str, tuple[int | None, int | None]]: Pixel coordinates for each
             object query; (None, None) if parsing failed.
         """
-        return self.molmo_point_fn(Image.fromarray(image), objects=[text_prompt])
+        result = self.molmo_point_fn(Image.fromarray(image), objects=[text_prompt])
+        overlay = draw_molmo_point(image, result)
+        self._save_debug_overlay(
+            "point_prompt",
+            self._draw_label(overlay, f"Point prompt: {text_prompt}"),
+        )
+        return result
 
     def get_oriented_bounding_box_from_3d_points(self, points: np.ndarray) -> dict[str, Any]:
         """Get the oriented bounding box from 3D points.
@@ -307,6 +397,15 @@ class FrankaLiberoApiReduced(ApiBase):
         grasp_sample_tf = (
             vtf.SE3.from_matrix(grasp_sample) @ vtf.SE3.from_translation(np.array([0, 0, 0.12]))
         ).as_matrix()
+        depth_vis = depth_to_rgb(depth)
+        mask_overlay = overlay_segmentation_masks(depth_vis, [segmentation > 0], opacity=0.35)
+        grasp_overlay = self._draw_grasp_points(
+            mask_overlay,
+            grasp_sample_tf,
+            grasp_scores,
+            intrinsics,
+        )
+        self._save_debug_overlay("grasp_plan", self._draw_label(grasp_overlay, "GraspNet candidates"))
         return grasp_sample_tf, grasp_scores
 
     def plan_grasp_from_point_clouds(

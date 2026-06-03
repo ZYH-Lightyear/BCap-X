@@ -21,11 +21,8 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import tyro
-
-from capx.utils.launch_utils import _load_config
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
@@ -183,15 +180,26 @@ def _ensure_frontend_built() -> None:
     print("[web-ui] Frontend build complete")
 
 
-def _run_web_ui(args: LaunchArgs, config: dict[str, Any]) -> None:
+def _run_web_ui(args: LaunchArgs) -> None:
     """Start the interactive web UI server."""
     import uvicorn
     from capx.web.server import create_app
 
     _ensure_frontend_built()
-    port = int(config.get("web_ui_port", 8200))
+    port = int(args.web_ui_port or 8200)
     app = create_app()
     app.state.default_config_path = args.config_path
+    app.state.default_launch_args = {
+        "model": args.model,
+        "server_url": args.server_url,
+        "temperature": args.temperature,
+        "max_tokens": args.max_tokens,
+        "reasoning_effort": args.reasoning_effort,
+        "use_visual_feedback": args.use_visual_feedback,
+        "use_img_differencing": args.use_img_differencing,
+        "visual_differencing_model": args.visual_differencing_model,
+        "visual_differencing_model_server_url": args.visual_differencing_model_server_url,
+    }
     print(f"\n  CaP-X Interactive Web UI: http://localhost:{port}\n")
     uvicorn.run(app, host="0.0.0.0", port=port)
 
@@ -202,17 +210,19 @@ def _run_web_ui(args: LaunchArgs, config: dict[str, Any]) -> None:
 
 def main(args: LaunchArgs) -> None:
     """Load config and dispatch to web UI or headless trial execution."""
+    if args.web_ui:
+        _run_web_ui(args)
+        return
+
     from capx.envs.runner import _run_headless_trials, _start_api_servers, _stop_api_servers
+    from capx.utils.launch_utils import _load_config
 
     start_time = time.time()
     env_factory, config, api_servers = _load_config(args)
     server_procs = _start_api_servers(api_servers)
 
     try:
-        if config.get("web_ui", False):
-            _run_web_ui(args, config)
-        else:
-            _run_headless_trials(args, env_factory, config, start_time)
+        _run_headless_trials(args, env_factory, config, start_time)
     finally:
         try:
             _stop_api_servers(server_procs)

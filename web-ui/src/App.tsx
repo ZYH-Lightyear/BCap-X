@@ -3,13 +3,22 @@ import { useTrialState } from './hooks/useTrialState';
 import { ConfigStartControl } from './components/ConfigStartControl';
 import { ChatPanel } from './components/ChatPanel';
 import { VisualizationPanel } from './components/VisualizationPanel';
+import { VideoArtifactsPanel } from './components/VideoArtifactsPanel';
 
 const FALLBACK_CONFIG = 'env_configs/cube_stack/franka_robosuite_cube_stack.yaml';
+const DEFAULT_MODEL = 'openrouter/qwen/qwen3.6-plus';
+const DEFAULT_SERVER_URL = 'http://127.0.0.1:8110/chat/completions';
 
 function App() {
   const trial = useTrialState();
-  const [model, setModel] = useState('google/gemini-3.1-pro-preview');
-  const [serverUrl, setServerUrl] = useState('http://127.0.0.1:8110/chat/completions');
+  const [model, setModel] = useState(DEFAULT_MODEL);
+  const [serverUrl, setServerUrl] = useState(DEFAULT_SERVER_URL);
+  const [visualDifferencingModel, setVisualDifferencingModel] = useState(DEFAULT_MODEL);
+  const [visualDifferencingServerUrl, setVisualDifferencingServerUrl] = useState(DEFAULT_SERVER_URL);
+  const [maxTokens, setMaxTokens] = useState(8192);
+  const [reasoningEffort, setReasoningEffort] = useState('minimal');
+  const [useImgDifferencing, setUseImgDifferencing] = useState(true);
+  const [useVisualFeedback, setUseVisualFeedback] = useState(false);
   const [temperature, setTemperature] = useState(1.0);
   const [awaitUserInput, setAwaitUserInput] = useState(true);
   const [executionTimeout, setExecutionTimeout] = useState(180);
@@ -59,6 +68,15 @@ function App() {
         const data = await resp.json();
         const configPath = data.config_path || FALLBACK_CONFIG;
         const shouldAutoStart = data.auto_start === true;
+        if (data.model) setModel(data.model);
+        if (data.server_url) setServerUrl(data.server_url);
+        if (data.visual_differencing_model) setVisualDifferencingModel(data.visual_differencing_model);
+        if (data.visual_differencing_model_server_url) setVisualDifferencingServerUrl(data.visual_differencing_model_server_url);
+        if (typeof data.temperature === 'number') setTemperature(data.temperature);
+        if (typeof data.max_tokens === 'number') setMaxTokens(data.max_tokens);
+        if (data.reasoning_effort) setReasoningEffort(data.reasoning_effort);
+        if (typeof data.use_img_differencing === 'boolean') setUseImgDifferencing(data.use_img_differencing);
+        if (typeof data.use_visual_feedback === 'boolean') setUseVisualFeedback(data.use_visual_feedback);
 
         const loaded = await trial.loadConfig(configPath);
 
@@ -82,11 +100,17 @@ function App() {
         model,
         server_url: serverUrl,
         temperature,
+        max_tokens: maxTokens,
+        reasoning_effort: reasoningEffort,
+        use_visual_feedback: useVisualFeedback,
+        use_img_differencing: useImgDifferencing,
+        visual_differencing_model: visualDifferencingModel,
+        visual_differencing_model_server_url: visualDifferencingServerUrl,
         await_user_input_each_turn: awaitUserInput,
         execution_timeout: executionTimeout,
       });
     }
-  }, [trial.configPath, trial.state, hasCheckedSession]);
+  }, [trial.configPath, trial.state, hasCheckedSession, model, serverUrl, temperature, maxTokens, reasoningEffort, useVisualFeedback, useImgDifferencing, visualDifferencingModel, visualDifferencingServerUrl, awaitUserInput, executionTimeout]);
 
   const isRunning = trial.state === 'running' || trial.state === 'awaiting_user_input';
 
@@ -158,6 +182,12 @@ function App() {
               model={model}
               serverUrl={serverUrl}
               temperature={temperature}
+              maxTokens={maxTokens}
+              reasoningEffort={reasoningEffort}
+              useVisualFeedback={useVisualFeedback}
+              useImgDifferencing={useImgDifferencing}
+              visualDifferencingModel={visualDifferencingModel}
+              visualDifferencingServerUrl={visualDifferencingServerUrl}
               awaitUserInput={awaitUserInput}
             />
           </div>
@@ -189,6 +219,8 @@ function App() {
                 <option value="openai/o1">O1</option>
               </optgroup>
               <optgroup label="Open Source">
+                <option value="openrouter/qwen/qwen3.6-plus">Qwen 3.6 Plus (OpenRouter)</option>
+                <option value="qwen/qwen3.6-plus">Qwen 3.6 Plus</option>
                 <option value="deepseek/deepseek-v3-0324">DeepSeek V3</option>
                 <option value="deepseek/deepseek-r1-0528">DeepSeek R1</option>
                 <option value="qwen/qwen-235b-a22b">Qwen 235B</option>
@@ -245,6 +277,19 @@ function App() {
                   </button>
                 </div>
                 <div className="p-5 space-y-5">
+                  {/* Model */}
+                  <div>
+                    <label htmlFor="settings-model" className="block text-xs font-display font-medium text-text-secondary mb-1.5 tracking-wide uppercase">Model</label>
+                    <input
+                      id="settings-model"
+                      type="text"
+                      value={model}
+                      onChange={(e) => setModel(e.target.value)}
+                      disabled={isRunning}
+                      className="w-full px-3 py-2 bg-surface-sunken border border-surface-border rounded-md text-sm text-text-primary font-mono placeholder-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent/40 focus:border-accent/40 disabled:opacity-40 transition-all"
+                    />
+                  </div>
+
                   {/* Server URL */}
                   <div>
                     <label htmlFor="settings-server-url" className="block text-xs font-display font-medium text-text-secondary mb-1.5 tracking-wide uppercase">Server URL</label>
@@ -256,6 +301,48 @@ function App() {
                       disabled={isRunning}
                       className="w-full px-3 py-2 bg-surface-sunken border border-surface-border rounded-md text-sm text-text-primary font-mono placeholder-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent/40 focus:border-accent/40 disabled:opacity-40 transition-all"
                     />
+                  </div>
+
+                  {/* Visual differencing */}
+                  <div className="space-y-3">
+                    <label className="flex items-center gap-2.5 cursor-pointer group py-1">
+                      <div className="relative">
+                        <input
+                          type="checkbox"
+                          checked={useImgDifferencing}
+                          onChange={(e) => setUseImgDifferencing(e.target.checked)}
+                          disabled={isRunning}
+                          className="sr-only peer"
+                        />
+                        <div className="w-8 h-4.5 bg-surface-border rounded-full peer-checked:bg-accent/80 transition-colors" />
+                        <div className="absolute top-0.5 left-0.5 w-3.5 h-3.5 bg-text-secondary rounded-full peer-checked:translate-x-3.5 peer-checked:bg-white transition-all" />
+                      </div>
+                      <span className="text-sm font-display text-text-secondary group-hover:text-text-primary transition-colors">
+                        Use image differencing
+                      </span>
+                    </label>
+                    <div>
+                      <label htmlFor="settings-vdm-model" className="block text-xs font-display font-medium text-text-secondary mb-1.5 tracking-wide uppercase">Visual Differencing Model</label>
+                      <input
+                        id="settings-vdm-model"
+                        type="text"
+                        value={visualDifferencingModel}
+                        onChange={(e) => setVisualDifferencingModel(e.target.value)}
+                        disabled={isRunning || !useImgDifferencing}
+                        className="w-full px-3 py-2 bg-surface-sunken border border-surface-border rounded-md text-sm text-text-primary font-mono placeholder-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent/40 focus:border-accent/40 disabled:opacity-40 transition-all"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="settings-vdm-server-url" className="block text-xs font-display font-medium text-text-secondary mb-1.5 tracking-wide uppercase">Visual Differencing Server URL</label>
+                      <input
+                        id="settings-vdm-server-url"
+                        type="text"
+                        value={visualDifferencingServerUrl}
+                        onChange={(e) => setVisualDifferencingServerUrl(e.target.value)}
+                        disabled={isRunning || !useImgDifferencing}
+                        className="w-full px-3 py-2 bg-surface-sunken border border-surface-border rounded-md text-sm text-text-primary font-mono placeholder-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent/40 focus:border-accent/40 disabled:opacity-40 transition-all"
+                      />
+                    </div>
                   </div>
 
                   {/* Temperature */}
@@ -272,6 +359,38 @@ function App() {
                       step="0.1"
                       className="w-24 px-3 py-2 bg-surface-sunken border border-surface-border rounded-md text-sm text-text-primary font-mono focus:outline-none focus:ring-1 focus:ring-accent/40 focus:border-accent/40 disabled:opacity-40 transition-all"
                     />
+                  </div>
+
+                  {/* Max tokens */}
+                  <div>
+                    <label htmlFor="settings-max-tokens" className="block text-xs font-display font-medium text-text-secondary mb-1.5 tracking-wide uppercase">Max Tokens</label>
+                    <input
+                      id="settings-max-tokens"
+                      type="number"
+                      value={maxTokens}
+                      onChange={(e) => setMaxTokens(parseInt(e.target.value) || 8192)}
+                      disabled={isRunning}
+                      min="1024"
+                      step="1024"
+                      className="w-28 px-3 py-2 bg-surface-sunken border border-surface-border rounded-md text-sm text-text-primary font-mono focus:outline-none focus:ring-1 focus:ring-accent/40 focus:border-accent/40 disabled:opacity-40 transition-all"
+                    />
+                  </div>
+
+                  {/* Reasoning effort */}
+                  <div>
+                    <label htmlFor="settings-reasoning-effort" className="block text-xs font-display font-medium text-text-secondary mb-1.5 tracking-wide uppercase">Reasoning Effort</label>
+                    <select
+                      id="settings-reasoning-effort"
+                      value={reasoningEffort}
+                      onChange={(e) => setReasoningEffort(e.target.value)}
+                      disabled={isRunning}
+                      className="px-3 py-2 bg-surface-sunken border border-surface-border rounded-md text-sm text-text-primary font-mono focus:outline-none focus:ring-1 focus:ring-accent/40 focus:border-accent/40 disabled:opacity-40 transition-all"
+                    >
+                      <option value="minimal">minimal</option>
+                      <option value="low">low</option>
+                      <option value="medium">medium</option>
+                      <option value="high">high</option>
+                    </select>
                   </div>
 
                   {/* Execution Timeout */}
@@ -365,7 +484,12 @@ function App() {
           className="flex flex-col bg-surface-raised overflow-hidden"
           style={{ width: `${100 - splitPercent}%` }}
         >
-          <VisualizationPanel trialState={trial.state} />
+          <div className="h-1/2 min-h-0 flex">
+            <VisualizationPanel trialState={trial.state} />
+          </div>
+          <div className="h-1/2 min-h-0 flex">
+            <VideoArtifactsPanel sessionId={trial.sessionId} trialState={trial.state} />
+          </div>
         </div>
       </main>
     </div>

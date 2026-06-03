@@ -103,6 +103,22 @@ export interface ExecutionStepEvent extends WSEventBase {
   highlight?: boolean;  // If true, display with highlighted color scheme
 }
 
+export interface ExecutionLineEvent extends WSEventBase {
+  type: 'execution_line';
+  block_index: number;
+  line_index: number;
+  lineno: number;
+  source: string;
+  phase: 'start' | 'update' | 'complete' | 'exception';
+  frame_start: number;
+  frame_end: number;
+  trace_time?: number | null;
+  stdout_delta: string;
+  stderr_delta: string;
+  exception_type?: string | null;
+  exception_message?: string | null;
+}
+
 export interface UserPromptRequestEvent extends WSEventBase {
   type: 'user_prompt_request';
   current_state_summary: string;
@@ -141,6 +157,7 @@ export type WSEvent =
   | CodeExecutionResultEvent
   | VisualFeedbackEvent
   | ExecutionStepEvent
+  | ExecutionLineEvent
   | ImageAnalysisEvent
   | UserPromptRequestEvent
   | TrialCompleteEvent
@@ -195,6 +212,7 @@ export interface StartTrialRequest {
   server_url?: string;
   temperature?: number;
   max_tokens?: number;
+  reasoning_effort?: string;
   use_visual_feedback?: boolean | null;
   use_img_differencing?: boolean | null;
   visual_differencing_model?: string | null;
@@ -206,6 +224,21 @@ export interface StartTrialRequest {
 export interface StartTrialResponse {
   session_id: string;
   status: string;
+}
+
+export interface ArtifactItem {
+  path: string;
+  name: string;
+  url: string;
+  mtime: number;
+  size: number;
+}
+
+export interface ArtifactListResponse {
+  output_dir: string | null;
+  videos: ArtifactItem[];
+  line_traces: ArtifactItem[];
+  overlays: ArtifactItem[];
 }
 
 // ============================================================================
@@ -233,6 +266,22 @@ export interface ExecutionStepData {
   images: string[];  // Base64 encoded images
   stepIndex: number;
   highlight?: boolean;  // If true, display with highlighted color scheme
+}
+
+export interface ExecutionLineData {
+  blockIndex: number;
+  lineIndex: number;
+  lineno: number;
+  source: string;
+  phase: 'start' | 'update' | 'complete' | 'exception';
+  frameStart: number;
+  frameEnd: number;
+  traceTime?: number | null;
+  stdoutDelta: string;
+  stderrDelta: string;
+  exceptionType?: string | null;
+  exceptionMessage?: string | null;
+  timestamp: string;
 }
 
 export interface ChatMessage {
@@ -264,6 +313,7 @@ export interface ChatMessage {
   endTime?: number;  // timestamp when generation ended
   // Execution step fields
   executionSteps?: ExecutionStepData[];  // Array of steps for the current code block
+  executionLines?: ExecutionLineData[];  // Line-level trace for the current code block
   toolName?: string;  // For individual execution step (single event)
   stepImages?: string[];  // Images for execution step
 }

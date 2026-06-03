@@ -13,6 +13,7 @@ from capx.envs.base import BaseEnv, ObsType, get_env
 from capx.envs.configs.instantiate import instantiate as cfg_instantiate
 from capx.envs.configs.loader import DictLoader
 from capx.integrations.base_api import ApiBase, get_api
+from capx.utils.line_trace import LineTraceRecorder, tracing
 
 
 class Tee(io.TextIOBase):
@@ -20,13 +21,17 @@ class Tee(io.TextIOBase):
     (enables breakpointing for debugging!)
     """
 
-    def __init__(self, *streams):
+    def __init__(self, *streams, on_write: Callable[[str], None] | None = None):
         self.streams = streams
+        self.on_write = on_write
 
     def write(self, s):
         for st in self.streams:
             st.write(s)
             st.flush()
+        if self.on_write is not None:
+            self.on_write(s)
+        return len(s)
 
     def flush(self):
         for st in self.streams:
@@ -123,6 +128,9 @@ class CodeExecutionEnvBase(Env):
         # Persistent execution namespace to retain variables across steps
         self._exec_globals: dict[str, Any] = {}
         self._init_exec_globals()
+        self._line_trace_block_index: int | None = None
+        self._line_trace_emit_callback: Callable[[dict[str, Any]], None] | None = None
+        self._last_line_trace_events: list[dict[str, Any]] = []
 
     # Functions that can be overridden by subclasses
     def compute_reward(self) -> float:
@@ -161,21 +169,45 @@ class CodeExecutionEnvBase(Env):
             for fn_name, fn in api.functions().items():
                 self._exec_globals[fn_name] = fn
 
+        recorder = None
+        if self._line_trace_block_index is not None:
+            recorder = LineTraceRecorder(
+                block_index=self._line_trace_block_index,
+                code=code,
+                get_frame_count=self.get_video_frame_count,
+                emit_callback=self._line_trace_emit_callback,
+            )
+
         stdout_buffer = io.StringIO()
-        tee_out = Tee(sys.stdout, stdout_buffer)
+        tee_out = Tee(
+            sys.stdout,
+            stdout_buffer,
+            on_write=recorder.record_stdout if recorder is not None else None,
+        )
         stderr_buffer = io.StringIO()
-        tee_err = Tee(sys.stderr, stderr_buffer)
+        tee_err = Tee(
+            sys.stderr,
+            stderr_buffer,
+            on_write=recorder.record_stderr if recorder is not None else None,
+        )
         ok = True
         try:
             with (
                 contextlib.redirect_stdout(tee_out),
                 contextlib.redirect_stderr(tee_err),
             ):
-                exec(code, self._exec_globals, self._exec_globals)
+                if recorder is None:
+                    exec(code, self._exec_globals, self._exec_globals)
+                else:
+                    compiled = recorder.compile()
+                    with tracing(recorder):
+                        exec(compiled, self._exec_globals, self._exec_globals)
         except BaseException:  # defensive; propagate minimal info
             ok = False
             # Always print full traceback to the redirected stderr (tee -> console and buffer)
             traceback.print_exc(file=tee_err)
+        finally:
+            self._last_line_trace_events = recorder.finish() if recorder is not None else []
 
         return {
             "ok": ok,
@@ -183,6 +215,20 @@ class CodeExecutionEnvBase(Env):
             "stderr": stderr_buffer.getvalue(),
             "result": self._exec_globals.get("RESULT"),
         }
+
+    def configure_line_trace(
+        self,
+        block_index: int | None,
+        emit_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        self._line_trace_block_index = block_index
+        self._line_trace_emit_callback = emit_callback
+        self._last_line_trace_events = []
+
+    def consume_line_trace_events(self) -> list[dict[str, Any]]:
+        events = list(self._last_line_trace_events)
+        self._last_line_trace_events = []
+        return events
 
     def _init_exec_globals(self) -> None:
         """
