@@ -29,6 +29,17 @@ class CodePolicy(Protocol):
     def act(self, prompt: list[dict]) -> str: ...
 
 
+class CompletionPolicy(Protocol):
+    """Returns the model's *raw* reply; the agent loop parses the action itself.
+
+    The unified ``CodingAgent`` core (skill-load / run-python / terminal) needs the
+    untouched text so it can route between actions, so it drives policies through
+    ``complete`` rather than the code-extracting ``act``.
+    """
+
+    def complete(self, prompt: list[dict]) -> str: ...
+
+
 class LLMCodePolicy:
     """Real LLM policy backed by ``capx.llm.client.query_model``.
 
@@ -56,10 +67,15 @@ class LLMCodePolicy:
         )
 
     def act(self, prompt: list[dict]) -> str:
-        content = self._query_model(self._args, prompt)["content"]
+        content = self.complete(prompt)
         if FINISH in content and not _CODE_FENCE.search(content):
             return FINISH
         return extract_code(content)
+
+    def complete(self, prompt: list[dict]) -> str:
+        """Raw model reply, untouched (the ``CodingAgent`` core parses it)."""
+
+        return self._query_model(self._args, prompt)["content"]
 
 
 class ScriptedCodePolicy:
@@ -75,3 +91,12 @@ class ScriptedCodePolicy:
         response = self._responses[self._index]
         self._index += 1
         return response if response == FINISH else extract_code(response)
+
+    def complete(self, prompt: list[dict]) -> str:
+        """Replay the next raw response verbatim (fences / ``USE SKILL`` intact)."""
+
+        if self._index >= len(self._responses):
+            return FINISH
+        response = self._responses[self._index]
+        self._index += 1
+        return response

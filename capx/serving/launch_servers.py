@@ -541,7 +541,7 @@ class LaunchServersArgs:
     log_dir: str | None = None
     """Directory to write per-server log files. Default: print to stdout with prefix."""
 
-    timeout: float = 120.0
+    timeout: float = 300.0
     """Seconds to wait for all servers to become ready."""
 
     host: str = "127.0.0.1"
@@ -666,10 +666,25 @@ def main(args: LaunchServersArgs) -> None:
         logger.info("Dry run; exiting without starting servers.")
         return
 
-    # 5. Start all servers
+    # 5. Start all servers. If a port is already accepting TCP connections,
+    # assume that server was launched by a previous run and reuse it instead of
+    # starting a duplicate process that will fail with "address already in use".
     processes: list[tuple[dict[str, Any], subprocess.Popen[str]]] = []
+    reused: list[dict[str, Any]] = []
     for srv in servers:
-        logger.info("Starting %s on port %s...", srv["server"], srv.get("port"))
+        host = srv.get("host", args.host)
+        port = srv.get("port", SERVER_REGISTRY[srv["server"]]["default_port"])
+        if _tcp_check(host, port):
+            logger.info(
+                "Reusing existing %s on %s:%s (already reachable).",
+                srv["server"],
+                host,
+                port,
+            )
+            reused.append(srv)
+            continue
+
+        logger.info("Starting %s on port %s...", srv["server"], port)
         try:
             proc = start_server(srv, workers=args.workers, log_dir=args.log_dir)
             processes.append((srv, proc))
@@ -678,7 +693,11 @@ def main(args: LaunchServersArgs) -> None:
             _shutdown(processes)
             sys.exit(1)
 
-    logger.info("All %d server(s) launched. Waiting for readiness...", len(processes))
+    logger.info(
+        "%d server(s) launched, %d reused. Waiting for readiness...",
+        len(processes),
+        len(reused),
+    )
 
     # 6. Wait for readiness
     all_ready = wait_for_ready(servers, processes, timeout=args.timeout)
@@ -686,6 +705,10 @@ def main(args: LaunchServersArgs) -> None:
         logger.info("All servers are ready.")
     else:
         logger.warning("Some servers did not become ready within %.0fs.", args.timeout)
+
+    if not processes:
+        logger.info("No new server processes were launched; leaving reused servers running.")
+        return
 
     # 7. Block until Ctrl-C or SIGTERM, then graceful shutdown
     shutdown_requested = False
@@ -716,7 +739,7 @@ def main(args: LaunchServersArgs) -> None:
                 rc = proc.poll()
                 if rc is None:
                     all_dead = False
-                elif rc != 0 and not getattr(srv, "_reported_exit", False):
+                elif rc != 0 and not srv.get("_reported_exit", False):
                     logger.error(
                         "%s (PID %d) exited unexpectedly with code %d",
                         srv["server"],

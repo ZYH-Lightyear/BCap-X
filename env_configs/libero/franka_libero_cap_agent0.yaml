@@ -56,6 +56,9 @@ api_servers:
     device: cuda
     port: 8114
     host: 127.0.0.1
+    # Local SAM3 weights. Leave unset to auto-discover <repo>/checkpoints/sam3/sam3.pt,
+    # then fall back to a HuggingFace download if no local checkpoint exists.
+    checkpoint_path: ./checkpoints/sam3/sam3.pt
 
 record_video: true
 output_dir: ./outputs/franka_libero_cap_agent0

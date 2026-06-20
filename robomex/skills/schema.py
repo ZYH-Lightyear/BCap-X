@@ -1,17 +1,31 @@
-"""Lightweight dual-species skill schema (v1.1).
+"""Skill carrier: a skill is a *directory package*, MMSkills/jianying-style.
 
-A skill is one markdown file with YAML frontmatter:
+A skill is procedural-knowledge text plus optional sidecar assets, laid out as a
+self-contained directory (progressive disclosure -- the agent reads ``SKILL.md``
+first and loads sidecars only when relevant). Files are split by *reader*::
 
-- frontmatter = the machine-facing contract (kind, claim interface, verify,
-  recovery, retrieval keywords);
-- body = the guidance text injected into the LLM prompt as-is. Seed skills are
-  hand-written; distilled skills are generated. One representation for both.
+    <skill_id>/
+      SKILL.md          # the executor agent: when / decompose / procedure / recovery
+      ref/              # the Verifier Agent: how to judge success
+        verify.md       #   authoritative pass/fail rubric (multimodal-friendly)
+        success.png     #   optional visual references (success frame, good mask, ...)
+      scripts/          # deterministic code (verifier-as-code, distiller-maintained)
+        verify.py       #   optional executable gate
 
-Two species share the schema, differing only in what their claims mean:
+``SKILL.md`` itself stays prose-first: a short YAML frontmatter for the few things
+code branches on, and a markdown body injected into the agent prompt verbatim.
+There is no typed claim interface, no API whitelist, no validation -- chaining and
+verification are the agent/planner's job, read from the prose (and, later, from the
+sidecars), not enforced by a schema.
 
-- ``observation`` skills produce claims about the world (gate 1 verifies them);
-- ``action`` skills consume claims as preconditions and produce effect-claims
-  that should become true after execution (gate 3 verifies them).
+Frontmatter keys that code looks at (all optional):
+
+- ``kind``: ``observation`` | ``action`` -- only organizes the library on disk.
+- ``compound``: ``true`` for a high-level skill whose body orchestrates others.
+- ``name`` / ``description``: the planner's capability-menu surface.
+
+Any other frontmatter key is kept untouched in ``meta`` and never enforced. The
+package layout carries structure; the frontmatter stays deliberately thin.
 """
 
 from __future__ import annotations
@@ -19,95 +33,140 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 import yaml
 
 
-class SkillKind(str, Enum):
+class SkillCategory(str, Enum):
+    """The three skill categories, mirroring the two-tier design.
+
+    - ``high_level``: compound skills that orchestrate leaf skills (planner menu).
+    - ``observation``: O-Skills that perceive/ground (segment, measure, vet grasps).
+    - ``action``: leaf A-Skills that move the robot.
+    """
+
+    HIGH_LEVEL = "high_level"
     OBSERVATION = "observation"
     ACTION = "action"
 
 
-# Typed interface between O-skills and A-skills. An action skill may only
-# require claim types that some observation skill produces; effect-claims are
-# what gate-3 verification checks after the action ran.
-CLAIM_TYPES: dict[str, str] = {
-    "object_mask": "2D segmentation mask of a named object in a camera view.",
-    "object_points": "Noise-filtered 3D points of a named object.",
-    "object_geometry": "Oriented bounding box / size estimate of an object.",
-    "grasp_pose": "A grasp position + quaternion, ideally IK-feasible.",
-    "object_grasped": "The object is held in the closed gripper (effect).",
-    "object_in_container": "The object rests inside the target container (effect).",
-}
-
-
-@dataclass(frozen=True)
-class Claim:
-    """A typed runtime assertion about the world, produced by a skill."""
-
-    claim_type: str
-    payload: dict[str, Any] = field(default_factory=dict)
-    confidence: float | None = None
-    source_skill: str | None = None
-    evidence: str = ""
-
-
 _FRONTMATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
 
-_TUPLE_FIELDS = ("requires", "produces", "apis", "verify", "recovery", "keywords")
+SKILL_FILE = "SKILL.md"
+REF_DIR = "ref"
+VERIFY_DOC = "verify.md"
+SCRIPTS_DIR = "scripts"
+VERIFIER_FILE = "verify.py"
+
+
+def _parse_category(meta: dict[str, Any]) -> SkillCategory:
+    """Read ``category`` from frontmatter, tolerating the legacy ``kind``/``compound``."""
+
+    raw = meta.get("category")
+    if raw:
+        return SkillCategory(str(raw))
+    if meta.get("compound"):  # legacy: compound action -> high level
+        return SkillCategory.HIGH_LEVEL
+    return SkillCategory(str(meta.get("kind", "action")))
 
 
 @dataclass(frozen=True)
 class Skill:
-    """One multimodal executable skill: contract (frontmatter) + guidance (body)."""
+    """One skill package: a little metadata, the prose body, and (lazily) its sidecars.
 
-    kind: SkillKind
+    ``root`` is the on-disk package directory when the skill was loaded from one
+    (``None`` for skills built in memory). Sidecar accessors resolve against it.
+    """
+
     skill_id: str
     name: str
-    description: str
-    requires: tuple[str, ...] = ()
-    produces: tuple[str, ...] = ()
-    apis: tuple[str, ...] = ()
-    verify: tuple[str, ...] = ()
-    recovery: tuple[str, ...] = ()
-    keywords: tuple[str, ...] = ()
-    guidance: str = ""
-    version: str = "0.1"
+    category: SkillCategory = SkillCategory.ACTION
+    description: str = ""
+    body: str = ""
+    meta: dict[str, Any] = field(default_factory=dict)
+    root: Path | None = None
 
-    def with_recovery(self, note: str) -> Skill:
-        """Return a copy with one recovery hint appended (failure patching)."""
+    @property
+    def guidance(self) -> str:
+        """The text injected into the prompt (the markdown body, verbatim)."""
 
-        return replace(self, recovery=self.recovery + (note,))
+        return self.body
+
+    @property
+    def compound(self) -> bool:
+        """High-level skills orchestrate other skills (the planner's menu)."""
+
+        return self.category is SkillCategory.HIGH_LEVEL
+
+    def verify_doc_path(self) -> Path | None:
+        """``ref/verify.md``: the Verifier Agent's success rubric, if present."""
+
+        if self.root is None:
+            return None
+        path = self.root / REF_DIR / VERIFY_DOC
+        return path if path.is_file() else None
+
+    def reference_paths(self) -> list[Path]:
+        """Visual/other reference assets under ``ref/`` (excluding ``verify.md``)."""
+
+        if self.root is None:
+            return []
+        refs = self.root / REF_DIR
+        if not refs.is_dir():
+            return []
+        return sorted(p for p in refs.iterdir() if p.is_file() and p.name != VERIFY_DOC)
+
+    def verifier_path(self) -> Path | None:
+        """``scripts/verify.py``: deterministic verifier-as-code, if it ships one."""
+
+        if self.root is None:
+            return None
+        path = self.root / SCRIPTS_DIR / VERIFIER_FILE
+        return path if path.is_file() else None
+
+    def with_note(self, note: str) -> Skill:
+        """Append a free-text note to the body (used to patch in failure lessons)."""
+
+        body = f"{self.body.rstrip()}\n\n## Notes\n\n- {note}\n"
+        return replace(self, body=body)
 
     @classmethod
-    def from_markdown(cls, text: str) -> Skill:
+    def from_dir(cls, path: str | Path) -> Skill:
+        """Load a skill package: parse ``<path>/SKILL.md`` and attach ``root=path``."""
+
+        path = Path(path)
+        text = (path / SKILL_FILE).read_text()
+        skill = cls.from_markdown(text, skill_id=path.name)
+        return replace(skill, root=path)
+
+    @classmethod
+    def from_markdown(cls, text: str, skill_id: str | None = None) -> Skill:
         match = _FRONTMATTER.match(text)
-        if not match:
-            raise ValueError("skill markdown must start with a YAML frontmatter block")
-        meta = yaml.safe_load(match.group(1)) or {}
-        body = text[match.end():].strip()
+        if match:
+            meta = yaml.safe_load(match.group(1)) or {}
+            body = text[match.end():].strip()
+        else:
+            meta, body = {}, text.strip()
+        sid = skill_id or meta.get("id") or meta.get("skill_id") or meta.get("name") or "skill"
         return cls(
-            kind=SkillKind(meta["kind"]),
-            skill_id=meta["skill_id"],
-            name=meta["name"],
-            description=meta.get("description", ""),
-            guidance=body,
-            version=str(meta.get("version", "0.1")),
-            **{f: tuple(meta.get(f, ()) or ()) for f in _TUPLE_FIELDS},
+            skill_id=str(sid),
+            name=str(meta.get("name", sid)),
+            category=_parse_category(meta),
+            description=str(meta.get("description", "") or ""),
+            body=body,
+            meta=dict(meta),
         )
 
     def to_markdown(self) -> str:
-        meta: dict[str, Any] = {
-            "kind": self.kind.value,
-            "skill_id": self.skill_id,
-            "name": self.name,
-            "description": self.description,
-            "version": self.version,
-        }
-        for f in _TUPLE_FIELDS:
-            value = getattr(self, f)
-            if value:
-                meta[f] = list(value)
+        meta = dict(self.meta)
+        meta.setdefault("name", self.name)
+        meta["category"] = self.category.value
+        if self.description:
+            meta.setdefault("description", self.description)
+        # Drop keys that are derived or not part of the prose-first contract.
+        for stale in ("id", "skill_id", "kind", "compound"):
+            meta.pop(stale, None)
         frontmatter = yaml.safe_dump(meta, sort_keys=False, allow_unicode=True, width=100).strip()
-        return f"---\n{frontmatter}\n---\n\n{self.guidance.strip()}\n"
+        return f"---\n{frontmatter}\n---\n\n{self.body.strip()}\n"

@@ -4,7 +4,7 @@ RoboMEx's distillation substrate is the *code trace* (generated code + stdout/
 stderr + verifier verdicts), not raw video or free text. A successful trace is
 condensed into an action skill whose guidance carries the working code as a
 reusable sketch; a failed trace contributes a recovery hint to the consulted
-skills. Distilled skills use the same markdown representation as seeds.
+skills. Distilled skills use the same package representation as the library.
 
 An incremental-value gate (Skill1's ``r(tau) - U_hat`` idea) only admits a new
 skill when the run succeeded and beats the best consulted skill's success rate.
@@ -16,7 +16,7 @@ import re
 
 from robomex.agent.trace import AgentTrace
 from robomex.library import SkillLibrary
-from robomex.skills import Skill, SkillKind
+from robomex.skills import Skill, SkillCategory
 
 
 def _slug(task: str) -> str:
@@ -54,19 +54,29 @@ class SkillDistiller:
 
     def _build_skill(self, trace: AgentTrace) -> Skill:
         slug = _slug(trace.task)
-        guidance_parts = [
+        body_parts = [
+            f"# {trace.task[:60]}",
+            "",
+            f"Distilled from a successful code trace for: {trace.task}",
+            "",
+            "## Procedure",
+            "",
             "Verified code trace from a successful run; adapt each step to the current observation.",
         ]
         for i, code in enumerate(trace.successful_code):
-            guidance_parts.append(f"Step {i}:\n\n```python\n{code}\n```")
+            body_parts.append(f"\nStep {i}:\n\n```python\n{code}\n```")
+        body_parts += [
+            "",
+            "## Verify",
+            "",
+            "- Re-run the checks used during the successful trace before trusting the result.",
+        ]
         return Skill(
-            kind=SkillKind.ACTION,
             skill_id=f"learned_{slug}",
             name=trace.task[:60],
+            category=SkillCategory.ACTION,
             description=f"Distilled from a successful code trace for: {trace.task}",
-            keywords=tuple(t for t in slug.split("_") if len(t) > 2),
-            verify=("Re-run the verifier checks used during the successful trace.",),
-            guidance="\n\n".join(guidance_parts),
+            body="\n".join(body_parts),
         )
 
     def _patch_failures(self, trace: AgentTrace, error: str) -> None:
@@ -76,7 +86,7 @@ class SkillDistiller:
             return
         for skill_id in trace.loaded_skill_ids:
             record = self.library.get(skill_id)
-            patched = record.skill.with_recovery(
+            patched = record.skill.with_note(
                 f"observed error: {error} -> re-perceive and re-plan before retrying"
             )
             self.library.admit(patched, source=record.utility.source)

@@ -78,15 +78,18 @@ low_level:
 
 ### Available Suites, LIBERO
 
-| Suite | Tasks | Description |
-|-------|-------|-------------|
-| `libero_10` | 10 | Core benchmark tasks (multi-object, multi-step) |
-| `libero_90` | 90 | Extended benchmark (diverse kitchen/living room scenes) |
-| `libero_object` | 10 | Object generalization (same scene, different objects) |
-| `libero_spatial` | 10 | Spatial generalization (same objects, different positions) |
-| `libero_goal` | 10 | Goal generalization (same scene, different goals) |
+
+| Suite            | Tasks | Description                                                |
+| ---------------- | ----- | ---------------------------------------------------------- |
+| `libero_10`      | 10    | Core benchmark tasks (multi-object, multi-step)            |
+| `libero_90`      | 90    | Extended benchmark (diverse kitchen/living room scenes)    |
+| `libero_object`  | 10    | Object generalization (same scene, different objects)      |
+| `libero_spatial` | 10    | Spatial generalization (same objects, different positions) |
+| `libero_goal`    | 10    | Goal generalization (same scene, different goals)          |
+
 
 ### Available Suites, LIBERO-PRO
+
 | `libero_10_swap` | 10 | Position perturbation on `libero_10` |
 | `libero_10_task` | 10 | Task perturbation on `libero_10` |
 | `libero_object_swap` | 10 | Position perturbation on `libero_object` |
@@ -108,25 +111,34 @@ benchmark_dict = benchmark.get_benchmark_dict(help=True)"
 ### Example Tasks
 
 **libero_10:**
-| Index | Task |
-|-------|------|
-| 0 | Put both the alphabet soup and the tomato sauce in the basket |
-| 1 | Put both the cream cheese box and the butter in the basket |
-| 2 | Turn on the stove and put the moka pot on it |
+
+
+| Index | Task                                                          |
+| ----- | ------------------------------------------------------------- |
+| 0     | Put both the alphabet soup and the tomato sauce in the basket |
+| 1     | Put both the cream cheese box and the butter in the basket    |
+| 2     | Turn on the stove and put the moka pot on it                  |
+
 
 **libero_spatial:**
-| Index | Task |
-|-------|------|
-| 0 | Pick up the black bowl between the plate and the ramekin and place it on the plate |
-| 1 | Pick up the black bowl next to the ramekin and place it on the plate |
-| 2 | Pick up the black bowl from table center and place it on the plate |
+
+
+| Index | Task                                                                               |
+| ----- | ---------------------------------------------------------------------------------- |
+| 0     | Pick up the black bowl between the plate and the ramekin and place it on the plate |
+| 1     | Pick up the black bowl next to the ramekin and place it on the plate               |
+| 2     | Pick up the black bowl from table center and place it on the plate                 |
+
 
 **libero_goal:**
-| Index | Task |
-|-------|------|
-| 0 | Open the middle drawer of the cabinet |
-| 1 | Put the bowl on the stove |
-| 2 | Put the wine bottle on top of the cabinet |
+
+
+| Index | Task                                      |
+| ----- | ----------------------------------------- |
+| 0     | Open the middle drawer of the cabinet     |
+| 1     | Put the bowl on the stove                 |
+| 2     | Put the wine bottle on top of the cabinet |
+
 
 To list all tasks in a suite:
 
@@ -181,14 +193,17 @@ env:
 
 ## Available APIs
 
-| API | Description |
-|-----|-------------|
-| `FrankaLiberoPrivilegedApi` | Ground-truth object poses, IK-based control (privileged) |
-| `FrankaLiberoApi` | Perception-based control with SAM3 + GraspNet (requires servers) |
-| `FrankaLiberoApiReduced` | Low-level abstractions for perception and control functions (requires servers) |
+
+| API                                  | Description                                                                                                                                           |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `FrankaLiberoPrivilegedApi`          | Ground-truth object poses, IK-based control (privileged)                                                                                              |
+| `FrankaLiberoApi`                    | Perception-based control with SAM3 + GraspNet (requires servers)                                                                                      |
+| `FrankaLiberoApiReduced`             | Low-level abstractions for perception and control functions (requires servers)                                                                        |
 | `FrankaLiberoApiReducedSkillLibrary` | Low-level abstractions for perception and control functions + extra utility functions from automatically synthesized skill library (requires servers) |
 
+
 ## Using CuRobo
+
 To use CuRobo uncomment the following functions in the API you want to use (i.e. `capx/integrations/franka/libero.py`, `capx/integrations/franka/libero_reduced.py`).
 
 ```python
@@ -201,3 +216,4 @@ def functions(self) -> dict[str, Any]:
       # "execute_joint_trajectory": self.execute_joint_trajectory,
   }
 ```
+

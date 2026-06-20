@@ -14,6 +14,7 @@ import random
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import requests
@@ -176,6 +177,45 @@ def _completions_to_responses_convert_prompt(prompt: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+def _write_raw_llm_log(
+    *,
+    server_url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    status_code: int | None,
+    response_body: Any,
+    elapsed_seconds: float,
+) -> None:
+    """Optionally dump raw LLM request/response pairs for debugging.
+
+    Enable with:
+        CAPX_LLM_RAW_LOG_DIR=outputs/llm_raw
+    """
+
+    log_dir = os.getenv("CAPX_LLM_RAW_LOG_DIR")
+    if not log_dir:
+        return
+
+    path = Path(log_dir)
+    path.mkdir(parents=True, exist_ok=True)
+
+    safe_headers = dict(headers)
+    if "Authorization" in safe_headers:
+        safe_headers["Authorization"] = "Bearer <redacted>"
+
+    record = {
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "server_url": server_url,
+        "headers": safe_headers,
+        "payload": payload,
+        "status_code": status_code,
+        "elapsed_seconds": elapsed_seconds,
+        "response": response_body,
+    }
+    name = f"{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}_{time.time_ns()}.json"
+    (path / name).write_text(json.dumps(record, ensure_ascii=False, indent=2))
+
+
 def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
     """Query vLLM server for code generation.
 
@@ -243,9 +283,7 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
     start_time = time.time()
 
     # keep calling until it works
-    response = requests.post(
-        server_url, headers=headers, data=json.dumps(payload), timeout=200
-    )
+    response = requests.post(server_url, headers=headers, data=json.dumps(payload), timeout=200)
     retry = 1
     while response.status_code in [404, 500, 502, 503, 504]:
         sleep_time = 240 + random.uniform(-90, 90)
@@ -260,6 +298,14 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
     print(f"Time taken to query model: {end_time - start_time:.2f} seconds")
     response.raise_for_status()
     body = response.json()
+    _write_raw_llm_log(
+        server_url=server_url,
+        headers=headers,
+        payload=payload,
+        status_code=response.status_code,
+        response_body=body,
+        elapsed_seconds=end_time - start_time,
+    )
     out = {}
     if args.debug:
         print(json.dumps(body, indent=2))

@@ -1,3 +1,3 @@
-from robomex.skills.schema import CLAIM_TYPES, Claim, Skill, SkillKind
+from robomex.skills.schema import Skill, SkillCategory
 
-__all__ = ["CLAIM_TYPES", "Claim", "Skill", "SkillKind"]
+__all__ = ["Skill", "SkillCategory"]

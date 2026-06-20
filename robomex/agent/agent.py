@@ -1,106 +1,137 @@
-"""CodeAsPolicy Skill Agent: the actor that consults skills and writes code.
+"""CodeAsPolicy Skill Agent: the executor that consults skills and writes code.
 
-Loop (mirrors the v1 design system loop): observe -> retrieve & load skills ->
-inject compact guidance -> LLM generates code grounded in the observation ->
-execute via the CapX env -> verify -> multi-turn feedback -> finish -> trace.
+Thin subclass of the unified :class:`~robomex.agent.coding_agent.CodingAgent`.
+The executor's specialisation: its context is the task (+observation), it becomes
+aware of the *whole* library via progressive disclosure (a short ``<available_skills>``
+list + ``USE SKILL`` to pull a body), each python turn is verified + has evidence
+bundled, and it terminates on ``FINISH`` or an env success signal.
 
 The skill is consulted, never executed verbatim; the policy emits its own code.
 """
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Any
 
-from robomex.agent.policy import FINISH, CodePolicy
-from robomex.agent.router import SkillRouter, build_query
+from robomex.agent.coding_agent import CodingAgent, SkillEntry
+from robomex.agent.policy import CompletionPolicy
+from robomex.agent.router import build_query
 from robomex.agent.trace import AgentTrace, TurnRecord
-from robomex.execution import BlockExecutionResult, SemanticActionBlock
+from robomex.execution import BlockExecutionResult
 from robomex.library import SkillLibrary
-from robomex.verification import TaskSignalVerifier, Verifier
+from robomex.perception import EvidenceCollector
+from robomex.verification.verifier import TaskSignalVerifier, Verifier
 
 _SYSTEM_PROMPT = (
     "You are a robot Code-as-Policy agent. Each turn, write one block of executable "
     "Python that advances the task, grounding every decision in the current observation. "
-    "Skill guidance below is advisory: adapt it, do not copy it blindly. "
-    "Reply with a ```python``` code block, or the word FINISH when the task is complete."
+    "Consult a relevant skill first with `USE SKILL: <name>` (its guidance is advisory -- "
+    "adapt it, do not copy it blindly). Reply with a ```python``` code block, a "
+    "`USE SKILL: <name>` line, or the word FINISH when the task is complete."
 )
 
 
-class BlockExecutor(Protocol):
-    def run_block(self, block: SemanticActionBlock) -> BlockExecutionResult: ...
-
-
-class CodeAsPolicyAgent:
+class CodeAsPolicyAgent(CodingAgent):
     def __init__(
         self,
-        executor: BlockExecutor,
-        policy: CodePolicy,
+        executor: Any,
+        policy: CompletionPolicy,
         library: SkillLibrary,
         verifier: Verifier | None = None,
-        router: SkillRouter | None = None,
+        router: Any = None,  # deprecated: routing is now progressive disclosure; kept for compat
+        collector: EvidenceCollector | None = None,
         max_turns: int = 6,
         system_prompt: str = _SYSTEM_PROMPT,
+        require_result: bool = False,
     ) -> None:
-        self.executor = executor
-        self.policy = policy
-        self.library = library
+        super().__init__(
+            executor=executor,
+            policy=policy,
+            library=library,
+            max_turns=max_turns,
+            system_prompt=system_prompt,
+        )
         self.verifier = verifier or TaskSignalVerifier()
-        self.router = router or SkillRouter(library)
-        self.max_turns = max_turns
-        self.system_prompt = system_prompt
+        self.collector = collector
+        self.require_result = require_result
+        self._task = ""
+        self._observation_summary = ""
 
     def run(self, task: str, observation_summary: str = "") -> AgentTrace:
-        query = build_query(task, observation_summary)
-        records = self.router.route(task, observation_summary)
-        guidance = self.router.guidance_for(records, task)
-        loaded_ids = tuple(r.skill_id for r in records)
+        self._task = task
+        self._observation_summary = observation_summary
+        return super().run()
 
-        prompt = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": self._initial_user_message(task, observation_summary, guidance)},
+    # ---- hooks -------------------------------------------------------------
+
+    def _skill_entries(self) -> list[SkillEntry]:
+        return [
+            SkillEntry(
+                name=r.skill_id,
+                description=r.skill.description or r.skill.name,
+                category=r.skill.category.value,
+            )
+            for r in self.library.all()
         ]
 
-        turns: list[TurnRecord] = []
-        success = False
-        for turn in range(self.max_turns):
-            code = self.policy.act(prompt)
-            if code == FINISH:
-                break
-
-            block = SemanticActionBlock(name=f"turn_{turn}", intent="agent-generated code", code=code)
-            execution = self.executor.run_block(block)
-            verdict = self.verifier.verify(block=block, execution=execution)
-            turns.append(TurnRecord(turn, code, execution, verdict))
-
-            prompt.append({"role": "assistant", "content": f"```python\n{code}\n```"})
-            prompt.append({"role": "user", "content": self._feedback_message(execution)})
-
-            if execution.terminated:
-                success = True
-                break
-
-        success = success or (bool(turns) and turns[-1].verification.passed)
-
-        return AgentTrace(
-            task=task,
-            skill_query=query,
-            loaded_skill_ids=loaded_ids,
-            turns=tuple(turns),
-            success=success,
-        )
-
-    @staticmethod
-    def _initial_user_message(task: str, observation_summary: str, guidance: str) -> str:
-        parts = [f"Task: {task}"]
-        if observation_summary:
-            parts.append(f"Observation: {observation_summary}")
-        if guidance:
-            parts.append(guidance)
+    def _initial_user_message(self) -> str:
+        parts = [f"Task: {self._task}"]
+        if self._observation_summary:
+            parts.append(f"Observation: {self._observation_summary}")
         return "\n\n".join(parts)
 
-    @staticmethod
-    def _feedback_message(execution: BlockExecutionResult) -> str:
+    def _block_metadata(self) -> dict:
+        return {"task": self._task}
+
+    def _on_python_turn(
+        self,
+        turn_idx: int,
+        code: str,
+        execution: BlockExecutionResult,
+        prev_observation: dict | None,
+        turns: list[Any],
+    ) -> None:
+        evidence = None
+        if self.collector is not None:
+            evidence = self.collector.bundle_for_block(
+                execution.block.name, prev_observation, execution.observation
+            )
+        verdict = self.verifier.verify(block=execution.block, execution=execution, evidence=evidence)
+        turns.append(TurnRecord(turn_idx, code, execution, verdict))
+
+    def _should_stop_after_python(self, execution: BlockExecutionResult) -> bool:
+        return bool(execution.terminated)
+
+    def _terminal_block_reason(self, turns: list[Any]) -> str | None:
+        """For a result-owing sub-goal, refuse FINISH until a RESULT manifest exists.
+
+        The contract lives here in the loop (not in a skill's ``## Report`` prose):
+        a measurement/observation executor must hand the verifier a machine-readable
+        manifest. An env-success turn (``terminated``) is exempt -- action sub-goals
+        are checked by the env signal, not a manifest.
+        """
+        if not self.require_result:
+            return None
+        for turn in turns:
+            if turn.execution.terminated or turn.execution.result is not None:
+                return None
         return (
-            f"stdout:\n{execution.stdout}\n\nstderr:\n{execution.stderr}\n\n"
-            "If the task is complete reply FINISH, otherwise reply with the next ```python``` block."
+            "You replied FINISH but recorded no structured RESULT for this sub-goal. "
+            "Before finishing, run ONE ```python``` block that assigns RESULT = {...} "
+            "(a JSON-safe manifest: scalars inline; save heavy arrays as .npy under "
+            "EVIDENCE_DIR and store their paths) following the consulted skill's "
+            "'## Report' section, so the verifier can check your actual artifacts. "
+            "Then reply FINISH."
+        )
+
+    def _finalize(self, *, turns: list[Any], loaded: tuple[str, ...], terminal_raw: str | None) -> AgentTrace:
+        success = any(t.execution.terminated for t in turns) or (
+            bool(turns) and turns[-1].verification.passed
+        )
+        return AgentTrace(
+            task=self._task,
+            skill_query=build_query(self._task, self._observation_summary),
+            loaded_skill_ids=loaded,
+            turns=tuple(turns),
+            success=success,
         )

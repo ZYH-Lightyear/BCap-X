@@ -1,39 +1,74 @@
 # RoboMEx 框架进度文档
 
-> 本文档记录 `robomex/` 包的当前实现进度：当前代码实现到了 `insights.md` 哪个设计版本、整体架构长什么样、与最新 **v1.1 设计**（双物种技能 + Claim 接口 + 三道验证门）之间的差距，以及下一阶段的重构与开发路线。
+> 本文档记录 `robomex/` 包的当前实现进度：整体架构、与目标设计之间的差距，以及下一阶段的开发路线。
+
+> **⚠️ 2026-06 技能包重构（最新，重要）**：在 prose-first 基础上，技能载体进一步从“单个扁平 `.md`”升级为 **MMSkills/jianying 式的目录包（package）**，并按**读者**拆分文件：
 >
-> 状态基线：2026-06。当前代码是 **v1 形态的可运行骨架**（`examples/run_skill_agent.py` 可离线端到端跑通）；设计已演进到 **v1.1**，代码尚未跟进。
+> ```text
+> skills_library/<category>/<skill_id>/
+>   SKILL.md       # 执行 Agent：when / 分解 / 过程 / 失败恢复（Verify 只留一句指针）
+>   ref/verify.md  # Verifier Agent：权威 pass/fail rubric（+ 可选视觉参考 *.png）
+>   scripts/verify.py  # 可选：Verifier 参考的验证原语库（参考非强制，详见 §5.6；estimate_geometry 已有可跑实现）
+> ```
+>
+> 同时把 `kind(observation/action) + compound` 两个字段**合并为单一 `category`**：`high_level` / `observation` / `action`（`compound` 改为派生属性 = `category==high_level`）。`schema.py` 仍是轻量容器（`skill_id / name / category / description / body + 开放 meta`），**无 typed `Claim` / `requires` / `produces` / `apis` 校验**。`seeds` 概念已删除——内置技能直接就是 `robomex/skills/skills_library/`（带自动生成的 `README.md` 清单）。`SkillRouter` 只做“关键词检索 + 注入 `SKILL.md` 正文”。
+>
+> 因此下文凡描述“`kind`/`compound` 字段、typed Claim 接口、claim 自动编排 / `producers_of`、`available_apis` 校验、扁平 `<skill_id>.md` 存储、`seeds/` 目录、8 个种子含 `pick_and_place`”的部分（尤其 §2 包结构、§2.1 架构图、§2.2 时序图、§3.1/§3.2、§5.1/§5.2、§6 清单相关行）**已过时**，以本 banner 与下文已更新章节为准。当前仍有效：验证升级阶梯思想（§4.2–4.6）、两层 ReAct + REPL 结构（§5.3）、分级技能/递归组合（§5.5）、路线图（§7）。
+
+> 状态基线：2026-06。技能库（目录包 + 三类 category + README 清单）/ 关键词检索 / gate-3 VLM 评判 / 单流蒸馏已落地，每个技能已带 `ref/verify.md`（Verifier Agent rubric）；**外层 ReactivePlanner + TwoLevelAgent 骨架已落地**（输出 JSON To-Do list、暂不重规划、暂不接 VLMJudge），`examples/run_planner.py` 离线可跑、`run_planner_live.py` 已就绪待真机联调。当前内置 **7 个技能**：高层 2（`pick_object`/`place_in_container`）+ 观测 3（`segment_object`/`estimate_geometry`/`grasp_candidates`）+ 动作 2（`grasp_object`/`place_into_container`）。**验证原语、多模态反馈、`scripts/verify.py` 实现、双流蒸馏均尚未落地**，内层主循环仍是单层 flat。
 
 ---
 
 ## 1. 一句话定位
 
-RoboMEx（**Robo**tic **M**ultimodal **Ex**ecutable Skills）的目标形态（v1.1）：
+RoboMEx（**Robo**tic **M**ultimodal **Ex**ecutable Skills）的目标形态（v1.3）：
 
-> **技能分两个物种：O-Skill（观察技能）产出可验证的世界断言（Claim），A-Skill（动作技能）消费断言、承诺可观测变化；代码是两者的组合方式；一套共享的 collect→render→judge 验证机器在三道门上检验链条的每一环；成功轨迹沉淀几何先验、失败轨迹归因到具体 Claim 反哺感知可靠性画像，形成自进化闭环。**
+> **技能是可递归组合的——高层技能（body 为子技能编排的复合 A-Skill）给外层 ReAct planner 当能力菜单、并编码自身的 O/A 分解；叶子 O/A 技能（O 产出可验证 Claim、A 消费 Claim 承诺 effect）给内层 REPL Code Agent 当 building block。外层 planner 在 grounded 的能力菜单上选择排序高层技能并重规划；内层在每个 sub-goal（= 验证单元）里做感知 grounded 的写码-观察-验证。每个技能都自带 When-to-use 与可执行的 How-to-verify（verifier-as-code，可内部调 VLM，沿“程序化→几何→VLM→换视角”升级阶梯）。成功轨迹沉淀几何先验与高层方法、失败轨迹归因到具体 Claim 或 postcondition，形成自进化闭环。所有 novelty 仍落在“可验证的 Claim + 可执行的验证 + 可蒸馏的技能”这条主线。**
 
-当前代码实现的是其前身 v1 形态：单物种七元组技能 + 咨询式 guidance + env 信号验证 + 单流蒸馏。v1 的核心主张（code 是感知、动作、验证与技能蒸馏之间的可执行桥梁）在 v1.1 中保持不变。
+当前代码状态（经 prose-first + 技能包 + planner-first 几次重构后）：**目录包技能库**（三类 category，每技能带 `ref/verify.md`）+ 咨询式 guidance（关键词检索 + 注入 `SKILL.md` 正文）+ gate-3 VLM 效果评判 + 单流蒸馏 + **外层 ReactivePlanner/TwoLevelAgent 骨架**。早期 v1.1 的 typed Claim 接口 / claim 自动编排已**废弃**——串联与验证改为 agent/planner 读 prose 决定。核心主张（code 是感知、动作、验证与技能蒸馏之间的可执行桥梁）不变，且 v1.2 进一步主张 **code 同时是观察与执行的统一媒介**（观察即可执行代码，故无需把 grounding 隔离成独立子对话）。距目标的主要缺口在**内层控制结构**（仍是单层 flat、纯文本反馈、验证为框架插桩而非 agent 可调原语）与**验证深度**（gate-1/2、verifier-as-code 实现、双流蒸馏未落地）。
 
-## 2. 包结构与模块职责（当前代码，v1 形态）
+### 版本演进速览
+
+- **v1（早期骨架，已越过）**：单层 flat 多轮主循环，单物种七元组技能，env 信号验证。
+- **v1.1（已基本落地）**：技能拆双物种 O/A，typed Claim 做接口，markdown 技能库 + claim 自动编排，collect→render→judge 中的 gate-3（VLMJudgeVerifier + EvidenceCollector + before/after 渲染）已实现，单流蒸馏。
+- **v1.2（设计，部分落地）**：保留 v1.1 全部 novelty；控制结构从“主循环 + Grounding Branch 子对话 + 三道固定门”收敛为**两层 ReAct + REPL Code Agent**；三道门从框架固定插桩改为 **agent 可调验证原语 + 升级阶梯**；**sub-goal = 验证单元**；Claim 增加 `frame` + 多实例 + `target_selection`；反馈通道升级为**多模态**（渲染证据图回流进 prompt）。
+- **v1.3（最新设计，本文目标，未落地）**：技能**可递归组合**——“高层”不是第三物种，而是 body 为子技能编排的**复合 A-Skill**（O/A 仍按 claim 方向硬区分）；**规划层配技能库**，高层技能服务外层 planner（能力菜单 + 编码 O/A 分解）；显式区分两个分解（任务→高层由 planner 现场规划 / 高层→O/A 编码在技能内可复用）；技能门面扩成 **When-to-use + How-to-verify**，`verify` 升级为 **verifier-as-code**（沙箱可执行、可内部调 VLM）；蒸馏升到两个粒度（高层方法蒸馏分期）。详见 `insights.md` 的 v1.3 章节。当前未落地部分见 §6 清单。
+
+## 2. 包结构与模块职责（当前代码，v1.1 已落地 + v1.2 部分落地）
 
 ```text
 robomex/
-├── skills/          # 技能数据模型 + 种子技能
-│   ├── schema.py    #   MultimodalExecutableSkill 及其全部子结构
-│   └── seeds/       #   pick_into_basket 种子技能（知识，非脚本）
-├── library/         # 磁盘技能库：持久化、关键词检索、utility 统计
-│   └── store.py
-├── agent/           # 决策核心
-│   ├── agent.py     #   CodeAsPolicyAgent 主循环
-│   ├── router.py    #   SkillRouter：技能 -> 紧凑 guidance
-│   ├── policy.py    #   CodePolicy：LLM / 脚本回放
-│   └── trace.py     #   AgentTrace / TurnRecord（蒸馏原料）
-├── execution/       # 执行抽象：SemanticActionBlock / BlockExecutionResult
-├── verification/    # 验证：Verifier 接口 + TaskSignalVerifier（占位实现）
-├── perception/      # 多模态证据结构：MultimodalEvidenceBundle（暂为死代码）
-├── distill/         # SkillDistiller：轨迹 -> 技能进化
-├── adapters/capx/   # CapXExecutorAdapter：鸭子类型桥接 CapX env.step(code)
-└── examples/        # run_skill_agent.py 端到端离线示例
+├── skills/              # 技能容器 + 内置技能库
+│   ├── schema.py        #   Skill(skill_id/name/category/description/body/meta + root)
+│   │                    #   + from_dir/from_markdown/to_markdown
+│   │                    #   + sidecar 钩子 verify_doc_path()/reference_paths()/verifier_path()
+│   └── skills_library/  #   目录包技能库：<category>/<skill_id>/{SKILL.md, ref/, scripts/}
+│       │                #   高层 2（pick_object/place_in_container）
+│       │                #   观测 3（segment_object/estimate_geometry/grasp_candidates）
+│       │                #   动作 2（grasp_object/place_into_container）
+│       ├── __init__.py  #   load_skills_library() + render_inventory()（生成 README）
+│       └── README.md    #   自动生成的技能清单（按 category 统计 + sidecar 徽章）
+├── library/             # 磁盘技能库：按 category 分目录、正文关键词检索、utility、compound_skills
+│   └── store.py         #   admit 落盘 <category>/<id>/{SKILL.md, ref/, scripts/, utility.json}
+├── planner/             # 外层规划（骨架已落地）
+│   └── planner.py       #   ReactivePlanner（task+场景图+高层菜单 → JSON To-Do）+ TwoLevelAgent
+├── agent/               # 内层决策核心（仍为单层 flat 主循环）
+│   ├── agent.py         #   CodeAsPolicyAgent：观察→检索→生成→执行→采证→验证→反馈
+│   ├── router.py        #   SkillRouter：关键词检索 top-k + 注入 SKILL.md 正文（无 claim 编排）
+│   ├── policy.py        #   CodePolicy：LLM / 脚本回放
+│   └── trace.py         #   AgentTrace / TurnRecord（蒸馏原料）
+├── execution/           # 执行抽象：SemanticActionBlock / BlockExecutionResult
+├── verification/        # 验证
+│   ├── verifier.py      #   Verifier 接口 + TaskSignalVerifier + CompositeVerifier + 失败优先合并
+│   └── vlm_judge.py     #   VLMJudgeVerifier：渲染证据 + checks → VLM（gate-3，已实现）
+├── perception/          # 多模态证据（已接通，非死代码）
+│   ├── evidence.py      #   EvidenceArtifact / MultimodalEvidenceBundle / 角色与种类枚举
+│   ├── collector.py     #   EvidenceCollector：before/after 快照 + 合成对比图
+│   └── render.py        #   save_rgb / render_before_after（before/after 渲染器，phase 1）
+├── distill/             # SkillDistiller：轨迹 -> 技能进化（单流，markdown 产物）
+├── adapters/capx/       # CapXExecutorAdapter + api_surface.py
+└── examples/            # run_skill_agent.py（内层离线）/ run_planner.py（两层离线）
+                         # + run_skill_agent_live.py / run_planner_live.py（真机）
 ```
 
 ### 2.1 架构总览图
@@ -55,9 +90,9 @@ graph TB
         LIB["SkillLibrary<br/>关键词检索 + utility 排序"]
     end
 
-    subgraph Skills["skills/ — 数据模型"]
-        SCH["MultimodalExecutableSkill"]
-        SEED["seeds/pick_into_basket"]
+    subgraph Skills["skills/ — 技能包载体"]
+        SCH["Skill(category/name/body + root)<br/>sidecar: ref/verify.md, scripts/verify.py"]
+        SEED["skills_library/ 7 包<br/>high_level/observation/action"]
     end
 
     subgraph Exec["execution/"]
@@ -65,8 +100,12 @@ graph TB
         BER["BlockExecutionResult"]
     end
 
+    subgraph Perceive["perception/"]
+        COL["EvidenceCollector<br/>before/after + 合成对比图"]
+    end
+
     subgraph Verify["verification/"]
-        VER["TaskSignalVerifier（占位）"]
+        VER["TaskSignalVerifier + VLMJudgeVerifier<br/>CompositeVerifier 失败优先合并"]
     end
 
     subgraph Distill["distill/"]
@@ -77,17 +116,27 @@ graph TB
         ADP["CapXExecutorAdapter"]
     end
 
+    subgraph Planner["planner/ — 外层（骨架已落地）"]
+        RP["ReactivePlanner<br/>task+场景图+高层菜单→JSON To-Do"]
+        TLA["TwoLevelAgent<br/>按 sub-goal 顺序驱动内层"]
+    end
+
+    RP --> LIB
+    RP --> TLA --> AG
     EX --> AG
     AG --> RT --> LIB
     AG --> PO
     AG --> SAB
+    AG --> COL --> VER
     AG --> VER
     AG --> TR
     LIB --> SCH
-    SEED -.种子.-> LIB
+    SEED -.内置.-> LIB
     TR --> DIS --> LIB
     ADP -.实现 BlockExecutor 协议.-> AG
 ```
+
+
 
 ### 2.2 运行时主循环（当前实现）
 
@@ -100,20 +149,23 @@ sequenceDiagram
     participant L as SkillLibrary
     participant P as CodePolicy(LLM)
     participant E as Executor(CapX env)
+    participant C as EvidenceCollector
     participant V as Verifier
     participant D as SkillDistiller
 
     A->>R: route(task, observation)
     R->>L: retrieve(query, top_k)  关键词重叠 + success_rate 排序
-    R-->>A: 紧凑 guidance（代码草图 + 验证提示 + recovery 提示）
+    R-->>A: 注入选中技能的 SKILL.md 正文（无 claim 编排）
 
     loop 每轮（max_turns 上限）
         A->>P: act(prompt) → ```python``` 或 FINISH
         A->>E: run_block(SemanticActionBlock)
-        E-->>A: BlockExecutionResult(stdout/reward/terminated/info)
-        A->>V: verify(block, execution)
+        E-->>A: BlockExecutionResult(stdout/reward/terminated/observation)
+        A->>C: bundle_for_block(before, after)  before/after 渲染
+        C-->>A: MultimodalEvidenceBundle
+        A->>V: verify(block, execution, evidence)
         V-->>A: VerificationResult(PASSED/FAILED/UNCERTAIN)
-        A->>A: 记录 TurnRecord，stdout/stderr 反馈进 prompt
+        A->>A: 记录 TurnRecord，stdout/stderr 反馈进 prompt（仍为纯文本）
     end
 
     A-->>D: AgentTrace
@@ -122,34 +174,38 @@ sequenceDiagram
     D->>L: update_utility（call_count / success_count / last_failure）
 ```
 
-## 3. 已实现的设计决策（v1.1 下仍然有效的部分）
+
+
+## 3. 已实现的设计决策（v1.2 下仍然有效的部分）
 
 ### 3.1 技能是"知识"不是"脚本"
 
-`SkillRouter.build_guidance` 把技能压缩成任务条件化的紧凑文本注入 prompt，并明确提示 "adapt it, do not copy it blindly"——技能被咨询、不被照搬执行，策略基于当前观察自己生成代码。这一原则在 v1.1 中不变。
+`SkillRouter.build_guidance` 把技能压缩成任务条件化的紧凑文本注入 prompt，并明确提示 "adapt it, do not copy it blindly"——技能被咨询、不被照搬执行，策略基于当前观察自己生成代码。这一原则在 v1.2 中不变。
 
-当前 schema 完整落地了 v1 七元组（`SkillDescriptor` / `RuntimeStateCard` / `PerceptionStep` / `ActionBlockSpec` / `VerificationSpec` / `RecoveryStep` / `EvidenceRef`），JSON 可序列化。**但 v1.1 已指出这个单物种七元组是"一锅烩"的**（见 §5.1），它会被拆分重构，原有子结构大部分可在拆分后复用。
+当前 schema 是 **prose-first 轻量容器**：`Skill` 只有 `skill_id`（取自技能目录名）/ `name` / `category`（`high_level`/`observation`/`action`，决定库内分目录）/ `description` / `body`（注入 prompt 的 `SKILL.md` 正文）+ 开放 `meta` + `root`（磁盘包目录，sidecar 解析用）。`compound` 是派生属性（`category==high_level`）。**没有 typed Claim 接口、没有 `requires`/`produces`/`apis` 校验、没有 YAML 化的 `verify`/`recovery`**——验证、分解、失败恢复都写在正文 prose 小节（`When to use` / `Procedure` / `Decomposition` / `Verify`(一句指针) / `Failure modes`）或 sidecar 文件里。
 
-### 3.2 知识与学习元数据分离
+### 3.2 技能 = 目录包，按读者拆文件；知识与学习元数据分离
 
-`library/store.py` 把每个技能拆成两个文件：
+技能不再是单文件，而是一个**目录包**，文件按**读者**拆分（详见顶部 banner）：`SKILL.md` 给执行 Agent、`ref/verify.md`(+视觉参考) 给 Verifier Agent、`scripts/verify.py` 是确定性代码闸。`library/store.py` 按 `category` 分目录落盘，每个技能包旁存一份本地学习统计：
 
 ```text
-<root>/<skill_id>/skill.json     # 可迁移知识
-<root>/<skill_id>/utility.json   # 本地学习统计（call/success/last_failure/source）
+<root>/<category>/<skill_id>/SKILL.md       # 可迁移知识（执行者正文）
+<root>/<category>/<skill_id>/ref/verify.md  # 可迁移知识（验证者 rubric）+ 可选 ref/*.png
+<root>/<category>/<skill_id>/scripts/        # 可选可执行验证码（verifier-as-code）
+<root>/<category>/<skill_id>/utility.json    # 本地学习统计（call/success/last_failure/source）
 ```
 
-知识可跨 agent / 模型迁移；utility 是库本地的检索排序与淘汰依据。这一分离在 v1.1 的双物种目录布局中保留。
+知识包（`SKILL.md` + `ref/` + `scripts/`）可跨 agent / 模型迁移；utility 是库本地的检索排序与淘汰依据。`admit` 落盘时会连带把源包的 `ref/`、`scripts/` 一起拷入库副本。`schema.py` 提供 sidecar 钩子 `verify_doc_path()` / `reference_paths()` / `verifier_path()` 懒解析这些文件。（已移除早期的 `available_apis`/L4 白名单 `apis` 校验。）
 
 ### 3.3 自进化闭环 + 增量价值门控
 
-`SkillDistiller.evolve()` 实现了 Skill1 的 \(r(\tau)-\hat{U}\) 思想：
+`SkillDistiller.evolve()` 实现了 Skill1 的 r(\tau)-\hat{U} 思想：
 
 - 无论成败，先对所有被咨询技能 `update_utility`；
 - **失败**：把最后一条错误转成 `RecoveryStep` 追加到被咨询技能；
 - **成功**：仅当历史最佳成功率 < 1.0 时才蒸馏新技能入库，避免冗余技能污染库。
 
-门控逻辑在 v1.1 中保留，但蒸馏会升级为双流（见 §5.4）。
+门控逻辑在 v1.2 中保留，但蒸馏会升级为双流（见 §5.4）。
 
 ### 3.4 接口解耦，离线/真实可切换
 
@@ -158,17 +214,25 @@ sequenceDiagram
 - 离线：`MockExecutor` + `ScriptedCodePolicy`（示例可直接跑通全闭环）；
 - 真实：`CapXExecutorAdapter(env)`（鸭子类型包装 `env.step(code)`，可选 line trace）+ `LLMCodePolicy`（走 `capx.llm.client.query_model`）。
 
-## 4. 验证：collect → render → judge 共享机器 + 三道门（v1.1 核心）
+## 4. 验证：collect → render → judge 共享机器 + 可调原语 + 升级阶梯（v1.2 核心）
 
-这是整个框架里 **"Multimodal" 一词真正的落点，也是当前实现最薄弱的一环**。没有它，系统退化为普通 code-as-policy + 关键词检索。
+这是整个框架里 **"Multimodal" 一词真正的落点**。gate-3（效果验证）这一环已经接通，但 gate-1/gate-2 与"验证原语化"尚未落地。
 
-### 4.1 现状的三个断点
+### 4.1 现状：gate-3 已通，gate-1/2 与原语化未通
 
-1. **`TaskSignalVerifier` 只看 env 信号**（`terminated` / `reward` / `sandbox_rc`），完全忽略接口里预留的 `evidence` 参数——本质是"模拟器作弊信号"，真机或无 reward 环境下失效；
-2. **Agent 调用 verify 时不传 evidence**，没有任何"执行后采集证据"的步骤；
-3. **`VerificationSpec` 里的 checks 只是字符串**，被 router 拼进 prompt 当提示语，没有代码真正执行这些检查。
+**已落地（v1.1）：**
 
-结论：`perception/evidence.py` 的 `MultimodalEvidenceBundle`、`EvidenceRole.VERIFICATION_CUE` 目前全是死代码，钩子留了但管线是空的。
+1. `EvidenceCollector` 在每个 block 执行前后采集 agentview RGB，并 `render_before_after` 合成带 BEFORE/AFTER 标注的对比图（`MultimodalEvidenceBundle` / `EvidenceRole.VERIFICATION_CUE` 已是活代码）；
+2. `VLMJudgeVerifier` 把对比图 + 技能声明的 `verify` checks 发给 VLM（走 `capx.llm.client`），返回带 confidence 的 JSON 裁决，低置信落 `UNCERTAIN` 而非 `FAILED`；
+3. `CompositeVerifier` + `combine_verification_results` 实现 env 信号与 VLM 评判的**失败优先合并**（"几何/信号硬检查与 VLM 组合"已有载体）。
+
+**尚未落地（v1.2 缺口）：**
+
+1. **只有 gate-3**：gate-1（Claim 验证）与 gate-2（可行性 dry-run）没有实现，O-Skill 产出的 mask/grasp 等中间产物还没有被采集和验证；
+2. **渲染器只有 before/after**：mask 叠加、bbox、点云轨迹回放渲染器都还没写；
+3. **没有 `GeometryVerifier`**：IK / 碰撞 / OBB 包含等几何硬检查缺位，验证升级阶梯的"几何"层是空的；
+4. **验证仍是框架插桩、非 agent 可调原语**：`observe / check_feasible / assert_effect` 尚不存在，verify 由主循环在固定时机调用；
+5. **反馈仍是纯文本**：渲染证据图没有回流进 prompt，policy 还不是多模态输入。
 
 ### 4.2 共享验证机器：collect → render → judge
 
@@ -178,7 +242,7 @@ sequenceDiagram
 - 检测（DINO）：bounding box + label 画到图上；
 - robot action：点云中回放运动过程的视频 + 末帧图像；
 
-然后交给 VLM 做理解评判。**渲染产物不是调试图，而是 VLM 评判的瞬态一等输入**：裸 mask / 裸轨迹 VLM 读不懂，叠加图 / 回放视频才是 VLM 友好的证据格式。注意 v1.1 的明确决策：渲染产物**不是技能的静态资产**（区别于 MMSkills 的 Images 资产路径），技能里沉淀的是"怎么渲染、问什么"的规约（`self_evidence_spec`），而非图片本身。
+然后交给 VLM 做理解评判。**渲染产物不是调试图，而是 VLM 评判的瞬态一等输入**：裸 mask / 裸轨迹 VLM 读不懂，叠加图 / 回放视频才是 VLM 友好的证据格式。注意自 v1.1 起的明确决策：渲染产物**不是技能的静态资产**（区别于 MMSkills 的 Images 资产路径），技能里沉淀的是"怎么渲染、问什么"的规约（`self_evidence_spec`），而非图片本身。
 
 ```mermaid
 graph LR
@@ -209,100 +273,220 @@ graph LR
     J3 --> CB
 ```
 
-### 4.3 同一套机器部署在三道门（v1.1）
 
-| 门 | 时机 | 问题 | 主要手段 |
-|---|---|---|---|
-| **门 1：Claim 验证** | O-Skill 之后 | "这个断言是真的吗？" | 渲染自证据 → VLM + 跨模态一致性（mask 深度覆盖率、多视角一致） |
-| **门 2：可行性验证（dry-run）** | A-Skill 之前 | "已验证的 Claims 满足 preconditions 吗？" | 纯几何为主：IK、碰撞、clearance |
-| **门 3：效果验证** | A-Skill 之后 | "postcondition 兑现了吗？" | before/after 渲染 + env 信号 + 几何终态检查 |
 
-三道门共享渲染器和 judge，只是问题模板和证据类型不同。门 1+2 由 **Grounding Branch** 承载：主 code policy 在高风险 A-Skill 前暂停，分支里**主动执行 O-Skill 现场采证**（区别于 MMSkills 被动加载存储参照图——GUI 状态重复所以可以存图，机器人场景从不重复所以必须现采），返回 grounding package（已验证 Claims + go/no-go）后主策略才生成运动代码。
+### 4.3 三类验证不再是固定门，而是 agent 可调原语（v1.2 关键调整）
 
-判定失败时归因到具体的 Claim（感知错）或 postcondition（执行错），这是后续 RL credit assignment 的结构基础。
+v1.1 把验证设想成框架在固定时机插桩的“三道门”，但 agent 在 REPL 里自由写 code，框架无法干净地切出 O/A block 来插门。v1.2 据此调整：**三类验证保留，但改为内层 Code Agent 可随时调用的原语，时机由 agent 自己决定**。
 
-### 4.4 风险与对策
-
-1. **VLM 评判本身会错**：要求 VLM 给 confidence 而非裸 yes/no，低置信走 `UNCERTAIN`，由 agent 多转一轮或换视角重新采证，而不是硬判失败（`VerificationStatus.UNCERTAIN` 已为此预留）。
-2. **机器人动作验证最难**：末帧图能验终态，但"运动过程无碰撞"靠点云回放 + VLM 是弱信号——几何硬检查必须与 VLM 评判**组合**而非二选一，`combine_verification_results` 的失败优先合并就是为此准备的。
-3. **成本控制（分级触发）**：sandbox 错误直接 FAILED（不调 VLM）；低风险动作不开 Grounding Branch；只有声明了高风险 precondition / verification_cue 的关键节点才触发完整的渲染 + VLM 评判。每技能每轨迹有 consult 预算，防止无限采证循环。
-
-## 5. v1 代码 → v1.1 设计的重构差距
-
-这是当前最重要的一张差距表。
-
-### 5.1 Schema：单物种七元组 → 双物种契约 + Claim 注册表
-
-| 现状（v1 代码） | v1.1 目标 |
-|---|---|
-| `MultimodalExecutableSkill` 一个类打包感知+动作+验证 | 拆成 **O-Skill 契约**（api_plan + claim_schema + self_evidence_spec + reliability_profile + fallback_chain）和 **A-Skill 契约**（precondition_claims + code_sketch + geometric_priors + postcondition_spec + 结构化 recovery） |
-| 感知输出和动作输入之间无类型约束 | **Claim 注册表**（`claims/schema.json`）：typed 世界断言（如 `ObjectMask` / `ObjectGeometry` / `GraspPose`），带出处、置信度、自证据引用 |
-| `VerificationSpec` 是字符串声明 | 可编译的检查规约（渲染模态 + 问题模板 + 几何检查参数），且带判别力统计、可被蒸馏迭代 |
-
-现有子结构的去向：`PerceptionStep` → O-Skill 的 api_plan；`ActionBlockSpec` → A-Skill 的 code_sketch；`RuntimeStateCard` / `RecoveryStep` 拆分后归属各自物种。
-
-### 5.2 技能载体：Python seed → 磁盘技能包
-
-种子技能目前是 Python 函数 `build_skill()`，与蒸馏产物（`skill.json`）形态不统一。v1.1 目标布局：
-
-```text
-skills/
-├── observation/<skill_id>/   # SKILL.md + skill.json + utility.json
-├── action/<skill_id>/        # SKILL.md + skill.json + utility.json
-└── claims/schema.json        # 全库共享的 Claim 类型注册表
+```python
+mask   = observe("milk carton")     # ~门1：返回 Claim，内部已渲染+判定，低置信抛 UNCERTAIN
+geom   = observe_geometry(mask)     # ~门1
+ok     = check_feasible(grasp_pose) # ~门2：IK/碰撞，纯几何，返回 go/no-go + 原因
+grasp(grasp_pose)
+assert_effect("object_grasped")     # ~门3：before/after + env 信号 + 几何终态
 ```
 
-`SKILL.md`（frontmatter + 适用/不适用条件）作为人/VLM 可读门面，供检索与快速 applicability 判断；seed 与蒸馏产物统一为同一种磁盘表示，技能彻底变成"可迭代的内容"而非"代码"。不设 Images 资产目录；可选 `exemplars/` 仅作 VLM few-shot 瞬态缓存，删除不影响技能可用。
+| 验证原语                         | 角色（约等于旧门） | 问题                  | 默认手段（见升级阶梯）             |
+| ---------------------------- | --------- | ------------------- | ----------------------- |
+| `observe()` / `observe_*()`  | Claim 验证  | “这个断言是真的吗？”         | 程序化/几何，模糊关系才升级 VLM 叠加图  |
+| `check_feasible()`           | 可行性（dry-run）| “Claims 满足 precondition 吗？” | 纯几何：IK、碰撞、clearance     |
+| `assert_effect()`            | 效果验证      | “postcondition 兑现了吗？” | env 信号 + 几何终态，必要时 before/after VLM |
 
-### 5.3 主循环：插入 Grounding Branch 与三道门
+这样 **“验证即技能” 在 API 层面成立**，且 **sub-goal 边界（由外层 ReAct 给定）= 验证单元边界**：一个 sub-goal 一个内层 episode，`assert_effect` 在 episode 末对照该 sub-goal 的 postcondition 跑——不需要框架解析代码切块。注意：v1.1 的 “Grounding Branch 子对话” 被取消，**观察是可执行代码，无需隔离子对话**（这是 v1.2 相对 v1.1 的核心结构变化，详见 `insights.md` v1.2 §1–2）。
 
-`CodeAsPolicyAgent` 主循环需要从"生成→执行→env 信号验证"升级为：
+### 4.4 验证升级阶梯：VLM 是升级手段，不是默认
 
-1. 生成代码前，对高风险 A-Skill 触发 Grounding Branch（执行 O-Skill → 门 1 验证 Claims → 门 2 dry-run）；
-2. 执行后走门 3 效果验证；
-3. `TurnRecord` 记录 Claims 与各门验证结果，失败归因到 Claim 或 postcondition。
+每个验证原语内部不默认调 VLM，而是沿成本递增的阶梯触发：
+
+```text
+程序化 assert（量/阈值） → 几何检查（IK/碰撞/OBB） → VLM judge（语义/遮挡/叠加图） → 换视角现采 / 多转一轮
+      最便宜，默认                次之                   贵，升级触发              最后手段
+```
+
+对机器人，程序化与几何检查又快又可靠，应是默认；VLM 只在语义/遮挡/关系消歧时升级触发。这天然缩小了 “VLM 会错” 的影响面——大部分 claim 根本到不了 VLM 那层。
+
+### 4.5 感知的两个角色：服务决策 ≠ 服务验证
+
+v1.1 几乎把 perception 等同于 verification（三道门都在判成败）。但最强 motivating case 恰恰**不是验证**：
+
+- **perception-for-planning（服务决策，主线）**：`geom = estimate_geometry(obj)` → 看到 height → 算 `place_z`；关系消歧选 target 同理。
+- **perception-for-verification（服务门控）**：判 claim 真假 / postcondition 兑现。
+
+两者共享 collect→render 机器；REPL 循环天然覆盖两者——观察 cell 的输出（含渲染图）既回流为下一步**决策输入**，也可被验证原语消费。
+
+### 4.6 风险与对策
+
+1. **VLM 评判本身会错**：升级阶梯已让多数 claim 不经 VLM；进到 VLM 的，要求给 confidence 而非裸 yes/no，低置信走 `UNCERTAIN`，由 agent 换视角现采或多转一轮，而非硬判失败（`VerificationStatus.UNCERTAIN` 已为此预留）。
+2. **机器人动作验证最难**：末帧图能验终态，但“运动过程无碰撞”靠点云回放 + VLM 是弱信号——几何硬检查必须与 VLM 评判**组合**而非二选一，`combine_verification_results` 的失败优先合并就是为此准备的。
+3. **成本控制**：sandbox 错误直接 FAILED（不调 VLM）；验证原语默认走阶梯低层，只有高风险节点（如关系消歧选 target、抓取提交前）才强制升级到完整渲染 + VLM。内层 episode 有 step / consult 预算，防止无限采证循环。
+4. **多模态反馈通道（架构硬要求）**：升级阶梯到 VLM 这层依赖把渲染证据图回流进下一轮 prompt，故 policy 必须是**多模态 LLM**、内层 loop 必须支持**图片反馈**。当前 `CodeAsPolicyAgent` 只回纯文本 stdout/stderr，是 v1.2 必补的一环。
+
+## 5. 现状 → 目标设计的重构差距
+
+> 技能载体已是 prose 目录包（§5.1/§5.2 的“双物种 + Claim schema”内容已随 prose-first 重构删除）；外层 ReactivePlanner 骨架也已落地（§5.3，输出 To-Do list、暂不重规划）。当前真正的大头是内层 REPL 化 + 验证原语 + 多模态反馈。
+
+### 5.1 Schema：已收敛为 prose 轻量容器（无遗留差距）
+
+技能载体已彻底 prose 化（见顶部重构说明与 §3.1）：最小 frontmatter + markdown 正文，无 typed Claim、无 `requires`/`produces`/`apis` 校验。原 v1.2 计划的 “Claim 细化（`frame` / 多实例 / `target_selection`）、verify 升级为可编译规约” 这条线**已废弃**——关系指代、验证方法等改为写在技能正文里、由 agent/planner 读 prose 处理。关系指代任务（如“左边的碗”）后续作为一个 prose O-skill（描述 detect-all + 几何消歧步骤）落地，不再引入 typed claim 字段。
+
+### 5.2 技能载体：已是目录包技能库（基本完成）
+
+**已完成**：内置技能与蒸馏产物统一为**目录包**（`SKILL.md` 正文 + `ref/verify.md` + 可选 `scripts/`/`ref/*.png`），按 `high_level/`·`observation/`·`action/` 三类 category 分目录，知识包与 utility 分文件存储，`admit` 落盘连带拷贝 sidecar。`seeds` 概念已删除，内置库即 `robomex/skills/skills_library/`（带自动生成 `README.md` 清单）。与早期"Python `build_skill()`"、扁平 `<skill_id>.md`、L4 `apis` 校验的差距均已消除。
+
+与 MMSkills 的对齐：技能现在是**自包含 package**，并按读者拆文件（`SKILL.md`→执行者、`ref/`→Verifier Agent、`scripts/`→代码闸）；当前不写实际 `ref/*.png` 视觉参考与 `scripts/verify.py`（钩子与目录约定已就位，留待验证闭环阶段填）。不强制 Images 资产、渲染产物为瞬态证据的决策保持不变（视觉参考仅在 `ref/` 里按需放，由 Verifier Agent 加载）。
+
+### 5.3 主循环：单层 flat → 两层 ReAct + REPL Code Agent（v1.2 最大结构改动）
+
+> **进度（2026-06）**：外层骨架已落地——`planner/planner.py` 的 `ReactivePlanner` 吃 task + 初始场景图 + 高层技能菜单（`library.compound_skills()`），一次 LLM 调用产出 **JSON To-Do list**（每项含 `goal` / `skill` / `postcondition`）；`TwoLevelAgent` 按顺序把 sub-goal 喂给内层 `CodeAsPolicyAgent`。**当前简化**：暂不重规划、外层暂不接 VLMJudge 校验 postcondition、内层仍是单层 flat。下面描述的是完整目标形态。
+
+当前 `CodeAsPolicyAgent.run()` 是**单层 flat 多轮循环**：每轮生成一段代码 → 执行 → 纯文本 stdout/stderr 反馈，没有任务分解、没有验证原语、没有图片反馈。v1.2 重构为两层：
+
+```text
+外层 ReAct planner（薄，新增）
+  输入：任务 + observation summary + 【高层技能库的能力菜单（name + when-to-use）】(v1.3)
+  在能力菜单上选择 + 排序高层技能，落成 sub-goal 序列；每个 sub-goal 附带 postcondition；接收内层回报后重规划
+        │ 下行：sub-goal + postcondition（= 选中的高层技能 + 其 effect 断言）
+        ▼
+内层 REPL 式 Code Agent（厚，由现 CodeAsPolicyAgent 演化）
+  load 选中高层技能的 decomposition（推荐 O/A 子技能，建议性）→ REPL：
+  observe()/写 code → 看证据（含渲染图）→ 再写 → check_feasible() → act → assert_effect()
+  O/A skill、Claim、验证原语、双流蒸馏原料全在这里
+        │ 上行：done + 已验证 claims  /  failed + 归因（claim 为假=感知错 / postcondition 违反=执行错）
+        ▼
+外层据回报推进下一个高层技能或重规划
+```
+
+具体改动：
+
+1. **新增外层 ReAct planner（v1.3：配高层技能库）**：不再是 v1.2 的“朴素 ReAct”，而是吃一份**高层技能能力菜单**（name + when-to-use）+ observation summary，在 grounded 的菜单上**选择 + 排序**高层技能、产出带 postcondition 的 sub-goal 序列，并消费内层回报重规划。保持薄——胜负手仍在 grounding 不在 planning。
+2. **内层升级为 REPL 式循环**：反馈通道从纯文本扩到**多模态**（渲染证据图回流进 prompt）；先 load 选中高层技能的 `decomposition`（推荐子技能，**建议性、可偏离**），再引入 `observe / check_feasible / assert_effect` 三个验证原语（取代 v1.1 的固定门与 Grounding Branch 子对话——观察是可执行代码，无需隔离子对话）。
+3. **sub-goal = 验证单元 = 一个高层技能的 episode**：`assert_effect` 在 episode 末对照该 sub-goal 的 postcondition（= 高层技能的 effect 断言）跑，边界由 planner 选定的高层技能给定。
+4. **层间契约**：下行 sub-goal + postcondition；上行结构化 `done + claims` 或 `failed + 归因`，归因既喂外层重规划、也喂双流蒸馏。
+5. `TurnRecord` / `AgentTrace` 扩展记录 sub-goal、选中高层技能、Claims 与各验证结果，失败归因到 Claim 或 postcondition——RL credit assignment 的结构基础。
 
 ### 5.4 蒸馏：单流 → 双流
 
-| 现状 | v1.1 目标 |
-|---|---|
-| 成功 → 整段代码打包成新技能 | 成功 → 更新 A-Skill **几何先验区间**（如 clearance: [2,4]cm, n=12，被验证过的参数范围而非猜测常量）/ 蒸馏新 A-Skill |
-| 失败 → 裸 `RecoveryStep` 字符串追加 | 失败 → 经三道门归因到具体 Claim 后，更新对应 **O-Skill 的可靠性画像**（"SAM 对透明物体不可靠→换 point-prompt"）与 fallback 链；同类失败结构化合并计数 |
+
+| 现状                          | v1.2 目标                                                                                           |
+| --------------------------- | ------------------------------------------------------------------------------------------------- |
+| 成功 → 整段代码打包成新技能             | 成功 → 更新 A-Skill **几何先验区间**（如 clearance: [2,4]cm, n=12，被验证过的参数范围而非猜测常量）/ 蒸馏新 A-Skill               |
+| 失败 → 裸 `RecoveryStep` 字符串追加 | 失败 → 经验证原语 + 层间归因（claim 为假 / postcondition 违反）定位到具体 Claim 后，更新对应 **O-Skill 的可靠性画像**（"SAM 缺乏空间语义→换 vlm-prompt"）与 fallback 链；同类失败结构化合并计数 |
+
 
 GraspNet quat、place height 两个 motivating case 由此分别沉淀为"grasp 候选验证" O-Skill 教训和"place 高度估计"几何先验，而不是散落在任务技能里。
 
+### 5.5 分级技能（递归组合）+ verifier-as-code（v1.3 新增）
+
+v1.3 在不改 O/A 物种区分的前提下，引入**技能递归组合**与**可执行验证**。详见 `insights.md` v1.3 章节，落到代码的差距如下。
+
+**(1) 高层技能 = 复合 A-Skill，不是第三物种。** `open_cabinet` / `pick_object` 这类高层能力本质仍是 A-Skill（消费前置、承诺 effect），区别只在 body 是“子技能编排”而非“一段代码”。schema 增量：
+
+
+| 现状（v1.1）                          | v1.3 目标（待补）                                                                                       |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------ |
+| A-Skill body = guidance（代码草图）       | ✅ 已落地：高层技能用 `category: high_level`，分解写在 `SKILL.md` 的 `## Decomposition`（建议性 O/A 子技能读单）；叶子技能 body 是 code/过程 |
+| `verify` 是 `tuple[str]`（喂 VLMJudge 当 checks） | 🟡 钩子就位 + 雏形：rubric 外置 `ref/verify.md`、代码闸位 `scripts/verify.py`（`verifier_path()` 钩子）；`estimate_geometry` 已有可跑 `verify.py`（provenance overlay + VLM judge）。**最终形态见 §5.6（Reference-Anchored Verifier）**：独立 Verify Agent 自写 judge code、以 `scripts/verify.py` 为参考原语库、读 manifest 验 executor 真实产物 |
+| `description` 承担 When-to-use（隐式）     | When-to-use 显式化，供**外层 planner 选技能**与检索做 applicability 判断 |
+
+
+**(2) 两个分解分给两个角色（HTN）。** 任务→高层技能（外层 planner 现场规划，新颖易变）；高层技能→O/A 子技能（编码在 `decomposition` 内，跨任务复用）。planner 职责 = 在能力菜单上选择排序 + 重规划，而非从零分解。
+
+**(3) verifier-as-code 的运行环境。** 验证码与动作代码同一 sandbox，额外注入感知 API（取 mask/点云/位姿）+ `vlm_judge()` 帮手（把现有 `VLMJudgeVerifier` 包成沙箱可调函数）。每层 verify 自洽：O-Skill 验 claim 可信、原语 A-Skill 验 effect、复合高层 A-Skill 验 sub-goal 的 postcondition。仍走升级阶梯（程序化/几何默认，VLM 升级）。
+
+**(4) O-Skill 服务两层。** 既服务 planner 选高层技能（验前置 affordance：有没有柜子、关着没、够得着没），也服务内层 code agent 写码。planner 不能只靠技能文本规划，需吃 observation summary，必要时先调 O-Skill 验前置再承诺高层技能。
+
+**(5) 纪律：decomposition 是建议性而非强制。** 高层技能记录的子技能清单是默认读单/默认拆法，code agent 可按当前场景偏离（延续 `"adapt it, do not copy it blindly"`）；显式读单与 claim 隐式连线互补——读单给方向、claim 连线保证类型对接。
+
+### 5.6 Reference-Anchored Verifier：全 Agentic 的独立验证者（最终定稿）
+
+经多轮收敛，验证者的形态定为 **Reference-Anchored Verifier**：一个**独立的 Verify Code Agent**，它**自己写 judge code**，而每个技能自带的 `scripts/verify.py` 是它**参考的"验证原语库"**——简单 sub-goal 可直接调用/照抄技能的 `verify()`，复杂/组合 sub-goal 则检索多个技能的原语、**组合出新的验证程序**。与 executor 形成对称：executor 检索技能 prose → 组合**执行** code；Verifier 检索技能 verify 原语 → 组合**验证** code（拟配一个 `VerifyRouter`，与 `SkillRouter` 对称）。
+
+**纪律取向：不设"确定性地板"。** 确定性数值检查只是 Verifier *可以选择* 写进 judge code 的一种手段，**不是 harness 强加的前置过滤**。要不要做、做哪些数值守卫，本身就是验证能力的体现——要 Agentic 就彻底,不给它套预过滤。`scripts/verify.py` 永远是**参考而非强制**。
+
+**独立性的真正边界 = 事实 vs 解释（不是"代码 vs 无代码"）。** 会污染 Verifier 的不是"它知道 executor 做了什么"，而是"它继承了 executor *为什么相信自己成功* 的那套解释"。据此构建 Context：
+- **永远给（声明性事实，零污染）**：① **用了哪些 skill**（`AgentTrace.loaded_skill_ids`，再由 manifest 的 `skill` 字段/op-trace 精化）→ 路由到对应 `ref/verify.md` + `scripts/verify.py`；② sub-goal / postcondition；③ **manifest = executor 的 Claim**（A 方案 artifact 路径 + 它*声称*的标量），以"断言"姿态给——"executor 声称 h=0.14，请验证或反驳"，保持对抗立场；④ rubric + 路由到的参考原语；⑤ 证据/观测访问权。
+- **给"流程"，但要事实不要叙事（双轨）**：**期望流程** = 高层 skill 的 `## Decomposition` 读单（作者写、干净）；**实际流程** = **sanitized op-trace**（executor 实际调的 API+参数，**去注释去 CoT**，默认就给——污染极低、provenance 收益高）。"期望 vs 实际"的差异本身即验证信号（如读单要 `filter_noise` 而 op-trace 没有 → 高度可能含噪）。
+- **按需披露**：原始完整执行代码**不默认推送**，仅当 Verifier 判 UNCERTAIN 或需弄清某 artifact 如何算出时**主动请求**。
+- **永不给**：executor 的思维链 / 自我评估 / "我成功了"叙事。
+- **裁决锚在证据 + 作者 rubric 上**：最终 verdict 走"渲染证据 PNG + `ref/verify.md` 固定 rubric → VLM judge"，Verifier 自写 code 的结论要被可视证据 + 固定 rubric 交叉验证，不是它自己说了算。
+
+**产物交接 = manifest（A 方案，避免把数组当字符串注入）。** Verifier 验的是 **executor 的真实产物**，不是重跑一遍 SAM3。沙箱 `_exec_globals` 跨 step 持久（`capx/envs/tasks/base.py`，`RESULT` 预置 None 供跨步复用），但重数据**落盘**、`RESULT` 只放 JSON-safe 清单：
+
+```
+RESULT = {
+  "skill": "estimate_geometry", "object": ...,
+  "height": float, "top_z": float, "bottom_z": float, "n_points": int,
+  "obb": {"center":[3], "extent":[3], "R":[3x3]},   # 小结构内联
+  "points_path": ".../points.npy", "mask_path": ".../mask.npy",  # 重产物给路径
+}
+```
+
+Verifier 端 `np.load` 取回数组 → 渲染 overlay → **只把 PNG + 标量给 VLM**（数组永不进 prompt、永不字符串化）。manifest 全程 JSON 干净,独立进程/审计/回放都安全。
+
+**自进化飞轮。** Verifier 组合出的好用判据,可由 distiller 沉淀回某个技能的 `scripts/verify.py`——验证库像技能库一样越长越强,与主线自进化同构。
+
+**当前落地 vs 目标。** 已落地:`observation/estimate_geometry` 带可跑的 `scripts/verify.py`(渲染 mask+投影点+OBB+最高/最低点标注的 provenance overlay,并接 VLM judge)与视觉版 `ref/verify.md`;`examples/run_code_agent_probe.py` 在真 LIBERO 跑"Code Agent 执行→沙箱内 verify"。**待改造**:① 现版 `verify.py` 仍是"独立重测"(应改为读 A 方案 manifest 验 executor 真实产物);② 抽出独立的 `Verifier` 组件 + `VerifyRouter`,把"原语库 + 组合"与上下文隔离落到代码;③ executor 侧按 manifest 契约落盘产物。
+
 ## 6. 进度清单
 
-| 模块 | 状态 | 说明 |
-|---|---|---|
-| v1 七元组 schema（JSON 可序列化） | ✅ 已实现 | v1.1 下将拆分重构，子结构大部分可复用 |
-| 种子技能（pick_into_basket） | ✅ 已实现 | 形态待改：Python `build_skill()` → 磁盘技能包 |
-| 磁盘技能库 + utility 分离 | ✅ 已实现 | 关键词检索 + success_rate 排序 |
-| SkillRouter（咨询式 guidance） | ✅ 已实现 | v1.1 下按物种检索，原则不变 |
-| CodeAsPolicyAgent 多轮主循环 | ✅ 已实现 | 待插入 Grounding Branch 与三道门 |
-| CodePolicy（LLM + 脚本回放） | ✅ 已实现 | LLM 走 capx query_model |
-| CapX 执行适配器 | ✅ 已实现 | 鸭子类型 env.step(code)，可选 line trace |
-| SkillDistiller + 增量价值门控 | ✅ 已实现 | 门控保留，待升级双流 |
-| 端到端离线示例 | ✅ 已实现 | run_skill_agent.py 全闭环可跑 |
-| **Claim 注册表 + O/A 双契约 schema** | ❌ 未实现 | §5.1，v1.1 的承重墙 |
-| **技能载体目录化（SKILL.md + 双物种布局）** | ❌ 未实现 | §5.2 |
-| **EvidenceCollector + 模态化 Renderer** | ❌ 未实现 | §4.2 共享机器第 1/2 层 |
-| **VLMJudgeVerifier + GeometryVerifier** | ❌ 未实现 | §4.2 第 3 层；目前仅有 env 信号占位 |
-| **Grounding Branch（门 1+2）** | ❌ 未实现 | §4.3 |
-| **门 3 效果验证接入主循环** | ❌ 未实现 | agent.py 补 evidence 参数与归因记录 |
-| **双流蒸馏（几何先验 + 可靠性画像）** | ❌ 未实现 | §5.4 |
-| 真实 CapX/LIBERO 环境联调 | ❌ 未开始 | MockExecutor → CapXExecutorAdapter 实跑 |
-| RL skill lifecycle training | ❌ 未开始 | 按设计应在 v1.1 闭环验证后再上 |
+### 已落地（v1.1）
+
+| 模块                                      | 状态    | 说明                                    |
+| --------------------------------------- | ----- | ------------------------------------- |
+| prose 技能容器（目录包 schema）                  | ✅ 已实现 | `schema.py`：`Skill(skill_id/name/category/description/body/meta+root)` + `from_dir/from/to_markdown` + sidecar 钩子，无 typed Claim/校验 |
+| 技能包技能库（7 个，按 category 目录包）             | ✅ 已实现 | `skills_library/`：高层 2 + 观测 3 + 动作 2；每个 `<skill>/SKILL.md` + `ref/verify.md`；自动生成 `README.md` 清单 |
+| ref/verify.md（Verifier Agent rubric）     | ✅ 已实现 | 7 个技能各一份；`SKILL.md` 的 `## Verify` 收成一句指针，消除重复 |
+| 磁盘技能库（按 category 目录包 + utility 分离）      | ✅ 已实现 | 三类分目录，`admit` 连带拷贝 `ref/`·`scripts/`，正文关键词检索 + success_rate 排序，`compound_skills()` 取高层菜单 |
+| 检索 + 正文注入（无 claim 编排）                  | ✅ 已实现 | `SkillRouter.route`：keyword 检索 top-k → `build_guidance` 注入 SKILL.md 正文 |
+| EvidenceCollector + before/after 渲染器     | ✅ 已实现 | `collector.py` + `render.py`（gate-3 用，phase 1） |
+| VLMJudgeVerifier（gate-3 效果验证）            | ✅ 已实现 | 渲染证据 + 可选 checks → VLM，confidence→UNCERTAIN |
+| CompositeVerifier + 失败优先合并               | ✅ 已实现 | env 信号与 VLM 评判可组合 |
+| CodePolicy（LLM + 脚本回放）/ CapX 执行适配器       | ✅ 已实现 | LLM 走 capx query_model；env.step(code) + 可选 line trace |
+| SkillDistiller + 增量价值门控（单流）            | ✅ 已实现 | 门控保留，待升级双流；产物为技能包 |
+| 端到端离线示例（含证据采集）                          | ✅ 已实现 | `run_skill_agent.py`（内层）/ `run_planner.py`（两层）全闭环可跑 |
+
+### 部分落地 / 待补全
+
+| 模块                                      | 状态    | 说明                                    |
+| --------------------------------------- | ----- | ------------------------------------- |
+| **外层 ReactivePlanner + TwoLevelAgent**  | 🟡 骨架已落地 | `planner/planner.py`：task+场景图+高层菜单→JSON To-Do list；按 sub-goal 顺序驱动内层。暂不重规划、外层暂不接 VLMJudge（§5.3） |
+| 真机两层联调（run_planner_live.py）            | 🟡 就绪待跑 | 脚本已写好（内层仅 TaskSignalVerifier），等环境/server 起来实跑 LIBERO-PRO |
+| collect→render→judge 三道门                | 🟡 仅 gate-3 | gate-1（Claim 验证）、gate-2（可行性 dry-run）未实现 |
+| 模态化 Renderer                            | 🟡 仅 before/after | mask 叠加 / bbox / 点云轨迹回放渲染器未写（§4.2） |
+| verifier-as-code（`scripts/verify.py`）   | 🟡 雏形可跑 | `estimate_geometry` 已有 `verify.py`（provenance overlay + VLM judge）+ `run_code_agent_probe.py`；目录/钩子就位。最终形态见 §5.6 |
+
+### 未落地（v1.2 / v1.3 缺口）
+
+| 模块                                      | 状态    | 说明                                    |
+| --------------------------------------- | ----- | ------------------------------------- |
+| **验证原语（observe / check_feasible / assert_effect）+ 升级阶梯** | ❌ 未实现 | §4.3/§4.4；verify 仍是主循环固定插桩，非 agent 可调 |
+| **GeometryVerifier（IK/碰撞/OBB）**          | ❌ 未实现 | §4.4 阶梯的“几何”层缺位 |
+| **独立 Verifier 组件 + VerifyRouter + manifest 交接** | ❌ 未实现 | §5.6：抽独立 Verify Agent（上下文隔离、自写 judge code、`scripts/verify.py` 为参考原语库、读 A 方案 manifest 验真实产物）；现版仍是 probe 内沙箱重测 |
+| **内层 REPL Code Agent + 多模态反馈通道**        | ❌ 未实现 | §5.3；内层仍单层 flat、纯文本反馈 |
+| **外层重规划 + 层间契约（postcondition↓ / 归因↑）** | ❌ 未实现 | §5.3；planner 现只产 To-Do 不重规划，内层回报未结构化喂回 |
+| **关系指代 prose O-skill（“左边的碗”）**          | ❌ 未实现 | detect-all + 几何消歧步骤写进技能正文，无 typed claim |
+| **双流蒸馏（几何先验 + 可靠性画像 + 失败归因）**          | ❌ 未实现 | §5.4；当前蒸馏单流，不分流归因 |
+| **高层方法蒸馏（多子目标轨迹 → 新 compound 技能）** | ❌ 未实现 | §5.5；阶段 B，闭环后再上 |
+| RL skill lifecycle training             | ❌ 未开始 | 按设计应在两层闭环验证后再上 |
+
+> 注：① 高层技能（`category: high_level`）+ prose `Decomposition`/`Postcondition` 已落地（2 个高层技能）；② 外层 planner 与“规划层技能库接入”从“未落地”升为“骨架已落地”（见上表 🟡）；③ verifier-as-code 拆成“钩子就位（🟡）+ 实现未写（❌）”两行。
+
 
 ## 7. 后续路线（建议顺序）
 
-1. **定契约（先纸面后代码）**：确定 Claim 类型注册表的首批类型（`ObjectMask` / `ObjectGeometry` / `GraspPose` / `PlacementTarget` 等）和 O/A 两份 `skill.json` 的 JSON schema。这是承重墙，定错了后面全返工。
-2. **Schema 重构 + 技能载体目录化**：拆分 `schema.py` 为双物种契约；seed 从 `build_skill()` 改为磁盘技能包（SKILL.md + skill.json）；`SkillLibrary` 支持按物种加载与检索。把 pick_into_basket 拆成若干 O-Skill（segment_target / estimate_geometry / grasp_candidates）+ A-Skill（grasp / place_in_basket）作为第一组双物种 seed。
-3. **共享验证机器**：实现 EvidenceCollector → 模态 Renderer（MaskOverlay / BBox / Trajectory / BeforeAfter）→ VLMJudgeVerifier + GeometryVerifier。先在 Mock 数据上单测渲染与评判。
-4. **主循环插三道门**：门 3（效果验证）先接——改动最小、立即让 verify 脱离 env 信号占位；再实现 Grounding Branch 承载门 1+2，含证据门控与 consult 预算。
-5. **双流蒸馏**：`SkillDistiller` 按归因结果分流更新（A-Skill 几何先验 / O-Skill 可靠性画像），结构化 failure modes 合并计数。
-6. **真实环境联调**：LIBERO pick/place 上 `CapXExecutorAdapter + LLMCodePolicy` 实跑，重点观察三道门的判定质量与成本。
-7. **实验与消融**：对照 insights.md v0 第 252 行的 baseline 序列（裸 code-as-policy / +技能咨询 / +门3 / +Grounding Branch / +双流蒸馏），为论文积累证据。
-8. **RL lifecycle training**：闭环验证有效后，再按 v1 第 8 节训练 selection / grounding / distillation 决策。
+> 技能库/检索/gate-3/单流蒸馏已完成，**外层 ReactivePlanner 骨架也已落地**（planner-first 调整，详见 §5.3）。下面的旧顺序待整体重写时同步；当前进行中的是第 1 步（真机联调）。
+
+1. **真机最小验证（进行中）**：两条入口已就绪——`run_skill_agent_live.py`（内层单层 + `CompositeVerifier(TaskSignalVerifier, VLMJudgeVerifier)`）与 `run_planner_live.py`（两层：ReactivePlanner 产 To-Do → 内层逐 sub-goal，内层暂仅 `TaskSignalVerifier`、暂不接 VLMJudge）。目的：验证已落地部分（检索+正文注入 + 两层规划 + gate-3）在真观测下是否成立、VLM 评判质量与成本如何。这是后续一切的地基，且**不需要写新架构**。当前受环境/server 阻塞，待启动后实跑 LIBERO-PRO。
+2. **验证原语化 + verifier-as-code + 升级阶梯**：把 verify 从主循环固定插桩改造为 `observe / check_feasible / assert_effect` 三个 agent 可调原语；同时把技能 `verify` 从字符串升级为**沙箱可执行验证码**，注入感知 API + `vlm_judge()` 帮手（v1.3）；补 `GeometryVerifier`（IK/碰撞/OBB）作为阶梯“几何”层，VLMJudge 降为升级手段。`assert_effect` 复用现有 gate-3 通道，改动最小。
+3. **多模态反馈通道**：把 `CodeAsPolicyAgent` 反馈从纯文本扩到多模态——渲染证据图回流进 prompt，policy 接多模态 LLM。这是 gate-1/REPL 生效的前提。
+4. **gate-1 采证 + 模态化 Renderer**：补 mask 叠加 / bbox / 点云轨迹渲染器与 O-Skill 中间产物采集，让 `observe()` 能现场验证 Claim。先在 Mock 数据上单测渲染与评判。
+5. **内层 REPL Code Agent**：把 flat 主循环改造成 REPL 式 episode 循环（写一小段→看证据→再写），接入验证原语。
+6. **分级技能库扩容**（v1.3，部分已落地）：高层技能容器（`category: high_level` + prose `Decomposition`/`Postcondition`）与 `compound_skills()` 菜单已就位（`pick_object`/`place_in_container`）。待补：扩写长程任务所需高层技能（`open_cabinet`/`place_in_cabinet`/`close_cabinet` 等）。
+7. **外层 planner 重规划 + 层间契约**（v1.3，骨架已落地）：`ReactivePlanner`/`TwoLevelAgent` 已能产 To-Do 并逐 sub-goal 驱动内层。待补：内层结构化回报（`done+claims` / `failed+归因`）上行、planner 据此**重规划**，确立 “sub-goal = 验证单元 = 一个高层技能 episode”。decomposition 已作为内层建议性读单。
+8. **Claim 细化 + 关系指代种子**：给 `Claim` 加 `frame`、新增多实例与 `target_selection` 类型，落地 `ground_referring_expression` O-Skill，跑通 “左边的碗” 这类 Case 3 任务。
+9. **双流蒸馏**：`SkillDistiller` 按 claim/postcondition 归因结果分流更新（A-Skill 几何先验区间 / O-Skill 可靠性画像），结构化 failure modes 合并计数。
+10. **实验与消融**：对照 baseline 序列（裸 code-as-policy / +技能咨询 / +gate-3 / +验证原语 / +分级技能+两层 ReAct / +双流蒸馏），为论文积累证据。尤其在 LIBERO-PRO 长程任务（开抽屉→放入→关）上体现高层技能价值。
+11. **高层方法蒸馏 + RL lifecycle**（最后期）：让蒸馏从成功的多子目标轨迹凝结新的复合高层技能（识别可复用子目标序列 → 固化 decomposition）；闭环有效后再训练 selection / grounding / distillation 决策。
 
 每一步都保持 `run_skill_agent.py` 离线可跑（Mock 链路同步更新），保证任意时刻有可演示的端到端闭环。

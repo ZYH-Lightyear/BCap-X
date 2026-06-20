@@ -72,6 +72,7 @@ class CapXExecutorAdapter:
             terminated=terminated,
             truncated=truncated,
             observation=obs,
+            result=info.get("result"),
             info=info,
             trace_events=trace_events,
         )

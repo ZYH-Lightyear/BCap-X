@@ -21,6 +21,10 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 mkdir -p logs
 
+# Restore the persistent uv toolchain (the container root FS is wiped on reboot).
+# shellcheck source=scripts/env.sh
+source scripts/env.sh
+
 OPENROUTER_KEY_FILE="${OPENROUTER_KEY_FILE:-.openrouterkey}"
 OPENROUTER_BASE_URL="${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1/}"
 FORCE_RESTART="${FORCE_RESTART:-0}"

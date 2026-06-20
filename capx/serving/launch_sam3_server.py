@@ -3,6 +3,7 @@ import base64
 import functools
 import io
 import logging
+from pathlib import Path
 from typing import Any, List, Tuple
 
 import numpy as np
@@ -233,10 +234,19 @@ async def segment_point(req: PointPromptRequest):
         raise HTTPException(status_code=500, detail=f"Point prompt inference failed: {e}")
 
 
+# Default to a project-local checkpoint so the model survives container/cache
+# wipes (e.g. ~/.cache being cleared on restart). Resolved relative to the repo
+# root: capx/serving/launch_sam3_server.py -> <repo>/checkpoints/sam3/sam3.pt
+_DEFAULT_CKPT_PATH = (
+    Path(__file__).resolve().parents[2] / "checkpoints" / "sam3" / "sam3.pt"
+)
+
+
 def main(
     device: str = "cuda",
     port: int = 8114,
     host: str = "127.0.0.1",
+    checkpoint_path: str | None = None,
 ):
     global _MODEL, _PROCESSOR, _DEVICE
 
@@ -254,10 +264,36 @@ def main(
             device_idx = int(device.split(":")[-1]) if ":" in device else 0
             torch.cuda.set_device(device_idx)
 
+    # Resolve checkpoint source: explicit arg > project-local default > HF download.
+    # A relative explicit path is resolved against the repo root (not the cwd of
+    # whoever launched the process) so configs can use clean relative paths.
+    resolved_ckpt: str | None = None
+    if checkpoint_path:
+        ckpt = Path(checkpoint_path).expanduser()
+        if not ckpt.is_absolute():
+            ckpt = _DEFAULT_CKPT_PATH.parents[2] / ckpt
+        if ckpt.exists():
+            resolved_ckpt = str(ckpt)
+        else:
+            logger.warning(
+                f"checkpoint_path '{checkpoint_path}' not found at {ckpt}; "
+                "falling back to default/HuggingFace."
+            )
+    if resolved_ckpt is None and _DEFAULT_CKPT_PATH.exists():
+        resolved_ckpt = str(_DEFAULT_CKPT_PATH)
+
     logger.info("Loading SAM3 model...")
     try:
-        # Assuming build_sam3_image_model loads default checkpoint
-        _MODEL = build_sam3_image_model(enable_inst_interactivity=True)
+        if resolved_ckpt is not None:
+            logger.info(f"Loading SAM3 weights from local checkpoint: {resolved_ckpt}")
+            _MODEL = build_sam3_image_model(
+                enable_inst_interactivity=True,
+                checkpoint_path=resolved_ckpt,
+                load_from_HF=False,
+            )
+        else:
+            logger.info("No local checkpoint found; downloading from HuggingFace...")
+            _MODEL = build_sam3_image_model(enable_inst_interactivity=True)
     except Exception as e:
         logger.error(f"Error building SAM3 model: {e}")
         raise

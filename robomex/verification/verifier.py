@@ -95,6 +95,31 @@ class TaskSignalVerifier(Verifier):
         )
 
 
+class CompositeVerifier(Verifier):
+    """Run several verifiers on the same block and merge with failure precedence.
+
+    Typical gate-3 composition: ``CompositeVerifier(TaskSignalVerifier(),
+    VLMJudgeVerifier(...))`` -- env signals and rendered-evidence judging
+    combined, never either alone.
+    """
+
+    def __init__(self, *verifiers: Verifier) -> None:
+        self.verifiers = verifiers
+
+    def verify(
+        self,
+        *,
+        block: SemanticActionBlock,
+        execution: BlockExecutionResult,
+        evidence: MultimodalEvidenceBundle | None = None,
+    ) -> VerificationResult:
+        results = [
+            v.verify(block=block, execution=execution, evidence=evidence)
+            for v in self.verifiers
+        ]
+        return combine_verification_results(results)
+
+
 def combine_verification_results(results: list[VerificationResult]) -> VerificationResult:
     """Combine verifier outputs with conservative failure precedence."""
 

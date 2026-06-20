@@ -52,6 +52,9 @@ class BlockExecutionResult:
     terminated: bool | None = None
     truncated: bool | None = None
     observation: dict[str, Any] | None = None
+    # The sandbox's structured ``RESULT`` after this block (first-class handoff to
+    # the verifier; ``None`` if the code set nothing). Mirrors CapX ``info["result"]``.
+    result: Any = None
     info: dict[str, Any] = field(default_factory=dict)
     trace_events: tuple[ExecutionTraceEvent, ...] = ()
 
