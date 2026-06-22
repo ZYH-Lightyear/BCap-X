@@ -38,7 +38,7 @@ object lifts with the arm.
 
 ## Verify
 
-Authoritative success rubric: `ref/verify.md` (used by the Verifier Agent).
+Authoritative success rubric: `reference/verify.md` (used by the Verifier Agent).
 Quick self-check: gripper width is above zero and the named object lifts with the arm.
 
 ## Failure modes

@@ -20,7 +20,7 @@ up with the gripper during the confirmation lift rather than staying on the surf
 target = "the object named in the sub-goal"  # fill from the sub-goal text
 prompt = (
     f"Two images: BEFORE then AFTER a grasp + small lift. Is '{target}' now held between "
-    "the gripper fingers and lifted off the surface (a secure grasp), or did the grasp miss "
+    "the gripper and lifted off the surface (a secure grasp), or did the grasp miss "
     '/ slip? Reply with JSON {"grasped": true/false, "why": "..."}.'
 )
 ans = query_vlm(prompt, images=[OBS_BEFORE, OBS_AFTER])

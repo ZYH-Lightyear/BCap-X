@@ -8,7 +8,7 @@
 - 它复用执行器的同一沙箱:执行器在子目标开场种好的 ``EVIDENCE``(技能发布的关键中间值,
   如 ``EVIDENCE['target_box']``)与 ``OBS_BEFORE``(起始帧)持久可读;开场再补 ``OBS_AFTER``
   (当前帧)与 ``draw_box`` 助手。它据此写代码、用沙箱里的 ``query_vlm`` 在证据上判断。
-- 它可以 ``USE SKILL`` 拉取某技能完整的 SKILL.md + 其 ``ref/verify.md`` rubric 作为参考。
+- 它可以 ``USE SKILL`` 拉取某技能完整的 SKILL.md + 其 ``reference/verify.md`` rubric 作为参考。
 - 它通过输出一个裸 JSON 裁决(而非代码围栏)来终止。
 """
 
@@ -43,7 +43,7 @@ _VERIFY_SYSTEM_PROMPT = (
     "RULE: never corrupt the pixels of the object being judged -- annotate with an OUTLINE "
     "bounding box or pass box coordinates as text; never paint a filled mask over the object.\n\n"
     "Each turn you may: consult a skill with `USE SKILL: <name>` (you get its full SKILL.md + "
-    "its ref/verify.md rubric), or write ONE ```python``` block to gather evidence and judge "
+    "its reference/verify.md rubric), or write ONE ```python``` block to gather evidence and judge "
     "with query_vlm. When confident, FINISH by replying with a single bare JSON object (NOT in "
     'a code fence): {"verdict": "passed"|"failed"|"uncertain", "confidence": 0.0-1.0, '
     '"reason": "...", "evidence": {"overlay": "<path or null>"}}.'

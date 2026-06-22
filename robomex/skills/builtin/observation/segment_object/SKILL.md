@@ -90,7 +90,7 @@ by outlining that box on the current frame and asking a VLM — without re-segme
 
 ## Verify
 
-Authoritative success rubric: `ref/verify.md` (used by the Verifier Agent).
+Authoritative success rubric: `reference/verify.md` (used by the Verifier Agent).
 Quick self-check: the mask covers exactly the named object and `len(points)` is at least a few hundred.
 
 ## Failure modes

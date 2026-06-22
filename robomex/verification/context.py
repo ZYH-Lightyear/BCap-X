@@ -10,7 +10,7 @@
 - ``sanitize_code`` / ``build_op_trace``:把执行器代码变成无注释、无 CoT 的操作轨迹
   (即“实际流程”,默认开启,低污染)。
 - ``collect_verify_resources``:即 VerifyRouter——把执行器用过的技能映射到它们的
-  ``ref/verify.md`` rubric + ``scripts/verify.py`` 原语。
+  ``reference/verify.md`` rubric + ``scripts/verify.py`` 原语。
 - ``VerifierContext``:组装好的、可渲染的上下文。
 """
 
@@ -140,5 +140,5 @@ class VerifierContext:
                       for i, op in enumerate(self.op_trace)]
         rubrics = self.rubrics_text()
         if rubrics:
-            lines += ["", "Authored success rubrics (ref/verify.md):", rubrics]
+            lines += ["", "Authored success rubrics (reference/verify.md):", rubrics]
         return "\n".join(lines)

@@ -3,7 +3,7 @@
 布局(对应 MMSkills 的 ``skills_library/<domain>/<skill>/``)::
 
     builtin/<category>/<skill_id>/SKILL.md
-                                  ref/           (可选:验证器资产)
+                                  reference/     (可选:验证器资产)
                                   scripts/       (可选:verifier-as-code)
 
 ``category`` 取 ``high_level`` / ``observation`` / ``action`` 之一(见
@@ -37,14 +37,14 @@ def render_inventory(skills: list[Skill]) -> str:
         "# RoboMEx Skill Library",
         "",
         "Each skill is a self-contained package, split by *reader*: `SKILL.md` for the",
-        "executor agent, `ref/` for the Verifier Agent, `scripts/` for deterministic code.",
+        "executor agent, `reference/` for the Verifier Agent, `scripts/` for deterministic code.",
         "",
         "## Package Structure",
         "",
         "```text",
         "<category>/<skill_id>/",
         "├── SKILL.md       # executor agent: when-to-use, procedure/decomposition, recovery",
-        "├── ref/           # Verifier Agent: verify.md rubric (+ optional visual references)",
+        "├── reference/     # Verifier Agent: verify.md rubric (+ optional visual references)",
         "└── scripts/       # optional: deterministic verifier-as-code (verify.py)",
         "```",
         "",
@@ -58,7 +58,7 @@ def render_inventory(skills: list[Skill]) -> str:
         names = "; ".join(f"`{s.skill_id}` ({s.name})" for s in items) or "—"
         lines.append(f"| {category.value} | {len(items)} | {names} |")
 
-    lines += ["", "## Directories", "", "Sidecars: `V` = ref/verify.md, `C` = scripts/verify.py.", ""]
+    lines += ["", "## Directories", "", "Sidecars: `V` = reference/verify.md, `C` = scripts/verify.py.", ""]
     for skill in sorted(skills, key=lambda s: (s.category.value, s.skill_id)):
         badges = "".join((
             "V" if skill.verify_doc_path() else "-",

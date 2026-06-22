@@ -6,7 +6,7 @@
 技能以目录包形式存储,按 category 分组::
 
     <root>/observation/<skill_id>/SKILL.md       # 技能 prose 正文
-    <root>/observation/<skill_id>/ref/           # 可选:验证 agent 资产
+    <root>/observation/<skill_id>/reference/     # 可选:验证 agent 资产
     <root>/observation/<skill_id>/scripts/       # 可选:verifier-as-code
     <root>/observation/<skill_id>/utility.json   # 运行期学习元数据
     <root>/action/<skill_id>/...
@@ -120,7 +120,7 @@ class SkillLibrary:
 
     @staticmethod
     def _copy_sidecars(skill: Skill, dest: Path) -> None:
-        """从源技能包拷贝 ref/ 和 scripts/ 这两个 sidecar 目录。"""
+        """从源技能包拷贝 reference/ 和 scripts/ 这两个 sidecar 目录。"""
 
         src = skill.root
         if src is None or src.resolve() == dest.resolve():

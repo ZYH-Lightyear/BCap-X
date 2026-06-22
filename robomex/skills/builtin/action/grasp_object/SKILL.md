@@ -51,7 +51,7 @@ assert gripper_width > 0.05, "gripper fully closed -> nothing was grasped"
 
 ## Verify
 
-Authoritative success rubric: `ref/verify.md` (used by the Verifier Agent).
+Authoritative success rubric: `reference/verify.md` (used by the Verifier Agent).
 Quick self-check: gripper width after closing is above zero and the object moved up with the lift.
 
 ## Failure modes

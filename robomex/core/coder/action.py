@@ -56,7 +56,7 @@ def build_skill_llm_content(base_dir: Any, body: str) -> str:
     base = str(base_dir) if base_dir else "(in-memory skill; no base directory)"
     return (
         f"Loaded skill. Base directory for this skill: {base}\n"
-        "Resolve any referenced sidecar files (e.g. ref/verify.md, scripts/verify.py) "
+        "Resolve any referenced sidecar files (e.g. reference/verify.md, scripts/verify.py) "
         "as absolute paths under this base directory.\n\n"
         f"{body.strip()}\n"
     )
