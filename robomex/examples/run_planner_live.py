@@ -1,16 +1,15 @@
-"""Live two-level RoboMEx agent on a real CapX/LIBERO(-PRO) task.
+"""在真实 CapX/LIBERO(-PRO) 任务上跑两层 RoboMEx agent(真机)。
 
-Outer ReactivePlanner (task + initial scene image + high-level skill menu) emits a
-JSON To-Do list of sub-goals; the inner CodeAsPolicyAgent runs each sub-goal on the
-real env in order. NO re-planning and NO VLMJudge yet -- the inner loop verifies
-with the env task signal only (TaskSignalVerifier). The goal is to validate the
-two-level plumbing on a real LIBERO-PRO task end to end.
+外层 ReactivePlanner 每步给出**下一个** sub-goal(任务 + 当前场景图 + 高层技能菜单 +
+历史);内层 CodeAsPolicyAgent 在真实 env 上执行它(并被告知先咨询哪个高层技能),
+随后刷新场景、再次询问 planner,直到它说 DONE。暂无 VLMJudge——内层只用 env 任务信号
+(TaskSignalVerifier)做验证。目标是在真实 LIBERO-PRO 任务上端到端验证反应式两层接线。
 
-Prerequisites (same servers the baseline uses):
-    - LLM proxy                        :8110
+前置依赖(与 baseline 用的是同一批服务):
+    - LLM 代理                          :8110
     - sam3 / contact-graspnet / pyroki :8114 / :8115 / :8116
 
-Usage::
+用法::
 
     uv run --no-sync --active robomex/examples/run_planner_live.py \\
         --config-path env_configs/libero/franka_libero_cap_agent0.yaml \\
@@ -21,8 +20,8 @@ from __future__ import annotations
 
 import os
 
-# MuJoCo needs a GL backend chosen before the sim is imported. Mirror launch.py;
-# override with MUJOCO_GL=osmesa for CPU rendering on headless boxes without EGL.
+# MuJoCo 必须在 import 仿真之前选好 GL 后端。这里照搬 launch.py;在没有 EGL 的无头
+# 机器上想用 CPU 渲染,可用 MUJOCO_GL=osmesa 覆盖。
 os.environ.setdefault("MUJOCO_GL", "egl")
 
 import time
@@ -44,32 +43,32 @@ _CODE_AS_POLICY_PROMPT = (
 
 @dataclass
 class LiveArgs:
-    """CLI arguments for a single live two-level trial."""
+    """单次真机两层试验的 CLI 参数。"""
 
     config_path: str = "env_configs/libero/franka_libero_cap_agent0.yaml"
-    """YAML env config (same one the CaP-Agent0 baseline uses)."""
+    """YAML env 配置(与 CaP-Agent0 baseline 用的同一个)。"""
 
     model: str = "openrouter/qwen/qwen3.6-plus"
-    """Model for BOTH the planner and the inner code agent (routed through the proxy)."""
+    """planner 和内层 code agent 共用的模型(经代理转发)。"""
 
     server_url: str = "http://localhost:8110/chat/completions"
-    """Local LLM proxy endpoint."""
+    """本地 LLM 代理端点。"""
 
     api_key: str | None = None
-    """Optional API key (proxy usually injects it)."""
+    """可选 API key(通常由代理注入)。"""
 
     max_turns: int = 6
-    """Max inner code-generation turns per sub-goal."""
+    """每个 sub-goal 内层最多的代码生成轮数。"""
 
     output_dir: str = "./outputs/robomex_planner_live"
-    """Root for this run's artifacts; a timestamp dir is created under it."""
+    """本次运行产物的根目录;会在其下创建一个时间戳子目录。"""
 
     seed: int | None = None
-    """Optional env reset seed."""
+    """可选的 env reset 种子。"""
 
 
 def _build_env(config_path: str) -> Any:
-    """Instantiate the high-level CapX env exactly like the trial workers do."""
+    """像 trial worker 那样实例化高层 CapX env。"""
 
     from capx.envs.configs.instantiate import instantiate
     from capx.envs.configs.loader import DictLoader
@@ -81,7 +80,7 @@ def _build_env(config_path: str) -> Any:
 
 
 def _task_language(env: Any) -> str:
-    """LIBERO task instruction string, used as the planner's task goal."""
+    """LIBERO 任务指令字符串,用作 planner 的任务目标。"""
 
     handle = getattr(env.low_level_env, "handle", None)
     lang = getattr(handle, "task_language", None) if handle is not None else None
@@ -89,14 +88,14 @@ def _task_language(env: Any) -> str:
 
 
 def _api_docs(env: Any) -> str:
-    """Concatenated API documentation the inner code agent needs."""
+    """拼接内层 code agent 需要的 API 文档。"""
 
     apis = getattr(env, "_apis", {})
     return "\n".join(api.combined_doc() for api in apis.values())
 
 
 def _save_scene_image(obs: dict, path: str) -> str | None:
-    """Save the initial agentview RGB so the planner can see the scene; None on miss."""
+    """保存 agentview RGB 让 planner 能看到场景;取不到则返回 None。"""
 
     from robomex.perception.render import save_rgb
 
@@ -110,82 +109,124 @@ def _save_scene_image(obs: dict, path: str) -> str | None:
         return None
 
 
+def _flush_video(env: Any, target_dir: Path, suffix: str) -> None:
+    """把**自上次取帧以来**累计的帧取走(clear=True)并立即写成 mp4。
+
+    `enable_video_capture` 后 env 持续往帧缓冲里录;每个 sub-goal 结束时调用一次,
+    取到的就正好是这段 sub-goal 的帧,写完缓冲清空、下段重新累计。多相机则各写一路。
+    """
+
+    from robomex.core.logging import get_logger
+
+    log = get_logger("live")
+    if not hasattr(env, "get_video_frames"):
+        return
+    try:
+        frames = env.get_video_frames(clear=True)
+    except Exception as exc:  # noqa: BLE001 - 录像失败不该让整个 run 挂掉
+        log.warning("取视频帧失败: %r", exc)
+        return
+    if not frames:
+        return
+
+    from capx.utils.video_utils import _write_video
+
+    if isinstance(frames, dict):
+        for cam, cam_frames in frames.items():
+            if cam_frames:
+                _write_video(cam_frames, str(target_dir), suffix=f"{suffix}_{cam}")
+    else:
+        _write_video(frames, str(target_dir), suffix=suffix)
+
+
 def main(args: LiveArgs) -> None:
-    from robomex.adapters.capx.executor import CapXExecutorAdapter
-    from robomex.agent import CodeAsPolicyAgent, LLMCodePolicy
-    from robomex.library import SkillLibrary
-    from robomex.planner import (
-        LLMPlannerPolicy,
-        ReactivePlanner,
-        SubGoalResult,
-    )
-    from robomex.skills.skills_library import load_skills_library
+    from robomex import RoboMExAgent, RoboMExConfig
+    from robomex.agents import LLMPlannerPolicy
+    from robomex.core.coder import LLMCodePolicy
+    from robomex.core.logging import configure_logging
+    from robomex.core.sandbox import CapXExecutorAdapter
+    from robomex.skills import SkillLibrary, load_builtin_skills
     from robomex.verification import TaskSignalVerifier
 
     out_dir = Path(args.output_dir) / time.strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[live] building env from {args.config_path} (MUJOCO_GL={os.environ.get('MUJOCO_GL')}) ...")
+    # 控制台 + run.log 双写;之后所有 robomex.* 的日志都会进这里。
+    log = configure_logging(log_file=out_dir / "run.log")
+    log.info("构建 env: %s (MUJOCO_GL=%s)", args.config_path, os.environ.get("MUJOCO_GL"))
+
     env = _build_env(args.config_path)
     obs, _info = env.reset(seed=args.seed)
+
+    # 开启整段 episode 的视频录制(env 支持时);run 结束后写盘。
+    if hasattr(env, "enable_video_capture"):
+        try:
+            env.enable_video_capture(True, clear=True)
+            log.info("已开启视频录制")
+        except Exception as exc:  # noqa: BLE001 - 录像不可用不该阻断 run
+            log.warning("开启视频录制失败: %r", exc)
+
     task = _task_language(env)
-    print(f"[live] task: {task}")
+    log.info("任务: %s", task)
 
     scene_path = _save_scene_image(obs, str(out_dir / "scene.png"))
-    print(f"[live] initial scene image: {scene_path or '(unavailable -> planning from text only)'}")
+    log.info("初始场景图: %s", scene_path or "(取不到 -> planner 仅凭文本规划)")
 
     library = SkillLibrary(str(out_dir / "library"))
-    for skill in load_skills_library():
+    for skill in load_builtin_skills():
         library.admit(skill, source="builtin")
-    menu = [r.skill_id for r in library.compound_skills()]
-    print(f"[live] high-level skills (planner menu): {menu}")
-
-    planner = ReactivePlanner(
-        library,
-        LLMPlannerPolicy(model=args.model, server_url=args.server_url, api_key=args.api_key),
-    )
 
     system_prompt = (
         f"{_CODE_AS_POLICY_PROMPT}\n\nAvailable API functions (already imported):\n{_api_docs(env)}"
     )
-    inner = CodeAsPolicyAgent(
-        executor=CapXExecutorAdapter(env),
-        policy=LLMCodePolicy(model=args.model, server_url=args.server_url, api_key=args.api_key),
+
+    # 框架入口:把所有依赖收进一个 RoboMExConfig,再交给 RoboMExAgent 装配 + 运行
+    # 反应式两层循环。刻意跳过 VLMJudge——内层只用 env 任务信号做验证。
+    config = RoboMExConfig(
         library=library,
-        verifier=TaskSignalVerifier(),  # env signal only; VLMJudge intentionally skipped
+        planner_policy=LLMPlannerPolicy(model=args.model, server_url=args.server_url, api_key=args.api_key),
+        code_policy=LLMCodePolicy(model=args.model, server_url=args.server_url, api_key=args.api_key),
+        executor=CapXExecutorAdapter(env),
+        verifier=TaskSignalVerifier(),
         max_turns=args.max_turns,
-        system_prompt=system_prompt,
+        max_subgoals=8,
+        inner_system_prompt=system_prompt,
+        observation_summary=(
+            "A LIBERO tabletop scene. Call get_observation() for agentview/wrist RGB, "
+            "depth, intrinsics, and camera pose."
+        ),
+        artifacts_dir=str(out_dir),
+    )
+    agent = RoboMExAgent(config)
+
+    # 真机场景刷新:每个 sub-goal 之后,用最新观测重渲染 planner 看到的场景
+    #(与具体 env 相关;离线时保持 None)。
+    step = {"n": 0}
+
+    def scene_refresh(observation: dict) -> str | None:
+        step["n"] += 1
+        return _save_scene_image(observation, str(out_dir / f"scene_step{step['n']}.png"))
+
+    # 每个 sub-goal 跑完的当下,就把这段视频写进它自己的 subgoal_NN/(不等整段结束)。
+    def on_subgoal_end(index: int, result: Any, sg_dir: Path | None) -> None:
+        if sg_dir is not None:
+            _flush_video(env, sg_dir, suffix="subgoal")
+
+    agent.run(
+        task,
+        scene_image_path=scene_path,
+        scene_refresh=scene_refresh,
+        on_subgoal_end=on_subgoal_end,
     )
 
-    # Plan first so we can print the To-Do list before executing.
-    subgoals = planner.plan(task, scene_image_path=scene_path)
-    print(f"\n[live] To-Do list ({len(subgoals)} sub-goals):")
-    for i, sg in enumerate(subgoals, 1):
-        print(f"  {i}. {sg.goal}")
-        print(f"     skill={sg.skill} | done-when: {sg.postcondition}")
-    if not subgoals:
-        print("[live] planner returned no sub-goals; aborting.")
-        return
-
-    # Run each sub-goal on the same (persistent) env, in order. No re-planning.
-    observation_summary = (
-        "A LIBERO tabletop scene. Call get_observation() for agentview/wrist RGB, "
-        "depth, intrinsics, and camera pose."
-    )
-    results: list[SubGoalResult] = []
-    for sg in subgoals:
-        print(f"\n[live] >>> sub-goal: {sg.goal}")
-        trace = inner.run(sg.goal, observation_summary)
-        results.append(SubGoalResult(subgoal=sg, trace=trace, success=trace.success))
-        print(f"[live]     turns={len(trace.turns)} success={trace.success} "
-              f"loaded={list(trace.loaded_skill_ids)}")
-        for t in trace.turns:
-            print(f"[live]       turn {t.turn}: exec={t.execution.status.value} "
-                  f"verdict={t.verification.status.value}")
-
-    overall = bool(results) and all(r.success for r in results)
-    print(f"\n[live] plan success={overall}  ({sum(r.success for r in results)}/{len(results)} sub-goals)")
-    print(f"[live] artifacts under: {out_dir}")
+    # 收尾:把最后一段 sub-goal 之后的残余帧(若有)落到 episode 根目录。
+    _flush_video(env, out_dir, suffix="tail")
+    log.info("本次运行产物目录: %s", out_dir)
+    log.info("  ├─ run.log          完整日志")
+    log.info("  ├─ planner.jsonl    每步 planner 原始回复 + 决策")
+    log.info("  ├─ summary.json     episode 汇总")
+    log.info("  ├─ subgoal_NN/      每个 sub-goal 的内层代码 turn_*.py + 输出 turn_*.out.txt + video_subgoal*.mp4")
+    log.info("  └─ scene*.png       每步 planner 看到的场景图")
 
 
 if __name__ == "__main__":

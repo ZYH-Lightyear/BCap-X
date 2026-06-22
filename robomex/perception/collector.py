@@ -1,8 +1,8 @@
-"""Collect per-block multimodal evidence from CapX-style observations.
+"""从 CapX 式观测中,按块采集多模态证据。
 
-Phase 1 scope: before/after agentview RGB snapshots plus the combined
-comparison render (gate-3 effect verification). Gate-1 artifact collection
-(masks, grasp candidates) plugs in later via the same bundle structure.
+Phase 1 范围:agentview 的 before/after RGB 快照,外加合成的对比渲染图
+(gate-3 效果验证)。gate-1 的产物采集(mask、抓取候选)以后通过同一套 bundle
+结构接入。
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ def _extract_rgb(observation: dict[str, Any] | None, camera: str) -> np.ndarray 
 
 
 class EvidenceCollector:
-    """Persists evidence images per block under ``output_dir/<block_name>/``."""
+    """按块把证据图持久化到 ``output_dir/<block_name>/`` 下。"""
 
     def __init__(self, output_dir: str | Path, camera: str = "agentview") -> None:
         self.output_dir = Path(output_dir)
@@ -44,7 +44,7 @@ class EvidenceCollector:
         before_observation: dict[str, Any] | None,
         after_observation: dict[str, Any] | None,
     ) -> MultimodalEvidenceBundle:
-        """Build (and persist) the evidence bundle for one executed block."""
+        """为一个已执行的块构建(并持久化)证据 bundle。"""
 
         block_dir = self.output_dir / block_name
         artifacts: list[EvidenceArtifact] = []

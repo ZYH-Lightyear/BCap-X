@@ -1,17 +1,17 @@
-"""Offline tests for the unified CodingAgent core (no env / LLM / network).
+"""统一 CodingAgent 内核的离线测试(无 env / LLM / 网络)。
 
-Drives the executor (CodeAsPolicyAgent) and verifier (VerifyCodeAgent) with a
-scripted policy and a fake sandbox executor to assert the shared loop: skill
-progressive disclosure (USE SKILL), python turns + feedback, terminal parsing,
-repeated-action / force-terminal safety.
+用脚本策略 + 假沙箱执行器驱动执行器(CodeAsPolicyAgent)和验证器(VerifyCodeAgent),
+断言共享循环:技能渐进披露(USE SKILL)、python 轮 + 反馈、终止解析、
+重复动作 / 强制终止 的安全护栏。
 """
 
 from __future__ import annotations
 
-from robomex.agent import CodeAsPolicyAgent, ScriptedCodePolicy
-from robomex.execution import ActionBlockStatus, BlockExecutionResult, SemanticActionBlock
+from robomex.agents import CodeAsPolicyAgent, VerifyCodeAgent
+from robomex.core.coder import ScriptedCodePolicy
+from robomex.core.sandbox import ActionBlockStatus, BlockExecutionResult, SemanticActionBlock
 from robomex.skills import Skill
-from robomex.verification import VerifierContext, VerifyCodeAgent
+from robomex.verification import VerifierContext
 
 
 class FakeRecord:
@@ -21,7 +21,7 @@ class FakeRecord:
 
 
 class FakeLibrary:
-    """Minimal SkillLibrary stand-in backed by in-memory Skill objects."""
+    """最小的 SkillLibrary 替身,用内存里的 Skill 对象支撑。"""
 
     def __init__(self, skills: list[Skill]) -> None:
         self._by_id = {s.skill_id: FakeRecord(s) for s in skills}
@@ -34,7 +34,7 @@ class FakeLibrary:
 
 
 class FakeExecutor:
-    """Records executed blocks; returns canned stdout, optional terminate rule."""
+    """记录执行过的块;返回预设 stdout,可选的终止规则。"""
 
     def __init__(self, terminate_when=None) -> None:
         self.blocks: list[SemanticActionBlock] = []
@@ -79,9 +79,9 @@ def test_verifier_use_skill_then_python_then_verdict() -> None:
     assert vtrace.verdict.verdict == "passed"
     assert vtrace.verdict.confidence == 0.9
     assert vtrace.verdict.evidence.get("overlay") == "o.png"
-    assert len(vtrace.turns) == 1  # one python judge turn
+    assert len(vtrace.turns) == 1  # 仅一个 python judge 轮
     assert vtrace.op_trace and "x = 1" in vtrace.op_trace[0]
-    # seed block ran first, then the one python turn
+    # seed 块先跑,然后才是那一个 python 轮
     assert ex.blocks[0].name == "verify_seed"
     res = vtrace.result
     assert res.passed
@@ -102,11 +102,11 @@ def test_verifier_unknown_skill_does_not_crash() -> None:
 def test_verifier_force_terminal_on_exhaust() -> None:
     lib = FakeLibrary([_skill("estimate_geometry", "g")])
     ctx = VerifierContext(sub_goal="x", skills_used=("estimate_geometry",))
-    # Always emits the same python block -> never terminal; loop must force-finish.
+    # 始终发同一个 python 块 -> 永不终止;循环必须强制收尾。
     policy = ScriptedCodePolicy(["```python\nprint('again')\n```"] * 10)
     agent = VerifyCodeAgent(executor=FakeExecutor(), policy=policy, context=ctx, library=lib, max_turns=3)
     vtrace = agent.verify()
-    # Out of steps with no JSON verdict -> a (best-effort) uncertain verdict, no crash.
+    # 步数用尽且无 JSON 裁决 -> 给出(尽力的)uncertain 裁决,不崩溃。
     assert vtrace.verdict.verdict == "uncertain"
     assert len(vtrace.turns) == 3
 
@@ -122,7 +122,7 @@ def test_executor_terminates_on_env_signal() -> None:
     trace = agent.run(task="pick and place")
     assert trace.success
     assert len(trace.turns) == 2
-    assert trace.loaded_skill_ids == ()  # scripted policy consulted no skills
+    assert trace.loaded_skill_ids == ()  # 脚本策略没咨询任何技能
 
 
 def test_executor_loads_skill_via_use_skill() -> None:
@@ -136,7 +136,7 @@ def test_executor_loads_skill_via_use_skill() -> None:
     agent = CodeAsPolicyAgent(executor=ex, policy=policy, library=lib, max_turns=6)
     trace = agent.run(task="grasp the cube")
     assert "grasp" in trace.loaded_skill_ids
-    assert len(trace.turns) == 1  # only the python turn is recorded
+    assert len(trace.turns) == 1  # 只记录 python 轮
 
 
 def _run_all() -> None:

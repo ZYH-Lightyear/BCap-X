@@ -152,6 +152,7 @@ class FrankaLiberoApiReduced(ApiBase):
         fns["segment_sam3_text_prompt"] = self.segment_sam3_text_prompt
         fns["segment_sam3_point_prompt"] = self.segment_sam3_point_prompt
         fns["point_prompt_molmo"] = self.point_prompt_molmo
+        fns["query_vlm"] = self.query_vlm
         fns["plan_grasp"] = self.plan_grasp
         fns["plan_grasp_from_point_clouds"] = self.plan_grasp_from_point_clouds
         fns["get_oriented_bounding_box_from_3d_points"] = (
@@ -306,6 +307,75 @@ class FrankaLiberoApiReduced(ApiBase):
             self._draw_label(overlay, f"Point prompt: {text_prompt}"),
         )
         return result
+
+    # --------------------------------------------------------------------- #
+    # 通用 VLM 查询(把 capx.llm.client.query_model 暴露成 code-block API)
+    # --------------------------------------------------------------------- #
+    def query_vlm(
+        self,
+        prompt: str,
+        images: np.ndarray | list[np.ndarray] | None = None,
+        *,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+    ) -> str:
+        """Ask a vision-language model a question about image(s) and get its raw text reply.
+
+        A thin, general-purpose bridge to the same LLM proxy the planner uses, so code
+        blocks can do their own VLM reasoning (e.g. localize an object, read a label,
+        sanity-check a scene). You parse the returned string yourself.
+
+        Model/endpoint are read from environment variables, falling back to the planner
+        defaults:
+          - CAPX_VLM_MODEL       (default "openrouter/qwen/qwen3.6-plus")
+          - CAPX_VLM_SERVER_URL  (default "http://localhost:8110/chat/completions")
+          - CAPX_VLM_API_KEY     (optional)
+
+        Args:
+            prompt: Instruction/question for the VLM. Be explicit about the output
+                format you want (e.g. ask for a JSON object) so it is easy to parse.
+            images: Optional RGB image (H, W, 3) uint8, or a list of them, to attach.
+            temperature: Decoding temperature (default 0.0 for deterministic parsing).
+            max_tokens: Maximum response tokens.
+
+        Returns:
+            str: The model's text reply, verbatim.
+
+        Note:
+            Many VLMs (e.g. Qwen) report pixel coordinates NORMALIZED to a 0-1000 range,
+            NOT absolute pixels. If you ask for coordinates, instruct the model which
+            convention to use and rescale by the real image width/height accordingly
+            (e.g. x_px = x / 1000 * W).
+
+        Example:
+            >>> rgb = get_observation()["agentview"]["images"]["rgb"]
+            >>> reply = query_vlm("Reply ONLY JSON {\"box\":[x1,y1,x2,y2]} for the red mug.", images=rgb)
+        """
+        import base64
+        import io
+        import os
+
+        from capx.llm.client import ModelQueryArgs, query_model
+
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        if images is not None:
+            img_list = images if isinstance(images, list) else [images]
+            for im in img_list:
+                buf = io.BytesIO()
+                Image.fromarray(np.asarray(im).astype(np.uint8)).save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode()
+                content.append(
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+                )
+
+        args = ModelQueryArgs(
+            model=os.getenv("CAPX_VLM_MODEL", "openrouter/qwen/qwen3.6-plus"),
+            server_url=os.getenv("CAPX_VLM_SERVER_URL", "http://localhost:8110/chat/completions"),
+            api_key=os.getenv("CAPX_VLM_API_KEY"),
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return query_model(args, [{"role": "user", "content": content}])["content"]
 
     def get_oriented_bounding_box_from_3d_points(self, points: np.ndarray) -> dict[str, Any]:
         """Get the oriented bounding box from 3D points.

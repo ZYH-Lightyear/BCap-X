@@ -5,12 +5,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from robomex.execution import BlockExecutionResult, SemanticActionBlock
+from robomex.core.sandbox import BlockExecutionResult, SemanticActionBlock
 from robomex.perception import MultimodalEvidenceBundle
 
 
 class VerificationStatus(str, Enum):
-    """Normalized verifier outcome."""
+    """归一化的验证结果。"""
 
     PASSED = "passed"
     FAILED = "failed"
@@ -20,7 +20,7 @@ class VerificationStatus(str, Enum):
 
 @dataclass(frozen=True)
 class VerificationSignal:
-    """A single check result produced by a verifier."""
+    """验证器产出的单条检查结果。"""
 
     name: str
     status: VerificationStatus
@@ -31,7 +31,7 @@ class VerificationSignal:
 
 @dataclass(frozen=True)
 class VerificationResult:
-    """Aggregated verification result for an action block or full task."""
+    """针对一个动作块或整个任务的聚合验证结果。"""
 
     status: VerificationStatus
     signals: tuple[VerificationSignal, ...] = ()
@@ -40,13 +40,13 @@ class VerificationResult:
 
     @property
     def passed(self) -> bool:
-        """Whether verification confidently passed."""
+        """验证是否“有把握地”通过。"""
 
         return self.status == VerificationStatus.PASSED
 
 
 class Verifier(ABC):
-    """Base verifier interface for visual, geometry, robot-state, or reward checks."""
+    """验证器基接口:用于视觉、几何、机器人状态或 reward 检查。"""
 
     @abstractmethod
     def verify(
@@ -56,15 +56,14 @@ class Verifier(ABC):
         execution: BlockExecutionResult,
         evidence: MultimodalEvidenceBundle | None = None,
     ) -> VerificationResult:
-        """Verify one executed semantic action block."""
+        """验证一个已执行的语义动作块。"""
 
 
 class TaskSignalVerifier(Verifier):
-    """Verify a block from the signals a CapX-style env returns after ``step``.
+    """依据 CapX 式 env 在 ``step`` 后返回的信号来验证一个块。
 
-    Precedence: a sandbox/runtime error fails; a terminated episode (reward 1.0)
-    or an explicit ``task_completed`` flag passes; otherwise the block is still
-    in progress and reported as uncertain.
+    优先级:沙箱/运行时报错 -> 失败;episode 终止(reward 1.0)或显式
+    ``task_completed`` 标志 -> 通过;否则视为仍在进行中,报告为 uncertain。
     """
 
     def verify(
@@ -96,11 +95,10 @@ class TaskSignalVerifier(Verifier):
 
 
 class CompositeVerifier(Verifier):
-    """Run several verifiers on the same block and merge with failure precedence.
+    """在同一个块上跑多个验证器,并按“失败优先”合并。
 
-    Typical gate-3 composition: ``CompositeVerifier(TaskSignalVerifier(),
-    VLMJudgeVerifier(...))`` -- env signals and rendered-evidence judging
-    combined, never either alone.
+    典型的 gate-3 组合:``CompositeVerifier(TaskSignalVerifier(),
+    VLMJudgeVerifier(...))``——env 信号与渲染证据评判结合,不单用任一个。
     """
 
     def __init__(self, *verifiers: Verifier) -> None:
@@ -121,7 +119,7 @@ class CompositeVerifier(Verifier):
 
 
 def combine_verification_results(results: list[VerificationResult]) -> VerificationResult:
-    """Combine verifier outputs with conservative failure precedence."""
+    """按保守的“失败优先”规则合并多个验证器的输出。"""
 
     if not results:
         return VerificationResult(

@@ -1,8 +1,7 @@
-"""Verifier primitive library: optional helpers seeded into the verifier sandbox.
+"""验证器原语库:注入验证器沙箱的可选 helper。
 
-The Verify Code Agent is fully agentic -- there is no mandatory deterministic
-floor. These are *building blocks* it may call, adapt, or ignore. The main one
-anchors a verdict on a rendered image + an authored rubric via a VLM judge.
+Verify Code Agent 是完全 agentic 的——没有强制的确定性底线。这些只是它可以调用、
+改写或忽略的*积木*。主力原语通过 VLM judge,把裁决锚定在“渲染图 + 作者写的 rubric”上。
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ def vlm_judge(
     api_key: str | None = None,
     max_tokens: int = 512,
 ) -> dict:
-    """Anchor a verdict on a rendered image + rubric. Returns verdict/confidence/reason."""
+    """把裁决锚定在“渲染图 + rubric”上。返回 verdict/confidence/reason。"""
 
     from capx.llm.client import ModelQueryArgs, query_model
 

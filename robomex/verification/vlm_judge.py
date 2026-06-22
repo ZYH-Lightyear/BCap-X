@@ -1,9 +1,9 @@
-"""Gate-3 effect verification: rendered evidence -> VLM verdict.
+"""Gate-3 效果验证:渲染证据 -> VLM 裁决。
 
-The judge receives the BEFORE/AFTER comparison render plus an optional list of
-checks (carried in ``block.metadata`` under ``checks``) and must answer with a
-JSON verdict including confidence. Low confidence maps to UNCERTAIN rather than
-FAILED so the agent re-perceives instead of aborting on a shaky judgment.
+judge 收到 BEFORE/AFTER 对比渲染图,外加一份可选的 checks 清单(放在
+``block.metadata`` 的 ``checks`` 里),必须回一个带 confidence 的 JSON 裁决。
+低置信度映射为 UNCERTAIN 而非 FAILED,这样 agent 会重新感知,而不是在一个摇摆的
+判断上直接中止。
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import json
 import re
 from pathlib import Path
 
-from robomex.execution import BlockExecutionResult, SemanticActionBlock
+from robomex.core.sandbox import BlockExecutionResult, SemanticActionBlock
 from robomex.perception import EvidenceRole, MultimodalEvidenceBundle
 from robomex.verification.verifier import (
     VerificationResult,
@@ -38,7 +38,7 @@ def _image_part(path: str) -> dict:
 
 
 class VLMJudgeVerifier(Verifier):
-    """Judges block effects from rendered evidence via CapX's LLM client."""
+    """通过 CapX 的 LLM client,从渲染证据评判块的效果。"""
 
     def __init__(
         self,
