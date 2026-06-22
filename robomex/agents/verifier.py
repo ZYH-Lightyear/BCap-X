@@ -5,10 +5,10 @@
 
 - 上下文是只含事实的 :class:`VerifierContext`(sub-goal、用过哪些技能、一份脱敏的
   op-trace、作者写的 rubric)——而*不含*执行器的思维链,这样它的盲区与执行器不相关。
-- 它可以 ``USE SKILL`` 拉取某技能完整的 SKILL.md + 基目录,再读它的
-  ``ref/verify.md`` rubric 和 ``scripts/verify.py`` 原语(为方便起见也被注入为可调用的
-  ``VERIFY_PRIMITIVES[skill_id]``)。这些都是它可以组合、照抄或改写的参考——不存在强制的
-  确定性底线。
+- 它复用执行器的同一沙箱:执行器在子目标开场种好的 ``EVIDENCE``(技能发布的关键中间值,
+  如 ``EVIDENCE['target_box']``)与 ``OBS_BEFORE``(起始帧)持久可读;开场再补 ``OBS_AFTER``
+  (当前帧)与 ``draw_box`` 助手。它据此写代码、用沙箱里的 ``query_vlm`` 在证据上判断。
+- 它可以 ``USE SKILL`` 拉取某技能完整的 SKILL.md + 其 ``ref/verify.md`` rubric 作为参考。
 - 它通过输出一个裸 JSON 裁决(而非代码围栏)来终止。
 """
 
@@ -32,23 +32,36 @@ from robomex.verification.verifier import (
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 _VERIFY_SYSTEM_PROMPT = (
-    "You are an INDEPENDENT robot-task Verifier. You did NOT write the executor's code; "
-    "you are given only facts about what it did (which skills it used, a sanitized op-trace, "
-    "and authored rubrics) -- never its reasoning. Your job is to verify or refute that the "
-    "sub-goal was achieved, against real evidence.\n\n"
-    "Each turn you may: consult a skill with `USE SKILL: <name>` (you will get its full "
-    "SKILL.md + base directory; read its 'Verifier reference' section for the exact functions "
-    "and signatures its scripts/verify.py exposes, plus its ref/verify.md rubric); or write ONE "
-    "```python``` block to gather evidence. Each used skill's verify.py is preloaded as "
-    "`VERIFY_PRIMITIVES[skill_id]` (a namespace already wired to the sandbox's APIs). Many skills "
-    "offer a one-shot `verify(...)` entry that gathers evidence, renders an evidence overlay, and "
-    "VLM-judges it in a single call -- prefer it when available, or compose the building blocks "
-    "(e.g. load_claim / render_evidence) or `vlm_judge(image_path, rubric, question)`. Use them, "
-    "adapt them, or write your own checks. If unsure of a primitive's API, USE SKILL to read its "
-    "reference first.\n\n"
-    "When confident, FINISH by replying with a single bare JSON object (NOT in a code fence): "
-    '{"verdict": "passed"|"failed"|"uncertain", "confidence": 0.0-1.0, "reason": "...", '
-    '"evidence": {"overlay": "<path or null>"}}.'
+    "You are an INDEPENDENT robot-task Verifier. You did NOT write the executor's code; you "
+    "are given only facts about what it did (the sub-goal, which skills it used, a sanitized "
+    "op-trace, and the authored verify.md rubric) -- never its reasoning. Decide whether the "
+    "sub-goal was actually achieved, against real visual evidence.\n\n"
+    "The sandbox persists the executor's state. Available to your code: get_observation(); "
+    "OBS_BEFORE / OBS_AFTER (RGB arrays of the scene at the sub-goal's start / now); EVIDENCE "
+    "(a dict of key values the skills published, e.g. EVIDENCE.get('target_box')); "
+    "query_vlm(prompt, images=[...]) to ask a VLM; draw_box(img, box) to outline a region.\n\n"
+    "RULE: never corrupt the pixels of the object being judged -- annotate with an OUTLINE "
+    "bounding box or pass box coordinates as text; never paint a filled mask over the object.\n\n"
+    "Each turn you may: consult a skill with `USE SKILL: <name>` (you get its full SKILL.md + "
+    "its ref/verify.md rubric), or write ONE ```python``` block to gather evidence and judge "
+    "with query_vlm. When confident, FINISH by replying with a single bare JSON object (NOT in "
+    'a code fence): {"verdict": "passed"|"failed"|"uncertain", "confidence": 0.0-1.0, '
+    '"reason": "...", "evidence": {"overlay": "<path or null>"}}.'
+)
+
+# 验证器开场注入沙箱:抓当前帧 OBS_AFTER + 注入 draw_box(只画外框,不污染物体像素);
+# EVIDENCE / OBS_BEFORE 由执行器在子目标开场种好,这里只做缺失兜底。
+_VERIFY_SEED = (
+    "try:\n    EVIDENCE\nexcept NameError:\n    EVIDENCE = {}\n"
+    "try:\n    OBS_BEFORE\nexcept NameError:\n    OBS_BEFORE = None\n"
+    "try:\n    OBS_AFTER = get_observation()['agentview']['images']['rgb']\n"
+    "except Exception as _e:\n    OBS_AFTER = None\n"
+    "def draw_box(img, box, color=(255, 0, 0), width=3):\n"
+    "    from PIL import Image as _I, ImageDraw as _D\n"
+    "    import numpy as _n\n"
+    "    _im = _I.fromarray(_n.asarray(img).astype('uint8')).copy()\n"
+    "    _D.Draw(_im).rectangle([float(_v) for _v in box], outline=color, width=width)\n"
+    "    return _n.asarray(_im)\n"
 )
 
 
@@ -115,9 +128,6 @@ class VerifyCodeAgent(CodingAgent):
         *,
         max_turns: int = 6,
         system_prompt: str = _VERIFY_SYSTEM_PROMPT,
-        primitive_model: str = "openrouter/qwen/qwen3.6-plus",
-        primitive_server_url: str = "http://localhost:8110/chat/completions",
-        primitive_api_key: str | None = None,
     ) -> None:
         super().__init__(
             executor=executor,
@@ -128,9 +138,6 @@ class VerifyCodeAgent(CodingAgent):
             force_terminal_on_exhaust=True,
         )
         self.context = context
-        self._primitive_model = primitive_model
-        self._primitive_server_url = primitive_server_url
-        self._primitive_api_key = primitive_api_key
 
     def verify(self) -> VerifyAgentTrace:
         return self.run()
@@ -138,45 +145,18 @@ class VerifyCodeAgent(CodingAgent):
     # ---- 钩子 --------------------------------------------------------------
 
     def _setup(self, prompt: list[dict]) -> None:
-        """尽力把各技能的 verify.py 原语 + vlm_judge 注入沙箱。
+        """注入当前帧 OBS_AFTER 与 draw_box 助手(EVIDENCE/OBS_BEFORE 已由执行器种好)。"""
 
-        每个技能的 ``scripts/verify.py`` 会被 ``exec`` 进一个*继承沙箱 globals*
-        (即 L4 API)的命名空间——因为它的 helper 通过 ``globals()`` 取这些 API,
-        它本就是为在沙箱内运行而写的,而非独立 import。我们把得到的命名空间包成
-        ``VERIFY_PRIMITIVES[skill_id]``,这样 agent 就能调用诸如
-        ``VERIFY_PRIMITIVES['estimate_geometry'].verify(...)``。
-        """
-
-        paths = {
-            sid: res.verifier_path
-            for sid, res in self.context.resources.items()
-            if res.verifier_path
-        }
-        seed = (
-            "import types as _t\n"
-            "try:\n    VERIFY_PRIMITIVES\nexcept NameError:\n    VERIFY_PRIMITIVES = {}\n"
-            f"for _sid, _p in {paths!r}.items():\n"
-            "    try:\n"
-            "        _ns = dict(globals())  # 把沙箱 L4 API 共享给 verify.py\n"
-            "        with open(_p) as _f:\n"
-            "            exec(compile(_f.read(), _p, 'exec'), _ns)\n"
-            "        VERIFY_PRIMITIVES[_sid] = _t.SimpleNamespace("
-            "**{_k: _v for _k, _v in _ns.items() if not _k.startswith('__')})\n"
-            "    except Exception as _e:\n"
-            "        print('seed primitive failed for ' + _sid + ': ' + repr(_e))\n"
-            "try:\n"
-            "    from robomex.verification.primitives import vlm_judge as _vj\n"
-            "    import functools as _ft\n"
-            f"    vlm_judge = _ft.partial(_vj, model={self._primitive_model!r}, "
-            f"server_url={self._primitive_server_url!r}, api_key={self._primitive_api_key!r})\n"
-            "except Exception as _e:\n"
-            "    print('seed vlm_judge failed: ' + repr(_e))\n"
-        )
         from robomex.core.sandbox import SemanticActionBlock
 
-        self.executor.run_block(
-            SemanticActionBlock(name="verify_seed", intent="seed verifier primitives", code=seed)
-        )
+        try:
+            self.executor.run_block(
+                SemanticActionBlock(name="verify_seed", intent="seed verifier evidence", code=_VERIFY_SEED)
+            )
+        except Exception as exc:  # noqa: BLE001 - 种子失败不该让验证崩溃
+            from robomex.core.logging import get_logger
+
+            get_logger("verifier").warning("验证器证据种子注入失败: %r", exc)
 
     def _skill_entries(self) -> list[SkillEntry]:
         entries: list[SkillEntry] = []
@@ -185,11 +165,10 @@ class VerifyCodeAgent(CodingAgent):
                 record = self.library.get(sid)
             except Exception:  # noqa: BLE001 - missing skill just drops from the menu
                 continue
-            note = "" if record.skill.verifier_path() else " [no verify.py]"
             entries.append(
                 SkillEntry(
                     name=sid,
-                    description=(record.skill.description or record.skill.name) + note,
+                    description=record.skill.description or record.skill.name,
                     category=record.skill.category.value,
                 )
             )
@@ -198,11 +177,10 @@ class VerifyCodeAgent(CodingAgent):
     def _initial_user_message(self) -> str:
         return (
             f"{self.context.render()}\n\n"
-            "Gather evidence and decide. Preloaded: VERIFY_PRIMITIVES[skill_id] (the skill's "
-            "verify.py, e.g. a one-shot verify(object_name, out_dir, rubric_path=...) or "
-            "load_claim/render_evidence) and vlm_judge(image_path, rubric, question). If you render "
-            "an overlay, save it under EVIDENCE_DIR when that variable is defined in the sandbox. "
-            "Finish with a bare JSON verdict."
+            "Evidence available in the sandbox: OBS_BEFORE / OBS_AFTER (scene at the sub-goal's "
+            "start / now), and EVIDENCE (dict the skills published, e.g. EVIDENCE.get('target_box')). "
+            "Judge against the rubric using query_vlm (annotate only with draw_box / coordinates, "
+            "never a filled mask over the object). Finish with a bare JSON verdict."
         )
 
     def _is_terminal(self, raw: str) -> bool:

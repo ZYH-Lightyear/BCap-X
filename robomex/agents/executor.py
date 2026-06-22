@@ -16,12 +16,25 @@ from robomex.core.coder import CodingAgent, SkillEntry
 from robomex.core.coder.policy import CompletionPolicy
 from robomex.core.coder.trace import AgentTrace, TurnRecord
 from robomex.core.logging import get_logger
-from robomex.core.sandbox import BlockExecutionResult
+from robomex.core.sandbox import BlockExecutionResult, SemanticActionBlock
 from robomex.perception import EvidenceCollector
 from robomex.skills import SkillLibrary
-from robomex.verification.verifier import TaskSignalVerifier, Verifier
 
 _log = get_logger("executor")
+
+# 子目标开场注入沙箱:重置语义证据字典 + 抓子目标起始帧。沙箱 globals 跨 block 持久,
+# 因此 EVIDENCE 与 OBS_BEFORE 会一直留到该子目标的 VerifyCodeAgent 取证时仍可读。
+_EVIDENCE_SEED = (
+    "try:\n"
+    "    EVIDENCE\n"
+    "except NameError:\n"
+    "    EVIDENCE = {}\n"
+    "EVIDENCE.clear()\n"
+    "try:\n"
+    "    OBS_BEFORE = get_observation()['agentview']['images']['rgb'].copy()\n"
+    "except Exception as _e:\n"
+    "    OBS_BEFORE = None\n"
+)
 
 _SYSTEM_PROMPT = (
     "You are a robot Code-as-Policy agent. Each turn, write one block of executable "
@@ -38,7 +51,6 @@ class CodeAsPolicyAgent(CodingAgent):
         executor: Any,
         policy: CompletionPolicy,
         library: SkillLibrary,
-        verifier: Verifier | None = None,
         collector: EvidenceCollector | None = None,
         max_turns: int = 6,
         system_prompt: str = _SYSTEM_PROMPT,
@@ -50,7 +62,6 @@ class CodeAsPolicyAgent(CodingAgent):
             max_turns=max_turns,
             system_prompt=system_prompt,
         )
-        self.verifier = verifier or TaskSignalVerifier()
         self.collector = collector
         self._task = ""
         self._observation_summary = ""
@@ -68,6 +79,18 @@ class CodeAsPolicyAgent(CodingAgent):
         return super().run()
 
     # ---- 钩子 --------------------------------------------------------------
+
+    def _setup(self, prompt: list[dict]) -> None:
+        """子目标开场:重置 EVIDENCE、抓起始帧 OBS_BEFORE(供事后验证器使用)。"""
+
+        try:
+            self.executor.run_block(
+                SemanticActionBlock(
+                    name="evidence_seed", intent="seed subgoal evidence", code=_EVIDENCE_SEED
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - 取证种子失败不该让子目标崩溃
+            _log.warning("证据种子注入失败: %r", exc)
 
     def _skill_entries(self) -> list[SkillEntry]:
         return [
@@ -104,28 +127,26 @@ class CodeAsPolicyAgent(CodingAgent):
         prev_observation: dict | None,
         turns: list[Any],
     ) -> None:
-        evidence = None
         if self.collector is not None:
-            evidence = self.collector.bundle_for_block(
+            # 逐块存 before/after 帧(调试产物);子目标级裁决另由 VerifyCodeAgent 做。
+            self.collector.bundle_for_block(
                 execution.block.name, prev_observation, execution.observation
             )
-        verdict = self.verifier.verify(block=execution.block, execution=execution, evidence=evidence)
         _log.info(
-            "turn %d: exec=%s reward=%s terminated=%s | verdict=%s",
-            turn_idx, execution.status.value, execution.reward, execution.terminated, verdict.status.value,
+            "turn %d: exec=%s reward=%s terminated=%s",
+            turn_idx, execution.status.value, execution.reward, execution.terminated,
         )
         stderr = (execution.stderr or "").strip()
         if not execution.ok and stderr:
             _log.info("turn %d: 报错 -> %s", turn_idx, stderr.splitlines()[-1][:300])
-        turns.append(TurnRecord(turn_idx, code, execution, verdict))
+        turns.append(TurnRecord(turn_idx, code, execution, None))
 
     def _should_stop_after_python(self, execution: BlockExecutionResult) -> bool:
         return bool(execution.terminated)
 
     def _finalize(self, *, turns: list[Any], loaded: tuple[str, ...], terminal_raw: str | None) -> AgentTrace:
-        success = any(t.execution.terminated for t in turns) or (
-            bool(turns) and turns[-1].verification.passed
-        )
+        # 执行器只报告 env 级终止信号;子目标是否达成由独立的 VerifyCodeAgent 裁决。
+        success = any(t.execution.terminated for t in turns)
         return AgentTrace(
             task=self._task,
             loaded_skill_ids=loaded,

@@ -2,8 +2,9 @@
 
 外层 ReactivePlanner 每步给出**下一个** sub-goal(任务 + 当前场景图 + 高层技能菜单 +
 历史);内层 CodeAsPolicyAgent 在真实 env 上执行它(并被告知先咨询哪个高层技能),
-随后刷新场景、再次询问 planner,直到它说 DONE。暂无 VLMJudge——内层只用 env 任务信号
-(TaskSignalVerifier)做验证。目标是在真实 LIBERO-PRO 任务上端到端验证反应式两层接线。
+随后刷新场景、再次询问 planner,直到它说 DONE。每个 sub-goal 结束后由独立的
+VerifyCodeAgent(复用同一沙箱 + query_vlm)做子目标级视觉裁决。目标是在真实
+LIBERO-PRO 任务上端到端验证反应式两层接线。
 
 前置依赖(与 baseline 用的是同一批服务):
     - LLM 代理                          :8110
@@ -146,7 +147,6 @@ def main(args: LiveArgs) -> None:
     from robomex.core.logging import configure_logging
     from robomex.core.sandbox import CapXExecutorAdapter
     from robomex.skills import SkillLibrary, load_builtin_skills
-    from robomex.verification import TaskSignalVerifier
 
     out_dir = Path(args.output_dir) / time.strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -181,13 +181,13 @@ def main(args: LiveArgs) -> None:
     )
 
     # 框架入口:把所有依赖收进一个 RoboMExConfig,再交给 RoboMExAgent 装配 + 运行
-    # 反应式两层循环。刻意跳过 VLMJudge——内层只用 env 任务信号做验证。
+    # 反应式两层循环。每个 sub-goal 结束后跑独立的 VerifyCodeAgent 做视觉裁决。
     config = RoboMExConfig(
         library=library,
         planner_policy=LLMPlannerPolicy(model=args.model, server_url=args.server_url, api_key=args.api_key),
         code_policy=LLMCodePolicy(model=args.model, server_url=args.server_url, api_key=args.api_key),
         executor=CapXExecutorAdapter(env),
-        verifier=TaskSignalVerifier(),
+        enable_verification=True,
         max_turns=args.max_turns,
         max_subgoals=8,
         inner_system_prompt=system_prompt,

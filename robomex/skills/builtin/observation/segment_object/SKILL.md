@@ -49,11 +49,14 @@ if m:
         box = None
 
 mask = None
+EVIDENCE["target_box"] = None  # published in REAL pixels for the Verifier (None if text fallback)
 if box and len(box) == 4:
     # Rescale 0-1000 normalized coords -> real pixels by the actual image size.
     x1, y1, x2, y2 = box
-    cx = float(np.clip((x1 + x2) / 2.0 / 1000.0 * W, 0, W - 1))
-    cy = float(np.clip((y1 + y2) / 2.0 / 1000.0 * H, 0, H - 1))
+    px = [x1 / 1000.0 * W, y1 / 1000.0 * H, x2 / 1000.0 * W, y2 / 1000.0 * H]
+    EVIDENCE["target_box"] = [float(v) for v in px]
+    cx = float(np.clip((px[0] + px[2]) / 2.0, 0, W - 1))
+    cy = float(np.clip((px[1] + px[3]) / 2.0, 0, H - 1))
     # 2) SAM3 point prompt at the VLM-located point -> precise mask.
     pr = segment_sam3_point_prompt(rgb, (cx, cy))
     if pr:
@@ -68,6 +71,10 @@ if mask is None:
 points = mask_to_world_points(mask, depth, cam["intrinsics"], cam["pose_mat"])
 points, _ = filter_noise(points)                                # always filter before geometry
 ```
+
+`EVIDENCE` is a sandbox-persistent dict (seeded at sub-goal start). Publishing
+`EVIDENCE["target_box"]` lets the Verifier Agent later check *which* object was grounded —
+by outlining that box on the current frame and asking a VLM — without re-segmenting.
 
 ## Rules
 

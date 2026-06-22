@@ -1,24 +1,34 @@
 # Verify: Pick Object
 
-You are the Verifier Agent. Decide whether the object was successfully picked up.
-Return PASS only if every pass criterion holds; otherwise FAIL with the reason.
+You are the Verifier Agent. Decide whether the named object was actually picked up.
+
+This is an *action* skill: judge the **before/after** change. `OBS_BEFORE` is the scene at
+the sub-goal's start, `OBS_AFTER` is the scene now. The simplest decisive evidence is:
+the named object is no longer resting on the surface and is now held by / lifted with the
+gripper.
+
+**Hygiene rule:** show the raw before/after frames; if you must point at the object, use a
+`draw_box` OUTLINE — never paint a filled mask over it.
 
 ## Pass criteria
 
-- The gripper closed onto the object with width clearly above zero (a fully closed
-  gripper means nothing was grasped).
-- After the confirmation lift, the named object rose with the gripper rather than
-  staying on the surface.
-- The object held is the one named in the task (not a neighbor).
+- In `OBS_AFTER` the named object has clearly left its `OBS_BEFORE` resting spot and is
+  raised with the gripper (not still on the table, not dropped, not a different object).
 
-## What to inspect
+## Example judge code
 
-- Before/after agentview (and wrist) frames spanning the grasp and the lift.
-- The reported gripper width signal after closing.
-- Any success-reference frame in this folder, if present.
+```python
+target = "the object named in the sub-goal"  # fill from the sub-goal text
+prompt = (
+    f"Two images: BEFORE then AFTER a robot pick attempt. Was '{target}' successfully "
+    "picked up — i.e. it is now lifted/held by the gripper and no longer resting where it "
+    'was? Reply with JSON {"picked": true/false, "why": "..."}.'
+)
+ans = query_vlm(prompt, images=[OBS_BEFORE, OBS_AFTER])
+print(ans)
+```
 
 ## Fail signals
 
-- Gripper fully closed (width ~0): empty grasp.
-- The object is still resting on the surface after the lift.
-- A different object moved instead of the requested one.
+- The object is still on the surface in `OBS_AFTER`, the gripper is empty (fingers fully
+  closed on nothing), or a different object moved instead of the requested one.

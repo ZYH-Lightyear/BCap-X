@@ -50,11 +50,16 @@ class SubGoal:
 
 @dataclass(frozen=True)
 class SubGoalResult:
-    """通过内层 Code Agent 执行一个 sub-goal 的结果。"""
+    """通过内层 Code Agent 执行一个 sub-goal 的结果。
+
+    ``note`` 为子目标级验证器给出的裁决理由(若有),会喂回 planner 历史,让反应式
+    planner 据此重试 / 改写 / 推进。
+    """
 
     subgoal: SubGoal
     trace: AgentTrace
     success: bool
+    note: str = ""
 
 
 @dataclass(frozen=True)
@@ -154,7 +159,8 @@ def _render_history(history: list[SubGoalResult]) -> str:
     lines = []
     for r in history:
         flag = "done" if r.success else "failed"
-        lines.append(f"- [{flag}] {r.subgoal.goal}")
+        note = f" ({r.note})" if r.note else ""
+        lines.append(f"- [{flag}] {r.subgoal.goal}{note}")
     return "\n".join(lines)
 
 

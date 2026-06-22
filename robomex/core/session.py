@@ -23,10 +23,12 @@ from robomex.agents.planner import (
     SubGoal,
     SubGoalResult,
 )
+from robomex.agents.verifier import VerifyCodeAgent
 from robomex.core.coder.policy import CompletionPolicy
 from robomex.core.coder.trace import AgentTrace
 from robomex.core.logging import get_logger
 from robomex.skills import SkillLibrary
+from robomex.verification import VerifierContext, build_op_trace, collect_verify_resources
 
 _log = get_logger("session")
 
@@ -43,21 +45,24 @@ class RoboMExConfig:
     - ``code_policy``     —— 驱动内层 :class:`CodeAsPolicyAgent`。
     - ``executor``        —— 沙箱后端(``run_block``);真机用
       ``CapXExecutorAdapter(env)``,离线用 mock。
-    - ``verifier``/``collector`` —— 可选的逐轮验证 + 证据采集。
+    - ``enable_verification`` —— 是否在每个 sub-goal 结束后跑独立的
+      :class:`VerifyCodeAgent` 做子目标级视觉裁决(它复用 ``code_policy`` 与同一沙箱)。
+    - ``collector`` —— 可选的逐块证据采集(存 before/after 帧调试产物)。
     - ``inner_system_prompt`` —— 覆盖执行器的角色提示词(例如注入真机 API 文档);
       ``None`` 则保持执行器默认。
     - ``artifacts_dir`` —— 可选;给定后,每个 sub-goal 的 planner 决策、内层每轮代码 /
-      输出 / 裁决,以及一份 episode 汇总都会落盘到此目录。``None`` 则不落盘。
+      输出、验证裁决,以及一份 episode 汇总都会落盘到此目录。``None`` 则不落盘。
     """
 
     library: SkillLibrary
     planner_policy: PlannerPolicy
     code_policy: CompletionPolicy
     executor: Any
-    verifier: Any | None = None
+    enable_verification: bool = False
     collector: Any | None = None
     max_turns: int = 6
     max_subgoals: int = 8
+    verify_max_turns: int = 4
     inner_system_prompt: str | None = None
     observation_summary: str = ""
     artifacts_dir: str | None = None
@@ -93,8 +98,6 @@ class RoboMExAgent:
             "library": config.library,
             "max_turns": config.max_turns,
         }
-        if config.verifier is not None:
-            kwargs["verifier"] = config.verifier
         if config.collector is not None:
             kwargs["collector"] = config.collector
         if config.inner_system_prompt is not None:
@@ -142,11 +145,23 @@ class RoboMExAgent:
                 self.config.observation_summary,
                 primary_skill_id=subgoal.skill,
             )
-            results.append(SubGoalResult(subgoal=subgoal, trace=trace, success=trace.success))
-            _log.info("[subgoal %d] 结果 success=%s | 内层轮数=%d | 加载技能=%s",
-                      i + 1, trace.success, len(trace.turns), list(trace.loaded_skill_ids))
+
+            # 子目标级视觉裁决:独立的 VerifyCodeAgent 复用同一沙箱(EVIDENCE/OBS_BEFORE
+            # 已持久),否则回退到 env 终止信号。
+            vtrace = self._verify_subgoal(subgoal, trace)
+            verdict = vtrace.verdict if vtrace is not None else None
+            if verdict is not None:
+                success = verdict.verdict == "passed"
+                note = verdict.reason
+            else:
+                success = trace.success
+                note = ""
+            results.append(SubGoalResult(subgoal=subgoal, trace=trace, success=success, note=note))
+            _log.info("[subgoal %d] 结果 success=%s | 裁决=%s | 内层轮数=%d | 加载技能=%s",
+                      i + 1, success, (verdict.verdict if verdict else "env-signal"),
+                      len(trace.turns), list(trace.loaded_skill_ids))
             sg_dir = (art / f"subgoal_{i:02d}") if art is not None else None
-            self._dump_subgoal(art, i, subgoal, trace)
+            self._dump_subgoal(art, i, subgoal, trace, vtrace)
 
             # sub-goal 跑完立即触发回调(真机:把这段视频当场写进 subgoal 目录)。
             if on_subgoal_end is not None:
@@ -172,6 +187,36 @@ class RoboMExAgent:
             _log.info("产物已落盘到: %s", art)
         return EpisodeResult(execution=execution)
 
+    # ---- 子目标级验证 ------------------------------------------------------
+
+    def _verify_subgoal(self, subgoal: SubGoal, trace: AgentTrace):
+        """跑独立的 VerifyCodeAgent 给这个 sub-goal 做视觉裁决;关闭则返回 ``None``。"""
+
+        if not self.config.enable_verification:
+            return None
+        try:
+            resources = collect_verify_resources(
+                [r.skill for r in self.config.library.all()], trace.loaded_skill_ids
+            )
+            context = VerifierContext(
+                sub_goal=subgoal.goal,
+                skills_used=trace.loaded_skill_ids,
+                op_trace=tuple(build_op_trace(trace.turns)),
+                resources=resources,
+                expected_decomposition=subgoal.postcondition,
+            )
+            agent = VerifyCodeAgent(
+                executor=self.config.executor,
+                policy=self.config.code_policy,
+                context=context,
+                library=self.config.library,
+                max_turns=self.config.verify_max_turns,
+            )
+            return agent.verify()
+        except Exception as exc:  # noqa: BLE001 - 验证失败回退到 env 信号,不该中断 episode
+            _log.warning("子目标验证失败,回退 env 信号: %r", exc)
+            return None
+
     # ---- 产物落盘(artifacts_dir 给定时启用) ------------------------------
 
     def _record_planner(self, art: Path | None, index: int, subgoal: SubGoal | None) -> None:
@@ -188,19 +233,25 @@ class RoboMExAgent:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     @staticmethod
-    def _dump_subgoal(art: Path | None, index: int, subgoal: SubGoal, trace: AgentTrace) -> None:
-        """把一个 sub-goal 的元信息 + 内层每轮代码/输出/裁决写到 ``subgoal_NN/``。"""
+    def _dump_subgoal(art: Path | None, index: int, subgoal: SubGoal, trace: AgentTrace, vtrace=None) -> None:
+        """把一个 sub-goal 的元信息 + 内层每轮代码/输出 + 验证裁决写到 ``subgoal_NN/``。"""
 
         if art is None:
             return
         d = art / f"subgoal_{index:02d}"
         d.mkdir(parents=True, exist_ok=True)
+        verdict = vtrace.verdict if vtrace is not None else None
         meta = {
             "goal": subgoal.goal,
             "skill": subgoal.skill,
             "postcondition": subgoal.postcondition,
-            "success": trace.success,
+            "env_terminated": trace.success,
             "loaded_skill_ids": list(trace.loaded_skill_ids),
+            "verdict": (
+                {"verdict": verdict.verdict, "confidence": verdict.confidence, "reason": verdict.reason}
+                if verdict is not None
+                else None
+            ),
         }
         (d / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
         for t in trace.turns:
@@ -210,7 +261,6 @@ class RoboMExAgent:
                 f"# ok        : {t.execution.ok}",
                 f"# reward    : {t.execution.reward}",
                 f"# terminated: {t.execution.terminated}",
-                f"# verdict   : {t.verification.status.value}  {t.verification.summary}",
                 "",
                 "## stdout",
                 t.execution.stdout or "(empty)",
@@ -219,6 +269,24 @@ class RoboMExAgent:
                 t.execution.stderr or "(empty)",
             ])
             (d / f"turn_{t.turn:02d}.out.txt").write_text(report, encoding="utf-8")
+        if vtrace is not None:
+            lines = [
+                f"# verdict   : {verdict.verdict}",
+                f"# confidence: {verdict.confidence}",
+                f"# reason    : {verdict.reason}",
+                "",
+            ]
+            for vt in vtrace.turns:
+                lines += [
+                    f"## verify turn {vt.turn} code",
+                    vt.code or "(none)",
+                    "## stdout",
+                    vt.stdout or "(empty)",
+                    "## stderr",
+                    vt.stderr or "(empty)",
+                    "",
+                ]
+            (d / "verify.txt").write_text("\n".join(lines), encoding="utf-8")
 
     @staticmethod
     def _dump_summary(art: Path | None, execution: PlanExecution) -> None:
