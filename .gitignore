@@ -48,3 +48,5 @@ wandb/
 *.ico
 *.webp
 check.md
+data/
+checkpoint/

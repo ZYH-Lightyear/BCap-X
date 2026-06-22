@@ -53,7 +53,9 @@ if TYPE_CHECKING:
     from capx.envs.launch import LaunchArgs
 
 
-MULTITURN_LIMIT = 10
+# Override with CAPX_MULTITURN_LIMIT for staged-agent configs that need more
+# turns; default unchanged so baseline behavior is identical.
+MULTITURN_LIMIT = int(os.environ.get("CAPX_MULTITURN_LIMIT", "10"))
 
 # ---------------------------------------------------------------------------
 # Shared formatting helpers

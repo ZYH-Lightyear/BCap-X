@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 import pathlib
 from collections.abc import Sequence
 from typing import Any
@@ -16,8 +17,8 @@ from capx.utils.serve_utils import post_with_retries
 
 """SAM 3 integration via FastAPI service."""
 
-# Configuration
-SERVICE_URL = "http://127.0.0.1:8114"
+# Configuration (override with SAM3_SERVICE_URL, same pattern as graspnet.py)
+SERVICE_URL = os.environ.get("SAM3_SERVICE_URL", "http://127.0.0.1:8114")
 
 
 def _encode_image(image: np.ndarray | Image.Image) -> str:

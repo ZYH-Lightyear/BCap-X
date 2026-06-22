@@ -402,6 +402,85 @@ class FrankaLiberoApi(ApiBase):
         print(f"Grasp sample quaternion wxyz for {object_name}: {best_grasp.wxyz_xyz[:4]}")
         return best_grasp.wxyz_xyz[-3:], best_grasp.wxyz_xyz[:4]
 
+    def sample_grasp_candidates(
+        self, object_name: str, k: int = 3, use_multiview: bool = True,
+        target_points: np.ndarray | None = None,
+    ) -> list[dict[str, Any]]:
+        """Sample the top-k grasp candidates for an object (not just argmax).
+
+        Same planning path as ``sample_grasp_pose`` (multiview point clouds ->
+        Contact-GraspNet -> +90deg wrist convention), but returns several
+        candidates so a downstream verifier can pick the one least likely to be
+        obstructed by neighbouring objects.
+
+        IMPORTANT: pass ``target_points`` (the (N,3) world points of the ALREADY
+        SELECTED instance, e.g. the mask chosen + verified upstream) so the grasp
+        is planned ON THAT EXACT instance. Without it, this method re-segments by
+        ``object_name`` and the SAM3 top-1 may be a DIFFERENT instance than the
+        one you selected -- producing grasps on the wrong bowl.
+
+        Args:
+            object_name: object to grasp, underscore-separated lowercase words.
+                Only used to re-segment when ``target_points`` is not given.
+            k: number of top-scoring candidates to return.
+            use_multiview: use the wrist camera in addition to the main camera.
+            target_points: (N,3) world points of the chosen instance to grasp.
+                When provided, segmentation is skipped and grasps are planned on
+                these points directly.
+
+        Returns:
+            list (len <= k) of dicts sorted by descending score, each with:
+                - "position":   (3,) XYZ world frame
+                - "quaternion": (4,) wxyz world frame
+                - "score":      float grasp confidence
+        """
+        if target_points is not None:
+            pc_segment = np.asarray(target_points, dtype=float).reshape(-1, 3)
+            if len(pc_segment) == 0:
+                raise ValueError("target_points is empty")
+        else:
+            result = self.get_object_3d_points_and_masks_from_language(
+                object_name, use_multiview=use_multiview
+            )
+            pc_segment = result["points_3d"]
+            if len(pc_segment) == 0:
+                raise ValueError(f"Could not segment object '{object_name}'")
+
+        obs = self.get_observation()
+        pc_full_parts = []
+        for cam_name in [self.camera_name, self.wrist_camera_name]:
+            depth = obs[cam_name]["images"]["depth"]
+            intrinsics = obs[cam_name]["intrinsics"]
+            extrinsics = obs[cam_name]["pose_mat"]
+            pts_camera = depth_to_pointcloud(depth, intrinsics, subsample_factor=1)
+            pts_homogeneous = np.concatenate(
+                [pts_camera, np.ones((len(pts_camera), 1))], axis=1
+            )
+            pc_full_parts.append((extrinsics @ pts_homogeneous.T).T[:, :3])
+        pc_full = np.concatenate(pc_full_parts)
+
+        pc_segment, _ = self.filter_noise(pc_segment)
+        if len(pc_segment) == 0:
+            raise ValueError(f"No valid points after filtering for '{object_name}'")
+
+        grasp_sample_tf, grasp_scores = self.plan_grasp_from_point_clouds(pc_full, pc_segment)
+        grasp_scores = np.asarray(grasp_scores).reshape(-1)
+        order = np.argsort(-grasp_scores)[: max(int(k), 1)]
+
+        candidates: list[dict[str, Any]] = []
+        for idx in order:
+            g = vtf.SE3.from_matrix(grasp_sample_tf[idx]) @ vtf.SE3.from_rotation(
+                rotation=vtf.SO3.from_rpy_radians(0.0, 0.0, np.pi / 2)
+            )
+            candidates.append({
+                "position": np.asarray(g.wxyz_xyz[-3:], dtype=float),
+                "quaternion": np.asarray(g.wxyz_xyz[:4], dtype=float),
+                "score": float(grasp_scores[idx]),
+            })
+        print(f"sample_grasp_candidates: {len(candidates)} candidates for "
+              f"'{object_name}', scores {[round(c['score'], 3) for c in candidates]}")
+        return candidates
+
     def _segment_object_from_language(
         self, image: Image.Image, object_name: str
     ) -> tuple[np.ndarray, tuple[int, int] | None, list[float] | None]:
@@ -490,8 +569,8 @@ class FrankaLiberoApi(ApiBase):
     ) -> dict[str, Any]:
         """Segment an object using text prompt across multiple views (agentview and wrist).
         
-        Uses Molmo to locate the object in both camera views, then SAM3 for
-        segmentation. Returns the masks and 3D points that appear in both views.
+        Uses SAM3 text prompting in each camera view, then falls back to Molmo
+        point prompting + SAM3 point prompting if text prompting fails.
         
         Args:
             text_prompt: Text description of the object to segment.
@@ -520,16 +599,13 @@ class FrankaLiberoApi(ApiBase):
             intrinsics = obs[cam_name]["intrinsics"]
             extrinsics = obs[cam_name]["pose_mat"]
             
-            # use Molmo to point prompt
-            points = self.point_prompt_molmo(rgb, text_prompt)
-            point = points[text_prompt]
-            
-            # Get SAM3 segmentations (fall back to text prompt if point prompt yields nothing)
-            masks = []
-            if point[0] is not None:
-                masks = self.segment_sam3_point_prompt(rgb, point)
+            # Prefer SAM3 text prompting so the default README servers are sufficient.
+            masks = self.segment_sam3_text_prompt(rgb, text_prompt)
             if not masks:
-                masks = self.segment_sam3_text_prompt(rgb, text_prompt)
+                points = self.point_prompt_molmo(rgb, text_prompt)
+                point = points[text_prompt]
+                if point[0] is not None:
+                    masks = self.segment_sam3_point_prompt(rgb, point)
             if not masks:
                 raise ValueError(
                     f"SAM3 segmentation failed for '{text_prompt}' on {cam_name}. "

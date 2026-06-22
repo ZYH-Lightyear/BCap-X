@@ -1,0 +1,80 @@
+# LIBERO Spatial Task 0 -- STAGED agent with auto-evidence (verifier prototype).
+# One semantic action stage per turn; evidence returns through stdout.
+# Servers must already run (sam3 8114, pyroki 8116, graspnet via GRASPNET_SERVICE_URL).
+# Launch:
+#   MUJOCO_GL=egl GRASPNET_SERVICE_URL=http://127.0.0.1:8125 CAPX_MULTITURN_LIMIT=16 \
+#   .venv-libero/bin/python capx/envs/launch.py \
+#     --config-path env_configs/libero/franka_libero_spatial_0_staged.yaml
+
+model: qwen3_5_397b_distill
+server_url: http://1054059136692489.cn-shanghai.pai-eas.aliyuncs.com/api/predict/qwen3_5_397b_distill/v1/chat/completions
+api_key: YTFkYmQwZTAwMWQwMGNmMjNmOGY5YTEyMjlhOGIzYTgzNjAzYjQ2ZQ==
+
+env:
+  _target_: capx.envs.tasks.franka.franka_libero_env.FrankaLiberoCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.libero.FrankaLiberoEnv
+      suite_name: libero_spatial
+      task_id: 0
+    privileged: false
+    apis:
+      - FrankaLiberoApiEvidence
+    prompt: |
+      You are controlling a Franka Emika robot with the API described below.
+      Goal: {libero_environment_goal}
+
+      Work in STAGES: write ONE short code block per turn (one stage only).
+      Printed evidence lines/reports come back to you via stdout each turn.
+
+      Stages:
+      1 PERCEIVE: for each object named in the goal, call
+        get_object_3d_points_and_masks_from_language(name) inside try/except
+        (it raises if segmentation fails); keep each result's points_3d in a
+        variable. An evidence line (score, center, top_z) prints automatically.
+      2 TARGET: the object to PICK is the direct object of 'pick up' in the
+        goal; words after 'between/next to/on' are anchors, NOT the target.
+        Print the chosen target and the numbers supporting it.
+      3 GRASP: position, quaternion = sample_grasp_pose(target_name); use the
+        returned quaternion as-is (orientation is handled internally). Then
+        goto_pose(position, quaternion, z_approach=0.1), goto_pose(...,
+        z_approach=0.0), close_gripper(), lift by setting z_approach=0.15.
+      4 VERIFY HOLD: re-run get_object_3d_points_and_masks_from_language with
+        THE SAME object words as the goal (never invent names); print
+        overhang = tcp_z - min(points_3d z). If segmentation fails while
+        holding, estimate overhang from the object's pre-grasp height.
+      5 TRANSIT: check_transit_clearance(...) with the other objects' points
+        as obstacles; if not ok, use at least the returned min_safe_tcp_z.
+      6 PLACE: check_place_metrics(...) gives release_tcp_z (never guess
+        heights); move above the goal at the safe transit height, descend to
+        release_tcp_z, open_gripper(), retreat upward, then re-segment to
+        verify the object ended on the receptacle.
+
+      Rules: one stage per turn; print key numbers with labels; never commit a
+      motion a check rejected; variables persist across turns; import numpy
+      yourself. Write ONLY executable Python, no code fences.
+
+    multi_turn_prompt: |
+      Executed:
+      ```python
+      {executed_code}
+      ```
+      stdout (evidence included):
+      ```
+      {console_stdout}
+      ```
+      stderr:
+      ```
+      {console_stderr}
+      ```
+      Read the evidence, then reply with EXACTLY ONE of:
+      - 'REGENERATE' followed by the NEXT stage's Python code in a ```python fence
+      - 'FINISH' if the task is complete and verified
+
+record_video: true
+use_visual_feedback: true
+output_dir: ./outputs/staged_agent_demo
+
+trials: 1
+num_workers: 1

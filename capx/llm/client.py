@@ -43,6 +43,7 @@ VLM_MODELS = [
     "qwen/qwen3.5-122b-a10b",
     "moonshotai/kimi-k2",
     "openrouter/qwen/qwen3.6-plus",
+    "qwen3_5_397b_distill",
 ]
 CLAUDE_MODELS = ["anthropic/claude-opus-4-5", "anthropic/claude-haiku-4-5"]
 OSS_MODELS = [

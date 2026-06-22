@@ -3,6 +3,11 @@
 # Available suites: libero_10, libero_90, libero_object, libero_spatial, libero_goal
 # Use: python capx/envs/launch.py --config-path env_configs/libero/franka_libero_spatial_0.yaml --web-ui True
 
+# LLM service configuration
+model: qwen3_5_397b_distill
+server_url: http://1054059136692489.cn-shanghai.pai-eas.aliyuncs.com/api/predict/qwen3_5_397b_distill/v1/chat/completions
+api_key: YTFkYmQwZTAwMWQwMGNmMjNmOGY5YTEyMjlhOGIzYTgzNjAzYjQ2ZQ==
+
 env:
   _target_: capx.envs.tasks.franka.franka_libero_env.FrankaLiberoCodeEnv
   cfg:
@@ -56,7 +61,8 @@ api_servers:
     host: 127.0.0.1
 
 record_video: true
+use_visual_feedback: true
 output_dir: ./outputs/franka_libero_spatial_0
 
 trials: 50
-num_workers: 10
+num_workers: 1

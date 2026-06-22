@@ -3,6 +3,7 @@ import base64
 import functools
 import io
 import logging
+import os
 from typing import Any, List, Tuple
 
 import numpy as np
@@ -237,6 +238,7 @@ def main(
     device: str = "cuda",
     port: int = 8114,
     host: str = "127.0.0.1",
+    checkpoint_path: str | None = None,
 ):
     global _MODEL, _PROCESSOR, _DEVICE
 
@@ -254,10 +256,15 @@ def main(
             device_idx = int(device.split(":")[-1]) if ":" in device else 0
             torch.cuda.set_device(device_idx)
 
+    checkpoint_path = "/mnt/nas/yingjiexu/models/sam3/checkpoints/sam3.pt"
+
     logger.info("Loading SAM3 model...")
+    logger.info("Loading SAM3 checkpoint from %s", checkpoint_path)
     try:
-        # Assuming build_sam3_image_model loads default checkpoint
-        _MODEL = build_sam3_image_model(enable_inst_interactivity=True)
+        _MODEL = build_sam3_image_model(
+            checkpoint_path=checkpoint_path,
+            enable_inst_interactivity=True,
+        )
     except Exception as e:
         logger.error(f"Error building SAM3 model: {e}")
         raise
