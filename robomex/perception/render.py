@@ -21,6 +21,25 @@ def save_rgb(path: str | Path, rgb: np.ndarray) -> str:
     return str(path)
 
 
+def save_video(path: str | Path, frames: list[np.ndarray], fps: int = 30) -> str | None:
+    """把一串 RGB 帧写成 MP4;空帧序列直接跳过(返回 ``None``)。
+
+    用 ``imageio`` 的 FFMPEG 后端写,与 :func:`clip_frames` 的读取后端对齐;逐 code block
+    落盘动作视频时调用。
+    """
+
+    if not frames:
+        return None
+    import imageio
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with imageio.get_writer(str(path), fps=fps, format="FFMPEG", codec="libx264") as writer:
+        for frame in frames:
+            writer.append_data(np.ascontiguousarray(np.asarray(frame).astype(np.uint8)))
+    return str(path)
+
+
 def render_before_after(before_rgb: np.ndarray, after_rgb: np.ndarray) -> np.ndarray:
     """生成带标注的左右并排对比图,用于 VLM 评判。"""
 

@@ -116,6 +116,10 @@ class VerifierContext:
     op_trace: tuple[str, ...] = ()
     resources: dict[str, VerifyResource] = field(default_factory=dict)
     expected_decomposition: str = ""
+    # 逐 code block 的过程视频片段(只含有动作的块):每项形如
+    # {"turn": int, "path": str, "start": int, "end": int};start/end 是 env 帧缓冲里的
+    # 帧区间,Verifier 可据此用 process_frames(start, end) 零解码取过程帧,或用 path 读 mp4。
+    clips: tuple[dict, ...] = ()
 
     def rubrics_text(self) -> str:
         """把所有路由进来的技能的作者 rubric 拼接起来。"""
@@ -138,6 +142,13 @@ class VerifierContext:
             lines += ["", "Actual flow (sanitized op-trace):"]
             lines += [f"  [{i}] " + op.replace("\n", "\n      ")
                       for i, op in enumerate(self.op_trace)]
+        if self.clips:
+            lines += ["", "Process video clips (one per executed action block, time-ordered):"]
+            lines += [
+                f"  CLIPS[{i}] turn={c.get('turn')} frames {c.get('start')}..{c.get('end')} "
+                f"-> {c.get('path')}"
+                for i, c in enumerate(self.clips)
+            ]
         rubrics = self.rubrics_text()
         if rubrics:
             lines += ["", "Authored success rubrics (reference/verify.md):", rubrics]

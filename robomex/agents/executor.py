@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from robomex.core.coder import CodingAgent, SkillEntry
@@ -17,7 +18,7 @@ from robomex.core.coder.policy import CompletionPolicy
 from robomex.core.coder.trace import AgentTrace, TurnRecord
 from robomex.core.logging import get_logger
 from robomex.core.sandbox import BlockExecutionResult, SemanticActionBlock
-from robomex.perception import EvidenceCollector
+from robomex.perception import EvidenceCollector, save_video
 from robomex.skills import SkillLibrary
 
 _log = get_logger("executor")
@@ -66,16 +67,21 @@ class CodeAsPolicyAgent(CodingAgent):
         self._task = ""
         self._observation_summary = ""
         self._primary_skill_id: str | None = None
+        self._video_dir: Path | None = None
+        self._clips: list[dict] = []
 
     def run(
         self,
         task: str,
         observation_summary: str = "",
         primary_skill_id: str | None = None,
+        video_dir: str | Path | None = None,
     ) -> AgentTrace:
         self._task = task
         self._observation_summary = observation_summary
         self._primary_skill_id = primary_skill_id
+        self._video_dir = Path(video_dir) if video_dir is not None else None
+        self._clips = []
         return super().run()
 
     # ---- 钩子 --------------------------------------------------------------
@@ -132,6 +138,7 @@ class CodeAsPolicyAgent(CodingAgent):
             self.collector.bundle_for_block(
                 execution.block.name, prev_observation, execution.observation
             )
+        self._save_block_clip(turn_idx, execution)
         _log.info(
             "turn %d: exec=%s reward=%s terminated=%s",
             turn_idx, execution.status.value, execution.reward, execution.terminated,
@@ -140,6 +147,37 @@ class CodeAsPolicyAgent(CodingAgent):
         if not execution.ok and stderr:
             _log.info("turn %d: 报错 -> %s", turn_idx, stderr.splitlines()[-1][:300])
         turns.append(TurnRecord(turn_idx, code, execution, None))
+
+    def _save_block_clip(self, turn_idx: int, execution: BlockExecutionResult) -> None:
+        """有动作的 block 才存视频:把这一块产生的帧区间写成 ``turn_NN.mp4``。
+
+        帧区间由适配器记在 ``execution.info['video_range']`` 里(没动作 → 没区间 → 不存)。
+        路径 + 区间一并记进 ``self._clips``,稍后随 ``trace.metadata['clips']`` 交给 Verifier。
+        """
+
+        if self._video_dir is None:
+            return
+        rng = (execution.info or {}).get("video_range")
+        env = getattr(self.executor, "env", None)
+        if not rng or env is None or not hasattr(env, "get_video_frames_range"):
+            return
+        start, end = int(rng[0]), int(rng[1])
+        try:
+            frames = env.get_video_frames_range(start, end)
+        except Exception as exc:  # noqa: BLE001 - 取帧失败不该中断子目标
+            _log.warning("turn %d: 取过程帧失败 -> %r", turn_idx, exc)
+            return
+        if not frames:
+            return
+        path = self._video_dir / f"turn_{turn_idx:02d}.mp4"
+        try:
+            saved = save_video(path, frames)
+        except Exception as exc:  # noqa: BLE001 - 写视频失败不该中断子目标
+            _log.warning("turn %d: 写过程视频失败 -> %r", turn_idx, exc)
+            return
+        if saved:
+            self._clips.append({"turn": turn_idx, "path": saved, "start": start, "end": end})
+            _log.info("turn %d: 已存过程视频 %s (%d 帧)", turn_idx, saved, len(frames))
 
     def _should_stop_after_python(self, execution: BlockExecutionResult) -> bool:
         return bool(execution.terminated)
@@ -152,4 +190,5 @@ class CodeAsPolicyAgent(CodingAgent):
             loaded_skill_ids=loaded,
             turns=tuple(turns),
             success=success,
+            metadata={"clips": tuple(self._clips)},
         )

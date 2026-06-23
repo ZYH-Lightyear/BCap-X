@@ -140,10 +140,17 @@ class RoboMExAgent:
             _log.info("[subgoal %d] planner → goal=%r | skill=%s | 成功条件=%r",
                       i + 1, subgoal.goal, subgoal.skill, subgoal.postcondition)
 
+            # 子目标产物目录提前建好:执行器把每个有动作的 code block 的过程视频当场写进
+            # 这里(turn_NN.mp4),Verifier 随后即可读到。
+            sg_dir = (art / f"subgoal_{i:02d}") if art is not None else None
+            if sg_dir is not None:
+                sg_dir.mkdir(parents=True, exist_ok=True)
+
             trace = self.executor_agent.run(
                 subgoal.goal,
                 self.config.observation_summary,
                 primary_skill_id=subgoal.skill,
+                video_dir=sg_dir,
             )
 
             # 子目标级视觉裁决:独立的 VerifyCodeAgent 复用同一沙箱(EVIDENCE/OBS_BEFORE
@@ -160,7 +167,6 @@ class RoboMExAgent:
             _log.info("[subgoal %d] 结果 success=%s | 裁决=%s | 内层轮数=%d | 加载技能=%s",
                       i + 1, success, (verdict.verdict if verdict else "env-signal"),
                       len(trace.turns), list(trace.loaded_skill_ids))
-            sg_dir = (art / f"subgoal_{i:02d}") if art is not None else None
             self._dump_subgoal(art, i, subgoal, trace, vtrace)
 
             # sub-goal 跑完立即触发回调(真机:把这段视频当场写进 subgoal 目录)。
@@ -204,6 +210,7 @@ class RoboMExAgent:
                 op_trace=tuple(build_op_trace(trace.turns)),
                 resources=resources,
                 expected_decomposition=subgoal.postcondition,
+                clips=tuple(trace.metadata.get("clips", ())),
             )
             agent = VerifyCodeAgent(
                 executor=self.config.executor,

@@ -5,7 +5,7 @@ from robomex.perception.evidence import (
     EvidenceRole,
     MultimodalEvidenceBundle,
 )
-from robomex.perception.render import render_before_after, save_rgb
+from robomex.perception.render import render_before_after, save_rgb, save_video
 
 __all__ = [
     "EvidenceArtifact",
@@ -15,4 +15,5 @@ __all__ = [
     "MultimodalEvidenceBundle",
     "render_before_after",
     "save_rgb",
+    "save_video",
 ]

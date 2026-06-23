@@ -225,7 +225,7 @@ def main(args: LiveArgs) -> None:
     log.info("  ├─ run.log          完整日志")
     log.info("  ├─ planner.jsonl    每步 planner 原始回复 + 决策")
     log.info("  ├─ summary.json     episode 汇总")
-    log.info("  ├─ subgoal_NN/      每个 sub-goal 的内层代码 turn_*.py + 输出 turn_*.out.txt + video_subgoal*.mp4")
+    log.info("  ├─ subgoal_NN/      内层代码 turn_*.py + 输出 turn_*.out.txt + 逐块过程视频 turn_*.mp4 + 整段 video_subgoal*.mp4")
     log.info("  └─ scene*.png       每步 planner 看到的场景图")
 
 

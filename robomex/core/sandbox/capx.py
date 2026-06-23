@@ -33,6 +33,10 @@ class CapXExecutorAdapter:
         if hasattr(self.env, "configure_line_trace"):
             self.env.configure_line_trace(current_index)
 
+        # 记录本块执行**前**的视频帧游标;执行后再取一次,得到这一块产生的帧区间
+        # (供逐块存视频 + Verifier 取过程帧用)。env 不支持录像时保持 None。
+        frame_start = self._video_frame_count()
+
         obs: dict[str, Any] | None = None
         reward: float | None = None
         terminated: bool | None = None
@@ -49,6 +53,11 @@ class CapXExecutorAdapter:
         except Exception as exc:
             ok = False
             info = {"adapter_error": repr(exc)}
+
+        if frame_start is not None:
+            frame_end = self._video_frame_count()
+            if frame_end is not None and frame_end > frame_start:
+                info["video_range"] = (frame_start, frame_end)
 
         raw_events = []
         if hasattr(self.env, "consume_line_trace_events"):
@@ -74,6 +83,17 @@ class CapXExecutorAdapter:
             info=info,
             trace_events=trace_events,
         )
+
+    def _video_frame_count(self) -> int | None:
+        """当前视频帧缓冲长度;env 不支持录像则返回 None。"""
+
+        getter = getattr(self.env, "get_video_frame_count", None)
+        if getter is None:
+            return None
+        try:
+            return int(getter())
+        except Exception:  # noqa: BLE001 - 录像探测失败不该影响动作执行
+            return None
 
     @staticmethod
     def _normalize_trace_event(event: Any, block_name: str) -> ExecutionTraceEvent:
