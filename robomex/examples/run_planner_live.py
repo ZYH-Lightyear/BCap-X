@@ -140,34 +140,88 @@ def _flush_video(env: Any, target_dir: Path, suffix: str) -> None:
         _write_video(frames, str(target_dir), suffix=suffix)
 
 
-def main(args: LiveArgs) -> None:
+def _concat_episode_video(out_dir: Path, log: Any) -> None:
+    """把各 sub-goal 的 ``video_subgoal*.mp4``(+ 收尾 ``video_tail*.mp4``)按时序拼成一段
+    完整 episode 视频 ``video_full*.mp4``,落在 episode 根目录。
+
+    逐 sub-goal 的分段视频仍各自保留;这里只是额外读回它们的帧、按 subgoal 序号(tail 最后)
+    拼接重写。多相机各拼一路(``video_full_<cam>.mp4``)。读不到/无片段则静默跳过。
+    """
+
+    import re
+
+    import numpy as np
+
+    from robomex.perception.render import save_video
+
+    seg_re = re.compile(r"video_(?:subgoal|tail)(?:_(?P<cam>.+))?\.mp4$")
+
+    # 收集 (排序键, 相机, 路径):sub-goal 段按 NN 排,tail 段排最后。
+    segments: list[tuple[int, str, Path]] = []
+    for sg in out_dir.glob("subgoal_*"):
+        if not sg.is_dir():
+            continue
+        try:
+            order = int(sg.name.split("_")[1])
+        except (IndexError, ValueError):
+            order = 9998
+        for mp4 in sg.glob("video_subgoal*.mp4"):
+            m = seg_re.match(mp4.name)
+            segments.append((order, (m.group("cam") or "") if m else "", mp4))
+    for mp4 in out_dir.glob("video_tail*.mp4"):
+        m = seg_re.match(mp4.name)
+        segments.append((9999, (m.group("cam") or "") if m else "", mp4))
+
+    if not segments:
+        return
+
+    import imageio
+
+    by_cam: dict[str, list[tuple[int, Path]]] = {}
+    for order, cam, path in segments:
+        by_cam.setdefault(cam, []).append((order, path))
+
+    for cam, items in by_cam.items():
+        items.sort(key=lambda x: (x[0], str(x[1])))
+        frames: list[np.ndarray] = []
+        for _, path in items:
+            try:
+                reader = imageio.get_reader(str(path), format="FFMPEG")
+                for fr in reader.iter_data():
+                    frames.append(np.asarray(fr))
+                reader.close()
+            except Exception as exc:  # noqa: BLE001 - 单段读失败不该毁掉整段拼接
+                log.warning("拼接读取失败 %s: %r", path, exc)
+        if not frames:
+            continue
+        name = "video_full.mp4" if not cam else f"video_full_{cam}.mp4"
+        save_video(out_dir / name, frames, fps=30)
+        log.info("完整 episode 视频: %s(%d 帧 / %d 段)", out_dir / name, len(frames), len(items))
+
+
+def run_episode(env: Any, obs: dict, task: str, out_dir: Path, args: LiveArgs, log: Any) -> Any:
+    """在**已 reset 的** ``env`` 上跑一整段 RoboMEx episode,产物落到 ``out_dir``。
+
+    单跑入口(``main``)和批量入口(``run_planner_batch``)共用这段逻辑:装配
+    ``RoboMExConfig`` + ``RoboMExAgent``,接好真机场景刷新与逐 sub-goal 视频落盘,
+    跑完返回 :class:`EpisodeResult`(含 ``execution``,可由此算 env 客观判据)。
+    """
+
     from robomex import RoboMExAgent, RoboMExConfig
     from robomex.agents import LLMPlannerPolicy
     from robomex.core.coder import LLMCodePolicy
-    from robomex.core.logging import configure_logging
     from robomex.core.sandbox import CapXExecutorAdapter
     from robomex.skills import SkillLibrary, load_builtin_skills
 
-    out_dir = Path(args.output_dir) / time.strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 控制台 + run.log 双写;之后所有 robomex.* 的日志都会进这里。
-    log = configure_logging(log_file=out_dir / "run.log")
-    log.info("构建 env: %s (MUJOCO_GL=%s)", args.config_path, os.environ.get("MUJOCO_GL"))
-
-    env = _build_env(args.config_path)
-    obs, _info = env.reset(seed=args.seed)
-
-    # 开启整段 episode 的视频录制(env 支持时);run 结束后写盘。
+    # 开启整段 episode 的视频录制(env 支持时);逐 sub-goal / 收尾时写盘。
     if hasattr(env, "enable_video_capture"):
         try:
             env.enable_video_capture(True, clear=True)
             log.info("已开启视频录制")
         except Exception as exc:  # noqa: BLE001 - 录像不可用不该阻断 run
             log.warning("开启视频录制失败: %r", exc)
-
-    task = _task_language(env)
-    log.info("任务: %s", task)
 
     scene_path = _save_scene_image(obs, str(out_dir / "scene.png"))
     log.info("初始场景图: %s", scene_path or "(取不到 -> planner 仅凭文本规划)")
@@ -212,7 +266,7 @@ def main(args: LiveArgs) -> None:
         if sg_dir is not None:
             _flush_video(env, sg_dir, suffix="subgoal")
 
-    agent.run(
+    result = agent.run(
         task,
         scene_image_path=scene_path,
         scene_refresh=scene_refresh,
@@ -221,6 +275,29 @@ def main(args: LiveArgs) -> None:
 
     # 收尾:把最后一段 sub-goal 之后的残余帧(若有)落到 episode 根目录。
     _flush_video(env, out_dir, suffix="tail")
+    # 再把所有分段拼成一段完整 episode 视频(分段视频仍保留)。
+    _concat_episode_video(out_dir, log)
+    return result
+
+
+def main(args: LiveArgs) -> None:
+    from robomex.core.logging import configure_logging
+
+    out_dir = Path(args.output_dir) / time.strftime("%Y%m%d_%H%M%S")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 控制台 + run.log 双写;之后所有 robomex.* 的日志都会进这里。
+    log = configure_logging(log_file=out_dir / "run.log")
+    log.info("构建 env: %s (MUJOCO_GL=%s)", args.config_path, os.environ.get("MUJOCO_GL"))
+
+    env = _build_env(args.config_path)
+    obs, _info = env.reset(seed=args.seed)
+
+    task = _task_language(env)
+    log.info("任务: %s", task)
+
+    run_episode(env, obs, task, out_dir, args, log)
+
     log.info("本次运行产物目录: %s", out_dir)
     log.info("  ├─ run.log          完整日志")
     log.info("  ├─ planner.jsonl    每步 planner 原始回复 + 决策")

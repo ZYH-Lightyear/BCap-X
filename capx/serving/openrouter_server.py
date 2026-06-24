@@ -39,6 +39,9 @@ class ChatCompletionRequest(BaseModel):
     top_p: float | None = None
     reasoning_effort: str | None = None
     max_completion_tokens: int | None = None
+    # OpenRouter 统一的 reasoning 控制(如 {"effort": "low"} / {"max_tokens": N} /
+    # {"exclude": true})。客户端可显式传;不传则用服务端默认(见 create_app)。
+    reasoning: dict | None = None
 
 
 class ChatCompletionResponseChoice(BaseModel):
@@ -70,7 +73,29 @@ def _load_api_keys(key_file: str) -> list[str]:
     return keys
 
 
-def create_app(api_key: str, base_url: str, async_client: bool = True) -> FastAPI:
+def _build_extra_body(
+    request: "ChatCompletionRequest", default_reasoning_effort: str | None
+) -> dict | None:
+    """组装转发给 OpenRouter 的 extra_body(主要是 reasoning 控制)。
+
+    优先用请求里显式传的 ``reasoning``;否则在配了服务端默认 effort 时注入
+    ``{"effort": <default>}`` 以统一降低各模型的 thinking 强度。``reasoning`` 不是 OpenAI
+    标准字段,必须经 ``extra_body`` 透传,不能直接当 kwarg 传给 client。
+    """
+
+    reasoning = request.reasoning
+    if reasoning is None and default_reasoning_effort:
+        reasoning = {"effort": default_reasoning_effort}
+    return {"reasoning": reasoning} if reasoning is not None else None
+
+
+def create_app(
+    api_key: str,
+    base_url: str,
+    async_client: bool = True,
+    default_reasoning_effort: str | None = "low",
+    timeout_s: float = 600.0,
+) -> FastAPI:
     default_headers = {
         "HTTP-Referer": "https://github.com/nvidia-gear/CaP-X",
         "X-Title": "CaP-X",
@@ -81,12 +106,14 @@ def create_app(api_key: str, base_url: str, async_client: bool = True) -> FastAP
             api_key=api_key,
             base_url=base_url,
             default_headers=default_headers,
+            timeout=timeout_s,
         )
     else:
         client = OpenAI(
             api_key=api_key,
             base_url=base_url,
             default_headers=default_headers,
+            timeout=timeout_s,
         )
 
     app = FastAPI(title="OpenRouter Proxy", version="1.0.0")
@@ -105,6 +132,9 @@ def create_app(api_key: str, base_url: str, async_client: bool = True) -> FastAP
         async def chat_completions(request: ChatCompletionRequest):
             try:
                 client_kwargs = request.model_dump(exclude_none=True)
+                # reasoning 经 extra_body 透传(非 OpenAI 标准 kwarg);不传则注入服务端默认。
+                client_kwargs.pop("reasoning", None)
+                extra_body = _build_extra_body(request, default_reasoning_effort)
 
                 # Strip the "openrouter/" prefix if present so OpenRouter sees the
                 # native model identifier (e.g. "google/gemini-2.5-pro-preview").
@@ -114,7 +144,7 @@ def create_app(api_key: str, base_url: str, async_client: bool = True) -> FastAP
 
                 if request.stream:
                     client_kwargs["stream"] = True
-                    response = await client.chat.completions.create(**client_kwargs)
+                    response = await client.chat.completions.create(**client_kwargs, extra_body=extra_body)
 
                     async def event_stream():
                         async for chunk in response:
@@ -123,9 +153,9 @@ def create_app(api_key: str, base_url: str, async_client: bool = True) -> FastAP
                         yield "data: [DONE]\n\n"
 
                     return StreamingResponse(event_stream(), media_type="text/event-stream")
-
+ 
                 client_kwargs["stream"] = False
-                response = await client.chat.completions.create(**client_kwargs)
+                response = await client.chat.completions.create(**client_kwargs, extra_body=extra_body)
 
                 choices = [
                     ChatCompletionResponseChoice(
@@ -149,6 +179,8 @@ def create_app(api_key: str, base_url: str, async_client: bool = True) -> FastAP
         def chat_completions(request: ChatCompletionRequest):
             try:
                 client_kwargs = request.model_dump(exclude_none=True)
+                client_kwargs.pop("reasoning", None)
+                extra_body = _build_extra_body(request, default_reasoning_effort)
 
                 model = client_kwargs.get("model", "")
                 if model.startswith("openrouter/"):
@@ -156,7 +188,7 @@ def create_app(api_key: str, base_url: str, async_client: bool = True) -> FastAP
 
                 client_kwargs["stream"] = False
 
-                response = client.chat.completions.create(**client_kwargs)
+                response = client.chat.completions.create(**client_kwargs, extra_body=extra_body)
 
                 choices = [
                     ChatCompletionResponseChoice(
@@ -188,18 +220,30 @@ def main(
     port: int = 8111,
     base_url: str = "https://openrouter.ai/api/v1/",
     async_client: bool = True,
+    reasoning_effort: str | None = "low",
+    timeout_s: float = 600.0,
 ):
     """
     Start the OpenRouter Proxy Server.
 
     Reads an API key from --api-key or from the key file (one key per line).
+
+    ``reasoning_effort`` 是未显式传 reasoning 的请求的默认 thinking 强度(max/xhigh/high/
+    medium/low/minimal/none);设为 None 则不注入、完全交给上游默认。``timeout_s`` 是到
+    OpenRouter 上游的读超时。
     """
     if api_key is None:
         keys = _load_api_keys(key_file)
         api_key = keys[0]
         logger.info(f"Loaded API key from {key_file}")
 
-    app = create_app(api_key=api_key, base_url=base_url, async_client=async_client)
+    app = create_app(
+        api_key=api_key,
+        base_url=base_url,
+        async_client=async_client,
+        default_reasoning_effort=reasoning_effort,
+        timeout_s=timeout_s,
+    )
     uvicorn.run(app, host=host, port=port)
 
 

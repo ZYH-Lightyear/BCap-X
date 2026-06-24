@@ -69,6 +69,7 @@ class CodeAsPolicyAgent(CodingAgent):
         self._primary_skill_id: str | None = None
         self._video_dir: Path | None = None
         self._clips: list[dict] = []
+        self._feedback = ""
 
     def run(
         self,
@@ -76,23 +77,27 @@ class CodeAsPolicyAgent(CodingAgent):
         observation_summary: str = "",
         primary_skill_id: str | None = None,
         video_dir: str | Path | None = None,
+        feedback: str = "",
     ) -> AgentTrace:
         self._task = task
         self._observation_summary = observation_summary
         self._primary_skill_id = primary_skill_id
         self._video_dir = Path(video_dir) if video_dir is not None else None
         self._clips = []
+        self._feedback = feedback or ""
         return super().run()
 
     # ---- 钩子 --------------------------------------------------------------
 
     def _setup(self, prompt: list[dict]) -> None:
-        """子目标开场:重置 EVIDENCE、抓起始帧 OBS_BEFORE(供事后验证器使用)。"""
+        """子目标开场:重置 EVIDENCE、抓起始帧 OBS_BEFORE + 注入 ARTIFACTS_DIR。"""
 
+        art_dir = str(self._video_dir) if self._video_dir else "/tmp"
+        seed = f"ARTIFACTS_DIR = {art_dir!r}\n" + _EVIDENCE_SEED
         try:
             self.executor.run_block(
                 SemanticActionBlock(
-                    name="evidence_seed", intent="seed subgoal evidence", code=_EVIDENCE_SEED
+                    name="evidence_seed", intent="seed subgoal evidence", code=seed
                 )
             )
         except Exception as exc:  # noqa: BLE001 - 取证种子失败不该让子目标崩溃
@@ -119,6 +124,12 @@ class CodeAsPolicyAgent(CodingAgent):
                 "to read how it orchestrates the work, then consult and freely combine the "
                 "observation/action leaf skills it points to -- decide the order and the "
                 "code yourself from each skill's guidance; there is no fixed pipeline."
+            )
+        if self._feedback:
+            parts.append(
+                "Feedback from the previous attempt's verifier (a separate agent judged your "
+                "last attempt did NOT achieve the sub-goal). Use it to fix your approach:\n"
+                f"{self._feedback}"
             )
         return "\n\n".join(parts)
 

@@ -116,6 +116,8 @@ class VerifierContext:
     op_trace: tuple[str, ...] = ()
     resources: dict[str, VerifyResource] = field(default_factory=dict)
     expected_decomposition: str = ""
+    # env 真值信号(LIBERO 的 BDDL goal 检查 / reward)的一行摘要;作为旁证而非裁决依据。
+    env_signal: str = ""
     # 逐 code block 的过程视频片段(只含有动作的块):每项形如
     # {"turn": int, "path": str, "start": int, "end": int};start/end 是 env 帧缓冲里的
     # 帧区间,Verifier 可据此用 process_frames(start, end) 零解码取过程帧,或用 path 读 mp4。
@@ -138,6 +140,9 @@ class VerifierContext:
         if self.expected_decomposition.strip():
             lines += ["", "Expected flow (authored decomposition):",
                       self.expected_decomposition.strip()]
+        if self.env_signal.strip():
+            lines += ["", "Environment signal (side evidence, not the verdict):",
+                      self.env_signal.strip()]
         if self.op_trace:
             lines += ["", "Actual flow (sanitized op-trace):"]
             lines += [f"  [{i}] " + op.replace("\n", "\n      ")

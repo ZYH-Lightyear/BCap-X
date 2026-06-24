@@ -68,6 +68,48 @@ OPENROUTER_MODELS = [
 ]
 OPENROUTER_SERVER_URL = "http://localhost:8110/chat/completions"
 
+# 单次 HTTP 请求的读超时(秒)与重试上限,均可用环境变量覆盖。默认放大到 600s 以容忍慢
+# 模型 / 长 thinking;重试用有上限的指数退避(替代旧的 240±90s 巨长 sleep)。
+REQUEST_TIMEOUT = float(os.getenv("CAPX_LLM_TIMEOUT", "600"))
+MAX_RETRIES = int(os.getenv("CAPX_LLM_MAX_RETRIES", "5"))
+# 这些状态码视为可重试(429 限流、5xx 上游/代理错误、404 偶发路由抖动)。
+_RETRYABLE_STATUS = (404, 429, 500, 502, 503, 504)
+
+
+def _post_with_retries(
+    server_url: str, headers: dict[str, str], payload: dict[str, Any]
+) -> "requests.Response":
+    """POST 到 LLM 端点,对网络异常与可重试状态码做有上限的指数退避重试。
+
+    旧实现只在收到特定状态码时重试,``ReadTimeout`` / ``ConnectionError`` 等异常会直接
+    抛出,导致整个 trial 作废;这里把异常也纳入重试,并给重试次数与退避加上限。
+    """
+
+    last_exc: Exception | None = None
+    response: requests.Response | None = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(
+                server_url, headers=headers, data=json.dumps(payload), timeout=REQUEST_TIMEOUT
+            )
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            sleep_time = min(60.0, 5.0 * (2 ** attempt)) + random.uniform(0, 5)
+            print(f"[query_model] 请求异常 {exc!r};{attempt + 1}/{MAX_RETRIES} 次,"
+                  f"{sleep_time:.0f}s 后重试…")
+            time.sleep(sleep_time)
+            continue
+        if response.status_code in _RETRYABLE_STATUS:
+            sleep_time = min(60.0, 5.0 * (2 ** attempt)) + random.uniform(0, 5)
+            print(f"[query_model] 状态码 {response.status_code}: {response.text[:200]};"
+                  f"{attempt + 1}/{MAX_RETRIES} 次,{sleep_time:.0f}s 后重试…")
+            time.sleep(sleep_time)
+            continue
+        return response
+    if response is not None:
+        return response  # 用尽重试仍是坏状态码:交给 raise_for_status 报错
+    raise last_exc if last_exc is not None else RuntimeError("query_model: 重试用尽且无响应")
+
 # ---------------------------------------------------------------------------
 # Ensemble configuration
 # ---------------------------------------------------------------------------
@@ -282,17 +324,8 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         headers["Authorization"] = f"Bearer {os.getenv('OPENAI_API_KEY')}"
     start_time = time.time()
 
-    # keep calling until it works
-    response = requests.post(server_url, headers=headers, data=json.dumps(payload), timeout=200)
-    retry = 1
-    while response.status_code in [404, 500, 502, 503, 504]:
-        sleep_time = 240 + random.uniform(-90, 90)
-        print(f"Retry {retry}. Model query failed with status code {response.status_code}. Error: {response.text}. Retrying in {sleep_time} seconds...")
-        time.sleep(sleep_time)
-        response = requests.post(
-            server_url, headers=headers, data=json.dumps(payload), timeout=200
-        )
-        retry += 1
+    # 网络异常 + 可重试状态码都走有上限的指数退避(见 _post_with_retries)。
+    response = _post_with_retries(server_url, headers, payload)
 
     end_time = time.time()
     print(f"Time taken to query model: {end_time - start_time:.2f} seconds")

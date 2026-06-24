@@ -17,21 +17,19 @@ it). Run it fresh after the scene changes — never reuse a stale mask.
 ## Procedure
 
 Localize the target with a VLM first (it disambiguates *which* object the task means),
-then let SAM3 produce the precise mask from that point. Fall back to SAM3 text grounding
-only if the VLM localization fails.
+then let SAM3 produce the precise mask from that point.
 
 ```python
-import json
-import re
+import json, os, re
 import numpy as np
+from PIL import Image as _I, ImageDraw as _D
 
 obs = get_observation()
 cam = obs["agentview"]
 rgb, depth = cam["images"]["rgb"], cam["images"]["depth"]
 H, W = rgb.shape[:2]
 
-# 1) VLM localization. Ask for a box in 0-1000 NORMALIZED coords (Qwen's native
-#    convention) so the answer is resolution-independent and easy to rescale.
+# 1) VLM localization — box in 0-1000 normalized coords (Qwen convention).
 q = (
     "You are given a tabletop image. "
     f"Find the single object that best matches: '{object_name}'. "
@@ -48,39 +46,51 @@ if m:
     except json.JSONDecodeError:
         box = None
 
-mask = None
-EVIDENCE["target_box"] = None  # published in REAL pixels for the Verifier (None if text fallback)
-if box and len(box) == 4:
-    # Rescale 0-1000 normalized coords -> real pixels by the actual image size.
-    x1, y1, x2, y2 = box
-    px = [x1 / 1000.0 * W, y1 / 1000.0 * H, x2 / 1000.0 * W, y2 / 1000.0 * H]
-    EVIDENCE["target_box"] = [float(v) for v in px]
-    cx = float(np.clip((px[0] + px[2]) / 2.0, 0, W - 1))
-    cy = float(np.clip((px[1] + px[3]) / 2.0, 0, H - 1))
-    # 2) SAM3 point prompt at the VLM-located point -> precise mask.
-    pr = segment_sam3_point_prompt(rgb, (cx, cy))
-    if pr:
-        mask = max(pr, key=lambda r: r["score"])["mask"]
+assert box and len(box) == 4, f"VLM localization failed for '{object_name}': {reply!r}"
 
-if mask is None:
-    # 3) Fallback: SAM3 text grounding (less reliable when similar objects coexist).
-    results = segment_sam3_text_prompt(rgb, text_prompt=object_name)
-    assert results, f"no mask for '{object_name}'"
-    mask = max(results, key=lambda r: r["score"])["mask"]      # (H, W) bool
+# Rescale 0-1000 normalized coords -> real pixels.
+x1, y1, x2, y2 = box
+px = [x1 / 1000.0 * W, y1 / 1000.0 * H, x2 / 1000.0 * W, y2 / 1000.0 * H]
+EVIDENCE["target_box"] = [float(v) for v in px]
+
+# Save VLM box overlay to disk (debug / verifier evidence).
+_ann = _I.fromarray(rgb.copy())
+_D.Draw(_ann).rectangle(px, outline=(255, 0, 0), width=3)
+_box_path = os.path.join(ARTIFACTS_DIR, "segment_vlm_box.png")
+_ann.save(_box_path)
+EVIDENCE["vlm_box_image"] = _box_path
+
+# 2) SAM3 point prompt at the VLM-located center -> precise mask.
+cx = float(np.clip((px[0] + px[2]) / 2.0, 0, W - 1))
+cy = float(np.clip((px[1] + px[3]) / 2.0, 0, H - 1))
+pr = segment_sam3_point_prompt(rgb, (cx, cy))
+assert pr, f"SAM3 returned no mask at ({cx:.0f}, {cy:.0f}) for '{object_name}'"
+mask = max(pr, key=lambda r: r["score"])["mask"]  # (H, W) bool
+
+# Save SAM3 mask contour overlay to disk (debug / verifier evidence).
+import cv2 as _cv
+_vis = rgb.copy()
+_contours, _ = _cv.findContours(mask.astype(np.uint8), _cv.RETR_EXTERNAL, _cv.CHAIN_APPROX_SIMPLE)
+_cv.drawContours(_vis, _contours, -1, (0, 255, 0), 2)
+_D.Draw(_I.fromarray(_vis)).rectangle(px, outline=(255, 0, 0), width=2)
+_mask_path = os.path.join(ARTIFACTS_DIR, "segment_sam3_mask.png")
+_I.fromarray(_vis).save(_mask_path)
+EVIDENCE["sam3_mask_image"] = _mask_path
 
 points = mask_to_world_points(mask, depth, cam["intrinsics"], cam["pose_mat"])
-points, _ = filter_noise(points)                                # always filter before geometry
+points, _ = filter_noise(points)
 ```
 
-`EVIDENCE` is a sandbox-persistent dict (seeded at sub-goal start). Publishing
-`EVIDENCE["target_box"]` lets the Verifier Agent later check *which* object was grounded —
-by outlining that box on the current frame and asking a VLM — without re-segmenting.
+`ARTIFACTS_DIR` is automatically set to the current sub-goal's output directory.
+`EVIDENCE` is a sandbox-persistent dict (seeded at sub-goal start). The saved images
+let both the Verifier Agent and human reviewers inspect exactly what VLM grounded and
+what SAM3 segmented.
 
 ## Rules
 
 - VLM localization comes first: it picks the *right* object semantically. SAM3 only
   turns that point into a precise mask — do not skip the VLM step when several similar
-  objects are on the table (that is exactly when text grounding picks the wrong one).
+  objects are on the table.
 - VLM coordinates are NORMALIZED to 0-1000 (Qwen convention). ALWAYS rescale by the real
   `W`/`H` (`x_px = x / 1000 * W`); never feed raw 0-1000 values to SAM3 as pixels.
 - Use the most specific object name available; add color/position qualifiers when
@@ -95,11 +105,10 @@ Quick self-check: the mask covers exactly the named object and `len(points)` is 
 
 ## Failure modes
 
-- VLM returns malformed / non-JSON output: the code falls back to SAM3 text grounding
-  automatically; you can also re-ask `query_vlm` with a stricter "ONLY JSON" instruction.
-- Wrong object grasped (e.g. milk instead of soup): the VLM localized poorly — re-ask
+- VLM returns malformed / non-JSON output: re-ask `query_vlm` with a stricter "ONLY JSON"
+  instruction, or try a more specific object description.
+- Wrong object grounded (e.g. milk instead of soup): the VLM localized poorly — re-ask
   with a more specific description (color, position, "the can labelled ..."), or crop
   the image to the relevant region before querying.
 - SAM3 point prompt returns nothing at the VLM point: nudge the point toward the box
   center, or try a couple of points sampled inside the rescaled box.
-- Empty result list from SAM3 text fallback: get a pixel with `point_prompt_molmo`, then `segment_sam3_point_prompt`.

@@ -87,7 +87,7 @@ class LLMPlannerPolicy:
         server_url: str = "http://localhost:8110/chat/completions",
         api_key: str | None = None,
         temperature: float = 0.0,
-        max_tokens: int = 1024,
+        max_tokens: int = 20480,  # 对齐 capx baseline(2048*10);含 reasoning 预算
     ) -> None:
         from capx.llm.client import ModelQueryArgs, query_model
 

@@ -317,7 +317,7 @@ class FrankaLiberoApiReduced(ApiBase):
         images: np.ndarray | list[np.ndarray] | None = None,
         *,
         temperature: float = 0.0,
-        max_tokens: int = 1024,
+        max_tokens: int = 20480,
     ) -> str:
         """Ask a vision-language model a question about image(s) and get its raw text reply.
 
