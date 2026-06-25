@@ -46,8 +46,8 @@ assert gripper_width > 0.05, "gripper fully closed -> nothing was grasped"
   large offsets drift.
 - Always `open_gripper` before approaching; a half-closed gripper hits the object.
 - The post-close width check is mandatory — it is the cheapest grasp-failure detector.
-- The top-down pose above is a sensible default; if a grasp-pose API is available in
-  the namespace, prefer it, and adapt `grasp_quat` to the env's orientation convention.
+- The top-down pose above is this skill's canonical, self-contained grasp — derive it
+  from the segmented `points`. Adapt `grasp_quat` to the env's orientation convention.
 
 ## Verify
 

@@ -48,3 +48,4 @@ wandb/
 *.ico
 *.webp
 check.md
+third_party/

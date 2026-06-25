@@ -37,9 +37,34 @@ _CODE_AS_POLICY_PROMPT = (
     "You are given ONE sub-goal of a larger task. Each turn, write ONE block of executable "
     "Python that advances the sub-goal, grounding every decision in the current observation "
     "via get_observation(). Skill guidance below is advisory: adapt it, do not copy it blindly. "
-    "All API functions listed below are already imported into the namespace. "
-    "Reply with a single ```python``` code block, or the word FINISH when the sub-goal is complete."
+    "The CORE API primitives listed below (sensing, motion, geometry, query_vlm) are always "
+    "imported and available. Higher-level capabilities -- segmentation, grasp planning, "
+    "placement -- are NOT listed here; they are provided through skills: consult the skill menu "
+    "and `USE SKILL: <name>` to load each skill's recipe and the exact APIs it uses. "
+    "Reply with a single ```python``` code block, a `USE SKILL: <name>` line, or the word FINISH "
+    "when the sub-goal is complete."
 )
+
+# Tier-0 API:写任何 manipulation 代码都绕不开的“词汇”——传感 + 运动原语 + 通用 VLM 工具 +
+# 纯几何/坐标变换。它们与具体技能策略无关、数量小且稳定,故**常驻**内层 system prompt。
+# 其余注册的 API 一律视作 Tier-1“能力”(分割 / 抓取规划 / 点云处理 / molmo 等):函数仍被
+# CapX import 进沙箱、随时可调,但**文档不进基座 prompt**,改由相关 Skill 在被 USE SKILL 加载
+# 时给出示例与签名。好处:技能成为这些能力的唯一策划入口,既省上下文,又避免 agent 绕过技能
+# 直接乱用底层能力(例如绕开 segment_object 直接 segment_sam3_text_prompt)。新 API 默认 Tier-1
+# (隐藏),要常驻就显式加进下面这张名单。
+_TIER0_APIS: frozenset[str] = frozenset({
+    # 传感
+    "get_observation",
+    # 运动原语
+    "goto_pose", "open_gripper", "close_gripper", "move_to_joints",
+    "goto_home_joint_position", "solve_ik",
+    # 通用推理工具(技能与验证器都靠它)
+    "query_vlm",
+    # 纯几何 / 坐标变换(无模型、无策略,处处要用)
+    "decompose_transform", "rotation_matrix_to_quaternion", "transform_points",
+    "pixel_to_world_point", "mask_to_world_points", "depth_to_point_cloud",
+    "normalize_vector",
+})
 
 
 @dataclass
@@ -88,11 +113,37 @@ def _task_language(env: Any) -> str:
     return lang or "complete the manipulation task"
 
 
-def _api_docs(env: Any) -> str:
-    """拼接内层 code agent 需要的 API 文档。"""
+def _api_docs(env: Any, allow: frozenset[str] = _TIER0_APIS) -> str:
+    """只把 **Tier-0** API 的文档拼进内层 system prompt。
 
-    apis = getattr(env, "_apis", {})
-    return "\n".join(api.combined_doc() for api in apis.values())
+    复刻 :meth:`capx.integrations.base_api.ApiBase.combined_doc` 的格式
+    (``name(signature)`` + 缩进的 docstring),但按 ``allow`` 名单逐函数过滤:Tier-1
+    能力级 API 不在此出现(它们仍被 CapX import 进沙箱、可调用,文档由对应 Skill 给出)。
+    遍历 ``env._apis`` 的所有 API 组,按名字判定 tier。
+    """
+
+    import inspect
+
+    lines: list[str] = []
+    for api in getattr(env, "_apis", {}).values():
+        try:
+            fns = api.functions()
+        except Exception:  # noqa: BLE001 - 某个 API 组取函数失败不该毁掉整段文档
+            continue
+        for name, fn in fns.items():
+            if name not in allow:
+                continue
+            try:
+                sig = str(inspect.signature(fn))
+            except (TypeError, ValueError):
+                sig = "(…)"
+            doc = inspect.getdoc(fn) or ""
+            lines.append(f"{name}{sig}")
+            if doc:
+                lines.append("  Doc:")
+                lines.extend(f"    {ln}" for ln in doc.splitlines())
+            lines.append("")
+    return "\n".join(lines).strip()
 
 
 def _save_scene_image(obs: dict, path: str) -> str | None:
