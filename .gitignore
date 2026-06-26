@@ -8,6 +8,7 @@ __pycache__/
 venv/
 env/
 .env
+configs/services/*.env
 .openrouterkey
 .nvinferencekeys
 .capx_skills.json

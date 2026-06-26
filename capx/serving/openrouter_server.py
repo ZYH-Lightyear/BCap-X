@@ -84,7 +84,11 @@ def _build_extra_body(
     """
 
     reasoning = request.reasoning
-    if reasoning is None and default_reasoning_effort:
+    # "none"/"off"/"" disables injection entirely. Non-OpenRouter upstreams
+    # (V-API, raw OpenAI/Gemini gateways) reject the OpenRouter-specific
+    # ``reasoning`` argument with a 400, so it must be omittable.
+    effort = (default_reasoning_effort or "").strip().lower()
+    if reasoning is None and effort and effort not in {"none", "off"}:
         reasoning = {"effort": default_reasoning_effort}
     return {"reasoning": reasoning} if reasoning is not None else None
 
