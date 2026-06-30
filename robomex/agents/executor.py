@@ -2,8 +2,8 @@
 
 它是共享 :class:`~robomex.core.coder.CodingAgent` 的轻量子类。执行器的特化在于:
 上下文是任务(+观测);通过渐进披露感知*整库*(开头一份简短的 ``<available_skills>``
-清单 + 用 ``USE SKILL`` 拉取正文);每个 python 轮都会被验证 + 打包证据;在 ``FINISH``
-或 env 成功信号时终止。
+清单 + 用 ``use_skill`` 拉取正文);每个 python 轮都会打包证据;``finish`` 表示
+Act 认为当前 sub-goal 尝试结束,控制权交回外层 Planner。
 
 技能只是被*咨询*,绝不照搬执行;代码由策略自己生成。
 """
@@ -16,6 +16,7 @@ from typing import Any
 from robomex.core.coder import CodingAgent, SkillEntry
 from robomex.core.coder.policy import CompletionPolicy
 from robomex.core.coder.trace import AgentTrace, TurnRecord
+from robomex.core.events import emit_event
 from robomex.core.logging import get_logger
 from robomex.core.sandbox import BlockExecutionResult, SemanticActionBlock
 from robomex.perception import EvidenceCollector, save_video
@@ -24,7 +25,7 @@ from robomex.skills import SkillLibrary
 _log = get_logger("executor")
 
 # 子目标开场注入沙箱:重置语义证据字典 + 抓子目标起始帧。沙箱 globals 跨 block 持久,
-# 因此 EVIDENCE 与 OBS_BEFORE 会一直留到该子目标的 VerifyCodeAgent 取证时仍可读。
+# 因此 EVIDENCE 与 OBS_BEFORE 会一直留到该子目标结束,作为调试和 planner 复盘材料。
 _EVIDENCE_SEED = (
     "try:\n"
     "    EVIDENCE\n"
@@ -38,11 +39,18 @@ _EVIDENCE_SEED = (
 )
 
 _SYSTEM_PROMPT = (
-    "You are a robot Code-as-Policy agent. Each turn, write one block of executable "
-    "Python that advances the task, grounding every decision in the current observation. "
-    "Consult a relevant skill first with `USE SKILL: <name>` (its guidance is advisory -- "
-    "adapt it, do not copy it blindly). Reply with a ```python``` code block, a "
-    "`USE SKILL: <name>` line, or the word FINISH when the task is complete."
+    "You are a robot Code-as-Policy agent. Each turn, reply with exactly one JSON action "
+    "object. Use run_python to execute one block of Python that advances the task, "
+    "grounding every decision in the current observation. "
+    "Before writing any Python for a sub-goal, consult at least one relevant skill with "
+    "`{\"tool\":\"use_skill\",\"args\":{\"name\":\"<skill>\"}}`. Skills are the operating procedure for this framework: follow "
+    "their Procedure / Rules / Failure modes unless the live observation contradicts them, "
+    "and state any deliberate deviation in code comments. Adapt skill guidance to the scene, "
+    "but do not ignore it or invent an unrelated pipeline. Inspect observations directly, save useful "
+    "raw evidence when it helps future planning, and decide whether another action is needed. "
+    "Use `{\"tool\":\"run_python\",\"args\":{\"code\":\"...\", \"intent\":\"...\"}}` for code. "
+    "Use `{\"tool\":\"finish\",\"args\":{\"claim\":\"...\"}}` when you believe this sub-goal attempt "
+    "is complete and control should return to the Planner."
 )
 
 
@@ -65,6 +73,7 @@ class CodeAsPolicyAgent(CodingAgent):
         )
         self.collector = collector
         self._task = ""
+        self._expected_postcondition = ""
         self._observation_summary = ""
         self._primary_skill_id: str | None = None
         self._video_dir: Path | None = None
@@ -76,13 +85,17 @@ class CodeAsPolicyAgent(CodingAgent):
         task: str,
         observation_summary: str = "",
         primary_skill_id: str | None = None,
+        expected_postcondition: str = "",
         video_dir: str | Path | None = None,
         feedback: str = "",
+        scene_image_path: str | None = None,
     ) -> AgentTrace:
         self._task = task
+        self._expected_postcondition = expected_postcondition
         self._observation_summary = observation_summary
         self._primary_skill_id = primary_skill_id
         self._video_dir = Path(video_dir) if video_dir is not None else None
+        self._scene_image_path = scene_image_path
         self._clips = []
         self._feedback = feedback or ""
         return super().run()
@@ -113,28 +126,89 @@ class CodeAsPolicyAgent(CodingAgent):
             for r in self.library.all()
         ]
 
-    def _initial_user_message(self) -> str:
+    def _initial_user_message(self) -> str | list:
+        from robomex.perception.render import image_content_part
+
         parts = [f"Task: {self._task}"]
         if self._observation_summary:
             parts.append(f"Observation: {self._observation_summary}")
+        parts.append(
+            "The current scene image is attached below. Inspect it before writing code. "
+            "If the arm, gripper, or held object occludes the target or receptacle in the "
+            "image, first call `goto_home_joint_position()` then `get_observation()` to "
+            "obtain a clear view before proceeding with segmentation or planning."
+        )
         if self._primary_skill_id:
             parts.append(
                 f"This sub-goal corresponds to the high-level skill "
-                f"`{self._primary_skill_id}`. Start with `USE SKILL: {self._primary_skill_id}` "
+                f"`{self._primary_skill_id}`. Start with "
+                f'`{{"tool":"use_skill","args":{{"name":"{self._primary_skill_id}"}}}}` '
                 "to read how it orchestrates the work, then consult and freely combine the "
                 "observation/action leaf skills it points to -- decide the order and the "
                 "code yourself from each skill's guidance; there is no fixed pipeline."
             )
         if self._feedback:
             parts.append(
-                "Feedback from the previous attempt's verifier (a separate agent judged your "
-                "last attempt did NOT achieve the sub-goal). Use it to fix your approach:\n"
+                "Feedback from a previous unresolved attempt/review. Use it to fix your approach:\n"
                 f"{self._feedback}"
             )
-        return "\n\n".join(parts)
+        text = "\n\n".join(parts)
+
+        if self._scene_image_path:
+            return [
+                {"type": "text", "text": text},
+                image_content_part(self._scene_image_path),
+            ]
+        return text
 
     def _block_metadata(self) -> dict:
         return {"task": self._task}
+
+    def _agent_role(self) -> str:
+        return "act"
+
+    def _agent_label(self) -> str:
+        return "Act Agent"
+
+    def _python_gate_message(self, code: str, loaded: tuple[str, ...]) -> str:
+        if loaded:
+            return ""
+        available = ", ".join(e.name for e in self._skill_entries())
+        if not available:
+            return (
+                "Python execution is blocked because no RoboMEx skills are available to this "
+                "Act Agent. This is a framework/configuration error: the skill library is empty."
+            )
+        return (
+            "Python execution is blocked until you consult a relevant RoboMEx skill. "
+            "Reply with exactly one use_skill JSON action first, choosing from the available "
+            f"skills: {available}. After reading the skill, write code that follows its "
+            "Procedure / Rules / Failure modes."
+        )
+
+    def _feedback_message(self, execution: BlockExecutionResult) -> str | list:
+        from robomex.perception.render import image_content_part, save_rgb
+
+        text = (
+            f"stdout:\n{execution.stdout}\n\nstderr:\n{execution.stderr}\n\n"
+            "Continue from the loaded skill guidance. Reply with exactly one JSON action: "
+            "use_skill if the next step needs different guidance, run_python for the next "
+            "code block, or finish."
+        )
+        obs = execution.observation
+        if obs and self._video_dir:
+            try:
+                rgb = obs["agentview"]["images"]["rgb"]
+                img_path = save_rgb(
+                    self._video_dir / f"act_obs_latest.png", rgb
+                )
+                return [
+                    {"type": "text", "text": text},
+                    image_content_part(img_path),
+                ]
+            except (KeyError, TypeError, OSError):
+                pass
+        return text
 
     def _on_python_turn(
         self,
@@ -145,7 +219,7 @@ class CodeAsPolicyAgent(CodingAgent):
         turns: list[Any],
     ) -> None:
         if self.collector is not None:
-            # 逐块存 before/after 帧(调试产物);子目标级裁决另由 VerifyCodeAgent 做。
+            # 逐块存 before/after 帧,作为调试产物和 planner 复盘材料。
             self.collector.bundle_for_block(
                 execution.block.name, prev_observation, execution.observation
             )
@@ -163,7 +237,7 @@ class CodeAsPolicyAgent(CodingAgent):
         """有动作的 block 才存视频:把这一块产生的帧区间写成 ``turn_NN.mp4``。
 
         帧区间由适配器记在 ``execution.info['video_range']`` 里(没动作 → 没区间 → 不存)。
-        路径 + 区间一并记进 ``self._clips``,稍后随 ``trace.metadata['clips']`` 交给 Verifier。
+        路径 + 区间一并记进 ``self._clips``,稍后随 ``trace.metadata['clips']`` 交给 Planner/日志。
         """
 
         if self._video_dir is None:
@@ -193,13 +267,36 @@ class CodeAsPolicyAgent(CodingAgent):
     def _should_stop_after_python(self, execution: BlockExecutionResult) -> bool:
         return bool(execution.terminated)
 
+    def _on_terminal_turn(
+        self,
+        turn_idx: int,
+        raw: str,
+        turns: list[Any],
+        loaded: tuple[str, ...],
+    ) -> tuple[bool, str]:
+        return True, ""
+
     def _finalize(self, *, turns: list[Any], loaded: tuple[str, ...], terminal_raw: str | None) -> AgentTrace:
-        # 执行器只报告 env 级终止信号;子目标是否达成由独立的 VerifyCodeAgent 裁决。
-        success = any(t.execution.terminated for t in turns)
+        success = terminal_raw is not None
+        act_status = "finished" if success else "exhausted"
+        unresolved = None
+        if not success:
+            unresolved = {
+                "subgoal": self._task,
+                "status": "unresolved",
+                "skills_used": list(loaded),
+                "last_state_summary": "Act exhausted its turn budget before finish.",
+                "suggested_recovery": "Re-plan from the current scene.",
+            }
         return AgentTrace(
             task=self._task,
             loaded_skill_ids=loaded,
             turns=tuple(turns),
             success=success,
-            metadata={"clips": tuple(self._clips)},
+            metadata={
+                "clips": tuple(self._clips),
+                "unresolved": unresolved,
+                "act_status": act_status,
+                "terminal_raw": terminal_raw,
+            },
         )

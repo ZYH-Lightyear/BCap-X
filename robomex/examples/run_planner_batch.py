@@ -8,9 +8,9 @@
       ``env.reset(options={"trial": t}, seed=t)``(口径同 ``capx/envs/trial.py``)。
 
 评测口径与 cap0-agent baseline 对齐:每个 episode 的 ``summary.json`` 里的 **env 客观
-判据**(LIBERO BDDL goal 检查的 ``env_success`` / ``env_reward`` /
-``env_task_completed``)被聚合成 success_rate;同时也报 agent(VLM Verifier)的主观
-成功率,用以对照、暴露假阳性。
+    判据**(LIBERO BDDL goal 检查的 ``env_success`` / ``env_reward`` /
+    ``env_task_completed``)被聚合成 success_rate;同时也报 Act/Planner 闭环的
+    finish rate,用以对照、暴露假阳性。
 
 复用关系:
     - 每个 episode 的执行逻辑复用 ``run_planner_live.run_episode``;
@@ -47,8 +47,10 @@ import os
 os.environ.setdefault("MUJOCO_GL", "egl")
 
 import json
+import multiprocessing as mp
 import re
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -75,7 +77,7 @@ class BatchArgs:
     """可选 API key(通常由代理注入)。"""
 
     max_turns: int = 6
-    """每个 sub-goal 内层最多的代码生成轮数。"""
+    """每个 sub-goal 内层最多执行多少个 python action block; use_skill 不计入。"""
 
     output_dir: str = "./outputs/robomex_planner_batch"
     """本次批量评测产物根目录;其下建时间戳子目录,再按 suite/task/trial 分层。"""
@@ -92,6 +94,20 @@ class BatchArgs:
 
     start_trial: int = 1
     """每个 task 的起始 trial 编号(支持断点续跑)。"""
+
+    num_workers: int = 1
+    """并行 worker 数;1 为原串行执行,>1 时每个 (task_id, trial) 独立进程执行。"""
+
+
+@dataclass(frozen=True)
+class TrialJob:
+    """一个可独立调度的 trial job。"""
+
+    suite: str
+    task_id: int
+    task_name: str
+    trial: int
+    trial_dir: str
 
 
 def _to_live_args(args: BatchArgs) -> LiveArgs:
@@ -202,6 +218,242 @@ def _close_env(env: Any) -> None:
             continue
 
 
+def _trial_error_record(job: TrialJob, error: str) -> dict[str, Any]:
+    return {
+        "suite": job.suite,
+        "task_id": job.task_id,
+        "task_name": job.task_name,
+        "trial": job.trial,
+        "agent_success": False,
+        "env_success": None,
+        "env_task_completed": None,
+        "env_reward": None,
+        "env_terminated": None,
+        "n_subgoals": 0,
+        "error": error,
+    }
+
+
+def _run_trial_job(args: BatchArgs, job: TrialJob) -> dict[str, Any]:
+    """Worker 入口:独立进程里构建 env、跑一个 trial、返回扁平记录。"""
+
+    from robomex.core.logging import configure_logging
+    from robomex.core.session import RoboMExAgent
+
+    trial_dir = Path(job.trial_dir)
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    log = configure_logging(log_file=trial_dir / "worker.log")
+    log.info(
+        "[worker] start suite=%s task=%d trial=%d -> %s",
+        job.suite,
+        job.task_id,
+        job.trial,
+        trial_dir,
+    )
+
+    env = None
+    try:
+        env = _build_env_for_task(args.config_path, job.suite, job.task_id)
+        task_lang = _task_language(env)
+        obs, _info = env.reset(options={"trial": job.trial}, seed=job.trial)
+        result = run_episode(env, obs, task_lang, trial_dir, _to_live_args(args), log)
+        obj = RoboMExAgent._env_objective(result.execution)
+        rec = {
+            "suite": job.suite,
+            "task_id": job.task_id,
+            "task_name": job.task_name,
+            "trial": job.trial,
+            "agent_success": bool(result.success),
+            "n_subgoals": len(result.execution.results),
+            "error": None,
+            **obj,
+        }
+    except Exception as exc:  # noqa: BLE001 - 单 job 失败要返回给主进程聚合
+        log.exception(
+            "[worker] failed suite=%s task=%d trial=%d: %r",
+            job.suite,
+            job.task_id,
+            job.trial,
+            exc,
+        )
+        rec = _trial_error_record(job, repr(exc))
+    finally:
+        if env is not None:
+            _close_env(env)
+
+    (trial_dir / "trial_record.json").write_text(
+        json.dumps(rec, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    log.info(
+        "[worker] done task=%d trial=%d | env_success=%s | agent_success=%s | reward=%s",
+        job.task_id,
+        job.trial,
+        rec.get("env_success"),
+        rec.get("agent_success"),
+        rec.get("env_reward"),
+    )
+    return rec
+
+
+def _task_summary(task_id: int, task_name: str, records: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"task_id": task_id, "task_name": task_name, "error": None, **_aggregate(records)}
+
+
+def _write_task_summary(task_dir: Path, summary: dict[str, Any], records: list[dict[str, Any]]) -> None:
+    task_dir.mkdir(parents=True, exist_ok=True)
+    (task_dir / "task_summary.json").write_text(
+        json.dumps({**summary, "trials": records}, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _records_by_task(records: list[dict[str, Any]]) -> dict[int, list[dict[str, Any]]]:
+    by_task: dict[int, list[dict[str, Any]]] = {}
+    for rec in records:
+        by_task.setdefault(int(rec["task_id"]), []).append(rec)
+    for task_records in by_task.values():
+        task_records.sort(key=lambda r: int(r["trial"]))
+    return by_task
+
+
+def _per_task_summaries(
+    task_ids: list[int],
+    task_names: list[str],
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    by_task = _records_by_task(records)
+    return [
+        _task_summary(task_id, task_names[task_id], by_task.get(task_id, []))
+        for task_id in task_ids
+    ]
+
+
+def _trial_jobs(
+    batch_root: Path,
+    suite: str,
+    task_ids: list[int],
+    task_names: list[str],
+    start_trial: int,
+    trials_per_task: int,
+) -> list[TrialJob]:
+    jobs: list[TrialJob] = []
+    last_trial = start_trial + trials_per_task - 1
+    for task_id in task_ids:
+        task_name = task_names[task_id]
+        task_dir = batch_root / suite / f"task_{task_id:02d}_{_safe_name(task_name)}"
+        for trial in range(start_trial, last_trial + 1):
+            jobs.append(
+                TrialJob(
+                    suite=suite,
+                    task_id=task_id,
+                    task_name=task_name,
+                    trial=trial,
+                    trial_dir=str(task_dir / f"trial_{trial:03d}"),
+                )
+            )
+    return jobs
+
+
+def _run_parallel(
+    args: BatchArgs,
+    batch_root: Path,
+    suite: str,
+    task_ids: list[int],
+    task_names: list[str],
+    log: Any,
+    start: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    jobs = _trial_jobs(
+        batch_root,
+        suite,
+        task_ids,
+        task_names,
+        args.start_trial,
+        args.trials_per_task,
+    )
+    all_records: list[dict[str, Any]] = []
+    max_workers = max(1, int(args.num_workers))
+    log.info("并行模式启动: %d jobs, num_workers=%d", len(jobs), max_workers)
+    ctx = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as pool:
+        future_to_job = {pool.submit(_run_trial_job, args, job): job for job in jobs}
+        try:
+            for i, future in enumerate(as_completed(future_to_job), start=1):
+                job = future_to_job[future]
+                try:
+                    rec = future.result()
+                except Exception as exc:  # noqa: BLE001 - 理论上 worker 已捕获,这里兜底
+                    log.exception("[parallel] job crashed task=%d trial=%d: %r", job.task_id, job.trial, exc)
+                    rec = _trial_error_record(job, repr(exc))
+                all_records.append(rec)
+                all_records.sort(key=lambda r: (int(r["task_id"]), int(r["trial"])))
+                per_task = _per_task_summaries(task_ids, task_names, all_records)
+                _dump_batch_summary(batch_root, args, suite, task_ids, all_records, per_task,
+                                    time.time() - start)
+                log.info(
+                    "[parallel] %d/%d done | task=%d trial=%d | env_success=%s | agent_success=%s | error=%s",
+                    i,
+                    len(jobs),
+                    rec.get("task_id"),
+                    rec.get("trial"),
+                    rec.get("env_success"),
+                    rec.get("agent_success"),
+                    rec.get("error"),
+                )
+        except KeyboardInterrupt:
+            log.warning("收到 Ctrl+C: 正在取消 pending jobs 并终止 %d 个 worker", max_workers)
+            for future in future_to_job:
+                future.cancel()
+            _terminate_process_pool(pool, log)
+            per_task = _per_task_summaries(task_ids, task_names, all_records)
+            _dump_batch_summary(batch_root, args, suite, task_ids, all_records, per_task,
+                                time.time() - start)
+            raise
+
+    by_task = _records_by_task(all_records)
+    per_task = _per_task_summaries(task_ids, task_names, all_records)
+    for summary in per_task:
+        task_id = int(summary["task_id"])
+        task_dir = batch_root / suite / f"task_{task_id:02d}_{_safe_name(task_names[task_id])}"
+        _write_task_summary(task_dir, summary, by_task.get(task_id, []))
+        log.info("[task %d] 完成 | env_success_rate=%.3f (%d/%d) | 出错 %d",
+                 task_id, summary["env_success_rate"], summary["env_success_count"],
+                 summary["n_trials"], summary["n_errored"])
+    return all_records, per_task
+
+
+def _terminate_process_pool(pool: ProcessPoolExecutor, log: Any) -> None:
+    """Best-effort hard stop for ProcessPoolExecutor workers on Ctrl+C.
+
+    ``shutdown(cancel_futures=True)`` only cancels jobs that have not started; running
+    MuJoCo/LLM workers must be explicitly terminated or they can keep writing to the
+    terminal after the parent exits.
+    """
+
+    processes = list((getattr(pool, "_processes", None) or {}).values())
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except Exception as exc:  # noqa: BLE001 - interrupt cleanup must be best-effort
+        log.warning("ProcessPool shutdown 失败: %r", exc)
+    for proc in processes:
+        try:
+            if proc.is_alive():
+                log.warning("终止 worker pid=%s", proc.pid)
+                proc.terminate()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("terminate worker pid=%s 失败: %r", getattr(proc, "pid", "?"), exc)
+    for proc in processes:
+        try:
+            proc.join(timeout=3)
+            if proc.is_alive():
+                log.warning("强制 kill worker pid=%s", proc.pid)
+                proc.kill()
+                proc.join(timeout=2)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("kill worker pid=%s 失败: %r", getattr(proc, "pid", "?"), exc)
+
+
 def main(args: BatchArgs) -> None:
     from robomex.core.logging import configure_logging
     from robomex.core.session import RoboMExAgent
@@ -221,14 +473,28 @@ def main(args: BatchArgs) -> None:
     if bad:
         raise ValueError(f"task id {bad} 超出 suite '{suite}' 的范围 [0, {n_tasks - 1}]")
 
-    log.info("批量评测 | suite=%s | task_ids=%s | trials/task=%d (start=%d) | model=%s",
-             suite, task_ids, args.trials_per_task, args.start_trial, args.model)
+    log.info("批量评测 | suite=%s | task_ids=%s | trials/task=%d (start=%d) | model=%s | workers=%d",
+             suite, task_ids, args.trials_per_task, args.start_trial, args.model,
+             args.num_workers)
     log.info("MUJOCO_GL=%s | config=%s", os.environ.get("MUJOCO_GL"), args.config_path)
 
-    live_args = _to_live_args(args)
     start = time.time()
     all_records: list[dict[str, Any]] = []
     per_task: list[dict[str, Any]] = []
+
+    if args.num_workers > 1:
+        all_records, per_task = _run_parallel(args, batch_root, suite, task_ids, task_names, log, start)
+        summary = _dump_batch_summary(batch_root, args, suite, task_ids, all_records, per_task,
+                                      time.time() - start)
+        ov = summary["overall"]
+        log.info("批量评测完成 | %s", batch_root)
+        log.info("总计 %d task / %d trial(出错 %d)| env 客观成功率 = %.3f (%d/%d) | agent 主观 = %.3f | 平均 reward = %.3f",
+                 len(task_ids), ov["n_trials"], ov["n_errored"], ov["env_success_rate"],
+                 ov["env_success_count"], ov["n_trials"], ov["agent_success_rate"],
+                 ov["average_reward"])
+        return
+
+    live_args = _to_live_args(args)
 
     for task_id in task_ids:
         task_name = task_names[task_id]
@@ -357,6 +623,7 @@ def _dump_batch_summary(
         "task_ids": task_ids,
         "trials_per_task": args.trials_per_task,
         "start_trial": args.start_trial,
+        "num_workers": args.num_workers,
         "elapsed_s": round(elapsed, 1),
         "overall": _aggregate(all_records),
         "per_task": per_task,

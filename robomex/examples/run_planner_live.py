@@ -1,9 +1,8 @@
 """在真实 CapX/LIBERO(-PRO) 任务上跑两层 RoboMEx agent(真机)。
 
-外层 ReactivePlanner 每步给出**下一个** sub-goal(任务 + 当前场景图 + 高层技能菜单 +
-历史);内层 CodeAsPolicyAgent 在真实 env 上执行它(并被告知先咨询哪个高层技能),
-随后刷新场景、再次询问 planner,直到它说 DONE。每个 sub-goal 结束后由独立的
-VerifyCodeAgent(复用同一沙箱 + query_vlm)做子目标级视觉裁决。目标是在真实
+外层 ReactivePlanner 每步参考高层技能指导给出**下一个自然语言** sub-goal(任务 +
+当前场景图 + 历史);内层 CodeAsPolicyAgent 在真实 env 上自主选择并组合技能执行它。
+Act 调用 finish 后刷新场景、再次询问 planner,直到它说 DONE。目标是在真实
 LIBERO-PRO 任务上端到端验证反应式两层接线。
 
 前置依赖(与 baseline 用的是同一批服务):
@@ -34,21 +33,28 @@ import tyro
 
 _CODE_AS_POLICY_PROMPT = (
     "You are a robot Code-as-Policy agent controlling a Franka arm in LIBERO. "
-    "You are given ONE sub-goal of a larger task. Each turn, write ONE block of executable "
-    "Python that advances the sub-goal, grounding every decision in the current observation "
+    "You are given ONE sub-goal of a larger task. Each turn, reply with exactly one JSON "
+    "action object. Use run_python to execute one block of Python that advances the sub-goal, "
+    "grounding every decision in the current observation "
     "via get_observation(). Skill guidance below is advisory: adapt it, do not copy it blindly. "
     "The CORE API primitives listed below (sensing, motion, geometry, query_vlm) are always "
     "imported and available. Higher-level capabilities -- segmentation, grasp planning, "
     "placement -- are NOT listed here; they are provided through skills: consult the skill menu "
-    "and `USE SKILL: <name>` to load each skill's recipe and the exact APIs it uses. "
-    "Reply with a single ```python``` code block, a `USE SKILL: <name>` line, or the word FINISH "
-    "when the sub-goal is complete."
+    "with `{\"tool\":\"use_skill\",\"args\":{\"name\":\"<skill>\"}}` to load each skill's recipe "
+    "and the exact APIs it uses. "
+    "`query_vlm` is for visual QA, state classification, and sanity checks only; do not use it "
+    "to produce object coordinates, boxes, or points. Use the perception skills that call "
+    "`vlm_bbox_detection` / `vlm_point_detection` for spatial grounding. "
+    "Use `{\"tool\":\"run_python\",\"args\":{\"code\":\"...\", \"intent\":\"...\"}}` for code and "
+    "`{\"tool\":\"finish\",\"args\":{\"claim\":\"...\"}}` when this sub-goal attempt is complete "
+    "and control should return to the "
+    "Planner."
 )
 
-# Tier-0 API:写任何 manipulation 代码都绕不开的“词汇”——传感 + 运动原语 + 通用 VLM 工具 +
+# Tier-0 API:写任何 manipulation 代码都绕不开的“词汇”——传感 + 运动原语 + 通用 VLM 问答工具 +
 # 纯几何/坐标变换。它们与具体技能策略无关、数量小且稳定,故**常驻**内层 system prompt。
 # 其余注册的 API 一律视作 Tier-1“能力”(分割 / 抓取规划 / 点云处理 / molmo 等):函数仍被
-# CapX import 进沙箱、随时可调,但**文档不进基座 prompt**,改由相关 Skill 在被 USE SKILL 加载
+    # CapX import 进沙箱、随时可调,但**文档不进基座 prompt**,改由相关 Skill 在被 use_skill 加载
 # 时给出示例与签名。好处:技能成为这些能力的唯一策划入口,既省上下文,又避免 agent 绕过技能
 # 直接乱用底层能力(例如绕开 segment_object 直接 segment_sam3_text_prompt)。新 API 默认 Tier-1
 # (隐藏),要常驻就显式加进下面这张名单。
@@ -58,7 +64,7 @@ _TIER0_APIS: frozenset[str] = frozenset({
     # 运动原语
     "goto_pose", "open_gripper", "close_gripper", "move_to_joints",
     "goto_home_joint_position", "solve_ik",
-    # 通用推理工具(技能与验证器都靠它)
+    # 通用视觉问答 / 状态判断工具；空间 grounding 应通过专用 detection API 的技能完成。
     "query_vlm",
     # 纯几何 / 坐标变换(无模型、无策略,处处要用)
     "decompose_transform", "rotation_matrix_to_quaternion", "transform_points",
@@ -84,7 +90,7 @@ class LiveArgs:
     """可选 API key(通常由代理注入)。"""
 
     max_turns: int = 6
-    """每个 sub-goal 内层最多的代码生成轮数。"""
+    """每个 sub-goal 内层最多执行多少个 python action block; use_skill 不计入。"""
 
     output_dir: str = "./outputs/robomex_planner_live"
     """本次运行产物的根目录;会在其下创建一个时间戳子目录。"""
@@ -266,6 +272,14 @@ def run_episode(env: Any, obs: dict, task: str, out_dir: Path, args: LiveArgs, l
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Code-block APIs such as query_vlm read their VLM backend from environment
+    # variables. By default, keep them on the same proxy route as the planner/act
+    # model so ``--model vapi/...`` does not silently fall back to OpenRouter.
+    os.environ.setdefault("CAPX_VLM_MODEL", args.model)
+    os.environ.setdefault("CAPX_VLM_SERVER_URL", args.server_url)
+    if args.api_key:
+        os.environ.setdefault("CAPX_VLM_API_KEY", args.api_key)
+
     # 开启整段 episode 的视频录制(env 支持时);逐 sub-goal / 收尾时写盘。
     if hasattr(env, "enable_video_capture"):
         try:
@@ -286,13 +300,12 @@ def run_episode(env: Any, obs: dict, task: str, out_dir: Path, args: LiveArgs, l
     )
 
     # 框架入口:把所有依赖收进一个 RoboMExConfig,再交给 RoboMExAgent 装配 + 运行
-    # 反应式两层循环。每个 sub-goal 结束后跑独立的 VerifyCodeAgent 做视觉裁决。
+    # 反应式两层循环。执行器在 inner loop 内 use_skill/run_python;finish 交回 Planner。
     config = RoboMExConfig(
         library=library,
         planner_policy=LLMPlannerPolicy(model=args.model, server_url=args.server_url, api_key=args.api_key),
         code_policy=LLMCodePolicy(model=args.model, server_url=args.server_url, api_key=args.api_key),
         executor=CapXExecutorAdapter(env),
-        enable_verification=True,
         max_turns=args.max_turns,
         max_subgoals=8,
         inner_system_prompt=system_prompt,

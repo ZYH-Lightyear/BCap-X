@@ -2,7 +2,7 @@
 
 这里是把整个框架接线的唯一地方(对应 qwen-code 的 ``Config`` + runtime 拆分):
 :class:`RoboMExConfig` 收集所有可替换依赖(技能库、两个策略、沙箱后端、可选的
-verifier/collector),:class:`RoboMExAgent` 据此装配出反应式两层循环并跑一整段
+collector),:class:`RoboMExAgent` 据此装配出反应式两层循环并跑一整段
 episode。入口(``examples/``、评测脚手架)应构造一个 config 再调用
 :meth:`RoboMExAgent.run`,而不是手工接线 planner 和 executor。
 """
@@ -23,12 +23,11 @@ from robomex.agents.planner import (
     SubGoal,
     SubGoalResult,
 )
-from robomex.agents.verifier import VerifyCodeAgent
 from robomex.core.coder.policy import CompletionPolicy
 from robomex.core.coder.trace import AgentTrace
+from robomex.core.events import emit_event, event_log, event_scope
 from robomex.core.logging import get_logger
 from robomex.skills import SkillLibrary
-from robomex.verification import VerifierContext, build_op_trace, collect_verify_resources
 
 _log = get_logger("session")
 
@@ -45,31 +44,24 @@ class RoboMExConfig:
     - ``code_policy``     —— 驱动内层 :class:`CodeAsPolicyAgent`。
     - ``executor``        —— 沙箱后端(``run_block``);真机用
       ``CapXExecutorAdapter(env)``,离线用 mock。
-    - ``enable_verification`` —— 是否在每个 sub-goal 结束后跑独立的
-      :class:`VerifyCodeAgent` 做子目标级视觉裁决(它复用 ``code_policy`` 与同一沙箱)。
     - ``collector`` —— 可选的逐块证据采集(存 before/after 帧调试产物)。
     - ``inner_system_prompt`` —— 覆盖执行器的角色提示词(例如注入真机 API 文档);
       ``None`` 则保持执行器默认。
     - ``artifacts_dir`` —— 可选;给定后,每个 sub-goal 的 planner 决策、内层每轮代码 /
-      输出、验证裁决,以及一份 episode 汇总都会落盘到此目录。``None`` 则不落盘。
+      输出、过程视频,以及一份 episode 汇总都会落盘到此目录。``None`` 则不落盘。
     """
 
     library: SkillLibrary
     planner_policy: PlannerPolicy
     code_policy: CompletionPolicy
     executor: Any
-    enable_verification: bool = False
     collector: Any | None = None
+    # 内层每个 sub-goal 最多执行多少个 python action block;use_skill 等元动作不计入。
     max_turns: int = 6
     max_subgoals: int = 8
-    verify_max_turns: int = 4
-    # 单个 sub-goal 内 Act↔Verifier 闭环的最大尝试次数:verifier 判 fail/uncertain 时,
-    # 把它的理由回灌给执行器在同一 sub-goal 内重试,直到 passed 或耗尽预算。
-    # =1 时退化为旧行为(执行一次,事后裁判,不重试)。仅在 enable_verification 时生效。
+    # 兼容旧配置项:主路径已改为 Act-only;subgoal 未 finish 时把 unresolved 报告交回
+    # Planner,不再由 session 自动重跑同一 subgoal。
     subgoal_max_attempts: int = 3
-    # 是否把 env 真值信号(LIBERO 的 BDDL goal 检查 / reward)作为旁证喂给 Verifier。
-    # 默认关闭;开启后仅作为 verifier 上下文里的一小段提示,不直接决定裁决。
-    expose_env_signal: bool = False
     inner_system_prompt: str | None = None
     observation_summary: str = ""
     artifacts_dir: str | None = None
@@ -89,8 +81,8 @@ class EpisodeResult:
 class RoboMExAgent:
     """顶层 agent:高层技能上的反应式 planner + 内层 coder。
 
-    每一步,planner 给出下一个 sub-goal(依据任务、当前场景、高层技能菜单、历史);
-    内层执行器执行它(并被告知先咨询哪个高层技能);随后可选地从最新观测刷新场景;
+    每一步,planner 参考高层技能指导给出下一个自然语言 sub-goal(依据任务、当前场景、历史);
+    内层执行器自主选择并组合技能执行它;随后可选地从最新观测刷新场景;
     如此循环,直到 planner 说 DONE 或触达 sub-goal 上限。该循环在离线和真机下完全
     一致——唯一差别是注入的场景刷新(它与具体 env 相关)。
     """
@@ -132,175 +124,125 @@ class RoboMExAgent:
         if art is not None:
             art.mkdir(parents=True, exist_ok=True)
 
-        menu = [r.skill_id for r in self.config.library.compound_skills()]
-        _log.info("episode 开始 | task=%r | 高层技能菜单=%s | max_subgoals=%d",
-                  task, menu, self.config.max_subgoals)
+        event_path = (art / "events.jsonl") if art is not None else None
+        with event_log(event_path), event_scope(task=task, artifacts_dir=str(art) if art else None):
+            menu = [r.skill_id for r in self.config.library.compound_skills()]
+            _log.info("episode 开始 | task=%r | 高层技能菜单=%s | max_subgoals=%d",
+                      task, menu, self.config.max_subgoals)
+            emit_event(
+                "episode_start",
+                "RoboMEx episode started",
+                scene_image_path=scene_image_path,
+                high_level_skills=menu,
+                max_subgoals=self.config.max_subgoals,
+            )
 
-        results: list[SubGoalResult] = []
-        cur_scene = scene_image_path
-        for i in range(self.config.max_subgoals):
-            subgoal = self.planner.next_subgoal(task, results, scene_image_path=cur_scene)
-            self._record_planner(art, i, subgoal)
-            if subgoal is None:
-                _log.info("[subgoal %d] planner → DONE(没有下一个 sub-goal,结束)", i + 1)
-                break
-            _log.info("[subgoal %d] planner → goal=%r | skill=%s | 成功条件=%r",
-                      i + 1, subgoal.goal, subgoal.skill, subgoal.postcondition)
+            results: list[SubGoalResult] = []
+            cur_scene = scene_image_path
+            for i in range(self.config.max_subgoals):
+                with event_scope(subgoal_index=i, subgoal_number=i + 1):
+                    subgoal = self.planner.next_subgoal(task, results, scene_image_path=cur_scene)
+                    self._record_planner(art, i, subgoal)
+                    if subgoal is None:
+                        _log.info("[subgoal %d] planner → DONE(没有下一个 sub-goal,结束)", i + 1)
+                        emit_event("planner_done", "Planner returned DONE")
+                        break
+                    _log.info("[subgoal %d] planner → goal=%r | planning_hint=%s | 成功条件=%r",
+                              i + 1, subgoal.goal, subgoal.skill, subgoal.postcondition)
+                    emit_event(
+                        "subgoal_start",
+                        f"Subgoal {i + 1}: {subgoal.goal}",
+                        goal=subgoal.goal,
+                        planning_hint=subgoal.skill,
+                        postcondition=subgoal.postcondition,
+                        scene_image_path=cur_scene,
+                    )
 
-            # 子目标产物目录提前建好:执行器把每个有动作的 code block 的过程视频当场写进
-            # 这里(turn_NN.mp4),Verifier 随后即可读到。
-            sg_dir = (art / f"subgoal_{i:02d}") if art is not None else None
-            if sg_dir is not None:
-                sg_dir.mkdir(parents=True, exist_ok=True)
+                    # 子目标产物目录提前建好:执行器把每个有动作的 code block 的过程视频当场写进
+                    # 这里(turn_NN.mp4),供日志、调试和 Planner 复盘使用。
+                    sg_dir = (art / f"subgoal_{i:02d}") if art is not None else None
+                    if sg_dir is not None:
+                        sg_dir.mkdir(parents=True, exist_ok=True)
 
-            # Act ↔ Verifier 闭环:执行 → 裁判 → 不过则把理由回灌、在同一 sub-goal 内重试。
-            trace, vtrace, success, note = self._run_subgoal(subgoal, sg_dir)
-            verdict = vtrace.verdict if vtrace is not None else None
-            results.append(SubGoalResult(subgoal=subgoal, trace=trace, success=success, note=note))
-            _log.info("[subgoal %d] 结果 success=%s | 裁决=%s | 内层轮数=%d | 加载技能=%s",
-                      i + 1, success, (verdict.verdict if verdict else "env-signal"),
-                      len(trace.turns), list(trace.loaded_skill_ids))
+                    # Act inner loop:执行器自主 use_skill/run_python,finish 表示当前 sub-goal
+                    # 尝试结束,随后刷新场景并交回 Planner 规划下一步。
+                    with event_scope(subgoal_dir=str(sg_dir) if sg_dir else None):
+                        trace, vtrace, success, note = self._run_subgoal(subgoal, sg_dir, cur_scene)
+                    results.append(SubGoalResult(subgoal=subgoal, trace=trace, success=success, note=note))
+                    trace_meta = trace.metadata or {}
+                    act_status = trace_meta.get("act_status", "act")
+                    _log.info("[subgoal %d] 结果 success=%s | act=%s | 内层轮数=%d | 加载技能=%s",
+                              i + 1, success, act_status,
+                              len(trace.turns), list(trace.loaded_skill_ids))
+                    emit_event(
+                        "subgoal_end",
+                        f"Subgoal {i + 1} ended",
+                        goal=subgoal.goal,
+                        success=success,
+                        act_status=act_status,
+                        inner_turns=len(trace.turns),
+                        loaded_skill_ids=list(trace.loaded_skill_ids),
+                        note=note,
+                    )
 
-            # sub-goal 跑完立即触发回调(真机:把这段视频当场写进 subgoal 目录)。
-            if on_subgoal_end is not None:
-                on_subgoal_end(i, results[-1], sg_dir)
+                    # sub-goal 跑完立即触发回调(真机:把这段视频当场写进 subgoal 目录)。
+                    if on_subgoal_end is not None:
+                        on_subgoal_end(i, results[-1], sg_dir)
 
-            # 真机:用最新观测刷新 planner 下一步看到的场景图;离线则跳过。
-            if scene_refresh is not None and trace.turns and trace.turns[-1].execution.observation:
-                refreshed = scene_refresh(trace.turns[-1].execution.observation)
-                cur_scene = refreshed or cur_scene
+                    # 真机:用最新观测刷新 planner 下一步看到的场景图;离线则跳过。
+                    if scene_refresh is not None and trace.turns and trace.turns[-1].execution.observation:
+                        refreshed = scene_refresh(trace.turns[-1].execution.observation)
+                        cur_scene = refreshed or cur_scene
+                        emit_event("scene_refreshed", "Planner scene image refreshed", scene_image_path=cur_scene)
 
-        success = bool(results) and all(r.success for r in results)
-        n_ok = sum(r.success for r in results)
-        _log.info("episode 结束 | success=%s | %d/%d 个 sub-goal 成功", success, n_ok, len(results))
+            success = bool(results) and all(r.success for r in results)
+            n_ok = sum(r.success for r in results)
+            _log.info("episode 结束 | success=%s | %d/%d 个 sub-goal 成功", success, n_ok, len(results))
 
-        execution = PlanExecution(
-            task=task,
-            subgoals=tuple(r.subgoal for r in results),
-            results=tuple(results),
-            success=success,
-        )
-        self._dump_summary(art, execution)
-        if art is not None:
-            _log.info("产物已落盘到: %s", art)
-        return EpisodeResult(execution=execution)
+            execution = PlanExecution(
+                task=task,
+                subgoals=tuple(r.subgoal for r in results),
+                results=tuple(results),
+                success=success,
+            )
+            self._dump_summary(art, execution)
+            emit_event(
+                "episode_end",
+                "RoboMEx episode ended",
+                success=success,
+                successful_subgoals=n_ok,
+                total_subgoals=len(results),
+            )
+            if art is not None:
+                _log.info("产物已落盘到: %s", art)
+                _log.info("  ├─ events.jsonl     结构化调试事件(Web UI/离线分析)")
+            return EpisodeResult(execution=execution)
 
-    # ---- Act ↔ Verifier 闭环 ----------------------------------------------
+    # ---- Act inner loop ----------------------------------------------------
 
-    def _run_subgoal(self, subgoal: SubGoal, sg_dir: Path | None):
-        """在一个 sub-goal 内跑 执行→裁判→(不过则回灌重试) 的闭环。
+    def _run_subgoal(self, subgoal: SubGoal, sg_dir: Path | None, scene_image_path: str | None = None):
+        """在一个 sub-goal 内跑 Act inner loop。
 
-        返回 ``(最后一次 trace, 最后一次 vtrace, success, note)``。verifier 判 ``passed``
-        即停;判 ``failed``/``uncertain`` 则把其理由作为 feedback 喂回执行器重试,直到
-        ``subgoal_max_attempts`` 耗尽。未开启验证时只执行一次(无可重试的信号)。
+        ``finish`` 结束当前 Act 尝试并交回 Planner;若 inner loop 耗尽,把 unresolved
+        报告作为 note。
         """
 
-        attempts = max(1, self.config.subgoal_max_attempts) if self.config.enable_verification else 1
-        feedback = ""
-        trace = vtrace = None
-        success = False
-        note = ""
-        for attempt in range(attempts):
-            # 重试各自落到 subgoal_NN/retry_MM/,避免覆盖上一次的 turn_*.mp4 / 代码产物。
-            a_dir = sg_dir
-            if sg_dir is not None and attempt > 0:
-                a_dir = sg_dir / f"retry_{attempt:02d}"
-                a_dir.mkdir(parents=True, exist_ok=True)
-            if attempt > 0:
-                _log.info("[%s] 第 %d/%d 次尝试(verifier 上次未通过,已回灌理由)",
-                          subgoal.goal[:40], attempt + 1, attempts)
-
-            trace = self.executor_agent.run(
-                subgoal.goal,
-                self.config.observation_summary,
-                primary_skill_id=subgoal.skill,
-                video_dir=a_dir,
-                feedback=feedback,
-            )
-            vtrace = self._verify_subgoal(subgoal, trace)
-            verdict = vtrace.verdict if vtrace is not None else None
-            if verdict is not None:
-                success = verdict.verdict == "passed"
-                note = verdict.reason
-            else:
-                success = trace.success
-                note = ""
-            self._dump_subgoal(a_dir, subgoal, trace, vtrace, attempt=attempt)
-
-            # 无验证(没有可重试的信号)或已通过 → 收工;否则准备 feedback 再试。
-            if verdict is None or verdict.verdict == "passed":
-                break
-            if attempt < attempts - 1:
-                feedback = self._retry_feedback(verdict, attempt)
-        return trace, vtrace, success, note
-
-    @staticmethod
-    def _retry_feedback(verdict, attempt: int) -> str:
-        """把 verifier 的裁决理由组织成给执行器下一次尝试的 feedback。"""
-
-        return (
-            f"Your attempt #{attempt + 1} did NOT pass an independent verifier.\n"
-            f"Verdict: {verdict.verdict} (confidence {verdict.confidence:.2f}).\n"
-            f"Reason: {verdict.reason}\n"
-            "Re-ground in the CURRENT observation and try a DIFFERENT approach to achieve the "
-            "sub-goal -- do not blindly repeat the same actions that just failed."
+        trace = self.executor_agent.run(
+            subgoal.goal,
+            self.config.observation_summary,
+            expected_postcondition=subgoal.postcondition,
+            video_dir=sg_dir,
+            scene_image_path=scene_image_path,
         )
-
-    @staticmethod
-    def _env_signal_text(trace: AgentTrace) -> str:
-        """从执行轨迹里提取 env 真值信号(BDDL goal 检查 / reward)的一行摘要。"""
-
-        reward = terminated = task_completed = None
-        for t in trace.turns:
-            ex = t.execution
-            if ex.reward is not None:
-                reward = ex.reward
-            if ex.terminated is not None:
-                terminated = ex.terminated
-            tc = (ex.info or {}).get("task_completed")
-            if tc is not None:
-                task_completed = tc
-        if reward is None and task_completed is None and terminated is None:
-            return ""
-        return (
-            f"Environment ground-truth after this sub-goal: task_completed={task_completed}, "
-            f"reward={reward}, terminated={terminated}. This is the WHOLE task's BDDL goal "
-            "check, not just this sub-goal: task_completed=True is decisive proof the full "
-            "task is done; False does NOT by itself mean this sub-goal failed."
-        )
-
-    # ---- 子目标级验证 ------------------------------------------------------
-
-    def _verify_subgoal(self, subgoal: SubGoal, trace: AgentTrace):
-        """跑独立的 VerifyCodeAgent 给这个 sub-goal 做视觉裁决;关闭则返回 ``None``。"""
-
-        if not self.config.enable_verification:
-            return None
-        try:
-            resources = collect_verify_resources(
-                [r.skill for r in self.config.library.all()], trace.loaded_skill_ids
-            )
-            env_signal = self._env_signal_text(trace) if self.config.expose_env_signal else ""
-            context = VerifierContext(
-                sub_goal=subgoal.goal,
-                skills_used=trace.loaded_skill_ids,
-                op_trace=tuple(build_op_trace(trace.turns)),
-                resources=resources,
-                expected_decomposition=subgoal.postcondition,
-                clips=tuple(trace.metadata.get("clips", ())),
-                env_signal=env_signal,
-            )
-            agent = VerifyCodeAgent(
-                executor=self.config.executor,
-                policy=self.config.code_policy,
-                context=context,
-                library=self.config.library,
-                max_turns=self.config.verify_max_turns,
-            )
-            return agent.verify()
-        except Exception as exc:  # noqa: BLE001 - 验证失败回退到 env 信号,不该中断 episode
-            _log.warning("子目标验证失败,回退 env 信号: %r", exc)
-            return None
+        success = trace.success
+        meta = trace.metadata or {}
+        unresolved = meta.get("unresolved") if isinstance(meta, dict) else None
+        if isinstance(unresolved, dict):
+            note = unresolved.get("last_state_summary", "")
+        else:
+            note = ""
+        self._dump_subgoal(sg_dir, subgoal, trace, None, attempt=0)
+        return trace, None, success, note
 
     # ---- 产物落盘(artifacts_dir 给定时启用) ------------------------------
 
@@ -313,13 +255,17 @@ class RoboMExAgent:
         if subgoal is None:
             entry["decision"] = "DONE"
         else:
-            entry.update(goal=subgoal.goal, skill=subgoal.skill, postcondition=subgoal.postcondition)
+            entry.update(
+                goal=subgoal.goal,
+                planning_hint=subgoal.skill,
+                postcondition=subgoal.postcondition,
+            )
         with (art / "planner.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     @staticmethod
     def _dump_subgoal(d: Path | None, subgoal: SubGoal, trace: AgentTrace, vtrace=None, attempt: int = 0) -> None:
-        """把一次 sub-goal 尝试的元信息 + 内层每轮代码/输出 + 验证裁决写到目录 ``d``。
+        """把一次 sub-goal 尝试的元信息 + 内层每轮代码/输出写到目录 ``d``。
 
         ``d`` 由调用方给定:首次尝试是 ``subgoal_NN/``,重试是 ``subgoal_NN/retry_MM/``。
         """
@@ -328,13 +274,16 @@ class RoboMExAgent:
             return
         d.mkdir(parents=True, exist_ok=True)
         verdict = vtrace.verdict if vtrace is not None else None
+        trace_meta = trace.metadata or {}
         meta = {
             "goal": subgoal.goal,
-            "skill": subgoal.skill,
+            "planning_hint": subgoal.skill,
             "postcondition": subgoal.postcondition,
             "attempt": attempt,
-            "env_terminated": trace.success,
+            "act_success": trace.success,
+            "act_status": trace_meta.get("act_status"),
             "loaded_skill_ids": list(trace.loaded_skill_ids),
+            "unresolved": trace_meta.get("unresolved"),
             "verdict": (
                 {"verdict": verdict.verdict, "confidence": verdict.confidence, "reason": verdict.reason}
                 if verdict is not None
@@ -416,8 +365,8 @@ class RoboMExAgent:
     def _dump_summary(art: Path | None, execution: PlanExecution) -> None:
         """把整段 episode 的汇总写到 ``summary.json``。
 
-        ``success`` 是 agent(VLM Verifier)的主观裁决;``env_*`` 是 env 的客观判据
-        (LIBERO BDDL goal),与 cap0-agent 同口径,两者并列以便对照、暴露假阳性。
+        ``success`` 表示 Planner/Act 闭环是否顺利结束;``env_*`` 是 env 的客观判据
+        (LIBERO BDDL goal),与 cap0-agent 同口径,两者并列以便对照。
         """
 
         if art is None:
@@ -430,10 +379,12 @@ class RoboMExAgent:
             "subgoals": [
                 {
                     "goal": r.subgoal.goal,
-                    "skill": r.subgoal.skill,
+                    "planning_hint": r.subgoal.skill,
                     "success": r.success,
                     "inner_turns": len(r.trace.turns),
                     "loaded_skill_ids": list(r.trace.loaded_skill_ids),
+                    "act_status": (r.trace.metadata or {}).get("act_status"),
+                    "unresolved": (r.trace.metadata or {}).get("unresolved"),
                 }
                 for r in execution.results
             ],
