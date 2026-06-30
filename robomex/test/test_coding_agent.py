@@ -94,6 +94,26 @@ class RecordingPolicy:
         return response
 
 
+class NativeTurnPolicy:
+    def __init__(self, turns) -> None:
+        self._turns = list(turns)
+        self.prompts: list[list[dict]] = []
+        self._index = 0
+
+    def complete_turn(self, prompt: list[dict]):
+        self.prompts.append(prompt)
+        if self._index >= len(self._turns):
+            from robomex.core.coder import ModelTurn
+
+            return ModelTurn(raw="", text="done")
+        turn = self._turns[self._index]
+        self._index += 1
+        return turn
+
+    def complete(self, prompt: list[dict]) -> str:
+        raise AssertionError("NativeTurnPolicy should be consumed through complete_turn")
+
+
 def _skill(skill_id: str, desc: str, category: str = "observation") -> Skill:
     return Skill.from_markdown(
         f"---\nname: {skill_id}\ncategory: {category}\ndescription: {desc}\n---\n\nBody of {skill_id}.",
@@ -114,18 +134,77 @@ def _finish(claim: str = "done") -> str:
 
 
 def test_parse_json_action_variants() -> None:
-    from robomex.core.coder import parse_action
+    from robomex.core.coder import parse_action, parse_model_turn
 
     action = parse_action(_run_python("print('x')"), lambda _raw: False)
     assert action.kind == "run_python"
     assert action.args["code"] == "print('x')"
 
+    turn = parse_model_turn(_run_python("print('x')"), lambda _raw: False)
+    assert not turn.is_error
+    assert len(turn.tool_calls) == 1
+    assert turn.tool_calls[0].name == "run_python"
+    assert turn.tool_calls[0].args["code"] == "print('x')"
+
     invalid = parse_action("not json", lambda _raw: False)
     assert invalid.kind == "invalid"
     assert invalid.error
 
+    invalid_turn = parse_model_turn("not json", lambda _raw: False)
+    assert invalid_turn.is_error
+    assert not invalid_turn.tool_calls
+
     terminal = parse_action('{"status":"pass","confidence":0.9}', lambda _raw: True)
     assert terminal.kind == "finish"
+
+
+def test_native_model_turn_final_text_stops_like_qwen_code() -> None:
+    from robomex.core.coder import ModelTurn
+
+    lib = FakeLibrary([_skill("grasp", "grasp objects", category="action")])
+    policy = NativeTurnPolicy([ModelTurn(raw="", text="sub-goal attempt complete")])
+    agent = CodeAsPolicyAgent(executor=FakeExecutor(), policy=policy, library=lib, max_turns=6)
+
+    trace = agent.run(task="grasp the cube")
+
+    assert trace.success
+    assert trace.turns == ()
+    assert trace.metadata["terminal_raw"] == "sub-goal attempt complete"
+
+
+def test_vapi_tool_call_response_maps_to_model_turn() -> None:
+    from robomex.core.coder.policy import _model_turn_from_chat_completion
+
+    turn = _model_turn_from_chat_completion(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_abc",
+                                "type": "function",
+                                "function": {
+                                    "name": "run_python",
+                                    "arguments": json.dumps({"code": "print('ok')", "intent": "probe"}),
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+    )
+
+    assert not turn.is_error
+    assert len(turn.tool_calls) == 1
+    call = turn.tool_calls[0]
+    assert call.id == "call_abc"
+    assert call.name == "run_python"
+    assert call.args["code"] == "print('ok')"
 
 
 def test_verifier_use_skill_then_python_then_verdict() -> None:
@@ -479,6 +558,8 @@ def test_human_event_lines_identify_roles_and_decisions() -> None:
 
 def _run_all() -> None:
     test_parse_json_action_variants()
+    test_native_model_turn_final_text_stops_like_qwen_code()
+    test_vapi_tool_call_response_maps_to_model_turn()
     test_verifier_use_skill_then_python_then_verdict()
     test_verifier_unknown_skill_does_not_crash()
     test_verifier_evidence_then_judge_uncertain()

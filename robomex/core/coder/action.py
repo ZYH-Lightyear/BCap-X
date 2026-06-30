@@ -1,9 +1,11 @@
-"""Coding Agent 的动作空间:把模型回复解析成结构化 action。
+"""Coding Agent 的模型回合与工具调用抽象。
 
 RoboMEx 的第一版 Qwen-Code-style runtime 不接 provider 原生 tool calls;模型在
-普通 assistant content 中输出一个 JSON action,本模块负责解析和校验:
+普通 assistant content 中输出一个 JSON action。本模块把这种文本协议适配成
+Qwen-Code-like ``ModelTurn`` / ``ToolCall``:
 
-- :func:`parse_action` —— 把原始回复路由为 ``run_python`` / ``use_skill`` /
+- :func:`parse_model_turn` —— 把原始回复路由为 ``ToolCall`` 或 parser error。
+- :func:`parse_action` —— 旧兼容入口,把原始回复路由为 ``run_python`` / ``use_skill`` /
   ``finish`` / ``empty`` / ``invalid``。
 - :class:`SkillEntry` + :func:`render_available_skills` —— 开场的
   ``<available_skills>`` 感知清单(仅名称 + 描述)。
@@ -28,7 +30,7 @@ class BlockExecutor(Protocol):
 
 @dataclass(frozen=True)
 class AgentAction:
-    """A single structured model action."""
+    """Legacy single structured model action."""
 
     kind: str
     args: dict[str, Any]
@@ -46,6 +48,45 @@ class AgentAction:
         if self.error:
             return self.error
         return json.dumps(self.args, ensure_ascii=False)
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """A normalized tool call produced by one model turn."""
+
+    name: str
+    args: dict[str, Any]
+    id: str = "call_0"
+    raw: str = ""
+
+    @property
+    def signature(self) -> tuple[str, str]:
+        return (self.name, json.dumps(self.args, sort_keys=True, ensure_ascii=False))
+
+    @property
+    def payload_preview(self) -> str:
+        return json.dumps(self.args, ensure_ascii=False)
+
+
+@dataclass(frozen=True)
+class ModelTurn:
+    """One normalized model turn.
+
+    ``tool_calls`` mirrors provider-native function-calling shape. For the
+    current JSON-in-text adapter it contains at most one call; future VAPI
+    tool-call policies can populate it directly from upstream ``tool_calls``.
+    ``error`` means the text adapter failed to produce a valid tool call and
+    the runtime should reprompt instead of treating the text as a final answer.
+    """
+
+    raw: str
+    text: str = ""
+    tool_calls: tuple[ToolCall, ...] = ()
+    error: str = ""
+
+    @property
+    def is_error(self) -> bool:
+        return bool(self.error)
 
 
 @dataclass(frozen=True)
@@ -150,3 +191,23 @@ def parse_action(raw: str, is_terminal: Callable[[str], bool]) -> AgentAction:
         args = {**args, "raw": text}
 
     return AgentAction(kind=kind, args=args, raw=text)
+
+
+def parse_model_turn(raw: str, is_terminal: Callable[[str], bool]) -> ModelTurn:
+    """Parse current JSON action text into a normalized ``ModelTurn``.
+
+    This is the adapter layer that lets the runtime operate on Qwen-Code-like
+    tool calls while retaining the existing JSON action protocol until VAPI
+    native tool calling is wired in.
+    """
+
+    action = parse_action(raw, is_terminal)
+    if action.kind == "empty":
+        return ModelTurn(raw=raw or "", error="Model returned empty content.")
+    if action.kind == "invalid":
+        return ModelTurn(raw=raw or "", error=action.error or "Invalid model action.")
+    return ModelTurn(
+        raw=raw or "",
+        text="",
+        tool_calls=(ToolCall(name=action.kind, args=action.args, raw=action.raw),),
+    )

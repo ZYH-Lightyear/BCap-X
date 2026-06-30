@@ -22,9 +22,11 @@ from typing import Any
 from robomex.core.coder.action import (
     AgentAction,
     BlockExecutor,
+    ModelTurn,
     SkillEntry,
+    ToolCall,
     build_skill_llm_content,
-    parse_action,
+    parse_model_turn,
     render_available_skills,
 )
 from robomex.core.coder.policy import CompletionPolicy
@@ -152,28 +154,59 @@ class CodingAgent:
                         max_action_turns=self.max_turns,
                     )
                     llm_started = time.monotonic()
-                    raw = self.policy.complete(prompt)
+                    turn = self._complete_turn(prompt)
                     emit_event(
                         "llm_response",
                         f"{label} received model turn {turn_idx}",
                         duration_s=round(time.monotonic() - llm_started, 3),
-                        raw=raw,
-                        raw_preview=preview(raw),
+                        raw=turn.raw,
+                        raw_preview=preview(turn.raw),
+                        tool_calls=[
+                            {"id": call.id, "name": call.name, "args_preview": preview(call.payload_preview, 300)}
+                            for call in turn.tool_calls
+                        ],
+                        parser_error=turn.error,
                     )
-                    prompt.append({"role": "assistant", "content": raw})
-                    action = parse_action(raw, self._is_terminal)
+                    prompt.append({"role": "assistant", "content": turn.raw or turn.text})
+                    tool_call = self._single_tool_call(turn)
                     emit_event(
                         "agent_action",
-                        f"{label} chose {action.kind}",
-                        action=action.kind,
-                        payload_preview=preview(action.payload_preview, 300),
+                        f"{label} chose {tool_call.name if tool_call else 'none'}",
+                        action=tool_call.name if tool_call else "none",
+                        payload_preview=preview(
+                            tool_call.payload_preview if tool_call else turn.error or turn.text, 300
+                        ),
                         action_turns=action_turns,
                         max_action_turns=self.max_turns,
                     )
 
-                    if action.kind == "finish":
+                    if tool_call is None:
+                        if not turn.is_error and not turn.tool_calls and turn.text.strip():
+                            log.info("turn %d: final text without tool calls", turn_idx)
+                            should_stop, message = self._on_terminal_turn(
+                                turn_idx, turn.text.strip(), turns, tuple(loaded)
+                            )
+                            emit_event(
+                                "terminal_review",
+                                "final text processed",
+                                should_stop=should_stop,
+                                feedback=message,
+                            )
+                            if message:
+                                prompt.append({"role": "user", "content": message})
+                            if should_stop:
+                                terminal_raw = turn.text.strip()
+                                stopped = True
+                                break
+                            continue
+                        log.info("turn %d: 无可执行工具调用,轻推重试", turn_idx)
+                        prompt.append({"role": "user", "content": self._nudge_message(turn)})
+                        emit_event("agent_nudge", "No actionable tool call parsed", reason=turn.error)
+                        continue
+
+                    if tool_call.name == "finish":
                         log.info("turn %d: finish action", turn_idx)
-                        terminal_candidate = str(action.args.get("raw", raw))
+                        terminal_candidate = str(tool_call.args.get("raw", turn.raw or turn.text))
                         should_stop, message = self._on_terminal_turn(
                             turn_idx, terminal_candidate, turns, tuple(loaded)
                         )
@@ -190,31 +223,26 @@ class CodingAgent:
                             stopped = True
                             break
                         continue
-                    if action.kind in ("empty", "invalid"):
-                        log.info("turn %d: 无可执行动作,轻推重试", turn_idx)
-                        prompt.append({"role": "user", "content": self._nudge_message(action)})
-                        emit_event("agent_nudge", "No actionable reply parsed", reason=action.error)
-                        continue
-                    if action.kind not in self._allowed_action_kinds():
-                        msg = self._unsupported_action_message(action)
+                    if tool_call.name not in self._allowed_action_kinds():
+                        msg = self._unsupported_action_message(tool_call)
                         prompt.append({"role": "user", "content": msg})
                         emit_event(
                             "agent_nudge",
                             "Action is not available to this agent",
-                            action=action.kind,
+                            action=tool_call.name,
                             reason=msg,
                         )
                         continue
 
-                    sig = action.signature
+                    sig = tool_call.signature
                     repeats = repeats + 1 if sig == last_sig else 1
                     last_sig = sig
                     if repeats >= self.repeat_limit:
                         prompt.append({"role": "user", "content": self._repeat_warning()})
                         emit_event("repeat_warning", "Repeated identical action", repeats=repeats)
 
-                    if action.kind == "use_skill":
-                        name = str(action.args.get("name", ""))
+                    if tool_call.name == "use_skill":
+                        name = str(tool_call.args.get("name", ""))
                         log.info("turn %d: use_skill %s", turn_idx, name)
                         message = self._load_skill_message(name, loaded)
                         prompt.append({"role": "user", "content": message})
@@ -225,8 +253,8 @@ class CodingAgent:
                             loaded_skills=list(loaded),
                             content_preview=preview(message, 700),
                         )
-                    elif action.kind == "run_python":
-                        code = str(action.args.get("code", "")).strip()
+                    elif tool_call.name == "run_python":
+                        code = str(tool_call.args.get("code", "")).strip()
                         gate_message = self._python_gate_message(code, tuple(loaded))
                         if gate_message:
                             log.info("turn %d: python blocked by agent gate", turn_idx)
@@ -259,7 +287,7 @@ class CodingAgent:
                         log.info("turn %d: 写出 python 代码块(%d 行),执行中…", turn_idx, line_count)
                         block = SemanticActionBlock(
                             name=f"turn_{turn_idx}",
-                            intent=str(action.args.get("intent", "agent-generated code") or "agent-generated code"),
+                            intent=str(tool_call.args.get("intent", "agent-generated code") or "agent-generated code"),
                             code=code,
                             metadata=self._block_metadata(),
                         )
@@ -314,7 +342,8 @@ class CodingAgent:
                     max_action_turns=self.max_turns,
                     decision_turns=decision_turn_idx,
                 )
-                terminal_raw = self.policy.complete(prompt)
+                terminal_turn = self._complete_turn(prompt)
+                terminal_raw = terminal_turn.raw or terminal_turn.text
                 prompt.append({"role": "assistant", "content": terminal_raw})
 
             result = self._finalize(turns=turns, loaded=tuple(loaded), terminal_raw=terminal_raw)
@@ -367,8 +396,24 @@ class CodingAgent:
             "Reply with exactly one JSON action: use_skill, run_python, or finish."
         )
 
-    def _nudge_message(self, action: AgentAction | None = None) -> str:
-        detail = f" Parser error: {action.error}" if action and action.error else ""
+    def _complete_turn(self, prompt: list[dict]) -> ModelTurn:
+        complete_turn = getattr(self.policy, "complete_turn", None)
+        if callable(complete_turn):
+            return complete_turn(prompt)
+        raw = self.policy.complete(prompt)
+        return parse_model_turn(raw, self._is_terminal)
+
+    @staticmethod
+    def _single_tool_call(turn: ModelTurn) -> ToolCall | None:
+        if turn.is_error:
+            return None
+        if len(turn.tool_calls) != 1:
+            return None
+        return turn.tool_calls[0]
+
+    def _nudge_message(self, turn: ModelTurn | AgentAction | None = None) -> str:
+        error = getattr(turn, "error", "") if turn is not None else ""
+        detail = f" Parser error: {error}" if error else ""
         return (
             "No valid action parsed."
             f"{detail} Reply with exactly one JSON object action, for example "
@@ -392,10 +437,11 @@ class CodingAgent:
     def _allowed_action_kinds(self) -> set[str]:
         return {"use_skill", "run_python", "finish"}
 
-    def _unsupported_action_message(self, action: AgentAction) -> str:
+    def _unsupported_action_message(self, action: AgentAction | ToolCall) -> str:
         allowed = ", ".join(sorted(self._allowed_action_kinds()))
+        name = getattr(action, "kind", getattr(action, "name", "unknown"))
         return (
-            f"The action '{action.kind}' is not available to this agent. "
+            f"The action '{name}' is not available to this agent. "
             f"Reply with exactly one JSON action using one of: {allowed}."
         )
 

@@ -9,8 +9,11 @@
 from robomex.core.coder.action import (
     AgentAction,
     BlockExecutor,
+    ModelTurn,
     SkillEntry,
+    ToolCall,
     build_skill_llm_content,
+    parse_model_turn,
     parse_action,
     render_available_skills,
 )
@@ -18,7 +21,9 @@ from robomex.core.coder.agent import CodingAgent
 from robomex.core.coder.policy import (
     CompletionPolicy,
     LLMCodePolicy,
+    ROBO_MEX_TOOL_SCHEMAS,
     ScriptedCodePolicy,
+    VAPIToolCallPolicy,
 )
 from robomex.core.coder.trace import AgentTrace, TurnRecord
 
@@ -29,10 +34,15 @@ __all__ = [
     "CodingAgent",
     "CompletionPolicy",
     "LLMCodePolicy",
+    "ModelTurn",
+    "ROBO_MEX_TOOL_SCHEMAS",
     "ScriptedCodePolicy",
     "SkillEntry",
+    "ToolCall",
     "TurnRecord",
+    "VAPIToolCallPolicy",
     "build_skill_llm_content",
+    "parse_model_turn",
     "parse_action",
     "render_available_skills",
 ]
