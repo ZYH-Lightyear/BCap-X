@@ -16,7 +16,10 @@ function-calling schema。
 
 from __future__ import annotations
 
+import json
 import time
+import inspect
+from pathlib import Path
 from typing import Any
 
 from robomex.core.coder.action import (
@@ -26,6 +29,7 @@ from robomex.core.coder.action import (
     SkillEntry,
     ToolCall,
     build_skill_llm_content,
+    normalized_action_json,
     parse_model_turn,
     render_available_skills,
 )
@@ -56,12 +60,53 @@ def _preview_content(content: str | list) -> str:
     return text[:600]
 
 
+def _redact_for_llm_io(value: Any) -> Any:
+    """Return JSON-safe LLM I/O with large image payloads replaced by metadata."""
+
+    if isinstance(value, dict):
+        if value.get("type") == "image_url":
+            image_url = value.get("image_url")
+            if isinstance(image_url, dict):
+                url = str(image_url.get("url", ""))
+                redacted = {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": _redacted_image_url(url),
+                        "redacted_chars": len(url),
+                    },
+                }
+                for key, val in image_url.items():
+                    if key != "url":
+                        redacted["image_url"][key] = _redact_for_llm_io(val)
+                return redacted
+            return {"type": "image_url", "image_url": "<redacted>"}
+        return {str(k): _redact_for_llm_io(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_for_llm_io(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_for_llm_io(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def _redacted_image_url(url: str) -> str:
+    if not url:
+        return "<empty image_url>"
+    if url.startswith("data:image/"):
+        header = url.split(",", 1)[0]
+        return f"{header},<base64 redacted>"
+    if len(url) > 240:
+        return url[:160] + f"... <redacted {len(url) - 240} chars> ..." + url[-80:]
+    return url
+
+
 class CodingAgent:
     """“用技能 + 在沙箱写代码”的 agent 模板;子类重写各个钩子即可。
 
     子类负责提供:角色(``system_prompt``)、感知清单(``_skill_entries``)、
-    开场消息(``_initial_user_message``)、何种回复算终止(``_is_terminal``)、
-    终止动作如何处理(``_on_terminal_turn``)、每个 python 轮该做什么、
+    开场消息(``_initial_user_message``)、终止动作如何处理(``_on_terminal_turn``)、
+    每个 python 轮该做什么、
     python 轮后是否停止(``_should_stop_after_python``)、以及如何组装最终结果
     (``_finalize``)。
     """
@@ -146,19 +191,24 @@ class CodingAgent:
                 turn_idx = decision_turn_idx
                 decision_turn_idx += 1
                 with event_scope(turn=turn_idx):
+                    request_dump = self._dump_llm_request(turn_idx, prompt)
                     emit_event(
                         "llm_request",
                         f"{label} requesting model turn {turn_idx}",
                         prompt_messages=len(prompt),
+                        prompt_preview=_preview_content(prompt[-1].get("content", "")) if prompt else "",
+                        llm_request_path=str(request_dump) if request_dump is not None else None,
                         action_turns=action_turns,
                         max_action_turns=self.max_turns,
                     )
                     llm_started = time.monotonic()
                     turn = self._complete_turn(prompt)
+                    response_dump = self._dump_llm_response(turn_idx, turn)
                     emit_event(
                         "llm_response",
                         f"{label} received model turn {turn_idx}",
                         duration_s=round(time.monotonic() - llm_started, 3),
+                        llm_response_path=str(response_dump) if response_dump is not None else None,
                         raw=turn.raw,
                         raw_preview=preview(turn.raw),
                         tool_calls=[
@@ -181,24 +231,6 @@ class CodingAgent:
                     )
 
                     if tool_call is None:
-                        if not turn.is_error and not turn.tool_calls and turn.text.strip():
-                            log.info("turn %d: final text without tool calls", turn_idx)
-                            should_stop, message = self._on_terminal_turn(
-                                turn_idx, turn.text.strip(), turns, tuple(loaded)
-                            )
-                            emit_event(
-                                "terminal_review",
-                                "final text processed",
-                                should_stop=should_stop,
-                                feedback=message,
-                            )
-                            if message:
-                                prompt.append({"role": "user", "content": message})
-                            if should_stop:
-                                terminal_raw = turn.text.strip()
-                                stopped = True
-                                break
-                            continue
                         log.info("turn %d: 无可执行工具调用,轻推重试", turn_idx)
                         prompt.append({"role": "user", "content": self._nudge_message(turn)})
                         emit_event("agent_nudge", "No actionable tool call parsed", reason=turn.error)
@@ -206,7 +238,12 @@ class CodingAgent:
 
                     if tool_call.name == "finish":
                         log.info("turn %d: finish action", turn_idx)
-                        terminal_candidate = str(tool_call.args.get("raw", turn.raw or turn.text))
+                        terminal_candidate = str(
+                            self._tool_call_raw_json(tool_call)
+                            or tool_call.args.get("raw")
+                            or turn.raw
+                            or turn.text
+                        )
                         should_stop, message = self._on_terminal_turn(
                             turn_idx, terminal_candidate, turns, tuple(loaded)
                         )
@@ -332,6 +369,16 @@ class CodingAgent:
                                 decision_turns=decision_turn_idx,
                             )
                             break
+                    else:
+                        log.info("turn %d: meta action %s", turn_idx, tool_call.name)
+                        message = self._handle_meta_action(tool_call, tuple(loaded))
+                        prompt.append({"role": "user", "content": message})
+                        emit_event(
+                            "meta_action_result",
+                            f"{label} handled {tool_call.name}",
+                            action=tool_call.name,
+                            result_preview=preview(str(message), 700),
+                        )
 
             if terminal_raw is None and self.force_terminal_on_exhaust and not stopped:
                 prompt.append({"role": "user", "content": self._force_terminal_message()})
@@ -342,8 +389,23 @@ class CodingAgent:
                     max_action_turns=self.max_turns,
                     decision_turns=decision_turn_idx,
                 )
+                request_dump = self._dump_llm_request(decision_turn_idx, prompt)
                 terminal_turn = self._complete_turn(prompt)
-                terminal_raw = terminal_turn.raw or terminal_turn.text
+                response_dump = self._dump_llm_response(decision_turn_idx, terminal_turn)
+                emit_event(
+                    "llm_response",
+                    "received forced terminal model turn",
+                    llm_request_path=str(request_dump) if request_dump is not None else None,
+                    llm_response_path=str(response_dump) if response_dump is not None else None,
+                    raw=terminal_turn.raw,
+                    raw_preview=preview(terminal_turn.raw),
+                    parser_error=terminal_turn.error,
+                )
+                terminal_call = self._single_tool_call(terminal_turn)
+                if terminal_call is not None and terminal_call.name == "finish":
+                    terminal_raw = self._tool_call_raw_json(terminal_call)
+                else:
+                    terminal_raw = terminal_turn.raw or terminal_turn.text
                 prompt.append({"role": "assistant", "content": terminal_raw})
 
             result = self._finalize(turns=turns, loaded=tuple(loaded), terminal_raw=terminal_raw)
@@ -399,9 +461,78 @@ class CodingAgent:
     def _complete_turn(self, prompt: list[dict]) -> ModelTurn:
         complete_turn = getattr(self.policy, "complete_turn", None)
         if callable(complete_turn):
+            try:
+                params = inspect.signature(complete_turn).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "tool_names" in params:
+                return complete_turn(prompt, tool_names=self._allowed_action_kinds())
             return complete_turn(prompt)
         raw = self.policy.complete(prompt)
-        return parse_model_turn(raw, self._is_terminal)
+        return parse_model_turn(raw)
+
+    def _llm_io_dir(self) -> Path | None:
+        """Return a directory for full LLM request/response dumps, if enabled."""
+
+        return None
+
+    def _dump_llm_request(self, turn_idx: int, prompt: list[dict]) -> Path | None:
+        out_dir = self._llm_io_dir()
+        if out_dir is None:
+            return None
+        payload = {
+            "turn": turn_idx,
+            "agent_role": self._agent_role(),
+            "agent_label": self._agent_label(),
+            "messages": _redact_for_llm_io(prompt),
+        }
+        return self._write_llm_io_json(out_dir / f"turn_{turn_idx:02d}_request.json", payload)
+
+    def _dump_llm_response(self, turn_idx: int, turn: ModelTurn) -> Path | None:
+        out_dir = self._llm_io_dir()
+        if out_dir is None:
+            return None
+        payload = {
+            "turn": turn_idx,
+            "agent_role": self._agent_role(),
+            "agent_label": self._agent_label(),
+            "raw": turn.raw,
+            "text": turn.text,
+            "parser_error": turn.error,
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "name": call.name,
+                    "args": call.args,
+                    "raw": call.raw,
+                }
+                for call in turn.tool_calls
+            ],
+        }
+        path = self._write_llm_io_json(out_dir / f"turn_{turn_idx:02d}_response.json", payload)
+        if path is not None:
+            self._write_llm_io_text(out_dir / f"turn_{turn_idx:02d}_response.txt", turn.raw or turn.text)
+        return path
+
+    @staticmethod
+    def _write_llm_io_json(path: Path, payload: dict[str, Any]) -> Path | None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, default=repr),
+                encoding="utf-8",
+            )
+            return path
+        except Exception:
+            return None
+
+    @staticmethod
+    def _write_llm_io_text(path: Path, text: str) -> None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text or "", encoding="utf-8")
+        except Exception:
+            return
 
     @staticmethod
     def _single_tool_call(turn: ModelTurn) -> ToolCall | None:
@@ -414,12 +545,21 @@ class CodingAgent:
     def _nudge_message(self, turn: ModelTurn | AgentAction | None = None) -> str:
         error = getattr(turn, "error", "") if turn is not None else ""
         detail = f" Parser error: {error}" if error else ""
+        allowed = ", ".join(sorted(self._allowed_action_kinds()))
+        examples = [
+            '{"tool":"use_skill","args":{"name":"<skill_name>"}}',
+            '{"tool":"run_python","args":{"code":"print(1)","intent":"inspect"}}',
+            '{"tool":"finish","args":{"claim":"done"}}',
+        ]
+        if "call_subagent" in self._allowed_action_kinds():
+            examples.insert(
+                1,
+                '{"tool":"call_subagent","args":{"task":"localize the target object and return mask/point evidence"}}',
+            )
         return (
             "No valid action parsed."
-            f"{detail} Reply with exactly one JSON object action, for example "
-            '{"tool":"use_skill","args":{"name":"<skill_name>"}}, '
-            '{"tool":"run_python","args":{"code":"print(1)","intent":"inspect"}}, '
-            '{"tool":"finish","args":{"claim":"done"}}.'
+            f"{detail} Reply with exactly one JSON object action using one of: {allowed}. "
+            f"Examples: {', '.join(examples)}."
         )
 
     def _repeat_warning(self) -> str:
@@ -437,6 +577,10 @@ class CodingAgent:
     def _allowed_action_kinds(self) -> set[str]:
         return {"use_skill", "run_python", "finish"}
 
+    @staticmethod
+    def _tool_call_raw_json(tool_call: ToolCall) -> str:
+        return normalized_action_json(tool_call.name, tool_call.args)
+
     def _unsupported_action_message(self, action: AgentAction | ToolCall) -> str:
         allowed = ", ".join(sorted(self._allowed_action_kinds()))
         name = getattr(action, "kind", getattr(action, "name", "unknown"))
@@ -449,6 +593,9 @@ class CodingAgent:
         """Return a user-facing rejection message for a python block, or empty to allow it."""
 
         return ""
+
+    def _handle_meta_action(self, action: ToolCall, loaded: tuple[str, ...]) -> str | list:
+        return self._unsupported_action_message(action)
 
     def _block_metadata(self) -> dict:
         return {}
@@ -470,9 +617,6 @@ class CodingAgent:
     def _initial_user_message(self) -> str | list:
         raise NotImplementedError
 
-    def _is_terminal(self, raw: str) -> bool:
-        return False
-
     def _on_terminal_turn(
         self,
         turn_idx: int,
@@ -480,7 +624,7 @@ class CodingAgent:
         turns: list[Any],
         loaded: tuple[str, ...],
     ) -> tuple[bool, str]:
-        """处理 terminal 动作。默认旧行为:立即停止。"""
+        """处理 terminal 动作。默认实现是接受终止并停止循环。"""
 
         return True, ""
 

@@ -41,7 +41,65 @@ env:
       - The word 'REGENERATE' followed immediately by new Python code in a fenced code block (```python...```) if you want to modify the code.
       - The word 'FINISH' if the task appears to be complete
 
+robomex:
+  vlm:
+    # Dedicated VLM used by query_vlm / vlm_bbox_detection / vlm_point_detection inside
+    # RoboMEx code blocks. Keep this separate from --model so Planner/Act can use a
+    # different model without changing grounding.
+    model: vapi/gpt-5.5
+    server_url: http://localhost:8110/chat/completions
+    coord_space: pixel
+  runtime:
+    # RoboMEx agent runtime knobs live in config instead of being hidden in code.
+    # Act delegates focused natural-language work to the generic read-only SubAgent;
+    # these settings describe the boundary, not named SubAgent roles or schemas.
+    max_subgoals: 8
+    subagent_max_turns: 8
+    scene_camera: agentview
+    act_observation_camera: agentview
+    prompt_api_names:
+      - get_observation
+      - goto_pose
+      - open_gripper
+      - close_gripper
+      - move_to_joints
+      - goto_home_joint_position
+      - solve_ik
+      - query_vlm
+      - decompose_transform
+      - rotation_matrix_to_quaternion
+      - transform_points
+      - pixel_to_world_point
+      - mask_to_world_points
+      - depth_to_point_cloud
+      - normalize_vector
+      - vlm_bbox_detection
+      - vlm_point_detection
+      - segment_sam3_text_prompt
+      - segment_sam3_point_prompt
+      - segment_sam3_box_prompt
+      - plan_grasp
+      - plan_grasp_from_point_clouds
+      - get_oriented_bounding_box_from_3d_points
+      - subsample_point_cloud
+      - filter_noise
+    subagent_denied_calls:
+      - close_gripper
+      - execute_joint_trajectory
+      - goto_home_joint_position
+      - goto_pose
+      - move_to_joints
+      - open_gripper
+      - reset
+      - step
+
 api_servers:
+  - _target_: capx.serving.openrouter_server.main
+    key_file: .openrouterkey
+    host: 127.0.0.1
+    port: 8110
+    reasoning_effort: low
+
   - _target_: capx.serving.launch_pyroki_server.main
     port: 8116
     host: 127.0.0.1

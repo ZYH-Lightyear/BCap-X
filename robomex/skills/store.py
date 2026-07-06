@@ -5,14 +5,13 @@
 
 技能以目录包形式存储,按 category 分组::
 
-    <root>/observation/<skill_id>/SKILL.md       # 技能 prose 正文
-    <root>/observation/<skill_id>/reference/     # 可选:验证 agent 资产
-    <root>/observation/<skill_id>/scripts/       # 可选:verifier-as-code
-    <root>/observation/<skill_id>/utility.json   # 运行期学习元数据
-    <root>/action/<skill_id>/...
-    <root>/high_level/<skill_id>/...
+    <root>/perception/<skill_id>/SKILL.md       # 技能 prose 正文
+    <root>/perception/<skill_id>/utility.json   # 运行期学习元数据
+    <root>/affordance/<skill_id>/...
+    <root>/motion/<skill_id>/...
+    <root>/task/<skill_id>/...
 
-技能内容与学习元数据并排存放,但概念上分离:技能包(SKILL.md + sidecar)可跨
+技能内容与学习元数据并排存放,但概念上分离:技能包(SKILL.md)可跨
 agent/模型移植,而 utility 是技能库用于检索/退役的本地统计量。
 """
 
@@ -24,7 +23,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from robomex.skills.schema import REF_DIR, SCRIPTS_DIR, SKILL_FILE, Skill, SkillCategory
+from robomex.skills.schema import SKILL_FILE, SKILL_PACKAGE_EXTRA_DIRS, Skill, SkillCategory
 
 _UTILITY_FILE = "utility.json"
 
@@ -59,7 +58,7 @@ class SkillRecord:
 class SkillLibrary:
     """技能包的磁盘后端存储:持久化 + utility。
 
-    发现方式是渐进披露,而非检索:调用方通过 :meth:`all` / :meth:`compound_skills`
+    发现方式是渐进披露,而非检索:调用方通过 :meth:`all` / :meth:`task_skills`
     列出整库,通过 :meth:`get` 按 id 加载某个具体技能包。
     """
 
@@ -83,7 +82,15 @@ class SkillLibrary:
         dest = self.root / skill.category.value / skill.skill_id
         dest.mkdir(parents=True, exist_ok=True)
         (dest / SKILL_FILE).write_text(skill.to_markdown())
-        self._copy_sidecars(skill, dest)
+        if skill.root is not None:
+            for dirname in SKILL_PACKAGE_EXTRA_DIRS:
+                src = skill.root / dirname
+                if not src.exists():
+                    continue
+                dst = dest / dirname
+                if dst.exists():
+                    shutil.rmtree(dst)
+                shutil.copytree(src, dst)
 
         utility_path = dest / _UTILITY_FILE
         utility = self._load_utility(utility_path) if utility_path.exists() else SkillUtility(source=source)
@@ -102,10 +109,10 @@ class SkillLibrary:
                 records.append(self.get(skill_md.parent.name))
         return records
 
-    def compound_skills(self) -> list[SkillRecord]:
-        """高层(复合)技能 —— 外层 planner 的能力菜单。"""
+    def task_skills(self) -> list[SkillRecord]:
+        """任务级技能 —— 外层 planner 的能力菜单。"""
 
-        return [record for record in self.all() if record.skill.compound]
+        return self.all(SkillCategory.TASK)
 
     def update_utility(self, skill_id: str, success: bool, failure_note: str = "") -> SkillUtility:
         utility_path = self._dir(skill_id) / _UTILITY_FILE
@@ -117,18 +124,6 @@ class SkillLibrary:
             utility.last_failure = failure_note
         utility_path.write_text(json.dumps(asdict(utility), indent=2))
         return utility
-
-    @staticmethod
-    def _copy_sidecars(skill: Skill, dest: Path) -> None:
-        """从源技能包拷贝 reference/ 和 scripts/ 这两个 sidecar 目录。"""
-
-        src = skill.root
-        if src is None or src.resolve() == dest.resolve():
-            return
-        for sub in (REF_DIR, SCRIPTS_DIR):
-            src_dir = src / sub
-            if src_dir.is_dir():
-                shutil.copytree(src_dir, dest / sub, dirs_exist_ok=True)
 
     @staticmethod
     def _load_utility(path: Path) -> SkillUtility:

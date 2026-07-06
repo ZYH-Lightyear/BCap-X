@@ -10,48 +10,88 @@ Act 认为当前 sub-goal 尝试结束,控制权交回外层 Planner。
 
 from __future__ import annotations
 
+import ast
+import json
+import re
 from pathlib import Path
 from typing import Any
 
-from robomex.core.coder import CodingAgent, SkillEntry
+from robomex.agents.subagents import SubAgentRegistry, SubAgentRequest, SubAgentResult, write_subagent_result_artifact
+from robomex.core.coder import CodingAgent, SkillEntry, parse_action_payload
+from robomex.core.context import (
+    AttemptRecord,
+    Diagnosis,
+    EvidencePacket,
+    EvidenceTimelineItem,
+    LocalVerdict,
+    PrimitiveTrace,
+    StatePatch,
+    WorkspaceArtifact,
+    compact_json,
+)
 from robomex.core.coder.policy import CompletionPolicy
 from robomex.core.coder.trace import AgentTrace, TurnRecord
 from robomex.core.events import emit_event
 from robomex.core.logging import get_logger
 from robomex.core.sandbox import BlockExecutionResult, SemanticActionBlock
 from robomex.perception import EvidenceCollector, save_video
-from robomex.skills import SkillLibrary
+from robomex.prompts import BASE_ACT_SYSTEM_PROMPT
+from robomex.skills import (
+    SkillLibrary,
+)
 
 _log = get_logger("executor")
 
+_STATE_CHANGING_API_CALLS = frozenset({
+    "close_gripper",
+    "execute_joint_trajectory",
+    "goto_home_joint_position",
+    "goto_pose",
+    "move_to_joints",
+    "open_gripper",
+    "reset",
+    "step",
+})
+
 # 子目标开场注入沙箱:重置语义证据字典 + 抓子目标起始帧。沙箱 globals 跨 block 持久,
 # 因此 EVIDENCE 与 OBS_BEFORE 会一直留到该子目标结束,作为调试和 planner 复盘材料。
-_EVIDENCE_SEED = (
-    "try:\n"
-    "    EVIDENCE\n"
-    "except NameError:\n"
-    "    EVIDENCE = {}\n"
-    "EVIDENCE.clear()\n"
-    "try:\n"
-    "    OBS_BEFORE = get_observation()['agentview']['images']['rgb'].copy()\n"
-    "except Exception as _e:\n"
-    "    OBS_BEFORE = None\n"
-)
+def _evidence_seed(camera: str | None) -> str:
+    return (
+        "try:\n"
+        "    EVIDENCE\n"
+        "except NameError:\n"
+        "    EVIDENCE = {}\n"
+        "EVIDENCE.clear()\n"
+        f"OBS_CAMERA = {camera!r}\n"
+        "try:\n"
+        "    _obs0 = get_observation()\n"
+        "    if OBS_CAMERA:\n"
+        "        OBS_BEFORE = _obs0[OBS_CAMERA]['images']['rgb'].copy()\n"
+        "    else:\n"
+        "        OBS_BEFORE = next(\n"
+        "            cam['images']['rgb'].copy()\n"
+        "            for cam in _obs0.values()\n"
+        "            if isinstance(cam, dict)\n"
+        "            and isinstance(cam.get('images'), dict)\n"
+        "            and 'rgb' in cam['images']\n"
+        "        )\n"
+        "except Exception as _e:\n"
+        "    OBS_BEFORE = None\n"
+    )
 
-_SYSTEM_PROMPT = (
-    "You are a robot Code-as-Policy agent. Each turn, reply with exactly one JSON action "
-    "object. Use run_python to execute one block of Python that advances the task, "
-    "grounding every decision in the current observation. "
-    "Before writing any Python for a sub-goal, consult at least one relevant skill with "
-    "`{\"tool\":\"use_skill\",\"args\":{\"name\":\"<skill>\"}}`. Skills are the operating procedure for this framework: follow "
-    "their Procedure / Rules / Failure modes unless the live observation contradicts them, "
-    "and state any deliberate deviation in code comments. Adapt skill guidance to the scene, "
-    "but do not ignore it or invent an unrelated pipeline. Inspect observations directly, save useful "
-    "raw evidence when it helps future planning, and decide whether another action is needed. "
-    "Use `{\"tool\":\"run_python\",\"args\":{\"code\":\"...\", \"intent\":\"...\"}}` for code. "
-    "Use `{\"tool\":\"finish\",\"args\":{\"claim\":\"...\"}}` when you believe this sub-goal attempt "
-    "is complete and control should return to the Planner."
-)
+
+def _extract_feedback_rgb(obs: dict[str, Any] | None, camera: str | None):
+    if not obs:
+        return None
+    if camera:
+        try:
+            return obs[camera]["images"]["rgb"]
+        except (KeyError, TypeError):
+            return None
+    for cam in obs.values():
+        if isinstance(cam, dict) and isinstance(cam.get("images"), dict) and "rgb" in cam["images"]:
+            return cam["images"]["rgb"]
+    return None
 
 
 class CodeAsPolicyAgent(CodingAgent):
@@ -62,7 +102,9 @@ class CodeAsPolicyAgent(CodingAgent):
         library: SkillLibrary,
         collector: EvidenceCollector | None = None,
         max_turns: int = 6,
-        system_prompt: str = _SYSTEM_PROMPT,
+        system_prompt: str = BASE_ACT_SYSTEM_PROMPT,
+        subagents: SubAgentRegistry | None = None,
+        observation_camera: str | None = None,
     ) -> None:
         super().__init__(
             executor=executor,
@@ -72,19 +114,29 @@ class CodeAsPolicyAgent(CodingAgent):
             system_prompt=system_prompt,
         )
         self.collector = collector
+        self.subagents = subagents
+        self.observation_camera = observation_camera
         self._task = ""
         self._expected_postcondition = ""
         self._observation_summary = ""
-        self._primary_skill_id: str | None = None
         self._video_dir: Path | None = None
         self._clips: list[dict] = []
         self._feedback = ""
+        self._subagent_call_index = 0
+        self._subagent_calls: list[dict[str, Any]] = []
+        self._primitive_traces: list[PrimitiveTrace] = []
+        self._attempt_records: list[AttemptRecord] = []
+        self._diagnoses: list[Diagnosis] = []
+        self._local_verdicts: list[LocalVerdict] = []
+        self._artifact_refs: list[WorkspaceArtifact] = []
+        self._evidence_packets: list[dict[str, Any]] = []
+        self._evidence_timeline: list[dict[str, Any]] = []
+        self._local_context_notes: list[str] = []
 
     def run(
         self,
         task: str,
         observation_summary: str = "",
-        primary_skill_id: str | None = None,
         expected_postcondition: str = "",
         video_dir: str | Path | None = None,
         feedback: str = "",
@@ -93,11 +145,20 @@ class CodeAsPolicyAgent(CodingAgent):
         self._task = task
         self._expected_postcondition = expected_postcondition
         self._observation_summary = observation_summary
-        self._primary_skill_id = primary_skill_id
         self._video_dir = Path(video_dir) if video_dir is not None else None
         self._scene_image_path = scene_image_path
         self._clips = []
         self._feedback = feedback or ""
+        self._subagent_call_index = 0
+        self._subagent_calls = []
+        self._primitive_traces = []
+        self._attempt_records = []
+        self._diagnoses = []
+        self._local_verdicts = []
+        self._artifact_refs = []
+        self._evidence_packets = []
+        self._evidence_timeline = []
+        self._local_context_notes = []
         return super().run()
 
     # ---- 钩子 --------------------------------------------------------------
@@ -106,7 +167,10 @@ class CodeAsPolicyAgent(CodingAgent):
         """子目标开场:重置 EVIDENCE、抓起始帧 OBS_BEFORE + 注入 ARTIFACTS_DIR。"""
 
         art_dir = str(self._video_dir) if self._video_dir else "/tmp"
-        seed = f"ARTIFACTS_DIR = {art_dir!r}\n" + _EVIDENCE_SEED
+        seed = (
+            f"ARTIFACTS_DIR = {art_dir!r}\n"
+            + _evidence_seed(self.observation_camera)
+        )
         try:
             self.executor.run_block(
                 SemanticActionBlock(
@@ -130,27 +194,30 @@ class CodeAsPolicyAgent(CodingAgent):
         from robomex.perception.render import image_content_part
 
         parts = [f"Task: {self._task}"]
+        if self._expected_postcondition:
+            parts.append(f"Expected postcondition: {self._expected_postcondition}")
         if self._observation_summary:
             parts.append(f"Observation: {self._observation_summary}")
         parts.append(
             "The current scene image is attached below. Inspect it before writing code. "
-            "If the arm, gripper, or held object occludes the target or receptacle in the "
-            "image, first call `goto_home_joint_position()` then `get_observation()` to "
-            "obtain a clear view before proceeding with segmentation or planning."
+            "If the empty arm or gripper occludes the target or receptacle, you may call "
+            "`goto_home_joint_position()` then `get_observation()` to obtain a clear view. "
+            "If an object may already be held, do not open the gripper for observation; "
+            "`goto_home_joint_position()` preserves the current gripper command."
         )
-        if self._primary_skill_id:
-            parts.append(
-                f"This sub-goal corresponds to the high-level skill "
-                f"`{self._primary_skill_id}`. Start with "
-                f'`{{"tool":"use_skill","args":{{"name":"{self._primary_skill_id}"}}}}` '
-                "to read how it orchestrates the work, then consult and freely combine the "
-                "observation/action leaf skills it points to -- decide the order and the "
-                "code yourself from each skill's guidance; there is no fixed pipeline."
-            )
         if self._feedback:
             parts.append(
                 "Feedback from a previous unresolved attempt/review. Use it to fix your approach:\n"
                 f"{self._feedback}"
+            )
+        if self.subagents is not None and self.subagents.has_runtime():
+            parts.append(
+                "A read-only Verifier SubAgent is available. Use call_subagent only for "
+                "state verification or diagnosis, such as checking whether the object is "
+                "held, whether a placement succeeded, whether a candidate pose is visibly "
+                "aligned, or why a just-executed attempt failed. Do not delegate grounding, "
+                "affordance generation, placement-point generation, or motion planning; "
+                "Act must load skills and write that code itself."
             )
         text = "\n\n".join(parts)
 
@@ -170,20 +237,219 @@ class CodeAsPolicyAgent(CodingAgent):
     def _agent_label(self) -> str:
         return "Act Agent"
 
+    def _llm_io_dir(self) -> Path | None:
+        if self._video_dir is None:
+            return None
+        return self._video_dir / "llm_io"
+
+    def _allowed_action_kinds(self) -> set[str]:
+        allowed = super()._allowed_action_kinds()
+        if self.subagents is not None:
+            allowed = set(allowed)
+            allowed.add("call_subagent")
+        return allowed
+
     def _python_gate_message(self, code: str, loaded: tuple[str, ...]) -> str:
+        if _opens_gripper_after_home(code):
+            return (
+                "Python execution is blocked because this code calls "
+                "`goto_home_joint_position()` and then `open_gripper()` in the same block. "
+                "Going home is an observation/repositioning action and must preserve any "
+                "held object. Remove `open_gripper()` unless the current loaded motion skill "
+                "is explicitly releasing at the target."
+            )
         if loaded:
             return ""
-        available = ", ".join(e.name for e in self._skill_entries())
-        if not available:
-            return (
-                "Python execution is blocked because no RoboMEx skills are available to this "
-                "Act Agent. This is a framework/configuration error: the skill library is empty."
-            )
+        state_changing = _state_changing_calls(code)
+        if not state_changing:
+            return ""
+        available = ", ".join(e.name for e in self._skill_entries()) or "(none)"
         return (
-            "Python execution is blocked until you consult a relevant RoboMEx skill. "
-            "Reply with exactly one use_skill JSON action first, choosing from the available "
-            f"skills: {available}. After reading the skill, write code that follows its "
-            "Procedure / Rules / Failure modes."
+            "Python execution is blocked because this block would change robot/environment "
+            f"state before any RoboMEx skill was loaded. State-changing call(s): "
+            f"{', '.join(state_changing)}. Observation, evidence preparation, SubAgent "
+            "delegation, VLM state checks, geometry, and IK checks may run before loading a "
+            "skill; physical execution must first consult a relevant skill with use_skill. "
+            f"Available skills: {available}."
+        )
+
+    def _handle_meta_action(self, action, loaded: tuple[str, ...]) -> str:
+        if action.name != "call_subagent":
+            return super()._handle_meta_action(action, loaded)
+        if self.subagents is None or not self.subagents.has_runtime():
+            return "No SubAgent registry is configured. Continue with use_skill, run_python, or finish."
+        task = str(action.args.get("task", ""))
+        inputs = action.args.get("inputs") if isinstance(action.args.get("inputs"), dict) else {}
+        task_id = action.args.get("task_id") if isinstance(action.args.get("task_id"), str) else None
+        if not _looks_like_verifier_request(task):
+            return (
+                "call_subagent is verifier-only in this RoboMEx loop. Do not delegate "
+                "grounding, segmentation, affordance generation, placement-point generation, "
+                "or motion planning. Load the relevant skill and write the Act code yourself; "
+                "use call_subagent only for a concrete state-check or failure-diagnosis claim."
+            )
+        call_index = self._subagent_call_index
+        sub_dir = None
+        if self._video_dir is not None:
+            sub_dir = self._video_dir / "subagents" / f"{call_index:02d}_{_slug(task)}"
+            sub_dir.mkdir(parents=True, exist_ok=True)
+        self._subagent_call_index += 1
+        request = SubAgentRequest(
+            task=task,
+            inputs=inputs,
+            artifacts_dir=str(sub_dir) if sub_dir is not None else None,
+            task_id=task_id,
+            context={
+                "act_task": self._task,
+                "expected_postcondition": self._expected_postcondition,
+                "role_contract": "Verifier only: check the current state or diagnose the last attempt; do not produce execution candidates.",
+            },
+        )
+        try:
+            result = self.subagents.run(request)
+        except Exception as exc:  # noqa: BLE001 - bad delegation should be recoverable by Act
+            payload = {
+                "schema": "robomex.subagent_call.v1",
+                "call_index": call_index,
+                "subagent": "verifier_subagent",
+                "task": task,
+                "request": {
+                    "task": task,
+                    "inputs": compact_json(inputs),
+                    "artifacts_dir": request.artifacts_dir,
+                    "task_id": request.task_id,
+                    "context": compact_json(request.context),
+                },
+                "ok": False,
+                "error": str(exc),
+                "artifacts_dir": request.artifacts_dir,
+            }
+            failure_packet = EvidencePacket.from_any(
+                {
+                    "claim": f"SubAgent call failed: {task}",
+                    "confidence": 1.0,
+                    "evidence": {"error": str(exc), "task": task},
+                    "verdict": {
+                        "status": "fail",
+                        "confidence": 1.0,
+                        "reason": str(exc),
+                        "verdict_type": "subagent_call",
+                    },
+                    "recommended_next": "Retry with a narrower task or continue without this evidence.",
+                },
+                default_source="verifier_subagent",
+                default_turn=f"subagent:{task_id or call_index}",
+            )
+            self._record_evidence_packet(f"subagent:{call_index}:error", failure_packet, call_index=call_index)
+            payload["evidence_packet"] = failure_packet.to_json_dict()
+            failure_result = SubAgentResult(
+                name="verifier_subagent",
+                ok=False,
+                result=failure_packet.to_json_dict(),
+                state_patch=StatePatch(),
+                loaded_skill_ids=(),
+                turns=0,
+                error=str(exc),
+                artifacts_dir=request.artifacts_dir,
+                task_id=request.task_id,
+            )
+            write_subagent_result_artifact(request, failure_result)
+        else:
+            write_subagent_result_artifact(request, result)
+            packet = result.resolved_evidence_packet()
+            payload = {
+                "schema": "robomex.subagent_call.v1",
+                "call_index": call_index,
+                "subagent": result.name,
+                "task": task,
+                "request": {
+                    "task": task,
+                    "inputs": compact_json(inputs),
+                    "artifacts_dir": request.artifacts_dir,
+                    "task_id": request.task_id,
+                    "context": compact_json(request.context),
+                },
+                **result.to_json_dict(),
+            }
+            self._record_evidence_packet(f"subagent:{call_index}", packet, call_index=call_index)
+            if not result.state_patch.is_empty or not packet.to_state_patch().is_empty:
+                self._append_local_context_note(
+                    f"subagent:{call_index} returned state_patch-like data, ignored by Act context. "
+                    "Treat only its verifier verdict and artifacts as useful."
+                )
+            self._primitive_traces.extend(result.primitive_traces)
+            self._attempt_records.extend(result.attempt_records)
+            self._diagnoses.extend(result.diagnoses)
+            self._artifact_refs.extend(result.artifact_refs)
+            if packet.artifact_refs:
+                self._artifact_refs.extend(packet.artifact_refs)
+            if result.local_verdict is not None:
+                self._local_verdicts.append(result.local_verdict)
+            elif packet.verdict is not None:
+                self._local_verdicts.append(packet.verdict)
+        if sub_dir is not None:
+            (sub_dir / "subagent_call.json").write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        self._subagent_calls.append(payload)
+        emit_event(
+            "subagent_result",
+            "SubAgent returned",
+            call_index=call_index,
+            subagent=payload.get("subagent"),
+            ok=payload.get("ok"),
+            result=payload,
+        )
+        return (
+            "Verifier SubAgent result JSON:\n"
+            f"{json.dumps(compact_json(payload), ensure_ascii=False, indent=2)}\n\n"
+            f"{self._local_context_for_prompt()}"
+            "Use this as a verifier verdict, not persistent state. Continue with exactly one JSON action: use_skill, "
+            "call_subagent, run_python, or finish."
+        )
+
+    def _record_evidence_packet(
+        self,
+        source: str,
+        packet: EvidencePacket,
+        *,
+        call_index: int | None = None,
+    ) -> None:
+        if packet.is_empty:
+            return
+        entry: dict[str, Any] = {
+            "source": source,
+            "packet": packet.to_json_dict(),
+        }
+        if call_index is not None:
+            entry["call_index"] = call_index
+        self._evidence_packets.append(entry)
+        self._evidence_timeline.append(
+            EvidenceTimelineItem.from_packet(
+                packet,
+                source=source,
+                subgoal_goal=self._task,
+                subgoal_postcondition=self._expected_postcondition,
+            ).to_json_dict()
+        )
+
+    def _append_local_context_note(self, note: str) -> None:
+        text = str(note or "").strip().replace("\n", " ")
+        if not text:
+            return
+        self._local_context_notes.append(text)
+        if len(self._local_context_notes) > 8:
+            self._local_context_notes = self._local_context_notes[-8:]
+
+    def _local_context_for_prompt(self) -> str:
+        if not self._local_context_notes:
+            return ""
+        lines = "\n".join(f"- {note}" for note in self._local_context_notes[-8:])
+        return (
+            "Local context updates from this Act sub-goal. Treat these as the freshest "
+            "working memory and reconcile later actions/verifier checks against them:\n"
+            f"{lines}\n\n"
         )
 
     def _feedback_message(self, execution: BlockExecutionResult) -> str | list:
@@ -195,10 +461,14 @@ class CodeAsPolicyAgent(CodingAgent):
             "use_skill if the next step needs different guidance, run_python for the next "
             "code block, or finish."
         )
-        obs = execution.observation
-        if obs and self._video_dir:
+        local_context = self._local_context_for_prompt()
+        if local_context:
+            text = f"{text}\n\n{local_context}"
+        if self._video_dir:
             try:
-                rgb = obs["agentview"]["images"]["rgb"]
+                rgb = _extract_feedback_rgb(execution.observation, self.observation_camera)
+                if rgb is None:
+                    return text
                 img_path = save_rgb(
                     self._video_dir / f"act_obs_latest.png", rgb
                 )
@@ -231,7 +501,26 @@ class CodeAsPolicyAgent(CodingAgent):
         stderr = (execution.stderr or "").strip()
         if not execution.ok and stderr:
             _log.info("turn %d: 报错 -> %s", turn_idx, stderr.splitlines()[-1][:300])
-        turns.append(TurnRecord(turn_idx, code, execution, None))
+        turns.append(TurnRecord(turn_idx, code, execution))
+        self._primitive_traces.extend(_primitive_traces_from_execution(turn_idx, execution, producer="act"))
+        calls = _state_changing_calls(code)
+        if calls and execution.ok:
+            self._append_local_context_note(
+                f"act:t{turn_idx} executed state-changing call(s): {', '.join(calls)}. "
+                "If the postcondition is not visually obvious, use the current observation "
+                "or call the Verifier before declaring success."
+            )
+        attempt = _attempt_from_execution(
+            turn_idx,
+            execution,
+            task=self._task,
+            clips=self._clips,
+        )
+        if attempt is not None:
+            self._attempt_records.append(attempt)
+        diagnosis = _diagnosis_from_failed_execution(turn_idx, execution)
+        if diagnosis is not None:
+            self._diagnoses.append(diagnosis)
 
     def _save_block_clip(self, turn_idx: int, execution: BlockExecutionResult) -> None:
         """有动作的 block 才存视频:把这一块产生的帧区间写成 ``turn_NN.mp4``。
@@ -279,6 +568,25 @@ class CodeAsPolicyAgent(CodingAgent):
     def _finalize(self, *, turns: list[Any], loaded: tuple[str, ...], terminal_raw: str | None) -> AgentTrace:
         success = terminal_raw is not None
         act_status = "finished" if success else "exhausted"
+        terminal_result = _parse_terminal_result(terminal_raw)
+        terminal_packet = EvidencePacket.from_any(
+            terminal_result,
+            default_source="act",
+            default_turn=f"subgoal:{self._task}",
+        )
+        terminal_artifacts = _extract_artifact_refs(terminal_result, default_producer="act")
+        if terminal_packet.artifact_refs:
+            terminal_artifacts = _merge_artifacts(terminal_artifacts, terminal_packet.artifact_refs)
+        terminal_traces = _extract_primitive_traces(terminal_result, default_producer="act")
+        terminal_attempts = _extract_attempt_records(terminal_result)
+        terminal_diagnoses = _extract_diagnoses(terminal_result)
+        terminal_verdict = _extract_local_verdict(terminal_result) or terminal_packet.verdict
+        if terminal_verdict is not None:
+            self._local_verdicts.append(terminal_verdict)
+        self._artifact_refs.extend(terminal_artifacts)
+        self._primitive_traces.extend(terminal_traces)
+        self._attempt_records.extend(terminal_attempts)
+        self._diagnoses.extend(terminal_diagnoses)
         unresolved = None
         if not success:
             unresolved = {
@@ -288,6 +596,31 @@ class CodeAsPolicyAgent(CodingAgent):
                 "last_state_summary": "Act exhausted its turn budget before finish.",
                 "suggested_recovery": "Re-plan from the current scene.",
             }
+            self._diagnoses.append(
+                _diagnosis_from_exhaustion(
+                    task=self._task,
+                    loaded=loaded,
+                    turns=turns,
+                )
+            )
+        terminal_evidence_entries = list(self._evidence_packets)
+        terminal_timeline_entries = list(self._evidence_timeline)
+        if not terminal_packet.is_empty:
+            terminal_entry = {
+                "source": "act:finish",
+                "packet": terminal_packet.to_json_dict(),
+            }
+            terminal_evidence_entries.append(terminal_entry)
+            terminal_timeline_entries.append(
+                EvidenceTimelineItem.from_packet(
+                    terminal_packet,
+                    source="act:finish",
+                    subgoal_goal=self._task,
+                    subgoal_postcondition=self._expected_postcondition,
+                    act_status=act_status,
+                    loaded_skill_ids=loaded,
+                ).to_json_dict()
+            )
         return AgentTrace(
             task=self._task,
             loaded_skill_ids=loaded,
@@ -298,5 +631,389 @@ class CodeAsPolicyAgent(CodingAgent):
                 "unresolved": unresolved,
                 "act_status": act_status,
                 "terminal_raw": terminal_raw,
+                "terminal_result": terminal_result,
+                "evidence_packets": tuple(terminal_evidence_entries),
+                "evidence_timeline": tuple(terminal_timeline_entries),
+                "subagent_calls": tuple(self._subagent_calls),
+                "artifact_refs": tuple(a.to_json_dict() for a in self._artifact_refs),
+                "primitive_traces": tuple(t.to_json_dict() for t in self._primitive_traces),
+                "attempt_records": tuple(a.to_json_dict() for a in self._attempt_records),
+                "diagnoses": tuple(d.to_json_dict() for d in self._diagnoses),
+                "local_verdicts": tuple(v.to_json_dict() for v in self._local_verdicts),
             },
         )
+
+
+def _primitive_traces_from_execution(turn_idx: int, execution: BlockExecutionResult, *, producer: str) -> list[PrimitiveTrace]:
+    traces: list[PrimitiveTrace] = []
+    block = execution.block
+    for i, event in enumerate(execution.trace_events or ()):
+        payload = dict(event.payload or {})
+        for j, raw in enumerate(payload.get("primitive_traces", ()) or ()):
+            parsed = PrimitiveTrace.from_any(
+                raw,
+                default_id=f"{producer}:t{turn_idx}:event{i}:primitive{j}",
+                default_producer=producer,
+            )
+            if parsed is not None:
+                traces.append(parsed)
+        if payload.get("primitive_traces"):
+            continue
+        traces.append(
+            PrimitiveTrace(
+                trace_id=f"{producer}:t{turn_idx}:event{i}",
+                primitive_name=event.event_type or "trace_event",
+                status=execution.status.value,
+                producer=producer,
+                block_name=event.block_name or block.name,
+                turn=turn_idx,
+                outputs_summary=payload,
+                error=execution.stderr if not execution.ok else "",
+            )
+        )
+    traces.append(
+        PrimitiveTrace(
+            trace_id=f"{producer}:t{turn_idx}:block",
+            primitive_name="run_python",
+            status=execution.status.value,
+            producer=producer,
+            block_name=block.name,
+            turn=turn_idx,
+            inputs_summary={
+                "intent": block.intent,
+                "line_count": block.code.count("\n") + 1,
+                "metadata": block.metadata,
+            },
+            outputs_summary={
+                "ok": execution.ok,
+                "reward": execution.reward,
+                "terminated": execution.terminated,
+                "truncated": execution.truncated,
+                "info": execution.info,
+            },
+            error=execution.stderr if not execution.ok else "",
+        )
+    )
+    return traces
+
+
+def _attempt_from_execution(
+    turn_idx: int,
+    execution: BlockExecutionResult,
+    *,
+    task: str,
+    clips: list[dict[str, Any]],
+) -> AttemptRecord | None:
+    calls = _state_changing_calls(execution.block.code)
+    if not calls:
+        return None
+    if execution.terminated:
+        outcome = "success"
+        confidence = 0.8
+    elif execution.ok:
+        outcome = "executed"
+        confidence = 0.5
+    else:
+        outcome = "failed"
+        confidence = 0.9
+    artifacts: list[WorkspaceArtifact] = []
+    for clip in clips:
+        if int(clip.get("turn", -1)) != turn_idx:
+            continue
+        path = str(clip.get("path") or "")
+        if path:
+            artifacts.append(
+                WorkspaceArtifact(
+                    artifact_id=f"act:t{turn_idx}:video",
+                    kind="video",
+                    path=path,
+                    producer="act",
+                    summary="Process video for this action block.",
+                )
+            )
+    reason = ""
+    if not execution.ok and execution.stderr:
+        reason = execution.stderr.strip().splitlines()[-1][:240]
+    return AttemptRecord(
+        attempt_id=f"act:t{turn_idx}:attempt",
+        object_key="",
+        strategy=execution.block.intent or ",".join(calls),
+        pose_or_target=compact_json(
+            {
+                "subgoal": task,
+                "state_changing_calls": list(calls),
+                "block": execution.block.name,
+                "info": execution.info,
+            },
+            max_depth=3,
+            max_items=8,
+            max_string=240,
+        ),
+        related_trace_ids=(f"act:t{turn_idx}:block",),
+        outcome=outcome,
+        failure_reason=reason,
+        recommended_repair=(
+            "Inspect current observation and avoid repeating the same physical block "
+            "unless evidence shows the scene or candidate changed."
+            if outcome == "failed"
+            else ""
+        ),
+        confidence=confidence,
+        artifact_refs=tuple(artifacts),
+    )
+
+
+def _diagnosis_from_failed_execution(turn_idx: int, execution: BlockExecutionResult) -> Diagnosis | None:
+    if execution.ok:
+        return None
+    reason = execution.stderr.strip().splitlines()[-1][:300] if execution.stderr else "execution failed"
+    return Diagnosis(
+        diagnosis_id=f"act:t{turn_idx}:diagnosis",
+        failed_primitive="run_python",
+        failure_type="execution_error",
+        evidence_trace_ids=(f"act:t{turn_idx}:block",),
+        next_route="Repair the code or choose a different candidate before retrying.",
+        confidence=0.9,
+        reason=reason,
+    )
+
+
+def _diagnosis_from_exhaustion(
+    *,
+    task: str,
+    loaded: tuple[str, ...],
+    turns: list[Any],
+) -> Diagnosis:
+    last_turn = turns[-1] if turns else None
+    evidence_trace_ids = (f"act:t{last_turn.turn}:block",) if last_turn is not None else ()
+    reason = "Act exhausted its action budget before finish."
+    if last_turn is not None:
+        stderr = (last_turn.execution.stderr or "").strip()
+        stdout = (last_turn.execution.stdout or "").strip()
+        if stderr:
+            reason = stderr.splitlines()[-1][:300]
+        elif stdout:
+            reason = stdout[-300:]
+    route = "Re-plan from the current scene."
+    if loaded:
+        route += f" Previously loaded skills: {', '.join(loaded)}."
+    last_turn_id = last_turn.turn if last_turn is not None else "none"
+    return Diagnosis(
+        diagnosis_id=f"act:subgoal_exhausted:t{last_turn_id}",
+        failed_primitive="subgoal",
+        failure_type="action_budget_exhausted",
+        evidence_trace_ids=evidence_trace_ids,
+        next_route=route,
+        confidence=0.7,
+        reason=f"{task}: {reason}",
+    )
+
+
+def _result_payload(raw: dict[str, Any]) -> dict[str, Any]:
+    result = raw.get("result")
+    if isinstance(result, dict):
+        return {**result, **{k: v for k, v in raw.items() if k != "result"}}
+    return raw
+
+
+def _merge_artifacts(
+    *groups: tuple[WorkspaceArtifact, ...],
+) -> tuple[WorkspaceArtifact, ...]:
+    seen: set[str] = set()
+    out: list[WorkspaceArtifact] = []
+    for group in groups:
+        for artifact in group:
+            key = artifact.artifact_id
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(artifact)
+    return tuple(out)
+
+
+def _extract_artifact_refs(raw: dict[str, Any], *, default_producer: str = "") -> tuple[WorkspaceArtifact, ...]:
+    payload = _result_payload(raw)
+    items: list[Any] = []
+    for key in ("artifact_refs", "artifacts"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            items.extend({"artifact_id": k, "path": v, "kind": k} for k, v in value.items())
+        elif isinstance(value, (list, tuple)):
+            items.extend(value)
+    artifacts: list[WorkspaceArtifact] = []
+    for item in items:
+        artifact = WorkspaceArtifact.from_any(item, default_producer=default_producer)
+        if artifact is not None:
+            artifacts.append(artifact)
+    return tuple(artifacts)
+
+
+def _extract_primitive_traces(raw: dict[str, Any], *, default_producer: str = "") -> tuple[PrimitiveTrace, ...]:
+    payload = _result_payload(raw)
+    traces: list[PrimitiveTrace] = []
+    for i, item in enumerate(payload.get("primitive_traces", ()) or payload.get("traces", ()) or ()):
+        trace = PrimitiveTrace.from_any(item, default_id=f"{default_producer}:trace:{i}", default_producer=default_producer)
+        if trace is not None:
+            traces.append(trace)
+    return tuple(traces)
+
+
+def _extract_attempt_records(raw: dict[str, Any]) -> tuple[AttemptRecord, ...]:
+    payload = _result_payload(raw)
+    attempts: list[AttemptRecord] = []
+    for i, item in enumerate(payload.get("attempt_records", ()) or payload.get("attempts", ()) or ()):
+        attempt = AttemptRecord.from_any(item, default_id=f"attempt:{i}")
+        if attempt is not None:
+            attempts.append(attempt)
+    return tuple(attempts)
+
+
+def _extract_diagnoses(raw: dict[str, Any]) -> tuple[Diagnosis, ...]:
+    payload = _result_payload(raw)
+    items = payload.get("diagnoses")
+    if items is None and isinstance(payload.get("diagnosis"), dict):
+        items = [payload["diagnosis"]]
+    diagnoses: list[Diagnosis] = []
+    for i, item in enumerate(items or ()):
+        diagnosis = Diagnosis.from_any(item, default_id=f"diagnosis:{i}")
+        if diagnosis is not None:
+            diagnoses.append(diagnosis)
+    return tuple(diagnoses)
+
+
+def _extract_local_verdict(raw: dict[str, Any]) -> LocalVerdict | None:
+    payload = _result_payload(raw)
+    for key in ("local_verdict", "verdict"):
+        verdict = LocalVerdict.from_any(payload.get(key))
+        if verdict is not None:
+            return verdict
+    return LocalVerdict.from_any(payload)
+
+
+_VERIFY_INTENT_WORDS = (
+    "verify",
+    "check",
+    "diagnose",
+    "diagnosis",
+    "review",
+    "inspect",
+    "confirm",
+    "whether",
+    "judge",
+    "classify",
+    "is ",
+    "are ",
+    "是否",
+    "验证",
+    "检查",
+    "诊断",
+    "判断",
+)
+
+_GENERATION_INTENT_WORDS = (
+    "localize",
+    "locate",
+    "ground",
+    "segment",
+    "detect",
+    "propose",
+    "generate",
+    "compute",
+    "estimate",
+    "plan a grasp",
+    "grasp candidate",
+    "affordance",
+    "placement affordance",
+    "placement point",
+    "place point",
+    "motion plan",
+    "find grasp",
+    "find placement",
+    "定位",
+    "分割",
+    "检测",
+    "生成",
+    "计算",
+    "规划",
+    "候选",
+    "抓取点",
+    "放置点",
+)
+
+
+def _looks_like_verifier_request(task: str) -> bool:
+    text = f" {task.strip().lower()} "
+    if not text.strip():
+        return False
+    has_verify = any(word in text for word in _VERIFY_INTENT_WORDS)
+    has_generation = any(word in text for word in _GENERATION_INTENT_WORDS)
+    if has_verify:
+        return True
+    return not has_generation
+
+
+def _opens_gripper_after_home(code: str) -> bool:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    calls.sort(key=lambda n: (getattr(n, "lineno", 0), getattr(n, "col_offset", 0)))
+    saw_home = False
+    for node in calls:
+        name = _call_name(node.func)
+        if name == "goto_home_joint_position":
+            saw_home = True
+        elif name == "open_gripper" and saw_home:
+            return True
+    return False
+
+
+def _state_changing_calls(code: str) -> tuple[str, ...]:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return ()
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_name(node.func)
+        if name in _STATE_CHANGING_API_CALLS:
+            names.add(name)
+    return tuple(sorted(names))
+
+
+def _parse_terminal_result(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {}
+    data = parse_action_payload(raw)
+    if data is None:
+        return {"claim": raw}
+    if not isinstance(data, dict):
+        return {"raw": data}
+    args = data.get("args")
+    if isinstance(args, dict):
+        result = args.get("result")
+        base = {
+            key: value
+            for key, value in args.items()
+            if key in {"claim", "state_patch", "uncertainty", "recommended_next", "error", "ok"}
+        }
+        if isinstance(result, dict):
+            return {**result, **base}
+        return dict(args)
+    return data
+
+
+def _call_name(func: ast.AST) -> str:
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return ""
+
+
+def _slug(text: str, *, max_len: int = 40) -> str:
+    slug = re.sub(r"[^0-9A-Za-z]+", "_", text.strip().lower()).strip("_")
+    return slug[:max_len].strip("_") or "task"

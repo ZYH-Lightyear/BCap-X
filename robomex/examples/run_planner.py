@@ -1,7 +1,7 @@
 """离线两层 demo:反应式 ReactivePlanner -> 内层 Code Agent,逐步推进。
 
-展示外层 planner 在高层(复合)技能菜单上给出**下一个** sub-goal,再由
-``TwoLevelAgent`` 通过内层 ``CodeAsPolicyAgent`` 执行它,如此循环直到 planner 说 DONE。
+展示外层 planner 参考 task 技能指导给出**下一个自然语言** sub-goal,再由
+``TwoLevelAgent`` 通过内层 ``CodeAsPolicyAgent`` 自主选技能执行它,如此循环直到 planner 说 DONE。
 全部是脚本/mock(无 env、LLM 或网络)。
 
 要跑真机:把 ``ScriptedPlannerPolicy`` 换成 ``LLMPlannerPolicy``,``MockExecutor``
@@ -24,9 +24,8 @@ from robomex.skills import SkillLibrary, load_builtin_skills
 # planner LLM 针对 "pick up the black bowl" 会给出的一个反应式步骤,之后 DONE
 #(脚本回复用尽后自动返回 DONE)。
 PLANNER_REPLIES = [
-    '{"goal": "pick up the black bowl from the table", '
-    '"skill": "pick_object", '
-    '"postcondition": "the black bowl is held in the closed gripper"}',
+    "Goal: pick up the black bowl from the table\n"
+    "Postcondition: the black bowl is held in the closed gripper",
 ]
 
 
@@ -55,14 +54,17 @@ def main() -> None:
             library.admit(skill, source="builtin")
 
         planner = ReactivePlanner(library, ScriptedPlannerPolicy(PLANNER_REPLIES))
-        print("capability menu (high-level skills):")
+        print("task skill guidance:")
         print(planner.menu())
 
         task = "pick up the black bowl"
         # 内层每个 sub-goal 产出一个代码块;随后 MockExecutor 直接终止它。
         inner = CodeAsPolicyAgent(
             executor=MockExecutor(),
-            policy=ScriptedCodePolicy(["```python\nobs = get_observation()\n```"]),
+            policy=ScriptedCodePolicy([
+                '{"tool":"use_skill","args":{"name":"pick_object"}}',
+                '{"tool":"run_python","args":{"code":"obs = get_observation()","intent":"inspect scene"}}',
+            ]),
             library=library,
         )
         execution = TwoLevelAgent(planner, inner).run(task)
@@ -70,8 +72,8 @@ def main() -> None:
         print(f"\nexecution success={execution.success}")
         for r in execution.results:
             flag = "OK  " if r.success else "FAIL"
-            print(f"  [{flag}] {r.subgoal.goal}  (skill={r.subgoal.skill}, "
-                  f"inner turns={len(r.trace.turns)}, loaded={list(r.trace.loaded_skill_ids)})")
+            print(f"  [{flag}] {r.subgoal.goal}  "
+                  f"(inner turns={len(r.trace.turns)}, loaded={list(r.trace.loaded_skill_ids)})")
 
 
 if __name__ == "__main__":

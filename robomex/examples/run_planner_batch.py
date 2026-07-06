@@ -57,7 +57,15 @@ from typing import Any
 
 import tyro
 
-from robomex.examples.run_planner_live import LiveArgs, _task_language, run_episode
+from robomex.examples.run_planner_live import (
+    DEFAULT_MAX_SUBGOALS,
+    DEFAULT_SCENE_CAMERA,
+    DEFAULT_SUBAGENT_MAX_TURNS,
+    LiveArgs,
+    _runtime_settings,
+    _task_language,
+    run_episode,
+)
 
 
 @dataclass
@@ -78,6 +86,18 @@ class BatchArgs:
 
     max_turns: int = 6
     """每个 sub-goal 内层最多执行多少个 python action block; use_skill 不计入。"""
+
+    max_subgoals: int = DEFAULT_MAX_SUBGOALS
+    """外层 planner 最多拆分多少个 sub-goal;传给单 episode runtime。"""
+
+    subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS
+    """每次 SubAgent 委托最多多少个 run_python action block。"""
+
+    scene_camera: str = DEFAULT_SCENE_CAMERA
+    """保存给 planner 看的场景图相机名;空值表示从 observation 自动选择。"""
+
+    act_observation_camera: str = ""
+    """Act 取 OBS_BEFORE/反馈图的相机名;空值表示跟随 scene_camera。"""
 
     output_dir: str = "./outputs/robomex_planner_batch"
     """本次批量评测产物根目录;其下建时间戳子目录,再按 suite/task/trial 分层。"""
@@ -119,6 +139,10 @@ def _to_live_args(args: BatchArgs) -> LiveArgs:
         server_url=args.server_url,
         api_key=args.api_key,
         max_turns=args.max_turns,
+        max_subgoals=args.max_subgoals,
+        subagent_max_turns=args.subagent_max_turns,
+        scene_camera=args.scene_camera,
+        act_observation_camera=args.act_observation_camera,
         output_dir=args.output_dir,
     )
 
@@ -616,6 +640,7 @@ def _dump_batch_summary(
 ) -> dict[str, Any]:
     """写 ``batch_summary.json``:整体聚合 + 每 task 明细 + 全部 trial 扁平记录。"""
 
+    runtime = _runtime_settings(_to_live_args(args))
     summary = {
         "config_path": args.config_path,
         "model": args.model,
@@ -624,6 +649,19 @@ def _dump_batch_summary(
         "trials_per_task": args.trials_per_task,
         "start_trial": args.start_trial,
         "num_workers": args.num_workers,
+        "runtime": {
+            "max_turns": args.max_turns,
+            "max_subgoals": runtime.max_subgoals,
+            "subagent_max_turns": runtime.subagent_max_turns,
+            "scene_camera": runtime.scene_camera,
+            "act_observation_camera": runtime.act_observation_camera,
+            "prompt_api_names": sorted(runtime.prompt_api_names),
+            "subagent_denied_calls": (
+                sorted(runtime.subagent_denied_calls)
+                if runtime.subagent_denied_calls is not None
+                else None
+            ),
+        },
         "elapsed_s": round(elapsed, 1),
         "overall": _aggregate(all_records),
         "per_task": per_task,

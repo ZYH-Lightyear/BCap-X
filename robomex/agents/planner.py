@@ -1,8 +1,8 @@
 """外层反应式 planner:任务 + 当前场景 -> 逐步给出**下一个** sub-goal。
 
 planner 刻意做得很薄(grounding 比 planning 更重要)。每一步它读取任务、*当前*场景图、
-高层(复合)技能的规划指导、以及已完成的 sub-goals,然后做一次 LLM 调用,返回单个
-自然语言 sub-goal(一个 JSON 对象)——或在任务完成时返回 ``DONE``。内层 Code Agent
+task 技能的规划指导、以及已完成的 sub-goals,然后做一次 LLM 调用,返回单个
+Markdown 两字段 sub-goal——或在任务完成时返回 ``DONE``。内层 Code Agent
 再根据这个 sub-goal 自主选择并组合技能,场景随之刷新,再次询问 planner。
 
 这个反应式循环取代了旧的“一次性把整张 To-Do 表规划出来”设计:每步都在实时场景上
@@ -11,7 +11,6 @@ planner 刻意做得很薄(grounding 比 planning 更重要)。每一步它读�
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,43 +27,44 @@ _log = get_logger("planner")
 
 _SYSTEM_PROMPT = (
     "You are a reactive robot task planner. Given a task, the current scene image, the "
-    "high-level skill guidance, and a concise execution history, first assess the CURRENT "
+    "task skill guidance, and a concise execution history, first assess the CURRENT "
     "scene state, then decide the SINGLE next natural-language sub-goal to do now. The "
-    "high-level skills are planning "
+    "task skills are planning "
     "patterns that help you choose the right granularity; do NOT merely name a skill or "
     "force the executor into one skill. "
     "Always inspect the current scene image before planning another manipulation. If the "
     "task goal is already visually satisfied, reply with exactly DONE. Do not repeat a "
     "pick/place just because a prior checkpoint was uncertain; uncertainty is not observed "
     "failure. "
-    'Reply with ONLY one JSON object with keys: "goal" (the concrete imperative next '
-    'sub-goal) and "postcondition" (a single visually-checkable condition that means it '
-    "succeeded). "
+    "If the task is not complete, reply with exactly two Markdown-style fields and no "
+    "extra prose:\n"
+    "Goal: <the concrete imperative next sub-goal>\n"
+    "Postcondition: <one visually-checkable condition that means it succeeded>\n"
     "If the task is already complete, reply with exactly the word DONE and nothing else."
 )
 
-_JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
+_MD_FIELD_RE = re.compile(
+    r"^\s*Goal\s*:\s*(?P<goal>.+?)(?:\n+\s*Postcondition\s*:\s*(?P<postcondition>.+))?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 @dataclass(frozen=True)
 class SubGoal:
     """一个反应式步骤:一个自然语言 sub-goal,外加“如何判断它成功了”。
-
-    ``skill`` 只为兼容旧 planner 回复/产物保留;新 planner prompt 不再要求它,
-    执行器也不会被该字段强制绑定到某个高层技能。
     """
 
     goal: str
     postcondition: str = ""
-    skill: str | None = None
 
 
 @dataclass(frozen=True)
 class SubGoalResult:
     """通过内层 Code Agent 执行一个 sub-goal 的结果。
 
-    ``note`` 为子目标级验证器给出的裁决理由(若有),会喂回 planner 历史,让反应式
-    planner 据此重试 / 改写 / 推进。
+    ``success`` 表示 Act 是否完成了这次 sub-goal 尝试并把控制权交回 Planner,
+    不是物理任务已经成功的证明。``note`` 是 Act 返回给 planner 的短反馈,
+    让反应式 planner 据此重试 / 改写 / 推进。
     """
 
     subgoal: SubGoal
@@ -84,7 +84,7 @@ class PlanExecution:
 
 
 class PlannerPolicy(Protocol):
-    """把 chat 形式的 prompt 变成 planner 的原始回复(一个 JSON 对象或 DONE)。"""
+    """把 chat 形式的 prompt 变成 planner 的原始回复(Markdown fields or DONE)。"""
 
     def propose(self, prompt: list[dict]) -> str: ...
 
@@ -128,19 +128,20 @@ class LLMPlannerPolicy:
                     "role": "user",
                     "content": (
                         "Your previous response contained no visible content. "
-                        "Reply now with either DONE or one JSON object containing the next sub-goal. "
+                        "Reply now with either DONE or two fields: "
+                        "Goal: <next sub-goal> and Postcondition: <visual success condition>. "
                         "Do not leave the message empty."
                     ),
                 },
             ]
-            print("[LLMPlannerPolicy] empty model content; retrying once with an explicit planner nudge")
+            _log.warning("empty model content; retrying once with an explicit planner nudge")
         return ""
 
 
 class ScriptedPlannerPolicy:
     """回放一组固定回复(每步一个),用尽后返回 ``DONE``。
 
-    用于反应式循环的离线运行和测试:每个预期步骤传入一个回复(JSON 对象字符串),
+    用于反应式循环的离线运行和测试:每个预期步骤传入一个 Markdown/DONE 回复,
     策略按序返回;序列用尽后返回 ``DONE`` 让循环终止。
     """
 
@@ -159,26 +160,51 @@ class ScriptedPlannerPolicy:
 def parse_next_subgoal(text: str) -> SubGoal | None:
     """把一条 planner 回复解析成下一个 SubGoal;DONE/空 则返回 ``None``。
 
-    含 ``goal`` 的 JSON 对象优先;否则 ``DONE``(或无法解析的回复)表示没有下一个
-    sub-goal。
+    Planner 的首选格式是轻量 Markdown 两字段::
+
+        Goal: ...
+        Postcondition: ...
+
+    严格 ``DONE`` 表示没有下一个 sub-goal。非空但不合首选格式的回复会作为自然语言
+    sub-goal 交给 Act,不能静默当作 DONE。
     """
 
-    match = _JSON_OBJ_RE.search(text or "")
-    if match:
-        try:
-            item = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            item = None
-        if isinstance(item, dict):
-            goal = str(item.get("goal") or item.get("goal_text") or "").strip()
-            if goal:
-                skill = item.get("skill") or item.get("skill_hint")
-                return SubGoal(
-                    goal=goal,
-                    postcondition=str(item.get("postcondition", "") or ""),
-                    skill=str(skill) if skill else None,
-                )
-    return None
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+    if stripped.upper() == "DONE":
+        return None
+
+    md = _parse_markdown_subgoal(stripped)
+    if md is not None:
+        return md
+
+    return SubGoal(goal=stripped)
+
+
+def _parse_markdown_subgoal(text: str) -> SubGoal | None:
+    if not re.match(r"^\s*Goal\s*:", text, re.IGNORECASE):
+        starts = list(re.finditer(r"(?im)^\s*Goal\s*:", text))
+        if starts:
+            text = text[starts[-1].start():].strip()
+    match = _MD_FIELD_RE.match(text)
+    if not match:
+        return None
+    goal = _clean_markdown_field(match.group("goal"))
+    postcondition = _clean_markdown_field(match.group("postcondition") or "")
+    if not goal:
+        return None
+    return SubGoal(goal=goal, postcondition=postcondition)
+
+
+def _clean_markdown_field(value: str) -> str:
+    lines = [line.strip() for line in str(value or "").strip().splitlines()]
+    cleaned: list[str] = []
+    for line in lines:
+        if re.match(r"^(Goal|Postcondition)\s*:", line, re.IGNORECASE):
+            break
+        cleaned.append(line)
+    return " ".join(line for line in cleaned if line).strip()
 
 
 def _image_part(path: str) -> dict:
@@ -192,16 +218,17 @@ def _render_history(history: list[SubGoalResult]) -> str:
     for i, r in enumerate(history, start=1):
         meta = r.trace.metadata or {}
         act_status = meta.get("act_status") or ("finished" if r.success else "stopped")
-        unresolved = meta.get("unresolved") if isinstance(meta, dict) else None
-        note = ""
-        if isinstance(unresolved, dict):
-            note = str(unresolved.get("last_state_summary", "")).strip().replace("\n", " ")
-            if len(note) > 180:
-                note = note[:177].rstrip() + "..."
+        terminal = meta.get("terminal_result") if isinstance(meta, dict) else None
+        claim = ""
+        if isinstance(terminal, dict):
+            claim = str(terminal.get("claim", "")).strip().replace("\n", " ")
+            if len(claim) > 180:
+                claim = claim[:177].rstrip() + "..."
         skills = ", ".join(r.trace.loaded_skill_ids) or "none"
         lines.append(
             f"{i}. {r.subgoal.goal}: Act {act_status}; skills: {skills}"
-            + (f"; note: {note}." if note else ".")
+            + (f"; claim: {claim}" if claim else "")
+            + "."
         )
     return "\n".join(lines)
 
@@ -221,16 +248,16 @@ class ReactivePlanner:
         self.last_raw: str = ""  # 最近一次 planner 原始回复(供入口落盘/排查)
 
     def menu(self) -> str:
-        """高层技能规划指导:每个复合技能的 id + 用途。
+        """高层技能规划指导:每个 task 技能的 id + 用途。
 
         Planner 只用它们校准 sub-goal 粒度与常见任务模式;它输出的是自然语言
         sub-goal,不是必须绑定给 executor 的技能函数名。
         """
 
         lines = []
-        for record in self.library.compound_skills():
+        for record in self.library.task_skills():
             lines.append(f"- {record.skill_id}: {record.skill.description}")
-        return "\n".join(lines) or "(no high-level skill guidance available)"
+        return "\n".join(lines) or "(no task skill guidance available)"
 
     def next_subgoal(
         self,
@@ -250,8 +277,11 @@ class ReactivePlanner:
                 f"Execution history (most recent last; checkpoint uncertainty is not failure):\n"
                 f"{_render_history(history)}\n\n"
                 "The current scene image is attached below when available. First decide whether "
-                "the task is already visually complete from the current scene and history. "
-                "Output DONE if complete; otherwise output the single next sub-goal now."
+                "the task is already visually complete from the current scene and execution history. "
+                "Do not repeat a pick/place solely because a previous checkpoint was uncertain; "
+                "use a natural next sub-goal grounded in the current scene image. "
+                "Output DONE if complete; otherwise output exactly two fields: "
+                "Goal: <next sub-goal> and Postcondition: <visual success condition>."
             ),
         }]
         if scene_image_path:
@@ -291,9 +321,11 @@ class TwoLevelAgent:
         observation_summary: str = "",
     ) -> PlanExecution:
         results: list[SubGoalResult] = []
+        planner_done = False
         for _ in range(self.max_subgoals):
             sg = self.planner.next_subgoal(task, results, scene_image_path)
             if sg is None:
+                planner_done = self.planner.last_raw.strip().upper() == "DONE"
                 break
             trace = self.inner.run(
                 sg.goal,
@@ -301,10 +333,9 @@ class TwoLevelAgent:
                 scene_image_path=scene_image_path,
             )
             results.append(SubGoalResult(subgoal=sg, trace=trace, success=trace.success))
-        success = bool(results) and all(r.success for r in results)
         return PlanExecution(
             task=task,
             subgoals=tuple(r.subgoal for r in results),
             results=tuple(results),
-            success=success,
+            success=planner_done,
         )

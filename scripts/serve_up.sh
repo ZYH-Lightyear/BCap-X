@@ -59,6 +59,10 @@ LLM_PORT="${LLM_PORT:-8110}"
 LLM_BASE_URL="${LLM_BASE_URL:-${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1/}}"
 LLM_REASONING_EFFORT="${LLM_REASONING_EFFORT:-low}"
 LLM_TIMEOUT_S="${LLM_TIMEOUT_S:-600}"
+# Multi-upstream routing: when set, the proxy serves several backends at once,
+# routed by model prefix (openrouter/... vs vapi/...). Keys are resolved by the
+# proxy itself from .env / key files, so no key needs baking into the command.
+LLM_ROUTES_FILE="${LLM_ROUTES_FILE:-}"
 KEY_FILE="${KEY_FILE:-${OPENROUTER_KEY_FILE:-.openrouterkey}}"
 LOG_DIR="${LOG_DIR:-./logs/servers}"
 # Virtualenv to run inside. .venv-libero is the complete env (torch + sam3 +
@@ -78,13 +82,20 @@ if [ -n "${LLM_API_KEY_ENV:-}" ]; then
     LLM_API_KEY="${!LLM_API_KEY_ENV:-${LLM_API_KEY:-}}"
 fi
 
-if [ -z "${LLM_API_KEY:-}" ] && [ ! -f "$KEY_FILE" ]; then
-    echo "ERROR: neither LLM_API_KEY nor key file '$KEY_FILE' is available"
-    echo "       Set LLM_API_KEY, or LLM_API_KEY_ENV=YOUR_ENV_VAR with that env var exported,"
-    echo "       or provide KEY_FILE=.openrouterkey."
+# Routes-file mode resolves keys inside the proxy (from .env / key files), so the
+# single-key requirement only applies to legacy single-upstream mode.
+if [ -z "$LLM_ROUTES_FILE" ]; then
+    if [ -z "${LLM_API_KEY:-}" ] && [ ! -f "$KEY_FILE" ]; then
+        echo "ERROR: neither LLM_API_KEY nor key file '$KEY_FILE' is available"
+        echo "       Set LLM_API_KEY, or LLM_API_KEY_ENV=YOUR_ENV_VAR with that env var exported,"
+        echo "       or provide KEY_FILE=.openrouterkey."
+        exit 1
+    fi
+    export LLM_API_KEY
+elif [ ! -f "$LLM_ROUTES_FILE" ]; then
+    echo "ERROR: LLM_ROUTES_FILE='$LLM_ROUTES_FILE' not found"
     exit 1
 fi
-export LLM_API_KEY
 
 if tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "session '$SESSION' already running -> tmux attach -t $SESSION"
@@ -94,22 +105,31 @@ fi
 mkdir -p "$LOG_DIR"
 
 # Each tmux window is a fresh login-less shell with none of our env, so cd to
-# the repo, re-source the persistent uv toolchain, and activate the LIBERO venv.
-PREP="cd $REPO_ROOT && source scripts/env.sh && source $VENV/bin/activate"
+# the repo, re-source the persistent uv toolchain, load repo-local secrets, and
+# activate the LIBERO venv. ``set -a`` exports keys from .env without embedding
+# their values in the tmux command line.
+PREP="cd $REPO_ROOT && source scripts/env.sh && if [ -f .env ]; then set -a && source .env && set +a; fi && source $VENV/bin/activate"
 
-# Bake the resolved key directly into the tmux command (safely quoted). The
-# tmux pane is a fresh shell that does NOT inherit LLM_API_KEY from us, so a
-# literal "$LLM_API_KEY" would expand to empty there and the upstream rejects
-# the request with 401 "no token provided".
-if [ -n "${LLM_API_KEY:-}" ]; then
-    LLM_AUTH_ARGS="--api-key $(printf '%q' "$LLM_API_KEY")"
+# Build the proxy launch args. In routes-file mode the proxy reads its own keys
+# (from .env / key files) and routes by model prefix; the single-upstream args
+# (key/base-url/effort) are then irrelevant. In legacy mode, bake the resolved
+# key directly into the command (safely quoted) -- the tmux pane is a fresh shell
+# that does NOT inherit LLM_API_KEY, so a literal "$LLM_API_KEY" would expand to
+# empty there and the upstream rejects the request with 401 "no token provided".
+if [ -n "$LLM_ROUTES_FILE" ]; then
+    LLM_PROXY_ARGS="--routes-file $(printf '%q' "$LLM_ROUTES_FILE")"
 else
-    LLM_AUTH_ARGS="--key-file $KEY_FILE"
+    if [ -n "${LLM_API_KEY:-}" ]; then
+        LLM_AUTH_ARGS="--api-key $(printf '%q' "$LLM_API_KEY")"
+    else
+        LLM_AUTH_ARGS="--key-file $KEY_FILE"
+    fi
+    LLM_PROXY_ARGS="$LLM_AUTH_ARGS --base-url $LLM_BASE_URL --reasoning-effort $LLM_REASONING_EFFORT"
 fi
 
 tmux new-session -d -s "$SESSION" -n proxy
 tmux send-keys -t "$SESSION:proxy" \
-    "$PREP && $RUN python -m capx.serving.openrouter_server $LLM_AUTH_ARGS --base-url $LLM_BASE_URL --host 0.0.0.0 --port $LLM_PORT --reasoning-effort $LLM_REASONING_EFFORT --timeout-s $LLM_TIMEOUT_S" C-m
+    "$PREP && $RUN python -m capx.serving.openrouter_server $LLM_PROXY_ARGS --dotenv-path .env --host 0.0.0.0 --port $LLM_PORT --timeout-s $LLM_TIMEOUT_S" C-m
 
 tmux new-window -t "$SESSION" -n gpu
 tmux send-keys -t "$SESSION:gpu" \

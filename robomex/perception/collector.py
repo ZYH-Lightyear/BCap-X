@@ -1,8 +1,7 @@
 """从 CapX 式观测中,按块采集多模态证据。
 
-Phase 1 范围:agentview 的 before/after RGB 快照,外加合成的对比渲染图
-(gate-3 效果验证)。gate-1 的产物采集(mask、抓取候选)以后通过同一套 bundle
-结构接入。
+Collector 保存执行前后的 RGB 快照和合成对比图。调用方可以指定相机;未指定时
+自动选择 observation 里第一个带 RGB 图像的相机。
 """
 
 from __future__ import annotations
@@ -21,20 +20,24 @@ from robomex.perception.evidence import (
 from robomex.perception.render import render_before_after, save_rgb
 
 
-def _extract_rgb(observation: dict[str, Any] | None, camera: str) -> np.ndarray | None:
+def _extract_rgb(observation: dict[str, Any] | None, camera: str | None) -> np.ndarray | None:
     if not observation:
         return None
-    try:
-        rgb = observation[camera]["images"]["rgb"]
-    except (KeyError, TypeError):
-        return None
-    return np.asarray(rgb)
+    if camera:
+        try:
+            return np.asarray(observation[camera]["images"]["rgb"])
+        except (KeyError, TypeError):
+            return None
+    for cam in observation.values():
+        if isinstance(cam, dict) and isinstance(cam.get("images"), dict) and "rgb" in cam["images"]:
+            return np.asarray(cam["images"]["rgb"])
+    return None
 
 
 class EvidenceCollector:
     """按块把证据图持久化到 ``output_dir/<block_name>/`` 下。"""
 
-    def __init__(self, output_dir: str | Path, camera: str = "agentview") -> None:
+    def __init__(self, output_dir: str | Path, camera: str | None = None) -> None:
         self.output_dir = Path(output_dir)
         self.camera = camera
 
@@ -71,9 +74,9 @@ class EvidenceCollector:
             artifacts.append(EvidenceArtifact(
                 artifact_id=f"{block_name}_before_after",
                 kind=EvidenceKind.RGB,
-                role=EvidenceRole.VERIFICATION_CUE,
+                role=EvidenceRole.REVIEW_CUE,
                 path=save_rgb(block_dir / "before_after.png", combined),
-                description="Side-by-side BEFORE/AFTER comparison for effect verification.",
+                description="Side-by-side BEFORE/AFTER comparison for debugging and review.",
             ))
 
         return MultimodalEvidenceBundle(

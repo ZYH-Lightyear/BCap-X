@@ -172,14 +172,16 @@ class FrankaLiberoEnv(BaseEnv):
         self._step_count = 0
         self._sim_step_count = 0
 
-        self._current_joints = self.handle.env.sim.data.qpos[:7].copy()
-        self.home_joint_position = np.array(libero_obs["robot0_joint_pos"], dtype=np.float64)
+        self._current_joints = self._current_arm_joint_positions()
         self._gripper_fraction = 1.0
 
         # Post-reset settling: let physics stabilize (objects drop, joints settle).
-        # 10 steps suffice — joints converge by step ~5.
+        # Record the home joint target after settling; the raw reset observation can
+        # differ slightly from the stable controller state.
         for _ in range(10):
             self._step_once()
+        self._current_joints = self._current_arm_joint_positions()
+        self.home_joint_position = self._current_joints.copy()
 
         obs = self.get_observation()
         self.gripper_link_wxyz_xyz = np.concatenate(
@@ -209,25 +211,38 @@ class FrankaLiberoEnv(BaseEnv):
 
     # ----------------------- FrankaControlApi Interface -----------------------
 
+    def _current_arm_joint_positions(self) -> np.ndarray:
+        return np.array(
+            self.handle.env.sim.data.qpos[self._panda_joint_qpos_addrs],
+            dtype=np.float64,
+        )
+
     def move_to_joints_blocking(
-        self, joints: np.ndarray, *, tolerance: float = 0.01, max_steps: int = 120
-    ) -> None:
+        self,
+        joints: np.ndarray,
+        *,
+        tolerance: float = 0.01,
+        max_steps: int = 120,
+        settle_steps: int = 0,
+        strict: bool = False,
+    ) -> dict[str, Any]:
         """Move to target joint positions using LIBERO's controller.
 
         Args:
             joints: (7,) target joint positions in radians
             tolerance: Position tolerance for convergence
             max_steps: Maximum simulation steps to reach target
+            settle_steps: Extra target-holding steps after convergence
+            strict: Raise if final joint error remains above tolerance
         """
         target = np.asarray(joints, dtype=np.float64).reshape(7)
         self._current_joints = target
 
         steps = 0
+        final_error = float("inf")
         while steps < max_steps:
             # Get current joint positions
-            current = np.array(
-                self.handle.env.sim.data.qpos[self._panda_joint_qpos_addrs], dtype=np.float64
-            )
+            current = self._current_arm_joint_positions()
 
             # Check convergence (but step at least once)
             error = np.linalg.norm(current - target)
@@ -263,6 +278,51 @@ class FrankaLiberoEnv(BaseEnv):
                 self._record_frame()
 
             steps += 1
+            final_error = float(np.linalg.norm(self._current_arm_joint_positions() - target))
+
+        final_error = float(np.linalg.norm(self._current_arm_joint_positions() - target))
+        if final_error < tolerance:
+            for _ in range(max(0, int(settle_steps))):
+                current = self._current_arm_joint_positions()
+                delta = (target - current) * self._control_freq
+                action = np.concatenate([delta, [self._gripper_fraction]])
+                action[-1] = 1.0 - action[-1] * 2.0
+                self._current_obs, self._current_reward, self._current_done, self._current_info = (
+                    self.handle.step(action)
+                )
+                self._sim_step_count += 1
+                steps += 1
+                self.gripper_link_wxyz_xyz = np.concatenate(
+                    [
+                        self.handle.env.sim.data.xquat[self.gripper_link_idx],
+                        self.handle.env.sim.data.xpos[self.gripper_link_idx],
+                    ]
+                )
+                if self.viser_debug and self._sim_step_count % self._subsample_rate == 0:
+                    if self._sim_step_count % self._full_viser_rate == 0:
+                        self._update_viser_server()
+                    else:
+                        self._update_viser_robot_only()
+                if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
+                    self._record_frame()
+            final_error = float(np.linalg.norm(self._current_arm_joint_positions() - target))
+
+        converged = final_error < tolerance
+        status = {
+            "converged": converged,
+            "steps": steps,
+            "final_error": final_error,
+            "tolerance": float(tolerance),
+            "target": target.copy(),
+            "current": self._current_arm_joint_positions().copy(),
+        }
+        if strict and not converged:
+            raise RuntimeError(
+                "move_to_joints_blocking did not converge: "
+                f"final_error={final_error:.6f}, tolerance={float(tolerance):.6f}, "
+                f"steps={steps}, max_steps={int(max_steps)}"
+            )
+        return status
 
     def _set_gripper(self, fraction: float) -> None:
         """Set gripper opening fraction.

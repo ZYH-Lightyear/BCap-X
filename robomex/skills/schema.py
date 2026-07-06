@@ -1,28 +1,28 @@
 """技能载体:一个技能就是一个*目录包*,MMSkills 风格。
 
-一个技能 = 程序性知识文本 + 可选的 sidecar 资产,布局成一个自包含目录(渐进披露——
-agent 先读 ``SKILL.md``,只在相关时才加载 sidecar)。文件按*读者*拆分::
+一个技能 = 程序性知识文本,布局成一个自包含目录(渐进披露——agent 先读
+``SKILL.md`` 短清单,只在相关时才加载正文)::
 
     <skill_id>/
-      SKILL.md          # 执行 agent:何时用 / 分解 / 过程 / 失败恢复
-      reference/        # 参考资料
-        verify.md       #   权威的 pass/fail rubric(对多模态友好)
-        success.png     #   可选的视觉参考(成功帧、好的 mask 等)
-      scripts/          # 确定性代码(verifier-as-code,由蒸馏器维护)
-        verify.py       #   可选的可执行门
+      SKILL.md          # 何时用 / 分解 / 过程 / 失败恢复
 
 ``SKILL.md`` 本身坚持 prose-first:用一小段 YAML frontmatter 承载少数代码会分支的字段,
 正文 markdown 原样注入 agent 提示词。没有 typed claim 接口、没有 API 白名单、没有校验——
-串联和验证是 agent/planner 的事,从 prose(以及之后从 sidecar)读取,而非由 schema 强制。
+串联是 agent/planner 的事,从 prose 读取,而非由 schema 强制。
+
+技能包可以携带 Claude-style 侧车目录 ``assets/``、``references/``、``scripts/``。
+``scripts/`` 放普通可运行/可检查的 helper 文件;``references/`` 放非直接运行的参考材料。
+运行时不会自动把侧车内容注入上下文;技能正文需要显式引用,agent 再根据加载 skill 时给出的
+base directory 按需读取、导入或执行。
 
 代码会看的 frontmatter 字段(全部可选):
 
-- ``kind``:``observation`` | ``action`` —— 仅用于在磁盘上组织技能库。
-- ``compound``:``true`` 表示高层技能,其正文编排其他技能。
+- ``category``:``perception`` | ``affordance`` | ``motion`` | ``task`` —— 仅用于在磁盘上组织技能库。
 - ``name`` / ``description``:planner 能力菜单的展示面。
 
-任何其他 frontmatter 字段都原样留在 ``meta`` 里,永不强制。结构由包布局承载;
-frontmatter 刻意保持轻薄。
+技能 id 由目录名承载,不由 frontmatter 的 ``id`` / ``skill_id`` 路由。任何其他
+frontmatter 字段都原样留在 ``meta`` 里,永不强制。结构由包布局承载;frontmatter
+刻意保持轻薄。
 """
 
 from __future__ import annotations
@@ -37,49 +37,46 @@ import yaml
 
 
 class SkillCategory(str, Enum):
-    """三类技能,对应两层设计。
+    """物理技能在 RoboMEx 闭环里的角色。
 
-    - ``high_level``:编排叶子技能的复合技能(planner 菜单)。
-    - ``observation``:做感知/grounding 的 O-Skill(分割、测量、甄别抓取)。
-    - ``action``:移动机器人的叶子 A-Skill。
+    - ``perception``:从观测得到物体/场景状态。
+    - ``affordance``:从状态生成可操作点、位姿、约束或候选。
+    - ``motion``:组织或执行机器人运动 primitives。
+    - ``verification``:检查状态、谓词、关系误差或失败原因。
+    - ``motif``:跨技能的闭环组合模式,供 DySC / Act 作为编排指导。
+    - ``task``:任务/流程级技能,用于 planner 菜单和 Act 编排。
     """
 
-    HIGH_LEVEL = "high_level"
-    OBSERVATION = "observation"
-    ACTION = "action"
+    PERCEPTION = "perception"
+    AFFORDANCE = "affordance"
+    MOTION = "motion"
+    VERIFICATION = "verification"
+    MOTIF = "motif"
+    TASK = "task"
 
 
 _FRONTMATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
 
 SKILL_FILE = "SKILL.md"
-REF_DIR = "reference"
-VERIFY_DOC = "verify.md"
-SCRIPTS_DIR = "scripts"
-VERIFIER_FILE = "verify.py"
+SKILL_PACKAGE_EXTRA_DIRS = ("assets", "references", "scripts")
 
 
 def _parse_category(meta: dict[str, Any]) -> SkillCategory:
-    """从 frontmatter 读取 ``category``,同时兼容旧的 ``kind``/``compound``。"""
+    """从 frontmatter 读取 ``category``."""
 
     raw = meta.get("category")
     if raw:
         return SkillCategory(str(raw))
-    if meta.get("compound"):  # 兼容旧版:复合 action -> high level
-        return SkillCategory.HIGH_LEVEL
-    return SkillCategory(str(meta.get("kind", "action")))
+    return SkillCategory.MOTION
 
 
 @dataclass(frozen=True)
 class Skill:
-    """一个技能包:少量元数据、prose 正文,以及(惰性的)sidecar。
-
-    ``root`` 是技能从磁盘加载时的包目录(内存中构造的技能为 ``None``)。sidecar
-    访问器都相对它解析。
-    """
+    """一个技能包:少量元数据、prose 正文,以及磁盘根目录。"""
 
     skill_id: str
     name: str
-    category: SkillCategory = SkillCategory.ACTION
+    category: SkillCategory = SkillCategory.MOTION
     description: str = ""
     body: str = ""
     meta: dict[str, Any] = field(default_factory=dict)
@@ -90,38 +87,6 @@ class Skill:
         """注入提示词的文本(即 markdown 正文,原样)。"""
 
         return self.body
-
-    @property
-    def compound(self) -> bool:
-        """高层技能编排其他技能(即 planner 的菜单)。"""
-
-        return self.category is SkillCategory.HIGH_LEVEL
-
-    def verify_doc_path(self) -> Path | None:
-        """``reference/verify.md``:验证 Agent 的成功 rubric(若存在)。"""
-
-        if self.root is None:
-            return None
-        path = self.root / REF_DIR / VERIFY_DOC
-        return path if path.is_file() else None
-
-    def reference_paths(self) -> list[Path]:
-        """``reference/`` 下的视觉/其他参考资产(不含 ``verify.md``)。"""
-
-        if self.root is None:
-            return []
-        refs = self.root / REF_DIR
-        if not refs.is_dir():
-            return []
-        return sorted(p for p in refs.iterdir() if p.is_file() and p.name != VERIFY_DOC)
-
-    def verifier_path(self) -> Path | None:
-        """``scripts/verify.py``:确定性的 verifier-as-code(若技能自带)。"""
-
-        if self.root is None:
-            return None
-        path = self.root / SCRIPTS_DIR / VERIFIER_FILE
-        return path if path.is_file() else None
 
     def with_note(self, note: str) -> Skill:
         """在正文末尾追加一条自由文本备注(用于打补丁记录失败教训)。"""
@@ -146,7 +111,7 @@ class Skill:
             body = text[match.end():].strip()
         else:
             meta, body = {}, text.strip()
-        sid = skill_id or meta.get("id") or meta.get("skill_id") or meta.get("name") or "skill"
+        sid = skill_id or meta.get("name") or "skill"
         return cls(
             skill_id=str(sid),
             name=str(meta.get("name", sid)),
@@ -162,8 +127,5 @@ class Skill:
         meta["category"] = self.category.value
         if self.description:
             meta.setdefault("description", self.description)
-        # 丢弃那些派生的、或不属于 prose-first 约定的键。
-        for stale in ("id", "skill_id", "kind", "compound"):
-            meta.pop(stale, None)
         frontmatter = yaml.safe_dump(meta, sort_keys=False, allow_unicode=True, width=100).strip()
         return f"---\n{frontmatter}\n---\n\n{self.body.strip()}\n"

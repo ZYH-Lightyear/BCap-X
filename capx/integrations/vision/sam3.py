@@ -214,3 +214,37 @@ def init_sam3_point_prompt(
         return results
 
     return point_prompt_fn
+
+
+def init_sam3_box_prompt(
+    device: str = "cuda",
+) -> Any:
+    """Initialize SAM3 box prompt client.
+
+    Returns a callable:
+        box_prompt_fn(image: np.ndarray | Image.Image,
+                      box: Sequence[float])
+            -> list[dict[str, Any]]
+    """
+
+    def box_prompt_fn(
+        image: np.ndarray | Image.Image, box: Sequence[float]
+    ) -> list[dict[str, Any]]:
+        encoded_image = _encode_image(image)
+        payload = {"image_base64": encoded_image, "box": [float(v) for v in box[:4]]}
+
+        try:
+            resp = post_with_retries(f"{SERVICE_URL}/segment_box", payload)
+        except RuntimeError as e:
+            raise RuntimeError(f"Failed to communicate with SAM3 service at {SERVICE_URL}: {e}")
+
+        scores = resp.get("scores", [])
+        masks_shape = tuple(resp.get("masks_shape", (0, 0, 0)))
+        masks_dtype = np.dtype(resp.get("masks_dtype", "float32"))
+        masks = _decode_mask(resp.get("masks_base64", ""), masks_shape, dtype=masks_dtype)
+        masks = masks.astype(bool)
+        results = [{"mask": mask, "score": score} for mask, score in zip(masks, scores)]
+
+        return results
+
+    return box_prompt_fn

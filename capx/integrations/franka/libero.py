@@ -614,13 +614,46 @@ class FrankaLiberoApi(ApiBase):
             "wrist_score": wrist_score,
         }
     
-    def goto_home_joint_position(self) -> None:
-        """Return the arm to its reset joint configuration with high manipulability"""
+    def goto_home_joint_position(
+        self,
+        tolerance: float = 0.008,
+        max_steps: int = 360,
+        retries: int = 1,
+    ) -> None:
+        """Return the arm to its reset joint configuration with high manipulability.
+
+        This preserves the current gripper command. It must not be paired with
+        ``open_gripper()`` merely to get a clearer observation, because the robot may
+        already be holding an object.
+        """
         home = getattr(self._env, "home_joint_position", None)
         if home is None:
             raise RuntimeError("Home joint position is unavailable in the current environment.")
         joints = np.asarray(home, dtype=np.float64).reshape(7)
-        self._env.move_to_joints_blocking(joints)
+        attempts = max(1, int(retries) + 1)
+        last_status = None
+        for _ in range(attempts):
+            last_status = self._env.move_to_joints_blocking(
+                joints,
+                tolerance=float(tolerance),
+                max_steps=int(max_steps),
+                settle_steps=8,
+                strict=False,
+            )
+            if isinstance(last_status, dict) and last_status.get("converged"):
+                return
+            if not isinstance(last_status, dict):
+                return
+        final_error = (
+            float(last_status.get("final_error", float("inf")))
+            if isinstance(last_status, dict)
+            else float("inf")
+        )
+        raise RuntimeError(
+            "goto_home_joint_position did not reach home: "
+            f"final_error={final_error:.6f}, tolerance={float(tolerance):.6f}, "
+            f"attempts={attempts}, max_steps={int(max_steps)}"
+        )
 
     def subsample_point_cloud(self, pc: np.ndarray, max_points: int = 10000) -> np.ndarray:
         """Randomly subsample a point cloud to a maximum number of points.

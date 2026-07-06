@@ -3,10 +3,8 @@
 布局(对应 MMSkills 的 ``skills_library/<domain>/<skill>/``)::
 
     builtin/<category>/<skill_id>/SKILL.md
-                                  reference/     (可选:验证器资产)
-                                  scripts/       (可选:verifier-as-code)
 
-``category`` 取 ``high_level`` / ``observation`` / ``action`` 之一(见
+``category`` 取 ``perception`` / ``affordance`` / ``motion`` / ``task`` 之一(见
 ``SkillCategory``)。``README.md`` 是给人看的清单;用
 ``render_inventory(load_builtin_skills())`` 重新生成。
 """
@@ -36,17 +34,26 @@ def render_inventory(skills: list[Skill]) -> str:
     lines = [
         "# RoboMEx Skill Library",
         "",
-        "Each skill is a self-contained package, split by *reader*: `SKILL.md` for the",
-        "executor agent, `reference/` for the Verifier Agent, `scripts/` for deterministic code.",
+        "Each skill is a self-contained package. The runtime loads `SKILL.md` through",
+        "progressive disclosure; optional sidecars are ordinary files resolved from the",
+        "loaded skill's base directory. Categories are not fixed execution phases or",
+        "SubAgent profiles.",
         "",
         "## Package Structure",
         "",
         "```text",
         "<category>/<skill_id>/",
-        "├── SKILL.md       # executor agent: when-to-use, procedure/decomposition, recovery",
-        "├── reference/     # Verifier Agent: verify.md rubric (+ optional visual references)",
-        "└── scripts/       # optional: deterministic verifier-as-code (verify.py)",
+        "├── SKILL.md       # compact workflow memory",
+        "├── references/    # optional explanatory material or non-runnable reference code",
+        "├── assets/        # optional visual/static assets; may intentionally be empty",
+        "└── scripts/       # optional runnable helper files with documented entry points",
         "```",
+        "",
+        "## Standard SKILL.md Shape",
+        "",
+        "Every built-in skill should include Purpose, When to use, Workflow, Candidate",
+        "Generation, Local Checks, Failure Modes, Clean Reusable Rules, Weak Priors,",
+        "Prohibited Shortcuts, Artifacts to Save, and Optional Sidecars when relevant.",
         "",
         "## Inventory",
         "",
@@ -58,13 +65,9 @@ def render_inventory(skills: list[Skill]) -> str:
         names = "; ".join(f"`{s.skill_id}` ({s.name})" for s in items) or "—"
         lines.append(f"| {category.value} | {len(items)} | {names} |")
 
-    lines += ["", "## Directories", "", "Sidecars: `V` = reference/verify.md, `C` = scripts/verify.py.", ""]
+    lines += ["", "## Directories", ""]
     for skill in sorted(skills, key=lambda s: (s.category.value, s.skill_id)):
-        badges = "".join((
-            "V" if skill.verify_doc_path() else "-",
-            "C" if skill.verifier_path() else "-",
-        ))
-        lines.append(f"- `[{badges}] {skill.category.value}/{skill.skill_id}` — {skill.description}")
+        lines.append(f"- `{skill.category.value}/{skill.skill_id}` — {skill.description}")
     return "\n".join(lines) + "\n"
 
 

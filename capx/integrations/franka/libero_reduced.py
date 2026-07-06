@@ -1,3 +1,4 @@
+import json
 import logging
 import pathlib
 import time
@@ -26,7 +27,7 @@ from capx.integrations.franka.common import (
 from capx.integrations.vision.graspnet import init_contact_graspnet, init_contact_graspnet_point_clouds
 from capx.integrations.vision.molmo import init_molmo  # noqa: F401  # kept for backward compatibility
 from capx.integrations.vision.point_backend import init_point_backend
-from capx.integrations.vision.sam3 import init_sam3, init_sam3_point_prompt
+from capx.integrations.vision.sam3 import init_sam3, init_sam3_box_prompt, init_sam3_point_prompt
 from capx.integrations.motion.pyroki import init_pyroki
 
 from capx.utils.camera_utils import obs_get_rgb
@@ -62,10 +63,13 @@ class FrankaLiberoApiReduced(ApiBase):
         # if self.use_sam3:
         self.sam3_seg_fn = init_sam3()
         self.sam3_point_prompt_fn = init_sam3_point_prompt()
+        self.sam3_box_prompt_fn = init_sam3_box_prompt()
 
         # else:
         # Pointing backend is selected at runtime via CAPX_POINT_BACKEND
-        # (defaults to "molmo"; set to "qwen" to use the generic-VLM adapter).
+        # (defaults to "molmo"; generic VLM pointing is still available for legacy
+        # experiments, but RoboMEx grounding should use the dedicated bbox/point
+        # detection helpers rather than raw query_vlm coordinate prompts).
         self.molmo_point_fn = init_point_backend()
             # self.sam2_point_prompt_fn = init_sam2_point_prompt()
         self.grasp_net_plan_fn = init_contact_graspnet()
@@ -74,6 +78,7 @@ class FrankaLiberoApiReduced(ApiBase):
         self.camera_name = "agentview"
         self.wrist_camera_name = "robot0_eye_in_hand"
         self.cfg = None
+        self._vlm_backend: dict[str, str] = {}
         self._debug_output_dir: pathlib.Path | None = None
         self._debug_block_idx = 0
         self._debug_counter = 0
@@ -91,6 +96,29 @@ class FrankaLiberoApiReduced(ApiBase):
         self._debug_output_dir = pathlib.Path(output_dir)
         self._debug_block_idx = block_idx
         self._debug_counter = 0
+
+    def configure_vlm_backend(
+        self,
+        *,
+        model: str | None = None,
+        server_url: str | None = None,
+        api_key: str | None = None,
+        coord_space: str | None = None,
+    ) -> None:
+        """Configure VLM APIs for this API instance without relying on process env."""
+
+        cfg = {
+            "model": model,
+            "server_url": server_url,
+            "api_key": api_key,
+            "coord_space": coord_space,
+        }
+        self._vlm_backend = {k: str(v) for k, v in cfg.items() if v not in (None, "")}
+
+    def _vlm_backend_value(self, key: str, env_name: str, default: str | None = None) -> str | None:
+        import os
+
+        return getattr(self, "_vlm_backend", {}).get(key) or os.getenv(env_name) or default
 
     def _save_debug_overlay(self, name: str, image: np.ndarray) -> None:
         if self._debug_output_dir is None:
@@ -151,8 +179,12 @@ class FrankaLiberoApiReduced(ApiBase):
         fns["get_observation"] = self.get_observation
         fns["segment_sam3_text_prompt"] = self.segment_sam3_text_prompt
         fns["segment_sam3_point_prompt"] = self.segment_sam3_point_prompt
+        fns["segment_sam3_box_prompt"] = self.segment_sam3_box_prompt
         fns["point_prompt_molmo"] = self.point_prompt_molmo
         fns["query_vlm"] = self.query_vlm
+        fns["vlm_bbox_detection"] = self.vlm_bbox_detection
+        fns["vlm_point_detection"] = self.vlm_point_detection
+        fns["parse_vlm_detections"] = self.parse_vlm_detections
         fns["plan_grasp"] = self.plan_grasp
         fns["plan_grasp_from_point_clouds"] = self.plan_grasp_from_point_clouds
         fns["get_oriented_bounding_box_from_3d_points"] = (
@@ -237,6 +269,29 @@ class FrankaLiberoApiReduced(ApiBase):
         )
         return results
 
+    def segment_sam3_box_prompt(
+        self,
+        rgb: np.ndarray,
+        box: list[float] | tuple[float, float, float, float],
+    ) -> list[dict[str, Any]]:
+        """Run SAM3 segmentation conditioned on an image-coordinate box prompt.
+
+        Args:
+            rgb:
+                RGB image array of shape (H, W, 3), dtype uint8.
+            box:
+                [x1, y1, x2, y2] pixel coordinates.
+        """
+        results = self.sam3_box_prompt_fn(Image.fromarray(rgb), box)
+        masks = [r["mask"] for r in results if "mask" in r]
+        overlay = overlay_segmentation_masks(rgb, masks) if masks else rgb.copy()
+        overlay = self._draw_boxes(overlay, [{"box": box}])
+        self._save_debug_overlay(
+            "sam3_box_prompt",
+            self._draw_label(overlay, f"SAM3 box prompt: {[round(float(v), 1) for v in box]}"),
+        )
+        return results
+
     def segment_sam3_text_prompt(
         self,
         rgb: np.ndarray,
@@ -313,69 +368,389 @@ class FrankaLiberoApiReduced(ApiBase):
     # --------------------------------------------------------------------- #
     def query_vlm(
         self,
-        prompt: str,
-        images: np.ndarray | list[np.ndarray] | None = None,
+        prompt: Any,
+        images: Any = None,
         *,
+        image: Any = None,
+        model: str | None = None,
         temperature: float = 0.0,
-        max_tokens: int = 20480,
+        max_tokens: int = 1024,
     ) -> str:
         """Ask a vision-language model a question about image(s) and get its raw text reply.
 
         A thin, general-purpose bridge to the same LLM proxy the planner uses, so code
-        blocks can do their own VLM reasoning (e.g. localize an object, read a label,
-        sanity-check a scene). You parse the returned string yourself.
+        blocks can do their own visual reasoning (e.g. read a label, classify scene
+        state, sanity-check an annotated image). You parse the returned string yourself.
+        Do not use this API for spatial grounding. Use ``vlm_bbox_detection`` for boxes
+        and ``vlm_point_detection`` for points.
 
-        Model/endpoint are read from environment variables, falling back to the planner
-        defaults:
-          - CAPX_VLM_MODEL       (default "openrouter/qwen/qwen3.6-plus")
+        Model/endpoint come from the API instance configuration when RoboMEx launches
+        the env. Other CapX launch paths may still use environment variables:
+          - CAPX_VLM_MODEL       (default "vapi/gpt-5.5", or the
+            RoboMEx run model when launched through RoboMEx)
           - CAPX_VLM_SERVER_URL  (default "http://localhost:8110/chat/completions")
           - CAPX_VLM_API_KEY     (optional)
+
+        Preferred call:
+            ``query_vlm(prompt, images=rgb_or_list)``
+
+        Compatibility calls accepted to avoid wasting robot-agent turns:
+            ``query_vlm(rgb_or_path, prompt)``
+            ``query_vlm(prompt=prompt, image=rgb_or_path)``
 
         Args:
             prompt: Instruction/question for the VLM. Be explicit about the output
                 format you want (e.g. ask for a JSON object) so it is easy to parse.
-            images: Optional RGB image (H, W, 3) uint8, or a list of them, to attach.
+            images: Optional RGB image/path/PIL image, or a list of them, to attach.
             temperature: Decoding temperature (default 0.0 for deterministic parsing).
-            max_tokens: Maximum response tokens.
+            max_tokens: Maximum response tokens. VLM grounding usually needs only a
+                short JSON answer; pass a larger value only for open-ended visual QA.
 
         Returns:
             str: The model's text reply, verbatim.
 
-        Note:
-            Many VLMs (e.g. Qwen) report pixel coordinates NORMALIZED to a 0-1000 range,
-            NOT absolute pixels. If you ask for coordinates, instruct the model which
-            convention to use and rescale by the real image width/height accordingly
-            (e.g. x_px = x / 1000 * W).
-
         Example:
             >>> rgb = get_observation()["agentview"]["images"]["rgb"]
-            >>> reply = query_vlm("Reply ONLY JSON {\"box\":[x1,y1,x2,y2]} for the red mug.", images=rgb)
+            >>> reply = query_vlm(
+            ...     "Reply ONLY JSON {\"state\":\"open|closed|unknown\"}: is the drawer open?",
+            ...     images=rgb,
+            ... )
         """
         import base64
         import io
         import os
+        from os import PathLike
 
         from capx.llm.client import ModelQueryArgs, query_model
+
+        def _is_image_like(value: Any) -> bool:
+            if isinstance(value, (np.ndarray, Image.Image, PathLike)):
+                return True
+            if isinstance(value, str):
+                lower = value.lower()
+                if lower.startswith("data:image/"):
+                    return True
+                if lower.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+                    return True
+                try:
+                    return pathlib.Path(value).is_file()
+                except OSError:
+                    return False
+            return False
+
+        if image is not None:
+            if images is not None:
+                raise TypeError("query_vlm received both images= and image=; pass only one")
+            images = image
+
+        # Backward-compatible robot-agent pattern: query_vlm(image, prompt).
+        if _is_image_like(prompt) and isinstance(images, str):
+            prompt, images = images, prompt
+
+        if not isinstance(prompt, str):
+            raise TypeError(
+                "query_vlm prompt must be text. Use query_vlm(prompt, images=rgb) "
+                "or the compatibility form query_vlm(rgb_or_path, prompt)."
+            )
+
+        def _image_to_pil(value: Any) -> Image.Image:
+            if isinstance(value, Image.Image):
+                return value.convert("RGB")
+            if isinstance(value, (str, PathLike)):
+                text = str(value)
+                if text.startswith("data:image/"):
+                    raise TypeError("query_vlm images= does not accept pre-encoded data URLs")
+                return Image.open(text).convert("RGB")
+            arr = np.asarray(value)
+            if arr.ndim == 2:
+                arr = np.stack([arr, arr, arr], axis=-1)
+            if arr.ndim != 3 or arr.shape[-1] not in (3, 4):
+                raise ValueError(
+                    f"query_vlm image must have shape (H,W,3/4), got {arr.shape!r}"
+                )
+            if arr.dtype != np.uint8:
+                arr = (arr * 255).clip(0, 255).astype(np.uint8) if arr.max() <= 1.0 else arr.astype(np.uint8)
+            if arr.shape[-1] == 4:
+                arr = arr[:, :, :3]
+            return Image.fromarray(arr).convert("RGB")
 
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         if images is not None:
             img_list = images if isinstance(images, list) else [images]
             for im in img_list:
                 buf = io.BytesIO()
-                Image.fromarray(np.asarray(im).astype(np.uint8)).save(buf, format="PNG")
+                _image_to_pil(im).save(buf, format="PNG")
                 b64 = base64.b64encode(buf.getvalue()).decode()
                 content.append(
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
                 )
 
         args = ModelQueryArgs(
-            model=os.getenv("CAPX_VLM_MODEL", "openrouter/qwen/qwen3.6-plus"),
-            server_url=os.getenv("CAPX_VLM_SERVER_URL", "http://localhost:8110/chat/completions"),
-            api_key=os.getenv("CAPX_VLM_API_KEY"),
+            model=model or self._vlm_backend_value("model", "CAPX_VLM_MODEL", "vapi/gpt-5.5"),
+            server_url=self._vlm_backend_value(
+                "server_url",
+                "CAPX_VLM_SERVER_URL",
+                "http://localhost:8110/chat/completions",
+            ),
+            api_key=self._vlm_backend_value("api_key", "CAPX_VLM_API_KEY"),
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        return query_model(args, [{"role": "user", "content": content}])["content"]
+        result = query_model(args, [{"role": "user", "content": content}])
+        return result.get("content", "") if isinstance(result, dict) else str(result)
+
+    def _resolve_vlm_grounding_model(self, model: str | None) -> str:
+        return model or self._vlm_backend_value("model", "CAPX_VLM_MODEL", "vapi/gpt-5.5") or "vapi/gpt-5.5"
+
+    def _vlm_grounding_coord_space(self, model: str | None, coord_space: str | None) -> str:
+        override = coord_space or self._vlm_backend_value("coord_space", "CAPX_VLM_COORD_SPACE")
+        if override in {"auto", "pixel", "norm1000", "fraction"}:
+            return override
+        resolved_model = self._resolve_vlm_grounding_model(model).lower()
+        if "qwen" in resolved_model:
+            return "norm1000"
+        return "pixel"
+
+    def vlm_bbox_detection(
+        self,
+        rgb: np.ndarray,
+        target_name: str,
+        *,
+        model: str | None = None,
+        coord_space: str | None = None,
+    ) -> list[float]:
+        """Locate a target with the VLM and return [x1, y1, x2, y2] pixel coordinates."""
+        H, W = rgb.shape[:2]
+        resolved_model = self._resolve_vlm_grounding_model(model)
+        resolved_coord_space = self._vlm_grounding_coord_space(resolved_model, coord_space)
+        coord_instruction = (
+            "using 0-1000 normalized coordinates"
+            if resolved_coord_space == "norm1000"
+            else "using REAL PIXEL coordinates"
+        )
+        prompt = (
+            "You are given a robot scene image. "
+            f"Find the single object or target that best matches: '{target_name}'. "
+            f"The image size is width={W}, height={H}. "
+            f"Reply ONLY JSON {{\"box\": [x1, y1, x2, y2]}} {coord_instruction}. "
+            "The box must tightly cover the target itself. No prose."
+        )
+        reply = self.query_vlm(
+            prompt, images=rgb, model=resolved_model, temperature=0.0, max_tokens=160
+        )
+        det = self.parse_vlm_detections(reply, image=rgb, coord_space=resolved_coord_space)
+        assert det["boxes"], f"VLM bbox detection failed for '{target_name}': {reply!r}"
+        box = [float(v) for v in det["boxes"][0]]
+        self._save_debug_overlay(
+            "vlm_bbox_detection",
+            self._draw_label(self._draw_boxes(rgb, [{"box": box}]), f"VLM bbox: {target_name}"),
+        )
+        return box
+
+    def vlm_point_detection(
+        self,
+        rgb: np.ndarray,
+        target_name: str,
+        *,
+        model: str | None = None,
+        coord_space: str | None = None,
+    ) -> list[float]:
+        """Locate a target with the VLM and return [x, y] pixel coordinates."""
+        H, W = rgb.shape[:2]
+        resolved_model = self._resolve_vlm_grounding_model(model)
+        resolved_coord_space = self._vlm_grounding_coord_space(resolved_model, coord_space)
+        coord_instruction = (
+            "using 0-1000 normalized coordinates"
+            if resolved_coord_space == "norm1000"
+            else "using REAL PIXEL coordinates"
+        )
+        prompt = (
+            "You are given a robot scene image. "
+            f"Find the single point at the center of the object or target: '{target_name}'. "
+            f"The image size is width={W}, height={H}. "
+            f"Reply ONLY JSON {{\"point\": [x, y]}} {coord_instruction}. No prose."
+        )
+        reply = self.query_vlm(
+            prompt, images=rgb, model=resolved_model, temperature=0.0, max_tokens=160
+        )
+        det = self.parse_vlm_detections(reply, image=rgb, coord_space=resolved_coord_space)
+        assert det["points"], f"VLM point detection failed for '{target_name}': {reply!r}"
+        point = [float(v) for v in det["points"][0]]
+        overlay = draw_molmo_point(rgb, {"point_prompt": (int(point[0]), int(point[1]))})
+        self._save_debug_overlay(
+            "vlm_point_detection",
+            self._draw_label(overlay, f"VLM point: {target_name}"),
+        )
+        return point
+
+    def parse_vlm_detections(
+        self,
+        reply: str,
+        image: np.ndarray | tuple[int, int] | None = None,
+        *,
+        coord_space: str = "auto",
+    ) -> dict[str, Any]:
+        """Robustly parse object boxes/points out of a free-form VLM grounding reply.
+
+        This is a low-level parser used by ``vlm_bbox_detection`` and
+        ``vlm_point_detection``. Different models wrap their grounding answer
+        differently: ``{"box": [x1,y1,x2,y2]}``, a markdown-fenced JSON array of
+        ``{"bbox_2d": [...], "label": ...}``, or ``{"point_2d": [x, y]}``.
+        This helper tolerates all of those plus surrounding
+        prose, ```` ```json ```` fences and trailing junk, so callers never have to
+        hand-roll a brittle regex (a single missed key like ``box`` vs ``bbox_2d``
+        otherwise silently yields no detection).
+
+        Args:
+            reply: Raw VLM grounding string.
+            image: Optional RGB image ``(H, W, 3)`` or an explicit ``(H, W)`` shape.
+                When provided, coordinates are rescaled to absolute pixels and clipped
+                to the image; when ``None`` the raw numbers are returned unchanged.
+            coord_space: How to interpret the raw coordinates.
+
+                - ``"auto"`` (default): treat coordinates as real pixels, except
+                  values in ``[0, 1]`` are treated as fractions. RoboMEx no longer
+                  guesses a 0-1000 normalized convention because that corrupts GPT
+                  pixel boxes in 800x512 LIBERO images.
+                - ``"norm1000"``: always treat as ``0-1000`` normalized.
+                - ``"fraction"``: always treat as ``0-1`` fractions.
+                - ``"pixel"``: already absolute pixels, no rescaling.
+
+        Returns:
+            dict with keys:
+                - ``"boxes"``: list of ``[x1, y1, x2, y2]`` (pixels if an image/shape
+                  was given), each normalized so ``x1<=x2`` and ``y1<=y2``.
+                - ``"points"``: list of ``[x, y]`` = the center of every parsed box,
+                  followed by any explicit point detections. ``points[0]`` is the most
+                  convenient single location for the first detection.
+                - ``"labels"``: list of label strings (or ``None``) aligned to the
+                  boxes-then-points detection order.
+                - ``"n"``: total number of detections parsed.
+            All lists are empty when nothing parseable is found; this never raises on
+            malformed input.
+
+        Example:
+            >>> rgb = get_observation()["agentview"]["images"]["rgb"]
+            >>> reply = '{"box": [120, 80, 210, 190]}'
+            >>> det = parse_vlm_detections(reply, image=rgb)
+            >>> if det["boxes"]:
+            ...     x1, y1, x2, y2 = det["boxes"][0]
+            ...     cx, cy = det["points"][0]
+        """
+        empty = {"boxes": [], "points": [], "labels": [], "n": 0}
+
+        def _extract_json_text_local(text: str) -> str:
+            text = (text or "").strip()
+            if text.startswith("```"):
+                lines = text.splitlines()
+                if lines and lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].strip().startswith("```"):
+                    lines = lines[:-1]
+                text = "\n".join(lines).strip()
+            starts = [i for i in (text.find("{"), text.find("[")) if i >= 0]
+            if not starts:
+                return text
+            start = min(starts)
+            open_ch = text[start]
+            close_ch = "}" if open_ch == "{" else "]"
+            end = text.rfind(close_ch)
+            return text[start : end + 1] if end >= start else text[start:]
+
+        def _try_load_json_local(text: str) -> Any:
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return None
+
+        payload = _try_load_json_local(_extract_json_text_local(reply or ""))
+        if isinstance(payload, dict):
+            payload = [payload]
+        if not isinstance(payload, list):
+            return empty
+
+        # Resolve image extent (if any) for rescaling/clipping.
+        W = H = None
+        if image is not None:
+            if isinstance(image, np.ndarray):
+                H, W = int(image.shape[0]), int(image.shape[1])
+            else:
+                H, W = int(image[0]), int(image[1])
+
+        def _nums(v: Any) -> list[float] | None:
+            if isinstance(v, (list, tuple)):
+                try:
+                    return [float(x) for x in v]
+                except (TypeError, ValueError):
+                    return None
+            return None
+
+        box_keys = ("box", "bbox_2d", "bbox", "box_2d", "boundingbox")
+        pt_keys = ("point_2d", "point", "coordinate", "coord", "xy")
+
+        raw_boxes: list[list[float]] = []
+        box_labels: list[Any] = []
+        raw_points: list[list[float]] = []
+        pt_labels: list[Any] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            label = item.get("label")
+            for k in box_keys:
+                if k in item:
+                    bb = _nums(item[k])
+                    if bb and len(bb) >= 4:
+                        raw_boxes.append(bb[:4])
+                        box_labels.append(label)
+                    break
+            for k in pt_keys:
+                if k in item:
+                    pt = _nums(item[k])
+                    if pt and len(pt) >= 2:
+                        raw_points.append(pt[:2])
+                        pt_labels.append(label)
+                    break
+
+        if not raw_boxes and not raw_points:
+            return empty
+
+        # Decide coordinate space once. RoboMEx grounding is pixel-first.
+        all_vals = [abs(v) for b in raw_boxes for v in b] + [abs(v) for p in raw_points for v in p]
+        space = coord_space
+        if space == "auto":
+            mx = max(all_vals) if all_vals else 0.0
+            space = "fraction" if mx <= 1.0 else "pixel"
+
+        def _scale(x: float, y: float) -> tuple[float, float]:
+            if W is None or H is None:
+                return x, y  # cannot rescale without image size
+            if space == "fraction":
+                x, y = x * W, y * H
+            elif space == "norm1000":
+                x, y = x / 1000.0 * W, y / 1000.0 * H
+            x = float(np.clip(x, 0, W - 1))
+            y = float(np.clip(y, 0, H - 1))
+            return x, y
+
+        boxes: list[list[float]] = []
+        centers: list[list[float]] = []
+        for bb in raw_boxes:
+            x1, y1 = _scale(bb[0], bb[1])
+            x2, y2 = _scale(bb[2], bb[3])
+            if x2 < x1:
+                x1, x2 = x2, x1
+            if y2 < y1:
+                y1, y2 = y2, y1
+            boxes.append([x1, y1, x2, y2])
+            centers.append([(x1 + x2) / 2.0, (y1 + y2) / 2.0])
+
+        points: list[list[float]] = list(centers)
+        for pt in raw_points:
+            px, py = _scale(pt[0], pt[1])
+            points.append([px, py])
+
+        labels = box_labels + pt_labels
+        return {"boxes": boxes, "points": points, "labels": labels, "n": len(labels)}
 
     def get_oriented_bounding_box_from_3d_points(self, points: np.ndarray) -> dict[str, Any]:
         """Get the oriented bounding box from 3D points.
@@ -408,9 +783,10 @@ class FrankaLiberoApiReduced(ApiBase):
         """Plan grasp candidates using Contact-GraspNet for a single instance.
 
         This is a thin wrapper around the Contact-GraspNet planner. It does not
-        apply any camera/world transforms or TCP offsets: the caller is
-        responsible for transforming the resulting grasp poses into the desired
-        frame and applying TCP offsets if necessary.
+        apply any camera/world transforms: the returned candidate poses are in
+        the camera frame and callers must transform them before robot motion.
+        The reduced API applies a small local grasp offset to the candidates
+        before returning them.
 
         Args:
             depth:
@@ -446,7 +822,7 @@ class FrankaLiberoApiReduced(ApiBase):
             ...     segmentation=mask,
             ... )
             >>> best_idx = grasp_scores.argmax()
-            >>> best_T = grasp_poses[best_idx]  # (4, 4)
+            >>> best_T = grasp_sample_tf[best_idx]  # (4, 4), camera frame
             >>> camera_extrinsics = cam["pose_mat"]
             >>> grasp_sample_world_frame = camera_extrinsics @ best_T
         """
@@ -613,13 +989,13 @@ class FrankaLiberoApiReduced(ApiBase):
         """Go to pose using Inverse Kinematics with optional approach motion.
 
         Combines solve_ik + move_to_joints into a single call. If z_approach > 0,
-        first moves to position offset by z_approach in the gripper's Z axis,
-        then moves to the final position.
+        first moves to position offset by z_approach in world +Z, then moves to
+        the final position.
 
         Args:
             position: (3,) XYZ target in meters (world frame).
             quaternion_wxyz: (4,) WXYZ unit quaternion (world frame).
-            z_approach: Z offset for approach motion (meters). Default 0.0.
+            z_approach: World +Z offset for approach motion (meters). Default 0.0.
 
         Example:
             >>> goto_pose(np.array([0.5, 0.0, 0.3]), np.array([0.0, 1.0, 0.0, 0.0]), z_approach=0.075)
@@ -636,13 +1012,46 @@ class FrankaLiberoApiReduced(ApiBase):
         joints = self.solve_ik(pos, quat)
         self.move_to_joints(joints)
     
-    def goto_home_joint_position(self) -> None:
-        """Return the arm to its reset joint configuration with high manipulability"""
+    def goto_home_joint_position(
+        self,
+        tolerance: float = 0.008,
+        max_steps: int = 360,
+        retries: int = 1,
+    ) -> None:
+        """Return the arm to its reset joint configuration with high manipulability.
+
+        This preserves the current gripper command. It must not be paired with
+        ``open_gripper()`` merely to get a clearer observation, because the robot may
+        already be holding an object.
+        """
         home = getattr(self._env, "home_joint_position", None)
         if home is None:
             raise RuntimeError("Home joint position is unavailable in the current environment.")
         joints = np.asarray(home, dtype=np.float64).reshape(7)
-        self._env.move_to_joints_blocking(joints)
+        attempts = max(1, int(retries) + 1)
+        last_status = None
+        for _ in range(attempts):
+            last_status = self._env.move_to_joints_blocking(
+                joints,
+                tolerance=float(tolerance),
+                max_steps=int(max_steps),
+                settle_steps=8,
+                strict=False,
+            )
+            if isinstance(last_status, dict) and last_status.get("converged"):
+                return
+            if not isinstance(last_status, dict):
+                return
+        final_error = (
+            float(last_status.get("final_error", float("inf")))
+            if isinstance(last_status, dict)
+            else float("inf")
+        )
+        raise RuntimeError(
+            "goto_home_joint_position did not reach home: "
+            f"final_error={final_error:.6f}, tolerance={float(tolerance):.6f}, "
+            f"attempts={attempts}, max_steps={int(max_steps)}"
+        )
     
     def subsample_point_cloud(self, pc: np.ndarray, max_points: int = 10000) -> np.ndarray:
         """Randomly subsample a point cloud to a maximum number of points.

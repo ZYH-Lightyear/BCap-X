@@ -1,0 +1,16 @@
+{
+  "default": "vapi",
+  "routes": {
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1/",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "key_file": ".openrouterkey",
+      "reasoning_effort": "low"
+    },
+    "vapi": {
+      "base_url": "https://api.gpt.ge/v1/",
+      "api_key_env": ["V_API_KEY", "LLM_API_KEY"],
+      "reasoning_effort": "none"
+    }
+  }
+}

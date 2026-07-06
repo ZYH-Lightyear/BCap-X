@@ -3,26 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
-
 from robomex.core.sandbox import BlockExecutionResult
-
-if TYPE_CHECKING:
-    from robomex.verification import VerificationResult
 
 
 @dataclass(frozen=True)
 class TurnRecord:
-    """一个 agent 轮次:生成的代码及其执行结果。
-
-    ``verification`` 已不在执行器逐轮使用(子目标级验证统一交给独立的
-    ``VerifyCodeAgent``),保留为可选字段仅为向后兼容,默认 ``None``。
-    """
+    """一个 agent 轮次:生成的代码及其执行结果。"""
 
     turn: int
     code: str
     execution: BlockExecutionResult
-    verification: "VerificationResult | None" = None
 
 
 @dataclass(frozen=True)

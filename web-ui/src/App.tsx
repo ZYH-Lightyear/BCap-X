@@ -4,12 +4,17 @@ import { ConfigStartControl } from './components/ConfigStartControl';
 import { ChatPanel } from './components/ChatPanel';
 import { VisualizationPanel } from './components/VisualizationPanel';
 import { VideoArtifactsPanel } from './components/VideoArtifactsPanel';
+import { RobomexDebugPanel } from './components/RobomexDebugPanel';
 
 const FALLBACK_CONFIG = 'env_configs/cube_stack/franka_robosuite_cube_stack.yaml';
 const DEFAULT_MODEL = 'openrouter/qwen/qwen3.6-plus';
 const DEFAULT_SERVER_URL = 'http://127.0.0.1:8110/chat/completions';
 
 function App() {
+  if (window.location.hash === '#robomex-debug') {
+    return <RobomexDebugPanel />;
+  }
+
   const trial = useTrialState();
   const [model, setModel] = useState(DEFAULT_MODEL);
   const [serverUrl, setServerUrl] = useState(DEFAULT_SERVER_URL);

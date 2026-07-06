@@ -241,6 +241,58 @@ export interface ArtifactListResponse {
   overlays: ArtifactItem[];
 }
 
+export interface RobomexRun {
+  path: string;
+  name: string;
+  mtime: number;
+  events: string;
+  summary?: Record<string, unknown>;
+}
+
+export interface RobomexEvent {
+  id?: string;
+  ts?: string;
+  t_rel?: number;
+  event: string;
+  message?: string;
+  task?: string;
+  artifacts_dir?: string;
+  subgoal_index?: number;
+  subgoal_number?: number;
+  subgoal_dir?: string;
+  agent_role?: string;
+  agent_label?: string;
+  turn?: number;
+  action?: string;
+  status?: string;
+  ok?: boolean;
+  success?: boolean;
+  duration_s?: number;
+  goal?: string;
+  question?: string;
+  expected?: string;
+  claim?: string;
+  feedback?: string;
+  raw?: string;
+  raw_preview?: string;
+  code?: string;
+  stdout?: string;
+  stderr?: string;
+  [key: string]: unknown;
+}
+
+export interface RobomexEventsResponse {
+  dir: string;
+  events: RobomexEvent[];
+  summary: {
+    task?: string;
+    success?: boolean;
+    n_subgoals?: number;
+    [key: string]: unknown;
+  } | null;
+  files: ArtifactItem[];
+}
+
 // ============================================================================
 // Chat Message Types (for UI rendering)
 // ============================================================================

@@ -31,34 +31,13 @@ from typing import Any
 
 import tyro
 
-_CODE_AS_POLICY_PROMPT = (
-    "You are a robot Code-as-Policy agent controlling a Franka arm in LIBERO. "
-    "You are given ONE sub-goal of a larger task. Each turn, reply with exactly one JSON "
-    "action object. Use run_python to execute one block of Python that advances the sub-goal, "
-    "grounding every decision in the current observation "
-    "via get_observation(). Skill guidance below is advisory: adapt it, do not copy it blindly. "
-    "The CORE API primitives listed below (sensing, motion, geometry, query_vlm) are always "
-    "imported and available. Higher-level capabilities -- segmentation, grasp planning, "
-    "placement -- are NOT listed here; they are provided through skills: consult the skill menu "
-    "with `{\"tool\":\"use_skill\",\"args\":{\"name\":\"<skill>\"}}` to load each skill's recipe "
-    "and the exact APIs it uses. "
-    "`query_vlm` is for visual QA, state classification, and sanity checks only; do not use it "
-    "to produce object coordinates, boxes, or points. Use the perception skills that call "
-    "`vlm_bbox_detection` / `vlm_point_detection` for spatial grounding. "
-    "Use `{\"tool\":\"run_python\",\"args\":{\"code\":\"...\", \"intent\":\"...\"}}` for code and "
-    "`{\"tool\":\"finish\",\"args\":{\"claim\":\"...\"}}` when this sub-goal attempt is complete "
-    "and control should return to the "
-    "Planner."
-)
+DEFAULT_MAX_SUBGOALS = 8
+DEFAULT_SUBAGENT_MAX_TURNS = 8
+DEFAULT_SCENE_CAMERA = ""
 
 # Tier-0 API:写任何 manipulation 代码都绕不开的“词汇”——传感 + 运动原语 + 通用 VLM 问答工具 +
-# 纯几何/坐标变换。它们与具体技能策略无关、数量小且稳定,故**常驻**内层 system prompt。
-# 其余注册的 API 一律视作 Tier-1“能力”(分割 / 抓取规划 / 点云处理 / molmo 等):函数仍被
-    # CapX import 进沙箱、随时可调,但**文档不进基座 prompt**,改由相关 Skill 在被 use_skill 加载
-# 时给出示例与签名。好处:技能成为这些能力的唯一策划入口,既省上下文,又避免 agent 绕过技能
-# 直接乱用底层能力(例如绕开 segment_object 直接 segment_sam3_text_prompt)。新 API 默认 Tier-1
-# (隐藏),要常驻就显式加进下面这张名单。
-_TIER0_APIS: frozenset[str] = frozenset({
+# 纯几何/坐标变换。它们与具体技能策略无关、数量小且稳定,故常驻 Act/SubAgent system prompt。
+CORE_PROMPT_APIS: frozenset[str] = frozenset({
     # 传感
     "get_observation",
     # 运动原语
@@ -71,6 +50,28 @@ _TIER0_APIS: frozenset[str] = frozenset({
     "pixel_to_world_point", "mask_to_world_points", "depth_to_point_cloud",
     "normalize_vector",
 })
+
+# Tier-1 capability API:分割、VLM grounding、抓取规划、点云处理等能力函数。它们也要对
+# Agent 可见,避免模型靠 inspect/open 探测签名;但 prompt 会明确要求优先通过相关 Skill 的
+# workflow 使用这些 API,不要把它们当作绕过 Skill 的底层捷径。
+CAPABILITY_PROMPT_APIS: frozenset[str] = frozenset({
+    "vlm_bbox_detection", "vlm_point_detection",
+    "segment_sam3_text_prompt", "segment_sam3_point_prompt", "segment_sam3_box_prompt",
+    "plan_grasp", "plan_grasp_from_point_clouds",
+    "get_oriented_bounding_box_from_3d_points",
+    "subsample_point_cloud", "filter_noise",
+})
+
+# Tier-2/advanced API:可注入 sandbox,但默认不进 prompt。它们通常是内部解析、低频 helper
+# 或容易误用的组合函数;只有当某个 skill 明确需要时才通过 runtime.prompt_api_names 打开。
+ADVANCED_PROMPT_APIS: frozenset[str] = frozenset({
+    "point_prompt_molmo",
+    "parse_vlm_detections",
+    "interpolate_segment",
+    "select_top_down_grasp",
+})
+
+DEFAULT_PROMPT_APIS: frozenset[str] = CORE_PROMPT_APIS | CAPABILITY_PROMPT_APIS
 
 
 @dataclass
@@ -98,17 +99,158 @@ class LiveArgs:
     seed: int | None = None
     """可选的 env reset 种子。"""
 
+    max_subgoals: int = DEFAULT_MAX_SUBGOALS
+    """外层 planner 最多拆分多少个 sub-goal;可由 YAML 的 robomex.runtime.max_subgoals 配置。"""
+
+    subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS
+    """每次 SubAgent 委托最多多少个 run_python action block。"""
+
+    scene_camera: str = DEFAULT_SCENE_CAMERA
+    """保存给 planner 看的场景图相机名;空值表示从 observation 自动选择。"""
+
+    act_observation_camera: str = ""
+    """Act 取 OBS_BEFORE/反馈图的相机名;空值表示跟随 scene_camera。"""
+
+
+@dataclass(frozen=True)
+class RuntimeSettings:
+    """RoboMEx live runner settings that are not environment-construction fields."""
+
+    max_subgoals: int = DEFAULT_MAX_SUBGOALS
+    subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS
+    scene_camera: str = DEFAULT_SCENE_CAMERA
+    act_observation_camera: str = DEFAULT_SCENE_CAMERA
+    prompt_api_names: frozenset[str] = DEFAULT_PROMPT_APIS
+    subagent_denied_calls: frozenset[str] | None = None
+
+
+def _load_config_dict(config_path: str) -> dict[str, Any]:
+    from capx.envs.configs.loader import DictLoader
+
+    return DictLoader.load([os.path.expanduser(config_path)])
+
 
 def _build_env(config_path: str) -> Any:
     """像 trial worker 那样实例化高层 CapX env。"""
 
     from capx.envs.configs.instantiate import instantiate
-    from capx.envs.configs.loader import DictLoader
 
-    configs_dict = DictLoader.load([os.path.expanduser(config_path)])
+    configs_dict = _load_config_dict(config_path)
     if "env" not in configs_dict:
         raise ValueError(f"config {config_path} has no 'env' key")
     return instantiate(configs_dict["env"])
+
+
+def _robomex_vlm_config(config_path: str) -> dict[str, Any]:
+    """Read optional RoboMEx VLM settings from the env YAML.
+
+    Preferred shape:
+
+    robomex:
+      vlm:
+        model: vapi/gpt-5.5
+        server_url: http://localhost:8110/chat/completions
+        coord_space: pixel
+
+    """
+
+    cfg = _load_config_dict(config_path)
+    robomex_cfg = cfg.get("robomex") if isinstance(cfg.get("robomex"), dict) else {}
+    vlm = robomex_cfg.get("vlm") if isinstance(robomex_cfg.get("vlm"), dict) else None
+    if not isinstance(vlm, dict):
+        return {}
+    return {str(k): v for k, v in vlm.items() if v not in (None, "")}
+
+
+def _robomex_runtime_config(config_path: str) -> dict[str, Any]:
+    """Read optional RoboMEx runtime settings from ``robomex.runtime``."""
+
+    cfg = _load_config_dict(config_path)
+    robomex_cfg = cfg.get("robomex") if isinstance(cfg.get("robomex"), dict) else {}
+    runtime = robomex_cfg.get("runtime") if isinstance(robomex_cfg.get("runtime"), dict) else {}
+    if not isinstance(runtime, dict):
+        return {}
+    return {str(k): v for k, v in runtime.items() if v is not None}
+
+
+def _coerce_str_frozenset(value: Any) -> frozenset[str] | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, str):
+        items = [part.strip() for part in value.split(",")]
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        items = [str(part).strip() for part in value]
+    else:
+        raise TypeError(f"expected string/list setting, got {type(value).__name__}")
+    return frozenset(item for item in items if item)
+
+
+def _runtime_settings(args: LiveArgs) -> RuntimeSettings:
+    """Merge YAML runtime settings with explicit CLI overrides."""
+
+    cfg = _robomex_runtime_config(args.config_path)
+    prompt_api_names = _coerce_str_frozenset(cfg.get("prompt_api_names")) or DEFAULT_PROMPT_APIS
+    denied_calls = _coerce_str_frozenset(cfg.get("subagent_denied_calls"))
+
+    def effective_int(name: str, cli_value: int, default: int) -> int:
+        if cli_value != default:
+            return int(cli_value)
+        if name in cfg:
+            return int(cfg[name])
+        return default
+
+    def effective_str(name: str, cli_value: str, default: str) -> str:
+        if cli_value != default:
+            return cli_value
+        if name in cfg:
+            return str(cfg[name])
+        return default
+
+    scene_camera_cli_override = args.scene_camera != DEFAULT_SCENE_CAMERA
+    scene_camera = effective_str("scene_camera", args.scene_camera, DEFAULT_SCENE_CAMERA)
+    act_observation_camera = (
+        args.act_observation_camera
+        or (scene_camera if scene_camera_cli_override else str(cfg.get("act_observation_camera") or scene_camera))
+    )
+
+    return RuntimeSettings(
+        max_subgoals=effective_int("max_subgoals", args.max_subgoals, DEFAULT_MAX_SUBGOALS),
+        subagent_max_turns=effective_int("subagent_max_turns", args.subagent_max_turns, DEFAULT_SUBAGENT_MAX_TURNS),
+        scene_camera=scene_camera,
+        act_observation_camera=act_observation_camera,
+        prompt_api_names=prompt_api_names,
+        subagent_denied_calls=denied_calls,
+    )
+
+
+def _configure_vlm_backend(args: LiveArgs, log: Any | None = None) -> dict[str, str]:
+    """Resolve code-block VLM API config from YAML, falling back to the run model."""
+
+    cfg = _robomex_vlm_config(args.config_path)
+    applied: dict[str, str] = {}
+
+    model = cfg.get("model")
+    server_url = cfg.get("server_url")
+    api_key = cfg.get("api_key")
+    coord_space = cfg.get("coord_space")
+
+    applied["model"] = str(model or args.model)
+    applied["server_url"] = str(server_url or args.server_url)
+    if api_key or args.api_key:
+        applied["api_key"] = str(api_key or args.api_key)
+    if coord_space:
+        applied["coord_space"] = str(coord_space)
+
+    if log is not None:
+        source = "config" if cfg else "run model fallback"
+        log.info(
+            "VLM grounding backend: model=%s server_url=%s coord_space=%s (%s)",
+            applied.get("model"),
+            applied.get("server_url"),
+            applied.get("coord_space", "auto"),
+            source,
+        )
+    return applied
 
 
 def _task_language(env: Any) -> str:
@@ -119,18 +261,45 @@ def _task_language(env: Any) -> str:
     return lang or "complete the manipulation task"
 
 
-def _api_docs(env: Any, allow: frozenset[str] = _TIER0_APIS) -> str:
-    """只把 **Tier-0** API 的文档拼进内层 system prompt。
+def _api_docs(env: Any, allow: frozenset[str] = DEFAULT_PROMPT_APIS) -> str:
+    """Render selected sandbox API docs for Act/SubAgent prompts.
 
-    复刻 :meth:`capx.integrations.base_api.ApiBase.combined_doc` 的格式
-    (``name(signature)`` + 缩进的 docstring),但按 ``allow`` 名单逐函数过滤:Tier-1
-    能力级 API 不在此出现(它们仍被 CapX import 进沙箱、可调用,文档由对应 Skill 给出)。
-    遍历 ``env._apis`` 的所有 API 组,按名字判定 tier。
+    The docs are grouped by intended use instead of hidden by tier. Capability APIs
+    are visible so agents do not need schema probing, but the prompt still directs
+    them to use Skills as the workflow layer around these APIs.
     """
 
     import inspect
 
-    lines: list[str] = []
+    groups: dict[str, list[str]] = {
+        "core": [],
+        "capability": [],
+        "advanced": [],
+        "other": [],
+    }
+
+    def group_for(name: str) -> str:
+        if name in CORE_PROMPT_APIS:
+            return "core"
+        if name in CAPABILITY_PROMPT_APIS:
+            return "capability"
+        if name in ADVANCED_PROMPT_APIS:
+            return "advanced"
+        return "other"
+
+    signature_overrides = {
+        "query_vlm": "(prompt, images=None, *, image=None, model=None, temperature=0.0, max_tokens=1024)",
+    }
+    doc_overrides = {
+        "query_vlm": (
+            "Ask visual QA or categorical state questions. Canonical form: "
+            "query_vlm('question', images=rgb_or_crop). Compatibility forms "
+            "query_vlm(rgb_or_path, 'question') and query_vlm(image=rgb_or_path, "
+            "prompt='question') are accepted. Do not ask it for bbox, point, "
+            "coordinates, masks, or grasp poses."
+        ),
+    }
+
     for api in getattr(env, "_apis", {}).values():
         try:
             fns = api.functions()
@@ -139,27 +308,77 @@ def _api_docs(env: Any, allow: frozenset[str] = _TIER0_APIS) -> str:
         for name, fn in fns.items():
             if name not in allow:
                 continue
-            try:
-                sig = str(inspect.signature(fn))
-            except (TypeError, ValueError):
-                sig = "(…)"
-            doc = inspect.getdoc(fn) or ""
+            if name in signature_overrides:
+                sig = signature_overrides[name]
+            else:
+                try:
+                    sig = str(inspect.signature(fn))
+                except (TypeError, ValueError):
+                    sig = "(…)"
+            doc = doc_overrides.get(name) or inspect.getdoc(fn) or ""
+            lines = groups[group_for(name)]
             lines.append(f"{name}{sig}")
             if doc:
                 lines.append("  Doc:")
                 lines.extend(f"    {ln}" for ln in doc.splitlines())
             lines.append("")
-    return "\n".join(lines).strip()
+
+    sections: list[str] = []
+    section_specs = [
+        (
+            "core",
+            "Core APIs: stable sensing, motion, VLM QA, and geometry primitives. "
+            "These may be used directly when they advance the current sub-goal.",
+        ),
+        (
+            "capability",
+            "Capability APIs: grounding, segmentation, grasp planning, and point-cloud "
+            "utilities. Prefer loading the relevant RoboMEx skill first so these APIs "
+            "are used with the right workflow, validation, and artifacts. Do not inspect "
+            "signatures or source just to discover how to call them; use the docs below.",
+        ),
+        (
+            "advanced",
+            "Advanced/internal APIs: use only when a loaded skill or a prior error makes "
+            "the need explicit.",
+        ),
+        (
+            "other",
+            "Additional configured APIs.",
+        ),
+    ]
+    for key, title in section_specs:
+        body = "\n".join(groups[key]).strip()
+        if body:
+            sections.append(f"{title}\n{body}")
+    return "\n\n".join(sections).strip()
 
 
-def _save_scene_image(obs: dict, path: str) -> str | None:
-    """保存 agentview RGB 让 planner 能看到场景;取不到则返回 None。"""
+def _select_rgb_camera(obs: dict, camera: str = DEFAULT_SCENE_CAMERA) -> Any | None:
+    if camera:
+        try:
+            return obs[camera]["images"]["rgb"]
+        except (KeyError, TypeError):
+            return None
+    if not isinstance(obs, dict):
+        return None
+    for cam in obs.values():
+        if not isinstance(cam, dict):
+            continue
+        try:
+            return cam["images"]["rgb"]
+        except (KeyError, TypeError):
+            continue
+    return None
+
+
+def _save_scene_image(obs: dict, path: str, *, camera: str = DEFAULT_SCENE_CAMERA) -> str | None:
+    """保存相机 RGB 让 planner 能看到场景;camera 为空时自动选第一个 RGB。"""
 
     from robomex.perception.render import save_rgb
 
-    try:
-        rgb = obs["agentview"]["images"]["rgb"]
-    except (KeyError, TypeError):
+    rgb = _select_rgb_camera(obs, camera)
+    if rgb is None:
         return None
     try:
         return save_rgb(path, rgb)
@@ -266,19 +485,18 @@ def run_episode(env: Any, obs: dict, task: str, out_dir: Path, args: LiveArgs, l
 
     from robomex import RoboMExAgent, RoboMExConfig
     from robomex.agents import LLMPlannerPolicy
+    from robomex.agents.subagents import SubAgentExecutionPolicy, render_subagent_system_prompt
     from robomex.core.coder import LLMCodePolicy
     from robomex.core.sandbox import CapXExecutorAdapter
+    from robomex.prompts import render_libero_act_system_prompt
     from robomex.skills import SkillLibrary, load_builtin_skills
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    runtime = _runtime_settings(args)
 
-    # Code-block APIs such as query_vlm read their VLM backend from environment
-    # variables. By default, keep them on the same proxy route as the planner/act
-    # model so ``--model vapi/...`` does not silently fall back to OpenRouter.
-    os.environ.setdefault("CAPX_VLM_MODEL", args.model)
-    os.environ.setdefault("CAPX_VLM_SERVER_URL", args.server_url)
-    if args.api_key:
-        os.environ.setdefault("CAPX_VLM_API_KEY", args.api_key)
+    # Code-block APIs such as query_vlm / vlm_bbox_detection receive their VLM backend
+    # through the CapX API instance, configured from YAML's `robomex.vlm` section.
+    vlm_backend = _configure_vlm_backend(args, log)
 
     # 开启整段 episode 的视频录制(env 支持时);逐 sub-goal / 收尾时写盘。
     if hasattr(env, "enable_video_capture"):
@@ -288,15 +506,26 @@ def run_episode(env: Any, obs: dict, task: str, out_dir: Path, args: LiveArgs, l
         except Exception as exc:  # noqa: BLE001 - 录像不可用不该阻断 run
             log.warning("开启视频录制失败: %r", exc)
 
-    scene_path = _save_scene_image(obs, str(out_dir / "scene.png"))
+    scene_path = _save_scene_image(obs, str(out_dir / "scene.png"), camera=runtime.scene_camera)
     log.info("初始场景图: %s", scene_path or "(取不到 -> planner 仅凭文本规划)")
 
     library = SkillLibrary(str(out_dir / "library"))
     for skill in load_builtin_skills():
         library.admit(skill, source="builtin")
 
-    system_prompt = (
-        f"{_CODE_AS_POLICY_PROMPT}\n\nAvailable API functions (already imported):\n{_api_docs(env)}"
+    api_docs = _api_docs(env, runtime.prompt_api_names)
+    system_prompt = render_libero_act_system_prompt(api_docs)
+    subagent_system_prompt = render_subagent_system_prompt(api_docs)
+    code_policy = LLMCodePolicy(model=args.model, server_url=args.server_url, api_key=args.api_key)
+    scene_camera_label = runtime.scene_camera or "auto"
+    act_camera_label = runtime.act_observation_camera or "auto"
+    log.info("Act/SubAgent code policy: JSON action adapter")
+    log.info(
+        "RoboMEx runtime: max_subgoals=%d subagent_max_turns=%d scene_camera=%s act_observation_camera=%s",
+        runtime.max_subgoals,
+        runtime.subagent_max_turns,
+        scene_camera_label,
+        act_camera_label,
     )
 
     # 框架入口:把所有依赖收进一个 RoboMExConfig,再交给 RoboMExAgent 装配 + 运行
@@ -304,14 +533,23 @@ def run_episode(env: Any, obs: dict, task: str, out_dir: Path, args: LiveArgs, l
     config = RoboMExConfig(
         library=library,
         planner_policy=LLMPlannerPolicy(model=args.model, server_url=args.server_url, api_key=args.api_key),
-        code_policy=LLMCodePolicy(model=args.model, server_url=args.server_url, api_key=args.api_key),
-        executor=CapXExecutorAdapter(env),
+        code_policy=code_policy,
+        executor=CapXExecutorAdapter(env, vlm_backend=vlm_backend),
         max_turns=args.max_turns,
-        max_subgoals=8,
+        max_subgoals=runtime.max_subgoals,
         inner_system_prompt=system_prompt,
+        subagent_system_prompt=subagent_system_prompt,
+        code_policy_kind="json_action_adapter",
+        observation_camera=runtime.act_observation_camera,
+        subagent_max_turns=runtime.subagent_max_turns,
+        subagent_execution_policy=(
+            SubAgentExecutionPolicy(denied_calls=runtime.subagent_denied_calls)
+            if runtime.subagent_denied_calls is not None
+            else None
+        ),
         observation_summary=(
-            "A LIBERO tabletop scene. Call get_observation() for agentview/wrist RGB, "
-            "depth, intrinsics, and camera pose."
+            f"A LIBERO tabletop scene. Planner snapshots use the {scene_camera_label!r} camera. "
+            "Call get_observation() for available RGB/depth, intrinsics, and camera poses."
         ),
         artifacts_dir=str(out_dir),
     )
@@ -323,7 +561,11 @@ def run_episode(env: Any, obs: dict, task: str, out_dir: Path, args: LiveArgs, l
 
     def scene_refresh(observation: dict) -> str | None:
         step["n"] += 1
-        return _save_scene_image(observation, str(out_dir / f"scene_step{step['n']}.png"))
+        return _save_scene_image(
+            observation,
+            str(out_dir / f"scene_step{step['n']}.png"),
+            camera=runtime.scene_camera,
+        )
 
     # 每个 sub-goal 跑完的当下,就把这段视频写进它自己的 subgoal_NN/(不等整段结束)。
     def on_subgoal_end(index: int, result: Any, sg_dir: Path | None) -> None:
@@ -366,7 +608,8 @@ def main(args: LiveArgs) -> None:
     log.info("  ├─ run.log          完整日志")
     log.info("  ├─ planner.jsonl    每步 planner 原始回复 + 决策")
     log.info("  ├─ summary.json     episode 汇总")
-    log.info("  ├─ subgoal_NN/      内层代码 turn_*.py + 输出 turn_*.out.txt + 逐块过程视频 turn_*.mp4 + 整段 video_subgoal*.mp4")
+    log.info("  ├─ subagents.json   SubAgent runtime 配置与执行边界")
+    log.info("  ├─ subgoal_NN/      Act turn_*.py/out + SubAgent request/result/code artifacts + 过程视频")
     log.info("  └─ scene*.png       每步 planner 看到的场景图")
 
 

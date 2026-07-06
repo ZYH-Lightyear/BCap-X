@@ -19,8 +19,20 @@ from robomex.agents.planner import (
     TwoLevelAgent,
     parse_next_subgoal,
 )
+from robomex.agents.subagents import (
+    CodingAgentSubAgent,
+    PolicyBoundBlockExecutor,
+    SubAgentExecutionPolicy,
+    SubAgentRegistry,
+    SubAgentRequest,
+    SubAgentResult,
+    make_default_subagent_registry,
+    render_subagent_system_prompt,
+)
 __all__ = [
     "CodeAsPolicyAgent",
+    "CodingAgentSubAgent",
+    "PolicyBoundBlockExecutor",
     "LLMPlannerPolicy",
     "PlanExecution",
     "PlannerPolicy",
@@ -29,6 +41,12 @@ __all__ = [
     "SkillDistiller",
     "SubGoal",
     "SubGoalResult",
+    "SubAgentExecutionPolicy",
+    "SubAgentRegistry",
+    "SubAgentRequest",
+    "SubAgentResult",
     "TwoLevelAgent",
+    "make_default_subagent_registry",
     "parse_next_subgoal",
+    "render_subagent_system_prompt",
 ]

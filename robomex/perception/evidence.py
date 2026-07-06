@@ -28,7 +28,7 @@ class EvidenceRole(str, Enum):
     AFTER = "after"
     STATE_CUE = "state_cue"
     ACTION_CUE = "action_cue"
-    VERIFICATION_CUE = "verification_cue"
+    REVIEW_CUE = "review_cue"
     FAILURE_CUE = "failure_cue"
 
 
@@ -63,4 +63,3 @@ class MultimodalEvidenceBundle:
         """返回具有指定 kind 的 artifact。"""
 
         return tuple(artifact for artifact in self.artifacts if artifact.kind == kind)
-

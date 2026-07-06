@@ -11,7 +11,8 @@ Usage:
 Selection happens via the ``CAPX_POINT_BACKEND`` environment variable. Recognised
 values (case-insensitive):
 
-    "molmo"   -> capx.integrations.vision.molmo.init_molmo                (default)
+    "auto"    -> Molmo first, Qwen/OpenRouter fallback on init/call failure (default)
+    "molmo"   -> capx.integrations.vision.molmo.init_molmo
     "qwen"    -> capx.integrations.vision.qwen_vlm_point.init_qwen_vlm_point
     "vlm"     -> alias for "qwen"
 
@@ -29,19 +30,32 @@ import PIL
 
 _QWEN_ALIASES = {"qwen", "vlm", "qwen_vlm", "openrouter"}
 _MOLMO_ALIASES = {"molmo", "moldmo"}
+_AUTO_ALIASES = {"auto", "fallback", "molmo_then_qwen"}
 
 
 def _resolve_backend(backend: str | None) -> str:
-    raw = (backend if backend is not None else os.environ.get("CAPX_POINT_BACKEND", "molmo"))
-    name = (raw or "molmo").strip().lower()
+    raw = (backend if backend is not None else os.environ.get("CAPX_POINT_BACKEND", "auto"))
+    name = (raw or "auto").strip().lower()
+    if name in _AUTO_ALIASES:
+        return "auto"
     if name in _QWEN_ALIASES:
         return "qwen"
     if name in _MOLMO_ALIASES:
         return "molmo"
     raise ValueError(
         f"Unknown CAPX_POINT_BACKEND={raw!r}; expected one of "
-        f"{sorted(_MOLMO_ALIASES | _QWEN_ALIASES)}."
+        f"{sorted(_AUTO_ALIASES | _MOLMO_ALIASES | _QWEN_ALIASES)}."
     )
+
+
+def _has_valid_point(result: dict[str, tuple[int | None, int | None]]) -> bool:
+    for point in result.values():
+        if point is None:
+            continue
+        x, y = point
+        if x is not None and y is not None:
+            return True
+    return False
 
 
 def init_point_backend(
@@ -52,7 +66,7 @@ def init_point_backend(
 
     Args:
         backend: Override for the env var. When ``None`` the value of
-            ``CAPX_POINT_BACKEND`` is used (default ``"molmo"``).
+            ``CAPX_POINT_BACKEND`` is used (default ``"auto"``).
         **kwargs: Forwarded to the chosen ``init_*`` constructor.
 
     Returns:
@@ -65,11 +79,43 @@ def init_point_backend(
 
         print(
             "[point_backend] using Qwen/VLM pointer "
-            f"(model={kwargs.get('model_name', 'openrouter/qwen/qwen3.6-plus')})"
+            f"(model={kwargs.get('model_name') or os.environ.get('CAPX_VLM_MODEL', 'openrouter/qwen/qwen3.6-plus')})"
         )
         return init_qwen_vlm_point(**kwargs)
 
     from capx.integrations.vision.molmo import init_molmo
+
+    if resolved == "auto":
+        try:
+            molmo_fn = init_molmo(**kwargs)
+            print("[point_backend] using Molmo pointer with Qwen/VLM fallback")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[point_backend] Molmo init failed ({exc!r}); using Qwen/VLM pointer")
+            from capx.integrations.vision.qwen_vlm_point import init_qwen_vlm_point
+
+            return init_qwen_vlm_point(**kwargs)
+
+        qwen_fn = None
+
+        def det_fn(
+            image: PIL.Image.Image, objects: list[str] | None = None
+        ) -> dict[str, tuple[int | None, int | None]]:
+            nonlocal qwen_fn
+            try:
+                result = molmo_fn(image, objects)
+                if _has_valid_point(result):
+                    return result
+                print("[point_backend] Molmo returned no valid point; falling back to Qwen/VLM")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[point_backend] Molmo request failed ({exc!r}); falling back to Qwen/VLM")
+
+            from capx.integrations.vision.qwen_vlm_point import init_qwen_vlm_point
+
+            if qwen_fn is None:
+                qwen_fn = init_qwen_vlm_point(**kwargs)
+            return qwen_fn(image, objects)
+
+        return det_fn
 
     print("[point_backend] using Molmo pointer")
     return init_molmo(**kwargs)

@@ -91,6 +91,11 @@ class PointPromptRequest(BaseModel):
     point_coords: list[float]  # [x, y] — JSON arrays, not tuples
 
 
+class BoxPromptRequest(BaseModel):
+    image_base64: str
+    box: list[float]  # [x1, y1, x2, y2]
+
+
 class PointPromptResponse(BaseModel):
     scores: list[float]
     masks_base64: str
@@ -215,6 +220,42 @@ def _do_segment_point(pil_image: Image.Image, point_coords_tuple: tuple[float, f
     )
 
 
+def _do_segment_box(pil_image: Image.Image, box: list[float]):
+    """Blocking SAM3 box-prompt segmentation (runs on GPU thread)."""
+    _device_type = "cuda" if "cuda" in _DEVICE else "cpu"
+    dtype_context = torch.autocast(_device_type, dtype=torch.bfloat16)
+
+    with dtype_context:
+        inference_state = _PROCESSOR.set_image(pil_image)
+        masks, scores, _ = _MODEL.predict_inst(
+            inference_state,
+            box=[float(v) for v in box[:4]],
+            multimask_output=True,
+        )
+
+    masks_np = np.asarray(masks)
+    scores_np = np.asarray(scores)
+
+    if masks_np.size == 0 or scores_np.size == 0:
+        return PointPromptResponse(
+            scores=[],
+            masks_base64="",
+            masks_shape=(0, 0, 0),
+            masks_dtype="float32",
+        )
+
+    sort_idx = np.argsort(scores_np)[::-1]
+    masks_np = masks_np[sort_idx]
+    scores_np = scores_np[sort_idx]
+
+    return PointPromptResponse(
+        scores=scores_np.astype(float).tolist(),
+        masks_base64=encode_array(masks_np),
+        masks_shape=tuple(masks_np.shape),
+        masks_dtype=str(masks_np.dtype),
+    )
+
+
 @app.post("/segment_point", response_model=PointPromptResponse)
 async def segment_point(req: PointPromptRequest):
     if _PROCESSOR is None or _MODEL is None:
@@ -232,6 +273,25 @@ async def segment_point(req: PointPromptRequest):
     except Exception as e:
         logger.error(f"Point prompt inference failed: {e}")
         raise HTTPException(status_code=500, detail=f"Point prompt inference failed: {e}")
+
+
+@app.post("/segment_box", response_model=PointPromptResponse)
+async def segment_box(req: BoxPromptRequest):
+    if _PROCESSOR is None or _MODEL is None:
+        raise HTTPException(status_code=503, detail="Model not initialized")
+    if getattr(_MODEL, "inst_interactive_predictor", None) is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Instance interactivity not enabled on SAM3 model",
+        )
+
+    pil_image = decode_image(req.image_base64)
+
+    try:
+        return await _run_on_gpu(_do_segment_box, pil_image, req.box)
+    except Exception as e:
+        logger.error(f"Box prompt inference failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Box prompt inference failed: {e}")
 
 
 # Default to a project-local checkpoint so the model survives container/cache

@@ -54,6 +54,7 @@ dependencies = [
   "opencv-python-headless",
   "pillow>=10",
   "cloudpickle",
+  "json-repair==0.*",
 ]
 
 [project.optional-dependencies]
@@ -162,7 +163,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["capx*", "robomex*"]
+include = ["capx*", "robomex*", "capskillbench*"]
 exclude = ["tests*", "configs*"]
 
 [tool.uv.extra-build-dependencies]

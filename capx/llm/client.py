@@ -128,6 +128,27 @@ def is_openrouter_model(model: str) -> bool:
     return model.startswith("openrouter/") or model in OPENROUTER_MODELS
 
 
+def is_vapi_model(model: str) -> bool:
+    """Return True if the model should be routed through the V-API proxy route."""
+    return model.startswith("vapi/")
+
+
+def _native_model_name(model: str) -> str:
+    """Strip the local routing prefix used by the proxy, if present."""
+    if "/" not in model:
+        return model
+    prefix, native = model.split("/", 1)
+    if prefix in {"openrouter", "vapi"}:
+        return native
+    return model
+
+
+def _supports_openai_reasoning_controls(model: str) -> bool:
+    """Whether this model should use OpenAI reasoning-token request fields."""
+    native = _native_model_name(model).lower()
+    return native.startswith("gpt-5") or native.startswith(("o1", "o3", "o4"))
+
+
 @dataclass
 class ModelQueryArgs:
     """Arguments for querying a model."""
@@ -139,6 +160,67 @@ class ModelQueryArgs:
     max_tokens: int = 4096
     reasoning_effort: str = "medium"
     debug: bool = False
+
+
+def _build_chat_payload(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> dict[str, Any]:
+    """Build an OpenAI-compatible chat payload for the configured backend.
+
+    ``vapi/...`` and ``openrouter/...`` are local proxy routing prefixes. OpenRouter
+    expects its native ``max_tokens`` surface; V-API can expose OpenAI reasoning
+    models (for example ``vapi/gpt-5.5``), where ``max_completion_tokens`` is the
+    correct budget field because it covers both hidden reasoning and visible output.
+    """
+    model = args.model
+    if model in GPT_MODELS:
+        if "codex" in model:
+            return {
+                "model": model,
+                "input": _completions_to_responses_convert_prompt(prompt),
+            }
+        return {
+            "model": model,
+            "reasoning_effort": args.reasoning_effort,
+            "max_completion_tokens": args.max_tokens,
+            "messages": prompt,
+        }
+    if is_vapi_model(model) and _supports_openai_reasoning_controls(model):
+        payload: dict[str, Any] = {
+            "model": model,
+            "max_completion_tokens": args.max_tokens,
+            "messages": prompt,
+        }
+        effort = (args.reasoning_effort or "").strip()
+        if effort and effort.lower() not in {"none", "off"}:
+            payload["reasoning_effort"] = effort
+        return payload
+    if is_openrouter_model(model):
+        return {
+            "model": model,
+            "messages": prompt,
+            "temperature": args.temperature,
+            "max_tokens": args.max_tokens,
+        }
+    if model in CLAUDE_MODELS:
+        return {
+            "model": model,
+            "temperature": args.temperature,
+            "max_tokens": args.max_tokens,
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "messages": prompt,
+        }
+    if model in OSS_MODELS:
+        return {
+            "model": model,
+            "messages": prompt,
+            "temperature": args.temperature,
+            "max_tokens": args.max_tokens,
+        }
+    return {
+        "model": model,
+        "temperature": args.temperature,
+        "max_tokens": args.max_tokens,
+        "messages": prompt,
+    }
 
 
 def collapse_text_image_inputs(messages: list[dict]) -> list[dict]:
@@ -274,49 +356,7 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
     else:
         server_url = args.server_url
 
-    if args.model in GPT_MODELS:
-        if "codex" in args.model:
-            prompt = _completions_to_responses_convert_prompt(prompt)
-            payload = {
-                "model": args.model,
-                "input": prompt,
-            }
-        else:
-            payload = {
-                "model": args.model,
-                "reasoning_effort": args.reasoning_effort,
-                "max_completion_tokens": args.max_tokens,  # Total completion tokens = reasoning + output tokens
-                "messages": prompt,
-            }
-    elif is_openrouter_model(args.model):
-        payload = {
-            "model": args.model,
-            "messages": prompt,
-            "temperature": args.temperature,
-            "max_tokens": args.max_tokens,
-        }
-    elif args.model in CLAUDE_MODELS:
-        payload = {
-            "model": args.model,
-            "temperature": args.temperature,
-            "max_tokens": args.max_tokens,
-            "thinking": {"type": "enabled", "budget_tokens": 4096},
-            "messages": prompt,
-        }
-    elif args.model in OSS_MODELS:
-        payload = {
-            "model": args.model,
-            "messages": prompt,
-            "temperature": args.temperature,
-            "max_tokens": args.max_tokens,
-        }
-    else:
-        payload = {
-            "model": args.model,
-            "temperature": args.temperature,
-            "max_tokens": args.max_tokens,
-            "messages": prompt,
-        }
+    payload = _build_chat_payload(args, prompt)
     headers = {"Content-Type": "application/json"}
     if args.api_key:
         headers["Authorization"] = f"Bearer {args.api_key}"
@@ -330,7 +370,14 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
     end_time = time.time()
     print(f"Time taken to query model: {end_time - start_time:.2f} seconds")
     response.raise_for_status()
-    body = response.json()
+    try:
+        body = response.json()
+    except json.JSONDecodeError as exc:
+        prefix = response.text[:1000].replace("\n", "\\n")
+        raise RuntimeError(
+            f"LLM server returned non-JSON response "
+            f"(status={response.status_code}, url={server_url}, body_prefix={prefix!r})"
+        ) from exc
     _write_raw_llm_log(
         server_url=server_url,
         headers=headers,
@@ -346,7 +393,7 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         if args.model in GPT_MODELS and "codex" in args.model:
             out["content"] = body["output_text"]
         else:
-            out["content"] = body["choices"][0]["message"]["content"]
+            out["content"] = body["choices"][0]["message"].get("content") or ""
     except (KeyError, IndexError) as exc:
         raise RuntimeError(f"Unexpected response format: {body}") from exc
     if body.get("choices") is not None:

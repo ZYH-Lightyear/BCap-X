@@ -1,227 +1,133 @@
-# RoboMEx 架构总览
+# RoboMEx 重构后框架结构
 
-> 用途:`robomex/` **当前实际落地结构**的高层快照——两层控制 + 子目标级闭环验证 + 技能目录包。
-> 本文只描述结构与数据流,与代码冲突处以代码为准。
->
-> **基线:2026-06-24。** 当前形态是一个**可跑通的 Agentic 闭环**:LIBERO → CapX 沙箱 →
-> 反应式 planner 逐步出 sub-goal → 内层 Code Agent 自由组合技能写码 → 独立 Verifier 做
-> 子目标级视觉裁决 → 不过则在同一 sub-goal 内回灌重试。验证子系统**已接入主循环**(不再是雏形)。
+> 本文描述当前 RoboMEx 的 agentic 框架设计。重构目标是先把 Act Coding Agent 做成
+> Qwen-Code 风格的工程内核:结构化工具动作、渐进披露技能、单 agent 自主推进并主动停机。
+> 独立审查器不再是主循环里的硬门控;Act 认为一个 sub-goal 尝试结束后,控制权直接交回 Planner。
 
 ---
 
-## 0. 一页结论
+## 1. 一句话概括
 
-- **两层控制已通**:外层 `ReactivePlanner` 每步只出"下一个" sub-goal(读任务 + 当前场景图 +
-  高层技能菜单 + 历史),由它主动输出 `DONE` 终止;内层 `CodeAsPolicyAgent` 在 sub-goal 内
-  渐进披露技能、写码-执行多轮。
-- **验证是子目标成败的唯一权威**:每个 sub-goal 跑完由独立的 `VerifyCodeAgent` 做一次视觉裁决,
-  它**复用执行器的同一沙箱**,直接读执行期沉淀的证据(`EVIDENCE` / `OBS_BEFORE` / `OBS_AFTER` /
-  过程视频 `CLIPS`),用 `query_vlm` 自主写 judge 代码,输出裸 JSON `verdict`。
-- **Act↔Verifier 闭环(Maker-Checker)**:Verifier 判 `failed`/`uncertain` 时,把理由作为
-  feedback 回灌执行器,在同一 sub-goal 内换思路重试,直到 `passed` 或耗尽 `subgoal_max_attempts`。
-- **技能 = 目录包,prose-first**:6 个内置技能(2 高层 / 2 观测 / 2 动作),`SKILL.md` 给执行器、
-  `reference/verify.md` 给验证器(验证配方,含示例 judge 代码)。技能只被**咨询**,不照搬执行;
-  O/A 的顺序与组合由内层 Agent 自行编排,无写死管线。
-- **客观判据并列落盘**:`summary.json` 同时记 agent 主观裁决(VLM Verifier)与 env 客观判据
-  (LIBERO BDDL goal / reward),便于对照、暴露假阳性。
-- **自进化蒸馏暂缓**:`SkillDistiller` 为 no-op 占位,待闭环稳定后再设计。
+当前 RoboMEx 是一个两层循环:
+
+- 外层 `ReactivePlanner` 负责看任务、当前场景图、历史执行结果和高层技能菜单,每次只提出下一个
+  natural-language sub-goal,或输出 `DONE` 结束 episode。
+- 内层 `CodeAsPolicyAgent` 负责完成这个 sub-goal。它像 Qwen-Code agent 一样,每轮只选择一个工具动作:
+  `use_skill`、`run_python` 或 `finish`。
+- `finish` 只表示 Act 认为当前 sub-goal 尝试可以交回 Planner,不是外部审查判定的成功证明。
+- Planner 收到 Act trace、状态摘要和刷新后的场景后,决定继续规划、修正目标,还是结束。
+
+这种设计先淡化硬规则,把核心能力压到一个高质量 Act Coding Agent 上:它要会读技能、写代码、看反馈、自我修正、适时停止。
 
 ---
 
-## 1. 设计主线
-
-技能可**递归组合**:高层技能(复合 A-Skill,正文编排叶子技能)给**外层反应式 planner** 当能力菜单;
-叶子 O/A 技能给**内层 Code Agent** 当 building block。外层在 grounded 的菜单上选择、排序、重规划;
-内层在每个 sub-goal(= **验证单元**)里做感知 grounded 的"写码-执行-验证"。每个技能自带
-**When-to-use(SKILL.md)+ How-to-verify(reference/verify.md 验证配方)**。验证由独立 Verifier
-承担,保持"执行 vs 裁决"互不污染。
-
-三根支柱:**① 两层控制(planner / 内层 coder) ② 双物种技能 + 可执行验证配方 ③ 子目标级闭环裁决**。
-
----
-
-## 2. 当前结构全景
+## 2. 总体流程图
 
 ```mermaid
-graph TB
-    subgraph Entry["框架入口 core/session.py"]
-        CFG["RoboMExConfig<br/>依赖容器:library / planner_policy / code_policy /<br/>executor(沙箱) / enable_verification / subgoal_max_attempts"]
-        AG["RoboMExAgent.run()<br/>装配并跑一整段反应式 episode"]
-        CFG --> AG
+flowchart TD
+    A["Entry: examples/run_planner_live.py<br/>构造 RoboMExConfig"] --> B["RoboMExAgent.run(task)"]
+
+    B --> C["ReactivePlanner.next_subgoal<br/>输入: task + scene image + history + high-level skill menu"]
+    C -->|DONE| Z["Episode end<br/>summary / videos / events 落盘"]
+    C -->|sub-goal + postcondition| D["CodeAsPolicyAgent.run<br/>Act-only inner loop"]
+
+    subgraph Inner["Qwen-Code-style Act Coding Agent"]
+        D --> E["System prompt<br/>Tier-0 API docs + available_skills 短菜单"]
+        E --> F["ModelTurn"]
+        F --> G{"tool call?"}
+        G -->|use_skill(name)| H["加载 SKILL.md 全文<br/>追加到上下文"]
+        H --> F
+        G -->|run_python(code,intent)| I["CapXExecutorAdapter.run_block<br/>在持久沙箱执行代码"]
+        I --> J["返回 stdout/stderr/status/reward/observation<br/>保存 turn code/output/video"]
+        J --> F
+        G -->|finish(claim)| K["生成 AgentTrace<br/>act_status=finished"]
+        G -->|invalid/empty| L["nudge/retry<br/>要求返回合法工具动作"]
+        L --> F
+        F -->|action budget exhausted| M["AgentTrace<br/>act_status=exhausted/unresolved"]
     end
 
-    subgraph Outer["外层(反应式,每步出下一个 sub-goal)"]
-        RP["ReactivePlanner.next_subgoal<br/>task + 当前场景图 + 高层菜单 + 历史(含裁决理由)<br/>→ 下一个 sub-goal(goal/skill/postcondition) 或 DONE"]
-    end
-
-    subgraph Inner["内层:一个 sub-goal 内的 Act ↔ Verifier 闭环"]
-        EXE["CodeAsPolicyAgent(执行器/Maker)<br/>渐进披露整库 + 先读高层技能编排<br/>写码→执行→逐块存过程视频"]
-        VER["VerifyCodeAgent(验证器/Checker)<br/>复用同一沙箱 + 证据 + query_vlm<br/>→ 裸 JSON verdict"]
-        EXE -->|"trace + 证据(同一沙箱)"| VER
-        VER -->|"failed/uncertain → 回灌理由重试"| EXE
-    end
-
-    subgraph Core["共享内核 core/coder(借 qwen-code 循环 + 渐进披露)"]
-        CA["CodingAgent 基类<br/>一次模型调用 → parse_action → 回灌 → 终止<br/>USE SKILL 渐进披露 / repeat_limit / force_terminal"]
-    end
-
-    subgraph Skills["技能载体 skills/(6 个目录包)"]
-        SCH["Skill = 目录包<br/>SKILL.md(执行器) + reference/verify.md(验证配方)"]
-        LIB["SkillLibrary<br/>compound_skills(菜单) + 渐进披露,无关键词检索"]
-    end
-
-    AG --> RP
-    RP -->|"sub-goal + primary_skill_id"| EXE
-    RP -.读高层菜单.-> LIB
-    EXE -.同源.-> CA
-    VER -.同源.-> CA
-    EXE --> LIB
-    VER --> LIB
-    LIB --> SCH
-    VER -->|"verdict + reason"| RP
-```
-
-### 2.1 支柱 A — 技能载体(目录包 + 渐进披露)
-
-- **结构**:`schema.py` 的 `Skill` = 目录包,按读者拆文件——`SKILL.md`(执行器:何时用 / 分解 /
-  过程 / 失败恢复)、`reference/verify.md`(验证器:pass/fail 配方 + 示例 judge 代码)、可选的
-  `scripts/verify.py`(确定性门,当前无)。`category ∈ {high_level, observation, action}`。
-- **库存(6 个)**:
-  - high_level:`pick_object`、`place_object`(planner 菜单;正文为**建议性读单**,引用叶子技能但
-    不写死 claim 管线);
-  - observation:`segment_object`(VLM 先定框 → SAM3 点提示分割,并把 VLM 框图 / SAM3 mask 叠加图
-    存盘到 `ARTIFACTS_DIR` 供验证器查看)、`find_placement`;
-  - action:`grasp_object`(自包含:从 segment 的 points 自取 top-down 位姿 → approach/close/lift)、
-    `release_at`。
-- **消费机制(唯一)**:**qwen-code 式渐进披露**——系统提示放整库 `name + description` 短清单,
-  Agent 用 `USE SKILL: <name>` 按需拉全文(及验证器侧的 `reference/verify.md`)。**无关键词检索**。
-
-### 2.2 支柱 B — 共享 CodingAgent 内核(执行器 / 验证器同源)
-
-- **核心 `core/coder/agent.py`**:执行器与验证器是**同一种 agent**,共享循环骨架(每轮一次模型调用 →
-  `parse_action` → 回灌 → 命中终止动作即停)与循环安全护栏(`max_turns` / `repeat_limit` 重复熔断 /
-  `force_terminal_on_exhaust` 强制终止)。三处差异由子类钩子定制:角色提示词、上下文来源、终止判定。
-- **执行器 `agents/executor.py: CodeAsPolicyAgent`**:菜单 = 整库;`run(goal, obs, primary_skill_id,
-  video_dir, feedback)` —— planner 传入的高层技能 id 提示它**先 `USE SKILL` 读编排再自由组合**叶子技能;
-  每个 python 轮逐块存过程视频(`turn_NN.mp4`,只存有动作的块)并收 before/after 帧;`feedback` 承载
-  上一次裁决理由(闭环重试)。**不写死任何 O→A 流程**;仅报告 env 级 `terminated`。
-- **验证器 `agents/verifier.py: VerifyCodeAgent`**:同核子类,上下文为只含事实的 `VerifierContext`
-  (sub-goal、用过哪些技能、脱敏 op-trace、`reference/verify.md` 配方、过程视频清单、可选 env 旁证),
-  **不含执行器的思维链**,故盲区互不相关;通过输出裸 JSON `verdict` 终止。
-
-### 2.3 支柱 C — 子目标级验证(已接入主循环)
-
-三层解耦:**Spec / Evidence / Judge**。
-
-1. **Spec = `reference/verify.md`**:纯文档,声明"什么算达成",含 rubric + 示例 judge 代码。
-   面向 VLM/人,不是死管线。
-2. **Evidence = 执行期捕获 + 持久沙箱状态**(按技能类型而非统一 before/after 组织):
-   - 框架在子目标开场种 `EVIDENCE = {}`、抓起始帧 `OBS_BEFORE`、注入 `ARTIFACTS_DIR`;技能把关键
-     中间量发布到 `EVIDENCE`(如 `EVIDENCE['target_box']`)并把可视化叠加图落盘;
-   - 沙箱 globals 跨 block 持久,验证器开场再补当前帧 `OBS_AFTER`、`draw_box`,以及过程视频
-     `CLIPS`(每个动作块一段)+ `process_frames(start,end)`(内存帧零解码取帧)/ `clip_frames(path)`
-     (兜底解码 mp4)。
-3. **Judge = `VerifyCodeAgent`**:子目标结束后**只跑一次**,用沙箱里的 `query_vlm` 在证据上判断,
-   输出 `verdict ∈ {passed, failed, uncertain}` + `confidence` + `reason`。
-   - **铁律(写在 verify.md)**:标注不得污染被判物体的像素——只允许画**外框 bounding box** 或把坐标
-     作为**文本**喂 VLM,**禁止**用颜色填涂 mask 盖在物体上。
-
-**粒度:逐块"存",整目标"判一次"。** 块级正确性靠沙箱 `ok`/`stderr` + 技能内 `assert`(廉价自纠错,
-驱动内层多轮);子目标级达成靠验证器一次性语义视觉裁决。
-
-**结果如何用**:`passed → SubGoalResult.success=True`;`failed/uncertain → False`;`reason` 永远进
-planner history。验证器是子目标成败的**唯一权威**,内层 `FINISH` 仅结束内层循环、不等于成功。
-
----
-
-## 3. 端到端数据流(当前真实路径)
-
-```
-RoboMExAgent.run(task):                                   [core/session.py]
-  loop(最多 max_subgoals):                                 [外层, 反应式步进]
-    ReactivePlanner.next_subgoal(task, history, 当前场景图)
-      → 下一个 sub-goal(goal/skill/postcondition) 或 DONE → 退出
-
-    _run_subgoal:                                          [内层 Act↔Verifier 闭环]
-      for attempt in range(subgoal_max_attempts):
-        CodeAsPolicyAgent.run(goal, primary_skill_id, video_dir, feedback)
-          USE SKILL 高层技能读编排 → 自由组合 observe/action 叶子
-          每轮: 写 python → 执行 → 逐块存 turn_NN.mp4 + 收 before/after
-          → AgentTrace(turns, success=env terminated, metadata.clips)
-        VerifyCodeAgent.verify()  (enable_verification 时)
-          复用同一沙箱 → query_vlm 在 EVIDENCE/OBS_*/CLIPS 上判断 → verdict
-        passed → break ; failed/uncertain → feedback=理由, 重试
-
-    on_subgoal_end 回调: 把这段 video_subgoal*.mp4 当场写进 subgoal_NN/
-    scene_refresh: 用最新观测刷新 planner 下一步看到的场景图(真机)
-
-  episode 末: 拼接全部 video_subgoal*.mp4 → video_full*.mp4
-  落盘 summary.json: success(主观裁决) + env_*(客观 BDDL 判据)
-```
-
-**可选 env 旁证(默认关闭)**:`expose_env_signal=True` 时,把 LIBERO 的 `task_completed`/`reward`
-作为一小段提示喂给 Verifier 上下文,仅作旁证、不直接决定裁决。
-
----
-
-## 4. 产物布局(`artifacts_dir` 给定时)
-
-```
-<episode>/
-  run.log                  完整日志
-  planner.jsonl            每步 planner 原始回复 + 决策
-  summary.json             episode 汇总(success + env_* 客观判据 + 各 sub-goal)
-  scene*.png               每步 planner 看到的场景图
-  video_full*.mp4          全部 sub-goal 拼接的完整 episode 视频
-  subgoal_NN/
-    meta.json              该 sub-goal 元信息 + 验证裁决
-    turn_MM.py             内层第 MM 轮代码
-    turn_MM.out.txt        该轮沙箱输出(status/ok/reward/terminated + stdout/stderr)
-    turn_MM.mp4            该轮(有动作时)的过程视频
-    video_subgoal*.mp4     整段 sub-goal 过程视频
-    verify.txt             验证器各 judge 轮 + 最终裁决
-    <skill 落盘的叠加图>     如 segment 的 VLM 框图 / SAM3 mask 图
-    retry_KK/              第 KK 次重试的同构产物(闭环重试时)
+    K --> N["SubGoalResult<br/>success = trace.success/env signal<br/>note = Act claim or unresolved reason"]
+    M --> N
+    N --> O["scene_refresh<br/>用最新 observation 保存场景图"]
+    O --> P["history += result"]
+    P --> C
 ```
 
 ---
 
-## 5. 目标 vs 实际 对齐
+## 3. 核心模块
 
-| 支柱 | 目标形态 | 当前实际 | 状态 |
-|---|---|---|---|
-| 两层控制·外层 | 菜单上选择排序 + 重规划 + 消费内层归因 | `ReactivePlanner.next_subgoal` 反应式步进,主动 `DONE` 终止;裁决理由进 history 驱动重写 | 🟢 已通 |
-| 两层控制·内层 | 感知 grounded 的写码-执行-验证 | flat 多轮 + 渐进披露 + `primary_skill_id` 引导;逐块存证 | 🟢 已通 |
-| 双物种技能 | O 产中间量 / A 消费;高层 = 复合 | prose 化;O/A 组合由内层自行编排,不写死;高层 = 建议性读单 | 🟢 已通 |
-| 可执行验证 | 每技能 verifier 配方 + 视觉裁决 | `reference/verify.md` 配方 + `VerifyCodeAgent` 复用沙箱 + `query_vlm`,**已接主循环** | 🟢 已通 |
-| 子目标闭环 | sub-goal = 验证单元,不过即重试 | Act↔Verifier 闭环(`subgoal_max_attempts` + feedback 回灌) | 🟢 已通 |
-| 客观判据对照 | 暴露假阳性 | `summary.json` 并列主观裁决 + env BDDL 判据;批量评测口径对齐 cap-x | 🟢 已通 |
-| 自进化蒸馏 | 双流(几何先验 / 可靠性画像)+ 失败归因 | `SkillDistiller` no-op 占位 | ⚪ 暂缓 |
-
-图例:🟢 已落地 / 🟡 骨架待续 / ⚪ 暂缓。
+| 模块 | 职责 |
+|---|---|
+| `robomex/core/session.py` | 框架入口。`RoboMExConfig` 注入技能库、planner policy、code policy、executor、产物目录等依赖;`RoboMExAgent.run()` 串起整个 episode。 |
+| `robomex/agents/planner.py` | 外层反应式 planner。每步返回自然语言 `Goal` + `Postcondition`,或 `DONE`;历史里包含 Act 的结果和 note。 |
+| `robomex/agents/executor.py` | 当前主力 Act agent。继承共享 `CodingAgent`,负责把 sub-goal 转成多轮技能读取和 Python 执行。 |
+| `robomex/core/coder/agent.py` | Qwen-Code-style agent loop。维护 prompt、解析工具动作、加载技能、执行代码、处理无效回复、预算和终止。 |
+| `robomex/core/coder/action.py` | 统一 `ModelTurn` / `ToolCall` / JSON action 解析。Provider 边界使用文本 JSON action,内部归一化为 `ToolCall`。 |
+| `robomex/core/coder/policy.py` | 模型策略层。`LLMCodePolicy` 走文本 JSON action,用于在线执行、训练回放和跨代理兼容。 |
+| `robomex/core/sandbox/capx.py` | CapX/LIBERO 执行适配器。负责把 `run_python` 代码块送进真实 env 沙箱,并回收 observation、reward、terminated、视频范围等。 |
+| `robomex/skills/` | 技能库。系统提示只放短菜单,Act/SubAgent 通过 `use_skill` 按需拉取具体 `SKILL.md`。 |
 
 ---
 
-## 6. 模块定位速查
+## 4. Act Agent 的工作方式
 
-| 路径 | 角色 | 状态 |
-|---|---|---|
-| `core/session.py` | **★框架入口**:`RoboMExConfig`(依赖容器) + `RoboMExAgent.run()`(反应式两层 + Act↔Verifier 闭环 + 落盘) | 最新 |
-| `core/coder/agent.py` | **★共享 CodingAgent 内核**(循环 + 渐进披露);执行器/验证器同源 | 最新 |
-| `core/coder/action.py` | `parse_action` / `SkillEntry` / 渐进披露渲染 | 稳定 |
-| `core/coder/policy.py` | `CodePolicy` / `CompletionPolicy`:LLM / 脚本回放 | 稳定 |
-| `core/coder/trace.py` | `AgentTrace`(含 `metadata.clips`) / `TurnRecord` | 稳定 |
-| `core/sandbox/action_block.py` | `SemanticActionBlock` / `BlockExecutionResult` | 稳定 |
-| `core/sandbox/capx.py` | CapX 执行适配器(`run_block` 记 `info['video_range']`) | 最新 |
-| `agents/planner.py` | `ReactivePlanner.next_subgoal` 反应式 + `SubGoal`/`SubGoalResult`(含 `note`) | 最新 |
-| `agents/executor.py` | `CodeAsPolicyAgent` 执行器(`run` 增 `video_dir`/`feedback`,逐块存视频) | 最新 |
-| `agents/verifier.py` | `VerifyCodeAgent` 独立验证 coder(复用沙箱 + `query_vlm` + 过程视频) | 最新 |
-| `agents/evolve.py` | `SkillDistiller` no-op 占位 | 暂缓 |
-| `skills/schema.py` | Skill 目录包数据模型(`reference/` sidecar) | 稳定 |
-| `skills/store.py` | 磁盘技能库 `SkillLibrary`:admit/get/all/compound_skills(纯渐进披露) | 稳定 |
-| `skills/builtin/` | **6 个**内置技能包 + 自动 README(`load_builtin_skills()`) | 最新 |
-| `verification/context.py` | `VerifierContext`(sub-goal/op-trace/resources/clips/env_signal) + `collect_verify_resources` | 最新 |
-| `verification/verifier.py` | 验证结果数据类型(`VerificationResult`/`Signal`/`Status`) | 稳定 |
-| `perception/` | `EvidenceCollector`(逐块 before/after)+ `save_video` / before-after 渲染 | 最新 |
-| `examples/run_planner_live.py` | **单 episode 真机入口**(build `RoboMExConfig` → `run()`;逐段存视频 + 拼 `video_full`) | 最新 |
-| `examples/run_planner_batch.py` | **批量评测入口**:选 suite + task 范围 + trials,复用 `run_episode`,口径对齐 cap-x | 最新 |
+Act 的动作空间被收敛为四个 JSON action:
+
+1. `use_skill(name)`: 读取一个技能的完整操作说明。初始 prompt 只给技能名和短描述,避免把所有技能正文塞进上下文。
+2. `call_subagent(task, inputs)`: 委托一个 focused natural-language task 给通用只读 CodingAgentSubAgent。Act 不选择固定 SubAgent 名称或 profile;SubAgent 根据任务和技能菜单自行选择 workflow,结果作为 evidence 回灌给 Act。
+3. `run_python(code, intent)`: 在 CapX 持久沙箱中执行一个 Python block。沙箱里的变量、`EVIDENCE`、观测结果和中间计算可以跨 block 复用。
+4. `finish(claim)`: Act 主动声明当前 sub-goal 尝试结束,把控制权交回 Planner。
+
+每轮模型调用后,`CodingAgent` 会把工具结果作为新的 user message 回灌给模型。代码执行失败时,stderr 和状态会直接进入下一轮上下文;模型需要自己修正。`use_skill` 不消耗 Python action budget,`run_python` 才消耗预算。若模型反复输出空内容、非法 JSON、多个动作或重复动作,agent 会给 nudge,但不把流程写死成固定 O-A-V 管线。
+
+---
+
+## 5. Planner 和 Act 的边界
+
+Planner 不写代码,也不直接选择底层 perception/action API。它只做任务分解和重规划:
+
+- 输入:原始任务语言、当前场景图、高层技能菜单、已执行 sub-goal 的 `SubGoalResult`。
+- 输出:下一个 sub-goal,例如“pick up the milk and place it near the basket”,附带建议技能和期望后置条件。
+- 停止:当 Planner 判断任务已经完成或无法继续时输出 `DONE`。
+
+Act 是当前 sub-goal 内的 swarm manager 和 coding executor。它可以直接读技能、写代码,也可以把定位、抓取候选、放置候选、状态检查等不确定环节委托给通用 SubAgent。SubAgent 的调用契约是任务文本,不是规则匹配字段;返回 JSON 只是为了把 compact evidence、置信度和 artifact 路径稳定回传给 Act。
+
+Act 不负责全局任务策略。它只在一个 sub-goal 内自由组合技能、SubAgent 和 API,并在合适时 `finish`。这样 Planner 可以在每个 sub-goal 后基于刷新场景重新决策,避免把一条长计划一次性写死。
+
+---
+
+## 6. 审查能力的新位置
+
+当前主路径已经改成 Act-only:
+
+- session 不再自动运行独立审查 agent。
+- session 不再保留 `subgoal_max_attempts` 这类硬重试门控。
+- 状态检查可以由 Act 自行完成,也可以在需要时作为普通 `call_subagent(task=...)` 委托出去;它不是固定的外部裁判。
+
+这不是否定审查,而是把当前工程优先级前移:先让 Act 本身具备足够好的工具使用、状态读取、错误恢复和停机判断。后续若强化 grounding、affordance、review 能力,也应作为“任务委托给通用 SubAgent + skill workflow”的形式加入,而不是恢复固定角色路由或硬循环。
+
+---
+
+## 7. 与 Qwen-Code 对齐的点
+
+- Agent 通过“模型回合 -> 工具调用 -> 工具结果回灌 -> 下一回合”的循环工作。
+- 技能采用渐进披露:先给短菜单,需要时再加载正文。
+- 停止由 agent 主动调用 `finish`,不是外部解析 `FINISH` 文本或固定轮数强行推断。
+- 动作被结构化为内部 `ToolCall`,但 provider 边界稳定采用文本 JSON action adapter。
+- Runtime 和 policy 分离:在线执行、训练、回放都通过 `LLMCodePolicy` 产出 JSON action,再解析为内部 `ToolCall`。
+
+当前不把 VAPI/OpenRouter 这类中转服务的 provider-native tool calling 作为 RoboMEx 主路径;它们在多层代理下容易丢失 `tools/tool_calls` 字段。JSON action adapter 是默认且唯一的在线执行协议。
+
+---
+
+## 8. 当前设计取舍
+
+这个版本有意先减少硬性规则:
+
+- 不再要求固定的 observe -> act -> verify 顺序。
+- 不再让 `query_vlm` 做 bbox/point 检测;空间 grounding 应通过 `vlm_bbox_detection` / `vlm_point_detection` 相关技能/API。
+- 不再让独立审查器决定每个 sub-goal 是否可以交回 Planner。
+- 不把 Grounding、Affordance、Verification 做成强绑定流程。当前只有一个通用 CodingAgentSubAgent runtime;Act 用自然语言任务委托它,SubAgent 自行加载相关 skill 并产出 evidence。
+
+短期目标是得到一个工程上干净、可调试、可逐步替换 policy 的 Act Coding Agent。长期目标是在这个内核上扩展 skill workflow 和 SubAgent 能力,但默认接口仍应保持 task-first:Act 提出具体问题,SubAgent 根据技能自行工作,最终只回传执行决策所需的 compact evidence。

@@ -24,6 +24,7 @@ read by the Franka LIBERO API classes.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from collections.abc import Callable
@@ -159,8 +160,8 @@ def _parse_points_any_format(text: str) -> tuple[list[tuple[float, float]], floa
 
 
 def init_qwen_vlm_point(
-    model_name: str = "openrouter/qwen/qwen3.6-plus",
-    base_url: str = SERVICE_URL,
+    model_name: str | None = None,
+    base_url: str | None = None,
     api_key: str | None = None,
     *,
     temperature: float = 0.0,
@@ -188,6 +189,8 @@ def init_qwen_vlm_point(
         list of object descriptions and returns ``{obj: (x_px, y_px)}``, with
         ``(None, None)`` when parsing fails or the object cannot be located.
     """
+    model_name = model_name or os.environ.get("CAPX_VLM_MODEL", "openrouter/qwen/qwen3.6-plus")
+    base_url = base_url or os.environ.get("CAPX_QWEN_VLM_BASE_URL", SERVICE_URL)
     chat_url = _build_chat_url(base_url)
     session = requests.Session()
     headers = {"Content-Type": "application/json"}

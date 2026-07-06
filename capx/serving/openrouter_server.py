@@ -1,6 +1,7 @@
 import itertools
 import json
 import logging
+import os
 from pathlib import Path
 from typing import List, Literal, Optional, Union
 
@@ -58,6 +59,31 @@ class ChatCompletionResponse(BaseModel):
     choices: list[ChatCompletionResponseChoice]
 
 
+def _load_dotenv(path: str = ".env") -> None:
+    """Best-effort load of a local .env into os.environ (without overriding).
+
+    Keeps the proxy self-sufficient: route api keys referenced via ``api_key_env``
+    resolve even when launched in a fresh shell (e.g. a tmux window) that didn't
+    inherit our exported secrets. Supports ``KEY=VALUE`` and ``export KEY=VALUE``.
+    """
+    p = Path(path)
+    if not p.exists():
+        return
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+
 def _load_api_keys(key_file: str) -> list[str]:
     """Load API keys from a file, one key per line. Ignores blank lines and comments."""
     path = Path(key_file)
@@ -76,51 +102,124 @@ def _load_api_keys(key_file: str) -> list[str]:
 def _build_extra_body(
     request: "ChatCompletionRequest", default_reasoning_effort: str | None
 ) -> dict | None:
-    """组装转发给 OpenRouter 的 extra_body(主要是 reasoning 控制)。
+    """组装转发给上游的 extra_body(主要是 reasoning 控制)。
 
-    优先用请求里显式传的 ``reasoning``;否则在配了服务端默认 effort 时注入
-    ``{"effort": <default>}`` 以统一降低各模型的 thinking 强度。``reasoning`` 不是 OpenAI
-    标准字段,必须经 ``extra_body`` 透传,不能直接当 kwarg 传给 client。
+    优先用请求里显式传的 ``reasoning``;否则在配了该路由默认 effort 时注入
+    ``{"effort": <default>}`` 以统一降低 thinking 强度。``reasoning`` 不是 OpenAI 标准
+    字段,必须经 ``extra_body`` 透传。``none``/``off``/空 表示完全不注入 —— 非 OpenRouter
+    的上游(V-API / 原生 OpenAI / Gemini 网关)会对这个参数报 400,所以必须可关闭。
     """
 
     reasoning = request.reasoning
-    # "none"/"off"/"" disables injection entirely. Non-OpenRouter upstreams
-    # (V-API, raw OpenAI/Gemini gateways) reject the OpenRouter-specific
-    # ``reasoning`` argument with a 400, so it must be omittable.
     effort = (default_reasoning_effort or "").strip().lower()
     if reasoning is None and effort and effort not in {"none", "off"}:
         reasoning = {"effort": default_reasoning_effort}
     return {"reasoning": reasoning} if reasoning is not None else None
 
 
-def create_app(
-    api_key: str,
-    base_url: str,
-    async_client: bool = True,
-    default_reasoning_effort: str | None = "low",
-    timeout_s: float = 600.0,
-) -> FastAPI:
+class Upstream:
+    """One configured backend (OpenRouter / V-API / ...) behind the proxy.
+
+    A request is routed to an upstream by the first segment of its model id
+    (``openrouter/qwen/...`` -> upstream ``openrouter``); the matched prefix is
+    stripped before forwarding so the upstream sees its native model id.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        client: AsyncOpenAI | OpenAI,
+        reasoning_effort: str | None,
+    ) -> None:
+        self.name = name
+        self.client = client
+        self.reasoning_effort = reasoning_effort
+
+
+def _resolve_api_key(spec: dict) -> str:
+    """Resolve a route's API key from ``api_key`` > ``api_key_env`` > ``key_file``."""
+    key = spec.get("api_key")
+    if key:
+        return key
+    env_names = spec.get("api_key_env")
+    if isinstance(env_names, str):
+        env_names = [env_names]
+    for env_name in env_names or ():
+        env_val = os.getenv(env_name)
+        if env_val:
+            return env_val
+    key_file = spec.get("key_file")
+    if key_file and Path(key_file).exists():
+        return _load_api_keys(key_file)[0]
+    raise ValueError(
+        f"route '{spec.get('name', spec)}': no API key "
+        f"(set one of api_key / api_key_env / key_file)"
+    )
+
+
+def _build_upstream(
+    name: str, spec: dict, async_client: bool, timeout_s: float
+) -> Upstream:
+    api_key = _resolve_api_key({**spec, "name": name})
+    base_url = spec["base_url"]
     default_headers = {
         "HTTP-Referer": "https://github.com/nvidia-gear/CaP-X",
         "X-Title": "CaP-X",
     }
+    cls = AsyncOpenAI if async_client else OpenAI
+    client = cls(
+        api_key=api_key,
+        base_url=base_url,
+        default_headers=default_headers,
+        timeout=timeout_s,
+    )
+    logger.info("route '%s' -> %s (effort=%s)", name, base_url, spec.get("reasoning_effort"))
+    return Upstream(name=name, client=client, reasoning_effort=spec.get("reasoning_effort"))
 
-    if async_client:
-        client = AsyncOpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            default_headers=default_headers,
-            timeout=timeout_s,
-        )
-    else:
-        client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            default_headers=default_headers,
-            timeout=timeout_s,
-        )
 
-    app = FastAPI(title="OpenRouter Proxy", version="1.0.0")
+def _proxy_error(exc: Exception, upstream: Upstream | None, native_model: str | None) -> HTTPException:
+    """Convert upstream/proxy exceptions into a diagnosable HTTP error."""
+    route = upstream.name if upstream is not None else "unresolved"
+    model = native_model or "unresolved"
+    response = getattr(exc, "response", None)
+    upstream_status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
+    body_prefix = ""
+    if response is not None:
+        try:
+            body_prefix = (response.text or "")[:800]
+        except Exception:  # noqa: BLE001 - best-effort diagnostics only
+            body_prefix = ""
+    detail = (
+        f"upstream route={route!r} model={model!r} failed: "
+        f"{type(exc).__name__}: {exc}"
+    )
+    if upstream_status:
+        detail += f" (upstream_status={upstream_status})"
+    if body_prefix:
+        detail += f" body_prefix={body_prefix!r}"
+    return HTTPException(status_code=502, detail=detail)
+
+
+def create_app(
+    routes: dict[str, Upstream],
+    default_name: str,
+    async_client: bool = True,
+) -> FastAPI:
+    if default_name not in routes:
+        raise ValueError(f"default route '{default_name}' not in routes {list(routes)}")
+
+    def _route_for(model: str) -> tuple[Upstream, str]:
+        """Pick the upstream + native model id for an incoming model string."""
+        prefix = model.split("/", 1)[0]
+        if "/" in model and prefix in routes:
+            return routes[prefix], model[len(prefix) + 1:]
+        # Backward compat: a bare "openrouter/..." with no matching route still
+        # gets the prefix stripped and goes to the default upstream.
+        if model.startswith("openrouter/") and "openrouter" not in routes:
+            return routes[default_name], model[len("openrouter/"):]
+        return routes[default_name], model
+
+    app = FastAPI(title="LLM Proxy", version="2.0.0")
 
     app.add_middleware(
         CORSMiddleware,
@@ -134,17 +233,17 @@ def create_app(
 
         @app.post("/chat/completions")
         async def chat_completions(request: ChatCompletionRequest):
+            upstream: Upstream | None = None
+            native_model: str | None = None
             try:
                 client_kwargs = request.model_dump(exclude_none=True)
-                # reasoning 经 extra_body 透传(非 OpenAI 标准 kwarg);不传则注入服务端默认。
+                # reasoning 经 extra_body 透传(非 OpenAI 标准 kwarg);不传则按路由默认注入。
                 client_kwargs.pop("reasoning", None)
-                extra_body = _build_extra_body(request, default_reasoning_effort)
 
-                # Strip the "openrouter/" prefix if present so OpenRouter sees the
-                # native model identifier (e.g. "google/gemini-2.5-pro-preview").
-                model = client_kwargs.get("model", "")
-                if model.startswith("openrouter/"):
-                    client_kwargs["model"] = model[len("openrouter/"):]
+                upstream, native_model = _route_for(client_kwargs.get("model", ""))
+                client_kwargs["model"] = native_model
+                extra_body = _build_extra_body(request, upstream.reasoning_effort)
+                client = upstream.client
 
                 if request.stream:
                     client_kwargs["stream"] = True
@@ -157,7 +256,7 @@ def create_app(
                         yield "data: [DONE]\n\n"
 
                     return StreamingResponse(event_stream(), media_type="text/event-stream")
- 
+
                 client_kwargs["stream"] = False
                 response = await client.chat.completions.create(**client_kwargs, extra_body=extra_body)
 
@@ -174,25 +273,28 @@ def create_app(
                     id=response.id, created=response.created, model=response.model, choices=choices
                 )
 
+            except HTTPException:
+                raise
             except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
+                logger.exception("LLM proxy request failed")
+                raise _proxy_error(e, upstream, native_model) from e
 
     else:
 
         @app.post("/chat/completions", response_model=ChatCompletionResponse)
         def chat_completions(request: ChatCompletionRequest):
+            upstream: Upstream | None = None
+            native_model: str | None = None
             try:
                 client_kwargs = request.model_dump(exclude_none=True)
                 client_kwargs.pop("reasoning", None)
-                extra_body = _build_extra_body(request, default_reasoning_effort)
 
-                model = client_kwargs.get("model", "")
-                if model.startswith("openrouter/"):
-                    client_kwargs["model"] = model[len("openrouter/"):]
+                upstream, native_model = _route_for(client_kwargs.get("model", ""))
+                client_kwargs["model"] = native_model
+                extra_body = _build_extra_body(request, upstream.reasoning_effort)
 
                 client_kwargs["stream"] = False
-
-                response = client.chat.completions.create(**client_kwargs, extra_body=extra_body)
+                response = upstream.client.chat.completions.create(**client_kwargs, extra_body=extra_body)
 
                 choices = [
                     ChatCompletionResponseChoice(
@@ -207,14 +309,44 @@ def create_app(
                     id=response.id, created=response.created, model=response.model, choices=choices
                 )
 
+            except HTTPException:
+                raise
             except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
+                logger.exception("LLM proxy request failed")
+                raise _proxy_error(e, upstream, native_model) from e
 
     @app.get("/health")
     async def health():
-        return {"status": "ok"}
+        return {"status": "ok", "routes": list(routes), "default": default_name}
 
     return app
+
+
+def _routes_from_file(path: str, async_client: bool, timeout_s: float) -> tuple[dict[str, Upstream], str]:
+    """Build the routing table from a JSON config.
+
+    Schema::
+
+        {
+          "default": "vapi",
+          "routes": {
+            "openrouter": {"base_url": "...", "api_key_env": "OPENROUTER_API_KEY",
+                            "key_file": ".openrouterkey", "reasoning_effort": "low"},
+            "vapi":       {"base_url": "...", "api_key_env": "V_API_KEY",
+                            "reasoning_effort": "none"}
+          }
+        }
+    """
+    spec = json.loads(Path(path).read_text())
+    route_specs = spec.get("routes") or {}
+    if not route_specs:
+        raise ValueError(f"routes file '{path}' has no 'routes'")
+    routes = {
+        name: _build_upstream(name, rspec, async_client, timeout_s)
+        for name, rspec in route_specs.items()
+    }
+    default_name = spec.get("default") or next(iter(routes))
+    return routes, default_name
 
 
 def main(
@@ -226,28 +358,43 @@ def main(
     async_client: bool = True,
     reasoning_effort: str | None = "low",
     timeout_s: float = 600.0,
+    routes_file: str | None = None,
+    dotenv_path: str = ".env",
 ):
     """
-    Start the OpenRouter Proxy Server.
+    Start the LLM Proxy Server.
 
-    Reads an API key from --api-key or from the key file (one key per line).
+    Two ways to configure upstreams:
+
+    * ``--routes-file routes.json``: multi-upstream routing keyed by model prefix
+      (e.g. ``openrouter/...`` -> OpenRouter, ``vapi/...`` -> V-API). This lets a
+      single proxy serve several backends at once.
+    * ``--api-key``/``--base-url``/``--reasoning-effort``: legacy single-upstream
+      mode. A model id is forwarded as-is, except a leading ``openrouter/`` is
+      stripped for backward compatibility.
 
     ``reasoning_effort`` 是未显式传 reasoning 的请求的默认 thinking 强度(max/xhigh/high/
-    medium/low/minimal/none);设为 None 则不注入、完全交给上游默认。``timeout_s`` 是到
-    OpenRouter 上游的读超时。
+    medium/low/minimal/none/off);``none``/``off`` 表示不注入。``timeout_s`` 是到上游的读超时。
     """
-    if api_key is None:
-        keys = _load_api_keys(key_file)
-        api_key = keys[0]
-        logger.info(f"Loaded API key from {key_file}")
+    _load_dotenv(dotenv_path)
+    if routes_file:
+        routes, default_name = _routes_from_file(routes_file, async_client, timeout_s)
+        logger.info("loaded %d route(s) from %s, default='%s'", len(routes), routes_file, default_name)
+    else:
+        if api_key is None:
+            api_key = _load_api_keys(key_file)[0]
+            logger.info(f"Loaded API key from {key_file}")
+        routes = {
+            "default": _build_upstream(
+                "default",
+                {"base_url": base_url, "api_key": api_key, "reasoning_effort": reasoning_effort},
+                async_client,
+                timeout_s,
+            )
+        }
+        default_name = "default"
 
-    app = create_app(
-        api_key=api_key,
-        base_url=base_url,
-        async_client=async_client,
-        default_reasoning_effort=reasoning_effort,
-        timeout_s=timeout_s,
-    )
+    app = create_app(routes=routes, default_name=default_name, async_client=async_client)
     uvicorn.run(app, host=host, port=port)
 
 

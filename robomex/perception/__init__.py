@@ -5,7 +5,15 @@ from robomex.perception.evidence import (
     EvidenceRole,
     MultimodalEvidenceBundle,
 )
-from robomex.perception.render import render_before_after, save_rgb, save_video
+from robomex.perception.render import (
+    image_content_part,
+    project_world_to_pixel,
+    render_before_after,
+    save_grasp_affordance_3d,
+    save_grasp_affordance_overlay,
+    save_rgb,
+    save_video,
+)
 
 __all__ = [
     "EvidenceArtifact",
@@ -13,7 +21,11 @@ __all__ = [
     "EvidenceKind",
     "EvidenceRole",
     "MultimodalEvidenceBundle",
+    "image_content_part",
+    "project_world_to_pixel",
     "render_before_after",
+    "save_grasp_affordance_3d",
+    "save_grasp_affordance_overlay",
     "save_rgb",
     "save_video",
 ]
