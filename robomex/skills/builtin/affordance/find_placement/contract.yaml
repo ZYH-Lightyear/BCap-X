@@ -1,0 +1,20 @@
+skill_id: find_placement
+tags: [affordance, placement]
+role: affordance
+changes_world: false
+capabilities: [perception_read, geometry_compute, artifact_write]
+forbidden_capabilities: [robot_motion, gripper_control, object_manipulation]
+input_ports:
+  - {name: target_points, schema: robomex.points3d.v1, frame: world}
+output_ports:
+  # position = executable TCP drop pose (not desired_object_center).
+  - {name: placement_affordance, schema: robomex.affordance.v1, frame: world}
+budget: {max_turns: 5}
+exit_conditions:
+  success: "Published one center-aware executable placement affordance for the requested target relation."
+  infeasible: "Target geometry or held-object compensation could not produce a finite placement TCP."
+  wrong_grounding: "The target points represent a different or ambiguous destination."
+functions:
+  - name: compute_drop_affordance
+    entry: "scripts/placement_affordance.py:compute_drop_affordance"
+    description: "Canonical center-aware placement affordance with executable TCP, desired object center, and approach pose."

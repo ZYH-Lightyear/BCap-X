@@ -1,0 +1,18 @@
+skill_id: grasp_graspnet
+tags: [affordance, grasping]
+role: affordance
+changes_world: false
+capabilities: [perception_read, geometry_compute, artifact_write]
+forbidden_capabilities: [robot_motion, gripper_control, object_manipulation]
+input_ports:
+  - {name: object_mask, schema: robomex.mask.v1}
+  - {name: object_points, schema: robomex.points3d.v1, frame: world}
+output_ports:
+  - {name: grasp_affordance, schema: robomex.affordance.v1, frame: world}
+preferred_skills: [grasp_pca_side, compute_obb_short_axis_grasp]
+budget: {max_turns: 6}
+exit_conditions:
+  success: "Published one transformed, IK-checked learned grasp candidate with explicit approach and lift geometry."
+  infeasible: "The service returned no geometrically plausible, reachable target candidate."
+  wrong_grounding: "Learned candidates attach to a neighbor or support rather than the requested target."
+functions: []

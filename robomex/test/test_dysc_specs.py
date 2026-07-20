@@ -7,7 +7,12 @@ import pytest
 from robomex.dysc.contracts import load_skill_contracts
 from robomex.dysc.society import load_society_spec
 from robomex.dysc.views import SkillLibraryView
-from robomex.skills import Skill, SkillCategory, SkillLibrary
+from robomex.skills import (
+    Skill,
+    SkillCategory,
+    SkillLibrary,
+    load_builtin_skills,
+)
 
 
 def _admit_skill(library: SkillLibrary, skill_id: str, category: str, description: str) -> None:
@@ -91,3 +96,47 @@ skill_access_policies:
     assert view.get("relational_grounding").skill.category == SkillCategory.PERCEPTION
     with pytest.raises(KeyError):
         view.get("controlled_release")
+
+
+def test_skill_library_admit_copies_contract_sidecar(tmp_path: Path) -> None:
+    source = tmp_path / "source_skill"
+    source.mkdir()
+    (source / "SKILL.md").write_text(
+        "---\nname: Demo\ncategory: perception\ndescription: demo\n---\n\nBody.",
+        encoding="utf-8",
+    )
+    (source / "contract.yaml").write_text(
+        "skill_id: source_skill\ntags: [perception]\noutputs: [object_grounding]\n",
+        encoding="utf-8",
+    )
+
+    library = SkillLibrary(tmp_path / "library")
+    library.admit(Skill.from_dir(source), source="test")
+    contracts = load_skill_contracts(tmp_path / "library")
+
+    assert contracts["source_skill"].tags == ("perception",)
+    assert contracts["source_skill"].outputs == ("object_grounding",)
+
+
+def test_task_skills_are_guidance_and_leaf_contracts_own_typed_ports(tmp_path: Path) -> None:
+    library = SkillLibrary(tmp_path / "library")
+    for skill in load_builtin_skills():
+        library.admit(skill, source="builtin")
+    contracts = load_skill_contracts(library.root)
+
+    pick = contracts["pick_object"]
+    ground = contracts["segment_object"]
+    action = contracts["grasp_object"]
+    verifier = contracts["verify_grasp_and_lift_via_robot_state"]
+
+    assert "recipe" not in pick.raw
+    assert not pick.role
+    assert [port.schema for port in ground.output_ports] == [
+        "robomex.mask.v1",
+        "robomex.points3d.v1",
+    ]
+    assert action.changes_world
+    assert action.role == "action_executor"
+    assert not verifier.changes_world
+    assert verifier.role == "verifier"
+    assert contracts["grasp_open_bowl"].output_ports[0].schema == "robomex.affordance.v1"

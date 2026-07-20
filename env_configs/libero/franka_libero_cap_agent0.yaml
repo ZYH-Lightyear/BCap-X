@@ -42,19 +42,36 @@ env:
       - The word 'FINISH' if the task appears to be complete
 
 robomex:
+  models:
+    # Outer task decomposition and dynamic swarm composition use the stronger model.
+    planner: vapi/claude-opus-4-8
+    manager: vapi/claude-opus-4-8
+    # Leaf Grounding / Affordance / Motion / Action / Verifier Coding Agents.
+    subagent: vapi/qwen3.5-27b
   vlm:
     # Dedicated VLM used by query_vlm / vlm_bbox_detection / vlm_point_detection inside
-    # RoboMEx code blocks. Keep this separate from --model so Planner/Act can use a
-    # different model without changing grounding.
+    # RoboMEx code blocks. Keep this separate from text-agent role models so
+    # Planner/Manager/SubAgents can change without changing visual grounding.
     model: vapi/gpt-5.5
     server_url: http://localhost:8110/chat/completions
     coord_space: pixel
   runtime:
     # RoboMEx agent runtime knobs live in config instead of being hidden in code.
-    # Act delegates focused natural-language work to the generic read-only SubAgent;
-    # these settings describe the boundary, not named SubAgent roles or schemas.
+    # Dynamic swarm is the main path. Use universal for a one-Coding-Agent baseline.
+    authoring_strategy: dynamic_swarm
     max_subgoals: 8
+    # Default leaf Coding SubAgent budget; Creator has a separate orchestration budget.
     subagent_max_turns: 8
+    swarm_manager_max_turns: 4
+    swarm_capability_ceiling:
+      - perception_read
+      - artifact_write
+      - geometry_compute
+      - simulation_probe
+      - active_perception
+      - robot_motion
+      - object_manipulation
+      - gripper_control
     scene_camera: agentview
     act_observation_camera: agentview
     prompt_api_names:
@@ -83,22 +100,11 @@ robomex:
       - get_oriented_bounding_box_from_3d_points
       - subsample_point_cloud
       - filter_noise
-    subagent_denied_calls:
-      - close_gripper
-      - execute_joint_trajectory
-      - goto_home_joint_position
-      - goto_pose
-      - move_to_joints
-      - open_gripper
-      - reset
-      - step
-
 api_servers:
   - _target_: capx.serving.openrouter_server.main
-    key_file: .openrouterkey
+    routes_file: configs/services/llm_routes.json
     host: 127.0.0.1
     port: 8110
-    reasoning_effort: low
 
   - _target_: capx.serving.launch_pyroki_server.main
     port: 8116

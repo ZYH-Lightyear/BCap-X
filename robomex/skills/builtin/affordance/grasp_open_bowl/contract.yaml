@@ -1,0 +1,21 @@
+skill_id: grasp_open_bowl
+tags: [affordance, grasping, container]
+role: affordance
+changes_world: false
+capabilities: [perception_read, geometry_compute, artifact_write]
+forbidden_capabilities: [robot_motion, gripper_control, object_manipulation]
+input_ports:
+  - {name: object_mask, schema: robomex.mask.v1}
+  - {name: object_points, schema: robomex.points3d.v1, frame: world}
+  - {name: object_geometry, schema: robomex.object_geometry.v1, frame: world, required: false}
+output_ports:
+  - {name: grasp_affordance, schema: robomex.affordance.v1, frame: world}
+budget: {max_turns: 6}
+exit_conditions:
+  success: "Published a finite observed-rim grasp with explicit approach and lift positions."
+  infeasible: "Rim support was too sparse, degenerate, or IK-infeasible for this grasp family."
+  wrong_grounding: "The points do not represent the requested open container."
+functions:
+  - name: propose_open_bowl_grasps
+    entry: "scripts/bowl_grasp.py:propose_open_bowl_grasps"
+    description: "Rank observed-rim grasp candidates with explicit approach/lift geometry."

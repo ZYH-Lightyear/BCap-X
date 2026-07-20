@@ -1,0 +1,15 @@
+skill_id: grasp_object
+tags: [motion_execution, grasping]
+role: action_executor
+changes_world: true
+capabilities: [robot_motion, gripper_control, object_manipulation, artifact_write]
+forbidden_capabilities: [perception_read, geometry_compute]
+input_ports:
+  - {name: trajectory, schema: robomex.trajectory.v1, frame: world}
+output_ports:
+  - {name: execution_evidence, schema: robomex.execution_evidence.v1}
+budget: {max_turns: 6}
+exit_conditions:
+  success: "Executed the declared bounded sequence and published primitive-level ExecutionEvidence; physical success is judged by the downstream verifier."
+  execution_fault: "A critical motion primitive failed or timed out; execution stopped before any dependent gripper or motion primitive."
+functions: []

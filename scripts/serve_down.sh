@@ -6,7 +6,7 @@
 set -euo pipefail
 
 SESSION="${SESSION:-robomex}"
-PORTS="${PORTS:-8110 8114 8115 8116}"
+PORTS="${PORTS:-8110 8114 8115 8116 8200}"
 
 if tmux has-session -t "$SESSION" 2>/dev/null; then
     tmux kill-session -t "$SESSION"

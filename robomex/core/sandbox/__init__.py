@@ -13,11 +13,14 @@ from robomex.core.sandbox.action_block import (
     SemanticActionBlock,
 )
 from robomex.core.sandbox.capx import CapXExecutorAdapter
+from robomex.core.sandbox.guards import MotionLeaseGuard, RuntimeSafetyState
 
 __all__ = [
     "ActionBlockStatus",
     "BlockExecutionResult",
     "CapXExecutorAdapter",
     "ExecutionTraceEvent",
+    "MotionLeaseGuard",
+    "RuntimeSafetyState",
     "SemanticActionBlock",
 ]

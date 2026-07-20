@@ -222,107 +222,159 @@ class FrankaLiberoEnv(BaseEnv):
         joints: np.ndarray,
         *,
         tolerance: float = 0.01,
-        max_steps: int = 120,
-        settle_steps: int = 0,
+        max_steps: int | None = None,
+        settle_steps: int = 10,
         strict: bool = False,
+        vel_tolerance: float = 0.05,
+        max_joint_vel: float = 1.0,
+        stall_patience: int = 30,
+        stall_min_progress: float = 1e-4,
     ) -> dict[str, Any]:
-        """Move to target joint positions using LIBERO's controller.
+        """Move to target joint positions by tracking a min-jerk reference.
+
+        Instead of pulling straight at the final target and counting a fixed
+        number of steps, this tracks a time-parameterized minimum-jerk
+        interpolant whose duration scales with the travel distance. That gives
+        a predictable velocity profile (near-zero velocity at arrival), makes
+        the step budget meaningful, and turns "blocked by contact" into an
+        explicit ``stalled`` outcome instead of a silent timeout.
 
         Args:
             joints: (7,) target joint positions in radians
-            tolerance: Position tolerance for convergence
-            max_steps: Maximum simulation steps to reach target
-            settle_steps: Extra target-holding steps after convergence
-            strict: Raise if final joint error remains above tolerance
+            tolerance: Joint-space position tolerance for convergence
+            max_steps: Optional hard cap on tracking steps. ``None`` derives the
+                cap from the distance-adaptive interpolation budget.
+            settle_steps: Target-holding steps after position convergence, used
+                to bleed off residual velocity before reporting success
+            strict: Raise if the motion did not converge
+            vel_tolerance: Max joint-velocity norm (rad/s) to report ``settled``
+            max_joint_vel: Reference profile speed for the slowest joint (rad/s)
+            stall_patience: Abort after this many steps without progress
+                (position error not improving), which indicates contact or a
+                joint limit rather than normal tracking lag
+            stall_min_progress: Minimum per-step error decrease that counts as
+                progress
         """
+        from capx.envs.simulators.motion_profiles import interp_step_budget, min_jerk
+
         target = np.asarray(joints, dtype=np.float64).reshape(7)
         self._current_joints = target
 
-        steps = 0
-        final_error = float("inf")
-        while steps < max_steps:
-            # Get current joint positions
-            current = self._current_arm_joint_positions()
+        start = self._current_arm_joint_positions()
+        n_interp = interp_step_budget(
+            start,
+            target,
+            control_freq=float(self._control_freq),
+            max_joint_vel=float(max_joint_vel),
+        )
+        # LIBERO's JOINT_POSITION controller can lag substantially behind a
+        # moving reference during large orientation changes. Keep the adaptive
+        # budget, but never give a normally-progressing segment fewer than 240
+        # control steps. The stall watchdog still exits blocked motions early.
+        step_cap = (
+            int(max_steps)
+            if max_steps is not None
+            else max(180, n_interp + 60)
+        )
 
-            # Check convergence (but step at least once)
-            error = np.linalg.norm(current - target)
+        steps = 0
+        stall_counter = 0
+        stalled = False
+        best_error = float("inf")
+        prev = start
+        joint_vel = 0.0
+        while steps < step_cap:
+            current = self._current_arm_joint_positions()
+            error = float(np.linalg.norm(current - target))
             if error < tolerance and steps > 0:
                 break
 
-            # Build LIBERO action: [7 joint positions + 1 gripper control]
-            delta = (target - current) * self._control_freq
-            action = np.concatenate([delta, [self._gripper_fraction]])
-            # Map gripper: 1.0 (open) -> -1.0, 0.0 (closed) -> 1.0
-            action[-1] = 1.0 - action[-1] * 2.0
+            # Progress watchdog: tracking lag still improves the error every
+            # step; a plateau means the arm is physically blocked.
+            if error < best_error - stall_min_progress:
+                best_error = error
+                stall_counter = 0
+            else:
+                stall_counter += 1
+                if stall_counter >= int(stall_patience):
+                    stalled = True
+                    break
 
-            # Step the environment
-            self._current_obs, self._current_reward, self._current_done, self._current_info = (
-                self.handle.step(action)
-            )
-            self._sim_step_count += 1
-
-            self.gripper_link_wxyz_xyz = np.concatenate(
-                [
-                    self.handle.env.sim.data.xquat[self.gripper_link_idx],
-                    self.handle.env.sim.data.xpos[self.gripper_link_idx],
-                ]
-            )
-
-            if self.viser_debug and self._sim_step_count % self._subsample_rate == 0:
-                if self._sim_step_count % self._full_viser_rate == 0:
-                    self._update_viser_server()  # Full update with pointcloud
-                else:
-                    self._update_viser_robot_only()  # Fast robot-only
-
-            if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
-                self._record_frame()
-
+            alpha = min_jerk((steps + 1) / n_interp)
+            reference = start + alpha * (target - start)
+            self._tracking_step(reference)
             steps += 1
-            final_error = float(np.linalg.norm(self._current_arm_joint_positions() - target))
+            joint_vel = float(
+                np.linalg.norm(self._current_arm_joint_positions() - prev) * self._control_freq
+            )
+            prev = self._current_arm_joint_positions()
 
         final_error = float(np.linalg.norm(self._current_arm_joint_positions() - target))
         if final_error < tolerance:
+            # Hold the target so residual velocity dies out before the caller
+            # issues the next command (no more corner-cutting between waypoints).
             for _ in range(max(0, int(settle_steps))):
-                current = self._current_arm_joint_positions()
-                delta = (target - current) * self._control_freq
-                action = np.concatenate([delta, [self._gripper_fraction]])
-                action[-1] = 1.0 - action[-1] * 2.0
-                self._current_obs, self._current_reward, self._current_done, self._current_info = (
-                    self.handle.step(action)
-                )
-                self._sim_step_count += 1
+                prev = self._current_arm_joint_positions()
+                self._tracking_step(target)
                 steps += 1
-                self.gripper_link_wxyz_xyz = np.concatenate(
-                    [
-                        self.handle.env.sim.data.xquat[self.gripper_link_idx],
-                        self.handle.env.sim.data.xpos[self.gripper_link_idx],
-                    ]
+                joint_vel = float(
+                    np.linalg.norm(self._current_arm_joint_positions() - prev)
+                    * self._control_freq
                 )
-                if self.viser_debug and self._sim_step_count % self._subsample_rate == 0:
-                    if self._sim_step_count % self._full_viser_rate == 0:
-                        self._update_viser_server()
-                    else:
-                        self._update_viser_robot_only()
-                if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
-                    self._record_frame()
             final_error = float(np.linalg.norm(self._current_arm_joint_positions() - target))
 
         converged = final_error < tolerance
+        timed_out = not converged and not stalled
         status = {
             "converged": converged,
+            "settled": converged and joint_vel < float(vel_tolerance),
+            "stalled": stalled,
+            "timed_out": timed_out,
             "steps": steps,
+            "step_cap": step_cap,
             "final_error": final_error,
+            "final_joint_vel": joint_vel,
             "tolerance": float(tolerance),
             "target": target.copy(),
             "current": self._current_arm_joint_positions().copy(),
         }
         if strict and not converged:
+            reason = "stalled (blocked by contact or joint limit)" if stalled else "timed out"
             raise RuntimeError(
-                "move_to_joints_blocking did not converge: "
+                f"move_to_joints_blocking did not converge ({reason}): "
                 f"final_error={final_error:.6f}, tolerance={float(tolerance):.6f}, "
-                f"steps={steps}, max_steps={int(max_steps)}"
+                f"steps={steps}, step_cap={step_cap}"
             )
         return status
+
+    def _tracking_step(self, reference: np.ndarray) -> None:
+        """Advance one control step tracking ``reference`` joint positions."""
+        current = self._current_arm_joint_positions()
+        delta = (reference - current) * self._control_freq
+        action = np.concatenate([delta, [self._gripper_fraction]])
+        # Map gripper: 1.0 (open) -> -1.0, 0.0 (closed) -> 1.0
+        action[-1] = 1.0 - action[-1] * 2.0
+
+        self._current_obs, self._current_reward, self._current_done, self._current_info = (
+            self.handle.step(action)
+        )
+        self._sim_step_count += 1
+
+        self.gripper_link_wxyz_xyz = np.concatenate(
+            [
+                self.handle.env.sim.data.xquat[self.gripper_link_idx],
+                self.handle.env.sim.data.xpos[self.gripper_link_idx],
+            ]
+        )
+
+        if self.viser_debug and self._sim_step_count % self._subsample_rate == 0:
+            if self._sim_step_count % self._full_viser_rate == 0:
+                self._update_viser_server()  # Full update with pointcloud
+            else:
+                self._update_viser_robot_only()  # Fast robot-only
+
+        if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
+            self._record_frame()
 
     def _set_gripper(self, fraction: float) -> None:
         """Set gripper opening fraction.

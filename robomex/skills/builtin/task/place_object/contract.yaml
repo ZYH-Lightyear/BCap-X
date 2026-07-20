@@ -1,0 +1,12 @@
+skill_id: place_object
+tags: [task, place]
+role: ""
+changes_world: true
+capabilities: []
+forbidden_capabilities: [robot_motion, gripper_control, object_manipulation, perception_read, geometry_compute, artifact_write]
+input_ports: []
+output_ports: []
+budget: {max_turns: 1}
+exit_conditions:
+  success: "Manager composed a typed place graph ending in independent relation verification."
+functions: []

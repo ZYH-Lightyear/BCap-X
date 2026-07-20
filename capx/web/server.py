@@ -9,12 +9,10 @@ import os
 from pathlib import Path
 from typing import Any
 from urllib.request import urlopen, Request as UrlRequest
-from urllib.parse import quote
-
 import tyro
 import uvicorn
 from dataclasses import dataclass
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -63,16 +61,6 @@ def _find_viser_port() -> int | None:
         except Exception:
             continue
     return None
-
-
-def _resolve_workspace_path(path: str) -> Path:
-    """Resolve a user-provided path and require it to stay inside the workspace."""
-
-    target = Path(path).expanduser().resolve()
-    cwd = Path.cwd().resolve()
-    if cwd not in target.parents and target != cwd:
-        raise HTTPException(status_code=403, detail="Path must be inside the workspace")
-    return target
 
 
 def create_app() -> FastAPI:
@@ -400,103 +388,6 @@ def create_app() -> FastAPI:
         root = Path(session.output_dir).resolve()
         target = (root / artifact_path).resolve()
         if root not in target.parents and target != root:
-            raise HTTPException(status_code=403, detail="Invalid artifact path")
-        if not target.exists() or not target.is_file():
-            raise HTTPException(status_code=404, detail="Artifact not found")
-        return FileResponse(target)
-
-    @app.get("/api/robomex/runs")
-    async def list_robomex_runs(root: str = Query("outputs", description="Directory to scan")):
-        """List RoboMEx artifact directories that contain events.jsonl."""
-
-        scan_root = Path(root).expanduser().resolve()
-        cwd = Path.cwd().resolve()
-        if cwd not in scan_root.parents and scan_root != cwd:
-            raise HTTPException(status_code=403, detail="Root must be inside the workspace")
-        if not scan_root.exists():
-            return {"root": str(scan_root), "runs": []}
-
-        runs = []
-        for events_file in scan_root.rglob("events.jsonl"):
-            run_dir = events_file.parent
-            summary_path = run_dir / "summary.json"
-            summary: dict[str, Any] = {}
-            if summary_path.exists():
-                try:
-                    summary = json.loads(summary_path.read_text(encoding="utf-8"))
-                except Exception:
-                    summary = {}
-            runs.append({
-                "path": str(run_dir),
-                "name": run_dir.name,
-                "mtime": events_file.stat().st_mtime,
-                "events": str(events_file),
-                "summary": summary,
-            })
-        runs.sort(key=lambda item: item["mtime"], reverse=True)
-        return {"root": str(scan_root), "runs": runs[:100]}
-
-    @app.get("/api/robomex/events")
-    async def get_robomex_events(dir: str = Query(..., description="RoboMEx artifact directory")):
-        """Read a RoboMEx events.jsonl file plus summary and artifact index."""
-
-        run_dir = _resolve_workspace_path(dir)
-        events_file = run_dir / "events.jsonl"
-        if not events_file.exists():
-            raise HTTPException(status_code=404, detail=f"events.jsonl not found under {run_dir}")
-
-        events = []
-        for line in events_file.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                events.append({"event": "malformed_event", "message": line})
-
-        summary_path = run_dir / "summary.json"
-        summary = None
-        if summary_path.exists():
-            try:
-                summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            except Exception:
-                summary = None
-
-        def item(path: Path) -> dict[str, Any]:
-            rel = path.relative_to(run_dir).as_posix()
-            return {
-                "path": rel,
-                "name": path.name,
-                "url": f"/api/robomex/file?dir={quote(str(run_dir))}&path={quote(rel)}",
-                "mtime": path.stat().st_mtime,
-                "size": path.stat().st_size,
-            }
-
-        files = sorted(
-            [
-                p for p in run_dir.rglob("*")
-                if p.is_file() and p.name != "events.jsonl"
-            ],
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        return {
-            "dir": str(run_dir),
-            "events": events,
-            "summary": summary,
-            "files": [item(path) for path in files[:500]],
-        }
-
-    @app.get("/api/robomex/file")
-    async def get_robomex_file(
-        dir: str = Query(..., description="RoboMEx artifact directory"),
-        path: str = Query(..., description="Relative artifact path"),
-    ):
-        """Serve a RoboMEx artifact file under a requested run directory."""
-
-        run_dir = _resolve_workspace_path(dir)
-        target = (run_dir / path).resolve()
-        if run_dir not in target.parents and target != run_dir:
             raise HTTPException(status_code=403, detail="Invalid artifact path")
         if not target.exists() or not target.is_file():
             raise HTTPException(status_code=404, detail="Artifact not found")

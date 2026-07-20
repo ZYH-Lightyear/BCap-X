@@ -1,0 +1,21 @@
+skill_id: release_at
+tags: [motion_execution, placement]
+role: action_executor
+changes_world: true
+capabilities: [robot_motion, gripper_control, object_manipulation, artifact_write]
+forbidden_capabilities: [perception_read, geometry_compute]
+input_ports:
+  - {name: trajectory, schema: robomex.trajectory.v1, frame: world}
+output_ports:
+  - {name: execution_evidence, schema: robomex.execution_evidence.v1}
+budget: {max_turns: 6}
+exit_conditions:
+  success: "Executed the canonical release sequence and published primitive-level evidence for downstream verification."
+  execution_fault: "A critical transport, descend, open, settle, or retreat primitive failed; dependent actions stopped."
+functions:
+  - name: compute_tcp_release_pos
+    entry: "scripts/release.py:compute_tcp_release_pos"
+    description: "Resolve the executable TCP release position without confusing it with desired object center."
+  - name: place_quat_from_affordance
+    entry: "scripts/release.py:place_quat_from_affordance"
+    description: "Resolve and validate the placement quaternion from the supplied affordance."

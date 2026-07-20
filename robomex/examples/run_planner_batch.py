@@ -62,6 +62,7 @@ from robomex.examples.run_planner_live import (
     DEFAULT_SCENE_CAMERA,
     DEFAULT_SUBAGENT_MAX_TURNS,
     LiveArgs,
+    _role_models,
     _runtime_settings,
     _task_language,
     run_episode,
@@ -76,7 +77,7 @@ class BatchArgs:
     """YAML env 配置(其 low_level.suite_name/task_id 作为默认,可被下方参数覆盖)。"""
 
     model: str = "openrouter/qwen/qwen3.6-plus"
-    """planner 和内层 code agent 共用的模型(经代理转发)。"""
+    """未在 ``robomex.models`` 分角色配置时使用的兼容模型。"""
 
     server_url: str = "http://localhost:8110/chat/completions"
     """本地 LLM 代理端点。"""
@@ -98,6 +99,11 @@ class BatchArgs:
 
     act_observation_camera: str = ""
     """Act 取 OBS_BEFORE/反馈图的相机名;空值表示跟随 scene_camera。"""
+
+    authoring_strategy: str = "universal"
+    """Authoring 策略: universal 或 dynamic_swarm。"""
+
+    swarm_manager_max_turns: int = 4
 
     output_dir: str = "./outputs/robomex_planner_batch"
     """本次批量评测产物根目录;其下建时间戳子目录,再按 suite/task/trial 分层。"""
@@ -143,6 +149,8 @@ def _to_live_args(args: BatchArgs) -> LiveArgs:
         subagent_max_turns=args.subagent_max_turns,
         scene_camera=args.scene_camera,
         act_observation_camera=args.act_observation_camera,
+        authoring_strategy=args.authoring_strategy,
+        swarm_manager_max_turns=args.swarm_manager_max_turns,
         output_dir=args.output_dir,
     )
 
@@ -497,9 +505,19 @@ def main(args: BatchArgs) -> None:
     if bad:
         raise ValueError(f"task id {bad} 超出 suite '{suite}' 的范围 [0, {n_tasks - 1}]")
 
-    log.info("批量评测 | suite=%s | task_ids=%s | trials/task=%d (start=%d) | model=%s | workers=%d",
-             suite, task_ids, args.trials_per_task, args.start_trial, args.model,
-             args.num_workers)
+    role_models = _role_models(_to_live_args(args))
+    log.info(
+        "批量评测 | suite=%s | task_ids=%s | trials/task=%d (start=%d) | "
+        "planner=%s manager=%s subagent=%s | workers=%d",
+        suite,
+        task_ids,
+        args.trials_per_task,
+        args.start_trial,
+        role_models.planner,
+        role_models.manager,
+        role_models.subagent,
+        args.num_workers,
+    )
     log.info("MUJOCO_GL=%s | config=%s", os.environ.get("MUJOCO_GL"), args.config_path)
 
     start = time.time()
@@ -641,9 +659,15 @@ def _dump_batch_summary(
     """写 ``batch_summary.json``:整体聚合 + 每 task 明细 + 全部 trial 扁平记录。"""
 
     runtime = _runtime_settings(_to_live_args(args))
+    role_models = _role_models(_to_live_args(args))
     summary = {
         "config_path": args.config_path,
         "model": args.model,
+        "models": {
+            "planner": role_models.planner,
+            "manager": role_models.manager,
+            "subagent": role_models.subagent,
+        },
         "suite": suite,
         "task_ids": task_ids,
         "trials_per_task": args.trials_per_task,
@@ -652,15 +676,13 @@ def _dump_batch_summary(
         "runtime": {
             "max_turns": args.max_turns,
             "max_subgoals": runtime.max_subgoals,
+            "authoring_strategy": runtime.authoring_strategy,
+            "swarm_manager_max_turns": runtime.swarm_manager_max_turns,
+            "swarm_capability_ceiling": sorted(runtime.swarm_capability_ceiling),
             "subagent_max_turns": runtime.subagent_max_turns,
             "scene_camera": runtime.scene_camera,
             "act_observation_camera": runtime.act_observation_camera,
             "prompt_api_names": sorted(runtime.prompt_api_names),
-            "subagent_denied_calls": (
-                sorted(runtime.subagent_denied_calls)
-                if runtime.subagent_denied_calls is not None
-                else None
-            ),
         },
         "elapsed_s": round(elapsed, 1),
         "overall": _aggregate(all_records),

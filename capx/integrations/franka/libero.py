@@ -85,10 +85,13 @@ class FrankaLiberoApi(ApiBase):
             "get_oriented_bounding_box_from_3d_points": self.get_oriented_bounding_box_from_3d_points,
             "get_object_3d_points_and_masks_from_language": self.get_object_3d_points_and_masks_from_language,
             "goto_home_joint_position": self.goto_home_joint_position,
-            # # CuRobo, uncomment these for the coding agent to use them!
-            # "plan_grasp_trajectory": self.plan_grasp_trajectory,
-            # "plan_with_grasped_object": self.plan_with_grasped_object,
-            # "execute_joint_trajectory": self.execute_joint_trajectory,
+            # Optional cuRobo backend; implementation imports remain lazy.
+            "parse_grasp_poses_for_curobo": self.parse_grasp_poses_for_curobo,
+            "update_curobo_world": self.update_curobo_world,
+            "update_curobo_world_with_object": self.update_curobo_world_with_object,
+            "plan_grasp_trajectory": self.plan_grasp_trajectory,
+            "plan_with_grasped_object": self.plan_with_grasped_object,
+            "execute_joint_trajectory": self.execute_joint_trajectory,
         }
 
         return fns
@@ -114,6 +117,31 @@ class FrankaLiberoApi(ApiBase):
         obs[self.camera_name]["images"]["depth"] = obs[self.camera_name]["images"]["depth"].squeeze(-1)
         obs[self.wrist_camera_name]["images"]["depth"] = obs[self.wrist_camera_name]["images"]["depth"].squeeze(-1)
         return obs
+
+    def get_ee_pose(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return current panda-hand position and WXYZ quaternion."""
+
+        state = np.asarray(
+            self._env.get_observation()["robot_cartesian_pos"],
+            dtype=np.float64,
+        ).reshape(-1)
+        if state.size < 7:
+            raise ValueError(
+                f"robot_cartesian_pos must contain xyz+wxyz, got shape {state.shape}"
+            )
+        return state[:3].copy(), state[3:7].copy()
+
+    def get_object_mask(self, object_name: str) -> np.ndarray | None:
+        """Return the highest-scoring SAM3 text mask for ``object_name``."""
+
+        obs = self._env.get_observation()
+        rgb = np.asarray(obs[self.camera_name]["images"]["rgb"])
+        detections = self.segment_sam3_text_prompt(rgb, object_name)
+        valid = [item for item in detections if item.get("mask") is not None]
+        if not valid:
+            return None
+        selected = max(valid, key=lambda item: float(item.get("score", 0.0)))
+        return np.asarray(selected["mask"], dtype=bool)
 
     def segment_sam3_point_prompt(
         self,
@@ -217,7 +245,7 @@ class FrankaLiberoApi(ApiBase):
 
     def goto_pose(
         self, position: np.ndarray, quaternion_wxyz: np.ndarray, z_approach: float = 0.0
-    ) -> None:
+    ) -> dict[str, Any]:
         """Go to pose using Inverse Kinematics.
         There is no need to call a second goto_pose with the same position and quaternion_wxyz after calling it with z_approach.
         Args:
@@ -225,7 +253,10 @@ class FrankaLiberoApi(ApiBase):
             quaternion_wxyz: (4,) WXYZ unit quaternion.
             z_approach: (float) Z-axis distance offset for goto_pose insertion approach motion. Will first arrive at position + z_approach meters in Z-axis before moving to the requested pose. Useful for more precise grasp approaches. Default is 0.0.
         Returns:
-            None
+            dict: Motion status of the final segment with keys ``converged``
+            (bool), ``stalled`` (bool, blocked by contact or a joint limit),
+            ``final_error`` (float, radians) and ``steps``. Always check
+            ``converged`` before assuming the arm reached the pose.
         """
 
         pos = np.asarray(position, dtype=np.float64).reshape(3)
@@ -237,6 +268,7 @@ class FrankaLiberoApi(ApiBase):
         rot = SciRotation.from_quat(quat_xyzw)
         offset_pos = pos + rot.apply(self._TCP_OFFSET)
 
+        approach_status: dict[str, Any] | None = None
         if (
             z_approach != 0.0
         ):  # If z_approach is not 0.0, approach the object from above by z_approach meters
@@ -259,7 +291,7 @@ class FrankaLiberoApi(ApiBase):
                 )
             joints_z_offset = np.asarray(self.cfg[:-1], dtype=np.float64).reshape(7)
 
-            self._env.move_to_joints_blocking(joints_z_offset)
+            approach_status = self._env.move_to_joints_blocking(joints_z_offset)
 
         if self.cfg is None:
             self.cfg = self._pks.solve_ik(
@@ -277,7 +309,15 @@ class FrankaLiberoApi(ApiBase):
                 prev_cfg=self.cfg,
             )
         joints = np.asarray(self.cfg[:-1], dtype=np.float64).reshape(7)
-        self._env.move_to_joints_blocking(joints)
+        final_status = self._env.move_to_joints_blocking(joints)
+        if approach_status is not None:
+            final_status = {
+                **final_status,
+                "approach_status": approach_status,
+                "all_converged": bool(approach_status.get("converged"))
+                and bool(final_status.get("converged")),
+            }
+        return final_status
 
     def open_gripper(self) -> None:
         """Open gripper fully.
@@ -889,16 +929,15 @@ class FrankaLiberoApi(ApiBase):
         Returns:
             (success, joint_trajectory, goalset_index): joint_trajectory is (T, 7) or None.
         """
-        if grasp_poses is None:
-            # positions, quaternions, scores = self._sample_grasp_poses_for_object(object_name, use_multiview=use_multiview)
-            # if len(positions) == 0:
-            #     return False, None, None
-            # k = min(top_k_grasps, len(positions))
-            # order = np.argsort(-scores)[:k] if scores is not None and len(scores) else np.arange(k)
-            # grasps_to_try = [(positions[i], quaternions[i]) for i in order]
-            assert grasp_poses is not None, "grasp_poses must be provided"
-        else:
-            grasps_to_try = [(np.asarray(p), np.asarray(q)) for p, q in grasp_poses]
+        if not grasp_poses:
+            raise ValueError(
+                "grasp_poses must contain explicit world-frame candidates; "
+                "generate affordances before calling cuRobo"
+            )
+        grasps_to_try = [
+            (np.asarray(position), np.asarray(quaternion))
+            for position, quaternion in grasp_poses[:top_k_grasps]
+        ]
 
         world = world_config
         if world is None:
@@ -906,6 +945,7 @@ class FrankaLiberoApi(ApiBase):
                 object_name,
                 object_mask=object_mask,
                 robot_distance_threshold=robot_distance_threshold,
+                object_at_ee=False,
             )
             world = self._curobo_world_config
             # Disable collision with the object so the robot can reach into it
@@ -934,15 +974,24 @@ class FrankaLiberoApi(ApiBase):
         *,
         subsample: int = 1,
         tolerance: float = 0.01,
-        max_steps: int = 120,
-    ) -> None:
+        max_steps: int | None = None,
+    ) -> dict[str, Any]:
         """Execute a joint-space trajectory (T, 7) by moving to each waypoint with move_to_joints_blocking.
+
+        Intermediate waypoints are tracked without a settle phase; only the
+        final waypoint settles to zero velocity.
 
         Args:
             joint_trajectory: (T, 7) joint positions in radians.
             subsample: Use every Nth waypoint (1 = all). Larger values speed up execution. Default is 1.
             tolerance: Passed to move_to_joints_blocking. Default is 0.01.
-            max_steps: Passed to move_to_joints_blocking. Default is 120.
+            max_steps: Optional hard cap passed to move_to_joints_blocking.
+                ``None`` uses its adaptive budget (with a 240-step floor).
+
+        Returns:
+            dict: Final-waypoint status plus ``waypoint_statuses``,
+            ``all_converged``, and ``completed_waypoints``. A failed waypoint
+            is recorded but does not block later waypoints.
         """
         traj = np.asarray(joint_trajectory, dtype=np.float64)
         if traj.ndim != 2 or traj.shape[1] < 7:
@@ -950,11 +999,31 @@ class FrankaLiberoApi(ApiBase):
         indices = list(range(0, len(traj), subsample))
         if indices and indices[-1] != len(traj) - 1:
             indices.append(len(traj) - 1)
+        status: dict[str, Any] = {}
+        waypoint_statuses: list[dict[str, Any]] = []
         for i in indices:
             joints = traj[i, :7]
-            self._env.move_to_joints_blocking(
-                joints, tolerance=tolerance, max_steps=max_steps
+            is_last = i == indices[-1]
+            status = self._env.move_to_joints_blocking(
+                joints,
+                tolerance=tolerance,
+                max_steps=max_steps,
+                settle_steps=10 if is_last else 0,
             )
+            waypoint_statuses.append({"waypoint_index": i, **status})
+            if (
+                not status.get("converged")
+                or status.get("timed_out")
+                or status.get("stalled")
+            ):
+                break
+        return {
+            **status,
+            "waypoint_statuses": waypoint_statuses,
+            "all_converged": bool(waypoint_statuses)
+            and all(item.get("converged") for item in waypoint_statuses),
+            "completed_waypoints": len(waypoint_statuses),
+        }
     
     def update_curobo_world_with_object(
         self,
@@ -966,6 +1035,7 @@ class FrankaLiberoApi(ApiBase):
         robot_file: str = "franka.yml",
         object_name_in_world: str | None = None,
         scene_name: str = "scene",
+        object_at_ee: bool = True,
         **kwargs: Any,
     ) -> Any:
         """Build CuRobo world from current observation with object/scene split (robot excluded) and store it.
@@ -1020,8 +1090,7 @@ class FrankaLiberoApi(ApiBase):
         # World-safe name (no spaces) for CuRobo lookup
         world_object_name = object_name_in_world if object_name_in_world is not None else object_name
         mesh_name = world_object_name.replace(" ", "_")
-        # Place object mesh at current EE pose so the world matches the grasped location (fixes wrong position in planning/debug)
-        ee_pos, ee_quat_wxyz = self.get_ee_pose()
+        object_pose_override = self.get_ee_pose() if object_at_ee else None
         world = _get_curobo_api().create_curobo_world_from_depth_with_object(
             depth,
             object_mask,
@@ -1032,7 +1101,7 @@ class FrankaLiberoApi(ApiBase):
             robot_distance_threshold=robot_distance_threshold,
             object_name=mesh_name,
             scene_name=scene_name,
-            object_pose_override=(ee_pos, ee_quat_wxyz),
+            object_pose_override=object_pose_override,
             **kwargs,
         )
         self._curobo_world_config = world

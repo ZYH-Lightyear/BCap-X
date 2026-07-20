@@ -1,0 +1,19 @@
+skill_id: compute_obb_short_axis_grasp
+tags: [affordance, grasping, geometry]
+role: affordance
+changes_world: false
+capabilities: [perception_read, geometry_compute, artifact_write]
+forbidden_capabilities: [robot_motion, gripper_control, object_manipulation]
+input_ports:
+  - {name: object_points, schema: robomex.points3d.v1, frame: world}
+  - {name: object_geometry, schema: robomex.object_geometry.v1, frame: world, required: false}
+output_ports:
+  - {name: grasp_affordance, schema: robomex.affordance.v1, frame: world}
+budget: {max_turns: 5}
+exit_conditions:
+  success: "Published a finite OBB-aligned grasp with explicit approach and lift positions."
+  infeasible: "The OBB or point support was missing, degenerate, or unsafe for this grasp family."
+functions:
+  - name: compute_obb_short_axis_grasp
+    entry: "scripts/obb_short_axis.py:compute_obb_short_axis_grasp"
+    description: "Canonical top-down grasp aligned to the OBB short horizontal axis."

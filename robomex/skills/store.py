@@ -23,7 +23,13 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from robomex.skills.schema import SKILL_FILE, SKILL_PACKAGE_EXTRA_DIRS, Skill, SkillCategory
+from robomex.skills.schema import (
+    SKILL_FILE,
+    SKILL_PACKAGE_EXTRA_DIRS,
+    SKILL_PACKAGE_EXTRA_FILES,
+    Skill,
+    SkillCategory,
+)
 
 _UTILITY_FILE = "utility.json"
 
@@ -88,9 +94,19 @@ class SkillLibrary:
                 if not src.exists():
                     continue
                 dst = dest / dirname
-                if dst.exists():
-                    shutil.rmtree(dst)
-                shutil.copytree(src, dst)
+                # Idempotent overwrite (M1.5 Fix G / B9): concurrent admits of the
+                # same builtin race between rmtree and copytree; dirs_exist_ok
+                # closes that window and __pycache__ noise is never copied.
+                shutil.copytree(
+                    src,
+                    dst,
+                    dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+                )
+            for filename in SKILL_PACKAGE_EXTRA_FILES:
+                src = skill.root / filename
+                if src.is_file():
+                    shutil.copy2(src, dest / filename)
 
         utility_path = dest / _UTILITY_FILE
         utility = self._load_utility(utility_path) if utility_path.exists() else SkillUtility(source=source)

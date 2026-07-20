@@ -6,8 +6,10 @@ from robomex.examples.run_planner_live import (
     LiveArgs,
     _api_docs,
     _configure_vlm_backend,
+    _robomex_model_config,
     _robomex_runtime_config,
     _robomex_vlm_config,
+    _role_models,
     _runtime_settings,
     _save_scene_image,
 )
@@ -29,8 +31,47 @@ def test_default_libero_config_declares_swarm_runtime() -> None:
     assert "vlm_bbox_detection" in settings.prompt_api_names
     assert "segment_sam3_box_prompt" in settings.prompt_api_names
     assert "plan_grasp" in settings.prompt_api_names
-    assert "goto_pose" in settings.subagent_denied_calls
-    assert "open_gripper" in settings.subagent_denied_calls
+    assert settings.authoring_strategy == "dynamic_swarm"
+    assert "robot_motion" in settings.swarm_capability_ceiling
+    assert "gripper_control" in settings.swarm_capability_ceiling
+
+
+def test_default_libero_config_declares_role_specific_models() -> None:
+    cfg = "env_configs/libero/franka_libero_cap_agent0.yaml"
+
+    parsed = _robomex_model_config(cfg)
+    resolved = _role_models(LiveArgs(config_path=cfg))
+
+    assert parsed == {
+        "planner": "vapi/claude-opus-4-8",
+        "manager": "vapi/claude-opus-4-8",
+        "subagent": "vapi/qwen3.5-27b",
+    }
+    assert resolved.planner == "vapi/claude-opus-4-8"
+    assert resolved.manager == "vapi/claude-opus-4-8"
+    assert resolved.subagent == "vapi/qwen3.5-27b"
+
+
+def test_role_models_use_hierarchical_legacy_fallback(tmp_path) -> None:
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        """
+env:
+  _target_: unused
+robomex:
+  models:
+    planner: vapi/planner
+""",
+        encoding="utf-8",
+    )
+
+    resolved = _role_models(
+        LiveArgs(config_path=str(cfg), model="vapi/legacy")
+    )
+
+    assert resolved.planner == "vapi/planner"
+    assert resolved.manager == "vapi/planner"
+    assert resolved.subagent == "vapi/planner"
 
 
 def test_api_docs_group_core_and_capability_apis() -> None:
@@ -271,9 +312,11 @@ robomex:
     prompt_api_names:
       - get_observation
       - query_vlm
-    subagent_denied_calls:
-      - goto_pose
-      - custom_motion
+    authoring_strategy: dynamic_swarm
+    swarm_manager_max_turns: 3
+    swarm_capability_ceiling:
+      - perception_read
+      - robot_motion
 """,
         encoding="utf-8",
     )
@@ -287,7 +330,9 @@ robomex:
     assert settings.scene_camera == "wrist"
     assert settings.act_observation_camera == "robot0_eye_in_hand"
     assert settings.prompt_api_names == frozenset({"get_observation", "query_vlm"})
-    assert settings.subagent_denied_calls == frozenset({"goto_pose", "custom_motion"})
+    assert settings.authoring_strategy == "dynamic_swarm"
+    assert settings.swarm_manager_max_turns == 3
+    assert settings.swarm_capability_ceiling == frozenset({"perception_read", "robot_motion"})
 
 
 def test_runtime_camera_defaults_to_auto_without_config(tmp_path) -> None:
@@ -431,6 +476,11 @@ def test_batch_summary_records_swarm_runtime(tmp_path) -> None:
     assert runtime["subagent_max_turns"] == 7
     assert runtime["scene_camera"] == "frontview"
     assert runtime["act_observation_camera"] == "frontview"
+    assert summary["models"] == {
+        "planner": "vapi/claude-opus-4-8",
+        "manager": "vapi/claude-opus-4-8",
+        "subagent": "vapi/qwen3.5-27b",
+    }
     assert (tmp_path / "batch_summary.json").exists()
 
 
@@ -449,9 +499,10 @@ robomex:
     prompt_api_names:
       - get_observation
       - query_vlm
-    subagent_denied_calls:
-      - goto_pose
-      - open_gripper
+    authoring_strategy: dynamic_swarm
+    swarm_capability_ceiling:
+      - perception_read
+      - gripper_control
 """,
         encoding="utf-8",
     )
@@ -473,4 +524,5 @@ robomex:
     assert runtime["scene_camera"] == "wrist"
     assert runtime["act_observation_camera"] == "robot0_eye_in_hand"
     assert runtime["prompt_api_names"] == ["get_observation", "query_vlm"]
-    assert runtime["subagent_denied_calls"] == ["goto_pose", "open_gripper"]
+    assert runtime["authoring_strategy"] == "dynamic_swarm"
+    assert runtime["swarm_capability_ceiling"] == ["gripper_control", "perception_read"]

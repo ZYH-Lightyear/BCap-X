@@ -32,8 +32,10 @@ from robomex.core.coder.action import (
     normalized_action_json,
     parse_model_turn,
     render_available_skills,
+    skill_script_modules,
 )
 from robomex.core.coder.policy import CompletionPolicy
+from robomex.core.coder.turn_engine import TurnBudget, TurnEngine
 from robomex.core.events import emit_event, event_scope, preview
 from robomex.core.logging import get_logger
 from robomex.core.sandbox import BlockExecutionResult, SemanticActionBlock
@@ -101,6 +103,23 @@ def _redacted_image_url(url: str) -> str:
     return url
 
 
+def _compact_stream_for_prompt(name: str, text: str, *, limit: int = 1800) -> str:
+    """Keep full execution streams on disk, but feed only compact text to the LLM."""
+
+    if not text or len(text) <= limit:
+        return text
+    half = max(limit // 2, 1)
+    head = text[:half].rstrip()
+    tail = text[-half:].lstrip()
+    omitted = len(text) - len(head) - len(tail)
+    return (
+        f"{head}\n\n"
+        f"... <{name} truncated for LLM feedback; {omitted} chars omitted; "
+        "full stream is saved in turn_*.out.txt/events.jsonl> ...\n\n"
+        f"{tail}"
+    )
+
+
 class CodingAgent:
     """“用技能 + 在沙箱写代码”的 agent 模板;子类重写各个钩子即可。
 
@@ -121,6 +140,9 @@ class CodingAgent:
         system_prompt: str = "",
         repeat_limit: int = 3,
         force_terminal_on_exhaust: bool = False,
+        max_model_calls: int = 32,
+        max_protocol_errors: int = 4,
+        preloaded_skills: tuple[str, ...] = (),
     ) -> None:
         self.executor = executor
         self.policy = policy
@@ -129,6 +151,16 @@ class CodingAgent:
         self.system_prompt = system_prompt
         self.repeat_limit = repeat_limit
         self.force_terminal_on_exhaust = force_terminal_on_exhaust
+        self.max_model_calls = max_model_calls
+        self.max_protocol_errors = max_protocol_errors
+        self.preloaded_skills = tuple(dict.fromkeys(preloaded_skills))
+        # scripts/ dirs already injected into the sandbox sys.path (M1.5 Fix C).
+        self._skill_script_paths: set[str] = set()
+        # Contract bindings already materialized per skill root (M2): maps the
+        # resolved root to the (functions, prompt names) advertised to the LLM.
+        self._skill_binding_cache: dict[
+            str, tuple[tuple[tuple[str, str, str], ...], tuple[str, ...]]
+        ] = {}
 
     # ---- 共享主循环 --------------------------------------------------------
 
@@ -136,8 +168,18 @@ class CodingAgent:
         log = get_logger("coder")
         role = self._agent_role()
         label = self._agent_label()
+        loaded: list[str] = []
+        system_content = self._system_with_skills()
+        preloaded_content = [
+            self._load_skill_message(skill_id, loaded) for skill_id in self.preloaded_skills
+        ]
+        if preloaded_content:
+            system_content = (
+                f"{system_content}\n\n# Preloaded specialist skills\n"
+                + "\n\n".join(preloaded_content)
+            )
         prompt: list[dict] = [
-            {"role": "system", "content": self._system_with_skills()},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": self._initial_user_message()},
         ]
 
@@ -158,17 +200,24 @@ class CodingAgent:
             )
 
             turns: list[Any] = []
-            loaded: list[str] = []
             prev_observation: dict | None = None
             last_sig: tuple[str, str] | None = None
             repeats = 0
             terminal_raw: str | None = None
             stopped = False
-            decision_turn_idx = 0
-            action_turns = 0
-            max_decision_turns = max(self.max_turns * 8 + 16, 32)
+            engine = TurnEngine(
+                self.policy,
+                allowed_tools=self._allowed_action_kinds(),
+                budget=TurnBudget(
+                    max_model_calls=self.max_model_calls,
+                    max_protocol_errors=self.max_protocol_errors,
+                    action_limits={"run_python": self.max_turns},
+                ),
+            )
 
             while True:
+                action_turns = engine.ledger.action_count("run_python")
+                decision_turn_idx = engine.ledger.model_calls
                 if action_turns >= self.max_turns:
                     emit_event(
                         "action_budget_exhausted",
@@ -178,18 +227,18 @@ class CodingAgent:
                         decision_turns=decision_turn_idx,
                     )
                     break
-                if decision_turn_idx >= max_decision_turns:
+                if not engine.can_call_model:
                     emit_event(
                         "decision_budget_exhausted",
                         f"{label} exhausted decision turn budget",
                         decision_turns=decision_turn_idx,
-                        max_decision_turns=max_decision_turns,
+                        max_decision_turns=self.max_model_calls,
+                        protocol_errors=engine.ledger.protocol_errors,
                         action_turns=action_turns,
                         max_action_turns=self.max_turns,
                     )
                     break
                 turn_idx = decision_turn_idx
-                decision_turn_idx += 1
                 with event_scope(turn=turn_idx):
                     request_dump = self._dump_llm_request(turn_idx, prompt)
                     emit_event(
@@ -202,7 +251,12 @@ class CodingAgent:
                         max_action_turns=self.max_turns,
                     )
                     llm_started = time.monotonic()
-                    turn = self._complete_turn(prompt)
+                    step = engine.next(prompt)
+                    if step is None:
+                        break
+                    turn = step.turn
+                    tool_call = step.tool_call
+                    decision_turn_idx = engine.ledger.model_calls
                     response_dump = self._dump_llm_response(turn_idx, turn)
                     emit_event(
                         "llm_response",
@@ -216,9 +270,9 @@ class CodingAgent:
                             for call in turn.tool_calls
                         ],
                         parser_error=turn.error,
+                        quarantined_prefix=turn.quarantined_prefix,
+                        quarantined_suffix=turn.quarantined_suffix,
                     )
-                    prompt.append({"role": "assistant", "content": turn.raw or turn.text})
-                    tool_call = self._single_tool_call(turn)
                     emit_event(
                         "agent_action",
                         f"{label} chose {tool_call.name if tool_call else 'none'}",
@@ -232,7 +286,7 @@ class CodingAgent:
 
                     if tool_call is None:
                         log.info("turn %d: 无可执行工具调用,轻推重试", turn_idx)
-                        prompt.append({"role": "user", "content": self._nudge_message(turn)})
+                        engine.append_feedback(prompt, self._nudge_message(turn))
                         emit_event("agent_nudge", "No actionable tool call parsed", reason=turn.error)
                         continue
 
@@ -254,7 +308,7 @@ class CodingAgent:
                             feedback=message,
                         )
                         if message:
-                            prompt.append({"role": "user", "content": message})
+                            engine.append_feedback(prompt, message)
                         if should_stop:
                             terminal_raw = terminal_candidate
                             stopped = True
@@ -262,7 +316,7 @@ class CodingAgent:
                         continue
                     if tool_call.name not in self._allowed_action_kinds():
                         msg = self._unsupported_action_message(tool_call)
-                        prompt.append({"role": "user", "content": msg})
+                        engine.append_feedback(prompt, msg)
                         emit_event(
                             "agent_nudge",
                             "Action is not available to this agent",
@@ -275,14 +329,14 @@ class CodingAgent:
                     repeats = repeats + 1 if sig == last_sig else 1
                     last_sig = sig
                     if repeats >= self.repeat_limit:
-                        prompt.append({"role": "user", "content": self._repeat_warning()})
+                        engine.append_feedback(prompt, self._repeat_warning())
                         emit_event("repeat_warning", "Repeated identical action", repeats=repeats)
 
                     if tool_call.name == "use_skill":
                         name = str(tool_call.args.get("name", ""))
                         log.info("turn %d: use_skill %s", turn_idx, name)
                         message = self._load_skill_message(name, loaded)
-                        prompt.append({"role": "user", "content": message})
+                        engine.append_feedback(prompt, message)
                         emit_event(
                             "skill_loaded",
                             f"Loaded skill {name}",
@@ -295,7 +349,7 @@ class CodingAgent:
                         gate_message = self._python_gate_message(code, tuple(loaded))
                         if gate_message:
                             log.info("turn %d: python blocked by agent gate", turn_idx)
-                            prompt.append({"role": "user", "content": gate_message})
+                            engine.append_feedback(prompt, gate_message)
                             emit_event(
                                 "python_blocked",
                                 "Python action blocked by agent gate",
@@ -350,9 +404,10 @@ class CodingAgent:
                             info=execution.info,
                         )
                         self._on_python_turn(turn_idx, code, execution, prev_observation, turns)
-                        action_turns += 1
+                        engine.record_action("run_python")
+                        action_turns = engine.ledger.action_count("run_python")
                         prev_observation = execution.observation
-                        prompt.append({"role": "user", "content": self._feedback_message(execution)})
+                        engine.append_feedback(prompt, self._feedback_message(execution))
                         if self._should_stop_after_python(execution):
                             stopped = True
                             terminal_raw = (
@@ -372,7 +427,7 @@ class CodingAgent:
                     else:
                         log.info("turn %d: meta action %s", turn_idx, tool_call.name)
                         message = self._handle_meta_action(tool_call, tuple(loaded))
-                        prompt.append({"role": "user", "content": message})
+                        engine.append_feedback(prompt, message)
                         emit_event(
                             "meta_action_result",
                             f"{label} handled {tool_call.name}",
@@ -381,7 +436,7 @@ class CodingAgent:
                         )
 
             if terminal_raw is None and self.force_terminal_on_exhaust and not stopped:
-                prompt.append({"role": "user", "content": self._force_terminal_message()})
+                engine.append_feedback(prompt, self._force_terminal_message())
                 emit_event(
                     "force_terminal",
                     "Forcing final terminal response after action budget",
@@ -389,32 +444,41 @@ class CodingAgent:
                     max_action_turns=self.max_turns,
                     decision_turns=decision_turn_idx,
                 )
-                request_dump = self._dump_llm_request(decision_turn_idx, prompt)
-                terminal_turn = self._complete_turn(prompt)
-                response_dump = self._dump_llm_response(decision_turn_idx, terminal_turn)
-                emit_event(
-                    "llm_response",
-                    "received forced terminal model turn",
-                    llm_request_path=str(request_dump) if request_dump is not None else None,
-                    llm_response_path=str(response_dump) if response_dump is not None else None,
-                    raw=terminal_turn.raw,
-                    raw_preview=preview(terminal_turn.raw),
-                    parser_error=terminal_turn.error,
-                )
-                terminal_call = self._single_tool_call(terminal_turn)
-                if terminal_call is not None and terminal_call.name == "finish":
-                    terminal_raw = self._tool_call_raw_json(terminal_call)
-                else:
-                    terminal_raw = terminal_turn.raw or terminal_turn.text
-                prompt.append({"role": "assistant", "content": terminal_raw})
+                request_dump = self._dump_llm_request(engine.ledger.model_calls, prompt)
+                terminal_step = engine.next(prompt)
+                if terminal_step is not None:
+                    terminal_turn = terminal_step.turn
+                    response_dump = self._dump_llm_response(terminal_step.index, terminal_turn)
+                    emit_event(
+                        "llm_response",
+                        "received forced terminal model turn",
+                        llm_request_path=str(request_dump) if request_dump is not None else None,
+                        llm_response_path=str(response_dump) if response_dump is not None else None,
+                        raw=terminal_turn.raw,
+                        raw_preview=preview(terminal_turn.raw),
+                        parser_error=terminal_turn.error,
+                    )
+                    terminal_call = terminal_step.tool_call
+                    if terminal_call is not None and terminal_call.name == "finish":
+                        terminal_raw = self._tool_call_raw_json(terminal_call)
+                    elif terminal_turn.text:
+                        terminal_raw = terminal_turn.text
 
             result = self._finalize(turns=turns, loaded=tuple(loaded), terminal_raw=terminal_raw)
+            result_trace = result if hasattr(result, "metadata") else getattr(result, "trace", None)
+            if result_trace is not None and isinstance(getattr(result_trace, "metadata", None), dict):
+                result_trace.metadata["runtime_budget"] = {
+                    "model_calls": engine.ledger.model_calls,
+                    "protocol_errors": engine.ledger.protocol_errors,
+                    "actions": dict(engine.ledger.actions),
+                }
             emit_event(
                 "agent_end",
                 f"{label} finished",
                 turns=len(turns),
                 action_turns=action_turns,
-                decision_turns=decision_turn_idx,
+                decision_turns=engine.ledger.model_calls,
+                protocol_errors=engine.ledger.protocol_errors,
                 max_action_turns=self.max_turns,
                 loaded_skills=list(loaded),
                 stopped=stopped,
@@ -449,13 +513,212 @@ class CodingAgent:
         skill = record.skill
         if skill.skill_id not in loaded:
             loaded.append(skill.skill_id)
-        return build_skill_llm_content(getattr(skill, "root", None), skill.body)
+        base_dir = getattr(skill, "root", None)
+        importable = self._ensure_skill_scripts_importable(base_dir)
+        functions, prompt_names = self._ensure_skill_contract_bindings(base_dir)
+        return build_skill_llm_content(
+            base_dir,
+            skill.body,
+            scripts_on_sys_path=importable,
+            bound_functions=functions,
+            prompt_names=prompt_names,
+        )
+
+    def _ensure_skill_scripts_importable(self, base_dir: Any) -> bool:
+        """Put a loaded skill's ``scripts/`` on the sandbox sys.path (M1.5 Fix C).
+
+        qwen-code's "base directory" hint is enough for bash agents; our agents
+        share one exec interpreter, so the runtime performs the import wiring
+        itself instead of taxing the agent an action turn of importlib
+        boilerplate. Runs as an internal block: no action budget, no ledger.
+        """
+
+        modules = skill_script_modules(base_dir)
+        if not modules:
+            return False
+        scripts_dir = str((Path(str(base_dir)) / "scripts").resolve())
+        if scripts_dir in self._skill_script_paths:
+            return True
+        code = (
+            "import sys\n"
+            f"if {scripts_dir!r} not in sys.path:\n"
+            f"    sys.path.insert(0, {scripts_dir!r})\n"
+        )
+        block = SemanticActionBlock(
+            name=f"skill_setup_{Path(str(base_dir)).name}",
+            intent="runtime skill setup: expose scripts/ for direct import",
+            code=code,
+            metadata={**self._block_metadata(), "runtime_setup": True},
+        )
+        try:
+            execution = self.executor.run_block(block)
+        except Exception as exc:  # noqa: BLE001 - setup must never kill the loop
+            emit_event(
+                "skill_setup_failed",
+                "Runtime skill setup block raised",
+                scripts_dir=scripts_dir,
+                error=str(exc),
+            )
+            return False
+        if not execution.ok:
+            emit_event(
+                "skill_setup_failed",
+                "Runtime skill setup block failed",
+                scripts_dir=scripts_dir,
+                stderr=execution.stderr,
+            )
+            return False
+        self._skill_script_paths.add(scripts_dir)
+        emit_event(
+            "skill_setup_done",
+            "Skill scripts directory injected into sandbox sys.path",
+            scripts_dir=scripts_dir,
+            modules=list(modules),
+        )
+        return True
+
+    def _ensure_skill_contract_bindings(
+        self, base_dir: Any
+    ) -> tuple[tuple[tuple[str, str, str], ...], tuple[str, ...]]:
+        """Bind a skill's contracted functions and prompts into the sandbox (M2).
+
+        The contract's ``functions:`` entries become directly callable names in
+        the persistent namespace, and ``prompts:`` templates land in a
+        ``PROMPTS`` dict — so the agent calls polished primitives instead of
+        re-deriving them, and reuses curated wording instead of improvising.
+        Returns ``((name, signature, description), ...)`` and prompt names for
+        the skill-load message. Best-effort: a broken binding is reported via
+        events and simply not advertised; it never kills the loop.
+        """
+
+        if not base_dir:
+            return (), ()
+        root = Path(str(base_dir)).resolve()
+        cached = self._skill_binding_cache.get(str(root))
+        if cached is not None:
+            return cached
+        # Local import: core.coder stays import-time independent from dysc.
+        from robomex.dysc.contract_checks import resolve_function_signature
+        from robomex.dysc.contracts import load_contract_for_skill
+
+        contract = load_contract_for_skill(root)
+        if contract is None or (not contract.functions and not contract.prompts):
+            self._skill_binding_cache[str(root)] = ((), ())
+            return (), ()
+
+        lines: list[str] = []
+        functions: list[tuple[str, str, str]] = []
+        if contract.functions:
+            lines += [
+                "import importlib.util as _m2_ilu",
+                "import sys as _m2_sys",
+                "def _m2_bind(_mod, _path, _func):",
+                "    _module = _m2_sys.modules.get(_mod)",
+                "    if _module is None or getattr(_module, '__file__', None) != _path:",
+                "        _spec = _m2_ilu.spec_from_file_location(_mod, _path)",
+                "        _module = _m2_ilu.module_from_spec(_spec)",
+                "        _spec.loader.exec_module(_module)",
+                "        _m2_sys.modules[_mod] = _module",
+                "    return getattr(_module, _func)",
+            ]
+            for function in contract.functions:
+                source = root / function.entry_path
+                if not function.name.isidentifier() or not source.is_file():
+                    emit_event(
+                        "skill_function_binding_skipped",
+                        "Contract function entry could not be resolved",
+                        skill_root=str(root),
+                        function=function.name,
+                        entry=function.entry,
+                    )
+                    continue
+                module_name = source.stem
+                lines.append(
+                    f"{function.name} = _m2_bind({module_name!r}, "
+                    f"{str(source)!r}, {function.entry_function!r})"
+                )
+                signature = resolve_function_signature(function, root)
+                functions.append(
+                    (function.name, signature or f"{function.name}(...)", function.description)
+                )
+        prompt_names: list[str] = []
+        if contract.prompts:
+            lines += ["try:", "    PROMPTS", "except NameError:", "    PROMPTS = {}"]
+            for template in contract.prompts:
+                path = root / template.path
+                try:
+                    text = path.read_text(encoding="utf-8")
+                except OSError:
+                    emit_event(
+                        "skill_prompt_binding_skipped",
+                        "Contract prompt template could not be read",
+                        skill_root=str(root),
+                        prompt=template.name,
+                        path=template.path,
+                    )
+                    continue
+                lines.append(f"PROMPTS[{template.name!r}] = {text!r}")
+                prompt_names.append(template.name)
+        if not functions and not prompt_names:
+            self._skill_binding_cache[str(root)] = ((), ())
+            return (), ()
+
+        block = SemanticActionBlock(
+            name=f"skill_bindings_{root.name}",
+            intent="runtime skill setup: bind contracted functions and prompts",
+            code="\n".join(lines) + "\n",
+            metadata={**self._block_metadata(), "runtime_setup": True},
+        )
+        try:
+            execution = self.executor.run_block(block)
+        except Exception as exc:  # noqa: BLE001 - setup must never kill the loop
+            emit_event(
+                "skill_bindings_failed",
+                "Runtime contract binding block raised",
+                skill_root=str(root),
+                error=str(exc),
+            )
+            return (), ()
+        if not execution.ok:
+            emit_event(
+                "skill_bindings_failed",
+                "Runtime contract binding block failed",
+                skill_root=str(root),
+                stderr=execution.stderr,
+            )
+            return (), ()
+        result = (tuple(functions), tuple(prompt_names))
+        self._skill_binding_cache[str(root)] = result
+        emit_event(
+            "skill_bindings_done",
+            "Contracted skill functions and prompts bound into the sandbox",
+            skill_root=str(root),
+            functions=[name for name, _, _ in functions],
+            prompts=list(prompt_names),
+        )
+        return result
 
     @staticmethod
     def _feedback_message(execution: BlockExecutionResult) -> str | list:
+        stdout = _compact_stream_for_prompt("stdout", execution.stdout)
+        stderr = _compact_stream_for_prompt("stderr", execution.stderr)
+        terminal_state = ""
+        robot_state = (
+            execution.info.get("terminal_robot_state")
+            if isinstance(execution.info, dict)
+            else None
+        )
+        if isinstance(robot_state, dict) and robot_state:
+            terminal_state = (
+                "terminal_robot_state (captured by the runtime after this "
+                "state-changing block; reference it in your evidence instead of "
+                f"calling get_observation):\n{json.dumps(robot_state)}\n\n"
+            )
         return (
-            f"stdout:\n{execution.stdout}\n\nstderr:\n{execution.stderr}\n\n"
-            "Reply with exactly one JSON action: use_skill, run_python, or finish."
+            f"stdout:\n{stdout}\n\nstderr:\n{stderr}\n\n{terminal_state}"
+            "Reply with exactly one JSON action: use_skill, run_python, or finish. "
+            "Keep future stdout compact: print a short stage report only, and put "
+            "large arrays, masks, candidates, or debug dumps in EVIDENCE/artifacts."
         )
 
     def _complete_turn(self, prompt: list[dict]) -> ModelTurn:
@@ -551,10 +814,11 @@ class CodingAgent:
             '{"tool":"run_python","args":{"code":"print(1)","intent":"inspect"}}',
             '{"tool":"finish","args":{"claim":"done"}}',
         ]
-        if "call_subagent" in self._allowed_action_kinds():
+        if "spawn_subagent" in self._allowed_action_kinds():
             examples.insert(
                 1,
-                '{"tool":"call_subagent","args":{"task":"localize the target object and return mask/point evidence"}}',
+                '{"tool":"spawn_subagent","args":{"spec":{"id":"inspector","role":"inspector",'
+                '"objective":"inspect current evidence","task":"inspect the target"}}}',
             )
         return (
             "No valid action parsed."

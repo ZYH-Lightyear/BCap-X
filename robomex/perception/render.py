@@ -32,6 +32,40 @@ def save_rgb(path: str | Path, rgb: np.ndarray) -> str:
     return str(path)
 
 
+def save_mask_overlay(
+    path: str | Path,
+    rgb: np.ndarray,
+    mask: np.ndarray,
+    *,
+    bbox: list[float] | tuple[float, float, float, float] | None = None,
+) -> str:
+    """Save a grounding review image with a translucent mask and bounding box."""
+
+    rgb_array = np.asarray(rgb).astype(np.uint8)
+    mask_array = np.asarray(mask).astype(bool)
+    if rgb_array.ndim != 3 or rgb_array.shape[2] < 3:
+        raise ValueError("rgb must have shape (H, W, 3).")
+    if mask_array.shape != rgb_array.shape[:2]:
+        raise ValueError("mask shape must match the RGB image.")
+
+    image = Image.fromarray(rgb_array[..., :3]).convert("RGBA")
+    _draw_mask_overlay(image, mask_array, color=(0, 255, 0, 80))
+    if bbox is None and np.any(mask_array):
+        ys, xs = np.nonzero(mask_array)
+        bbox = (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
+    if bbox is not None and len(bbox) == 4:
+        ImageDraw.Draw(image).rectangle(
+            [float(value) for value in bbox],
+            outline=(255, 64, 64, 255),
+            width=3,
+        )
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    image.convert("RGB").save(output)
+    return str(output)
+
+
 def project_world_to_pixel(
     point_world: np.ndarray | list[float] | tuple[float, ...],
     intrinsics: np.ndarray,

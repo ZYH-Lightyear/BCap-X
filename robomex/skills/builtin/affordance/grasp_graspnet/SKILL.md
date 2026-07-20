@@ -20,6 +20,11 @@ misses. It is also a good fallback when local geometry heuristics disagree.
 Act runs this analysis directly. If the resulting candidate or execution state is
 visually ambiguous, ask the Verifier SubAgent to review that concrete claim.
 
+## When NOT to use
+
+Do not use when a simple interpretable affordance is reliable, when segmentation or
+depth is stale, or as permission to execute the highest learned score blindly.
+
 ## Workflow
 
 1. Use the current RGB-D camera, target mask, intrinsics, and camera pose.
@@ -75,6 +80,13 @@ visually ambiguous, ask the Verifier SubAgent to review that concrete claim.
 - Candidate overlay with target mask, selected point, approach axis, jaw axis, score,
   and IK status.
 - Optional short text trace describing why the chosen candidate beat alternatives.
+
+## Multimodal Evidence Contract
+
+Consume current RGB-D, target mask, camera calibration, and target points from one
+epoch. Publish the transformed selected candidate with exact TCP/quaternion,
+explicit approach/lift positions, score, IK result, and overlay. Candidate attachment
+to a neighbor routes `wrong_grounding`; an empty plausible set routes `infeasible`.
 
 ## Optional Sidecars
 

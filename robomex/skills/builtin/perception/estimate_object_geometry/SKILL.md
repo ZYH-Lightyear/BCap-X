@@ -19,6 +19,11 @@ pose matters, or after a failed action changed the object. Typical cases include
 bowls, cups, lying cylinders, elongated objects, thin packages, and partially occluded
 targets.
 
+## When NOT to use
+
+Do not use raw scene points, mix multiple object masks, command robot motion, or
+promote a noisy PCA axis to unquestioned physical truth.
+
 ## Workflow
 
 1. Read filtered object points from local evidence or the current code block.
@@ -76,8 +81,24 @@ targets.
 - Short text summary in the trace: pose hint, dimensions, and reason for the chosen
   grasp family.
 
+## Multimodal Evidence Contract
+
+Consume only the typed world-frame points and observation epoch produced by
+grounding. Publish compact robust dimensions and pose hints with the same epoch.
+Save an OBB/PCA visualization when axis choice changes grasp strategy. Sparse or
+non-finite inputs emit `infeasible`; they are not repaired with fabricated extents.
+
 ## Optional Sidecars
 
-No helper script is required. Implement the lightweight summary directly from the
-segmented points, using environment geometry utilities such as
-`get_oriented_bounding_box_from_3d_points` when available.
+`estimate_object_geometry` is a contracted canonical function pre-bound from
+`scripts/object_geometry.py`. Call it directly on the supplied point artifact;
+use environment geometry utilities only for optional visual diagnostics.
+
+## Reference Code
+
+```python
+import numpy as np
+
+points = np.load(INPUTS["object_points"]["refs"][0]["path"])
+geometry = estimate_object_geometry(points)
+```

@@ -1,0 +1,19 @@
+skill_id: grasp_pca_side
+tags: [affordance, grasping, geometry]
+role: affordance
+changes_world: false
+capabilities: [perception_read, geometry_compute, artifact_write]
+forbidden_capabilities: [robot_motion, gripper_control, object_manipulation]
+input_ports:
+  - {name: object_points, schema: robomex.points3d.v1, frame: world}
+  - {name: object_geometry, schema: robomex.object_geometry.v1, frame: world, required: false}
+output_ports:
+  - {name: grasp_affordance, schema: robomex.affordance.v1, frame: world}
+budget: {max_turns: 6}
+exit_conditions:
+  success: "Published a finite PCA body grasp with explicit side approach and vertical lift."
+  infeasible: "Target points were sparse, degenerate, or produced no safe side candidate."
+functions:
+  - name: compute_pca_side_grasps
+    entry: "scripts/pca_side_grasp.py:compute_pca_side_grasps"
+    description: "Canonical two-sided PCA body grasp candidates with explicit approach and lift positions."

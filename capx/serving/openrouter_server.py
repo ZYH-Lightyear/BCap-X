@@ -13,6 +13,8 @@ from fastapi.responses import StreamingResponse
 from openai import AsyncOpenAI, OpenAI
 from pydantic import BaseModel, Field
 
+from capx.llm.routing import RouteProfile, normalize_proxy_payload
+
 logger = logging.getLogger(__name__)
 
 
@@ -35,7 +37,7 @@ class ChatCompletionRequest(BaseModel):
     model: str = "openrouter/google/gemini-2.5-pro-preview"
     messages: list[Message]
     temperature: float | None = 0.2
-    max_tokens: int | None = 256
+    max_tokens: int | None = None
     stream: bool = False
     top_p: float | None = None
     reasoning_effort: str | None = None
@@ -99,22 +101,22 @@ def _load_api_keys(key_file: str) -> list[str]:
     return keys
 
 
-def _build_extra_body(
-    request: "ChatCompletionRequest", default_reasoning_effort: str | None
-) -> dict | None:
-    """组装转发给上游的 extra_body(主要是 reasoning 控制)。
+def _prepare_upstream_request(
+    request: "ChatCompletionRequest",
+    upstream: "Upstream",
+    native_model: str,
+) -> tuple[dict, dict | None]:
+    """Normalize one proxy request for a declaratively configured upstream."""
 
-    优先用请求里显式传的 ``reasoning``;否则在配了该路由默认 effort 时注入
-    ``{"effort": <default>}`` 以统一降低 thinking 强度。``reasoning`` 不是 OpenAI 标准
-    字段,必须经 ``extra_body`` 透传。``none``/``off``/空 表示完全不注入 —— 非 OpenRouter
-    的上游(V-API / 原生 OpenAI / Gemini 网关)会对这个参数报 400,所以必须可关闭。
-    """
-
-    reasoning = request.reasoning
-    effort = (default_reasoning_effort or "").strip().lower()
-    if reasoning is None and effort and effort not in {"none", "off"}:
-        reasoning = {"effort": default_reasoning_effort}
-    return {"reasoning": reasoning} if reasoning is not None else None
+    return normalize_proxy_payload(
+        request.model_dump(exclude_none=True),
+        native_model=native_model,
+        profile=RouteProfile(
+            token_field=upstream.token_field,
+            reasoning_style=upstream.reasoning_style,
+            reasoning_effort=upstream.reasoning_effort,
+        ),
+    )
 
 
 class Upstream:
@@ -130,10 +132,14 @@ class Upstream:
         name: str,
         client: AsyncOpenAI | OpenAI,
         reasoning_effort: str | None,
+        token_field: str = "auto",
+        reasoning_style: str = "none",
     ) -> None:
         self.name = name
         self.client = client
         self.reasoning_effort = reasoning_effort
+        self.token_field = token_field
+        self.reasoning_style = reasoning_style
 
 
 def _resolve_api_key(spec: dict) -> str:
@@ -173,8 +179,27 @@ def _build_upstream(
         default_headers=default_headers,
         timeout=timeout_s,
     )
-    logger.info("route '%s' -> %s (effort=%s)", name, base_url, spec.get("reasoning_effort"))
-    return Upstream(name=name, client=client, reasoning_effort=spec.get("reasoning_effort"))
+    token_field = str(spec.get("token_field") or "auto")
+    reasoning_style = str(spec.get("reasoning_style") or "none")
+    if token_field not in {"auto", "max_tokens", "max_completion_tokens"}:
+        raise ValueError(f"route {name!r}: unsupported token_field {token_field!r}")
+    if reasoning_style not in {"none", "openai", "openrouter"}:
+        raise ValueError(f"route {name!r}: unsupported reasoning_style {reasoning_style!r}")
+    logger.info(
+        "route '%s' -> %s (token_field=%s reasoning_style=%s effort=%s)",
+        name,
+        base_url,
+        token_field,
+        reasoning_style,
+        spec.get("reasoning_effort"),
+    )
+    return Upstream(
+        name=name,
+        client=client,
+        reasoning_effort=spec.get("reasoning_effort"),
+        token_field=token_field,
+        reasoning_style=reasoning_style,
+    )
 
 
 def _proxy_error(exc: Exception, upstream: Upstream | None, native_model: str | None) -> HTTPException:
@@ -236,13 +261,10 @@ def create_app(
             upstream: Upstream | None = None
             native_model: str | None = None
             try:
-                client_kwargs = request.model_dump(exclude_none=True)
-                # reasoning 经 extra_body 透传(非 OpenAI 标准 kwarg);不传则按路由默认注入。
-                client_kwargs.pop("reasoning", None)
-
-                upstream, native_model = _route_for(client_kwargs.get("model", ""))
-                client_kwargs["model"] = native_model
-                extra_body = _build_extra_body(request, upstream.reasoning_effort)
+                upstream, native_model = _route_for(request.model)
+                client_kwargs, extra_body = _prepare_upstream_request(
+                    request, upstream, native_model
+                )
                 client = upstream.client
 
                 if request.stream:
@@ -286,12 +308,10 @@ def create_app(
             upstream: Upstream | None = None
             native_model: str | None = None
             try:
-                client_kwargs = request.model_dump(exclude_none=True)
-                client_kwargs.pop("reasoning", None)
-
-                upstream, native_model = _route_for(client_kwargs.get("model", ""))
-                client_kwargs["model"] = native_model
-                extra_body = _build_extra_body(request, upstream.reasoning_effort)
+                upstream, native_model = _route_for(request.model)
+                client_kwargs, extra_body = _prepare_upstream_request(
+                    request, upstream, native_model
+                )
 
                 client_kwargs["stream"] = False
                 response = upstream.client.chat.completions.create(**client_kwargs, extra_body=extra_body)
@@ -331,9 +351,11 @@ def _routes_from_file(path: str, async_client: bool, timeout_s: float) -> tuple[
           "default": "vapi",
           "routes": {
             "openrouter": {"base_url": "...", "api_key_env": "OPENROUTER_API_KEY",
-                            "key_file": ".openrouterkey", "reasoning_effort": "low"},
+                            "key_file": ".openrouterkey", "reasoning_effort": "low",
+                            "token_field": "auto", "reasoning_style": "openrouter"},
             "vapi":       {"base_url": "...", "api_key_env": "V_API_KEY",
-                            "reasoning_effort": "none"}
+                            "reasoning_effort": "none", "token_field": "auto",
+                            "reasoning_style": "openai"}
           }
         }
     """
@@ -387,7 +409,13 @@ def main(
         routes = {
             "default": _build_upstream(
                 "default",
-                {"base_url": base_url, "api_key": api_key, "reasoning_effort": reasoning_effort},
+                {
+                    "base_url": base_url,
+                    "api_key": api_key,
+                    "reasoning_effort": reasoning_effort,
+                    "token_field": "auto",
+                    "reasoning_style": "openrouter",
+                },
                 async_client,
                 timeout_s,
             )

@@ -30,6 +30,9 @@ from pathlib import Path
 from typing import Any
 
 import tyro
+import yaml
+
+from robomex.authoring.capabilities import KNOWN_CAPABILITIES
 
 DEFAULT_MAX_SUBGOALS = 8
 DEFAULT_SUBAGENT_MAX_TURNS = 8
@@ -82,7 +85,7 @@ class LiveArgs:
     """YAML env 配置(与 CaP-Agent0 baseline 用的同一个)。"""
 
     model: str = "openrouter/qwen/qwen3.6-plus"
-    """planner 和内层 code agent 共用的模型(经代理转发)。"""
+    """未在 ``robomex.models`` 分角色配置时使用的兼容模型。"""
 
     server_url: str = "http://localhost:8110/chat/completions"
     """本地 LLM 代理端点。"""
@@ -111,6 +114,21 @@ class LiveArgs:
     act_observation_camera: str = ""
     """Act 取 OBS_BEFORE/反馈图的相机名;空值表示跟随 scene_camera。"""
 
+    dysc_online: bool = False
+    """启用 DySC online society evolution。也可由 YAML 的 robomex.dysc.enabled 开启。"""
+
+    dysc_society_path: str | None = None
+    """可选 seed SocietySpec YAML;为空时使用默认 DySC society。"""
+
+    dysc_society_dir: str | None = None
+    """可选 DySC society 版本目录;为空时写入本次输出目录下的 dysc_society/。"""
+
+    authoring_strategy: str = "universal"
+    """Authoring 策略: universal 或 dynamic_swarm。"""
+
+    swarm_manager_max_turns: int = 4
+    """SubgoalSwarmManager 渐进加载 task skill 并生成动态图的最大模型调用数。"""
+
 
 @dataclass(frozen=True)
 class RuntimeSettings:
@@ -121,13 +139,33 @@ class RuntimeSettings:
     scene_camera: str = DEFAULT_SCENE_CAMERA
     act_observation_camera: str = DEFAULT_SCENE_CAMERA
     prompt_api_names: frozenset[str] = DEFAULT_PROMPT_APIS
-    subagent_denied_calls: frozenset[str] | None = None
+    authoring_strategy: str = "universal"
+    swarm_manager_max_turns: int = 4
+    swarm_capability_ceiling: frozenset[str] = KNOWN_CAPABILITIES
+
+
+@dataclass(frozen=True)
+class RoleModels:
+    """Resolved model IDs for the three text-agent roles."""
+
+    planner: str
+    manager: str
+    subagent: str
 
 
 def _load_config_dict(config_path: str) -> dict[str, Any]:
-    from capx.envs.configs.loader import DictLoader
+    """Load declarative YAML without importing the simulator package.
 
-    return DictLoader.load([os.path.expanduser(config_path)])
+    Runtime/config inspection must remain usable on machines that do not have
+    Gymnasium, MuJoCo, or LIBERO installed. Environment classes are imported only by
+    the actual environment-construction path.
+    """
+
+    path = Path(os.path.expanduser(config_path))
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"config {path} must contain a YAML mapping")
+    return raw
 
 
 def _build_env(config_path: str) -> Any:
@@ -162,6 +200,29 @@ def _robomex_vlm_config(config_path: str) -> dict[str, Any]:
     return {str(k): v for k, v in vlm.items() if v not in (None, "")}
 
 
+def _robomex_model_config(config_path: str) -> dict[str, Any]:
+    """Read optional role-specific text models from ``robomex.models``."""
+
+    cfg = _load_config_dict(config_path)
+    robomex_cfg = cfg.get("robomex") if isinstance(cfg.get("robomex"), dict) else {}
+    models = (
+        robomex_cfg.get("models")
+        if isinstance(robomex_cfg.get("models"), dict)
+        else {}
+    )
+    return {str(k): v for k, v in models.items() if v not in (None, "")}
+
+
+def _role_models(args: LiveArgs) -> RoleModels:
+    """Resolve role models with backward-compatible ``--model`` fallback."""
+
+    cfg = _robomex_model_config(args.config_path)
+    planner = str(cfg.get("planner") or args.model)
+    manager = str(cfg.get("manager") or planner)
+    subagent = str(cfg.get("subagent") or manager)
+    return RoleModels(planner=planner, manager=manager, subagent=subagent)
+
+
 def _robomex_runtime_config(config_path: str) -> dict[str, Any]:
     """Read optional RoboMEx runtime settings from ``robomex.runtime``."""
 
@@ -171,6 +232,31 @@ def _robomex_runtime_config(config_path: str) -> dict[str, Any]:
     if not isinstance(runtime, dict):
         return {}
     return {str(k): v for k, v in runtime.items() if v is not None}
+
+
+def _robomex_dysc_config(config_path: str) -> dict[str, Any]:
+    """Read optional DySC settings from ``robomex.dysc``."""
+
+    cfg = _load_config_dict(config_path)
+    robomex_cfg = cfg.get("robomex") if isinstance(cfg.get("robomex"), dict) else {}
+    dysc = robomex_cfg.get("dysc") if isinstance(robomex_cfg.get("dysc"), dict) else {}
+    if not isinstance(dysc, dict):
+        return {}
+    return {str(k): v for k, v in dysc.items() if v is not None}
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(value)
 
 
 def _coerce_str_frozenset(value: Any) -> frozenset[str] | None:
@@ -190,7 +276,6 @@ def _runtime_settings(args: LiveArgs) -> RuntimeSettings:
 
     cfg = _robomex_runtime_config(args.config_path)
     prompt_api_names = _coerce_str_frozenset(cfg.get("prompt_api_names")) or DEFAULT_PROMPT_APIS
-    denied_calls = _coerce_str_frozenset(cfg.get("subagent_denied_calls"))
 
     def effective_int(name: str, cli_value: int, default: int) -> int:
         if cli_value != default:
@@ -219,7 +304,18 @@ def _runtime_settings(args: LiveArgs) -> RuntimeSettings:
         scene_camera=scene_camera,
         act_observation_camera=act_observation_camera,
         prompt_api_names=prompt_api_names,
-        subagent_denied_calls=denied_calls,
+        authoring_strategy=(
+            args.authoring_strategy
+            if args.authoring_strategy != "universal"
+            else str(cfg.get("authoring_strategy") or "universal")
+        ),
+        swarm_manager_max_turns=effective_int(
+            "swarm_manager_max_turns", args.swarm_manager_max_turns, 4
+        ),
+        swarm_capability_ceiling=(
+            _coerce_str_frozenset(cfg.get("swarm_capability_ceiling"))
+            or KNOWN_CAPABILITIES
+        ),
     )
 
 
@@ -234,7 +330,7 @@ def _configure_vlm_backend(args: LiveArgs, log: Any | None = None) -> dict[str, 
     api_key = cfg.get("api_key")
     coord_space = cfg.get("coord_space")
 
-    applied["model"] = str(model or args.model)
+    applied["model"] = str(model or _role_models(args).planner)
     applied["server_url"] = str(server_url or args.server_url)
     if api_key or args.api_key:
         applied["api_key"] = str(api_key or args.api_key)
@@ -485,14 +581,15 @@ def run_episode(env: Any, obs: dict, task: str, out_dir: Path, args: LiveArgs, l
 
     from robomex import RoboMExAgent, RoboMExConfig
     from robomex.agents import LLMPlannerPolicy
-    from robomex.agents.subagents import SubAgentExecutionPolicy, render_subagent_system_prompt
     from robomex.core.coder import LLMCodePolicy
     from robomex.core.sandbox import CapXExecutorAdapter
+    from robomex.dysc import DySCOnlineConfig
     from robomex.prompts import render_libero_act_system_prompt
     from robomex.skills import SkillLibrary, load_builtin_skills
 
     out_dir.mkdir(parents=True, exist_ok=True)
     runtime = _runtime_settings(args)
+    role_models = _role_models(args)
 
     # Code-block APIs such as query_vlm / vlm_bbox_detection receive their VLM backend
     # through the CapX API instance, configured from YAML's `robomex.vlm` section.
@@ -515,43 +612,82 @@ def run_episode(env: Any, obs: dict, task: str, out_dir: Path, args: LiveArgs, l
 
     api_docs = _api_docs(env, runtime.prompt_api_names)
     system_prompt = render_libero_act_system_prompt(api_docs)
-    subagent_system_prompt = render_subagent_system_prompt(api_docs)
-    code_policy = LLMCodePolicy(model=args.model, server_url=args.server_url, api_key=args.api_key)
+    manager_policy = LLMCodePolicy(
+        model=role_models.manager,
+        server_url=args.server_url,
+        api_key=args.api_key,
+    )
+    subagent_policy = LLMCodePolicy(
+        model=role_models.subagent,
+        server_url=args.server_url,
+        api_key=args.api_key,
+    )
     scene_camera_label = runtime.scene_camera or "auto"
     act_camera_label = runtime.act_observation_camera or "auto"
-    log.info("Act/SubAgent code policy: JSON action adapter")
+    log.info("Authoring code policy: JSON action adapter")
     log.info(
-        "RoboMEx runtime: max_subgoals=%d subagent_max_turns=%d scene_camera=%s act_observation_camera=%s",
+        "RoboMEx runtime: max_subgoals=%d authoring_strategy=%s scene_camera=%s act_observation_camera=%s",
         runtime.max_subgoals,
-        runtime.subagent_max_turns,
+        runtime.authoring_strategy,
         scene_camera_label,
         act_camera_label,
     )
+    log.info(
+        "RoboMEx role models: planner=%s manager=%s subagent=%s",
+        role_models.planner,
+        role_models.manager,
+        role_models.subagent,
+    )
+    dysc_cfg = _robomex_dysc_config(args.config_path)
+    dysc_enabled = args.dysc_online or _coerce_bool(dysc_cfg.get("enabled"), default=False)
+    dysc_society_path = args.dysc_society_path or dysc_cfg.get("society_path")
+    dysc_society_dir = args.dysc_society_dir or dysc_cfg.get("society_dir") or str(out_dir / "dysc_society")
+    dysc_online = (
+        DySCOnlineConfig(
+            society_path=str(dysc_society_path) if dysc_society_path else None,
+            society_dir=str(dysc_society_dir) if dysc_society_dir else None,
+        )
+        if dysc_enabled
+        else None
+    )
+    if dysc_online is not None:
+        log.info(
+            "DySC online evolution enabled: society_path=%s society_dir=%s",
+            dysc_online.society_path or "(default)",
+            dysc_online.society_dir or "(default)",
+        )
 
-    # 框架入口:把所有依赖收进一个 RoboMExConfig,再交给 RoboMExAgent 装配 + 运行
-    # 反应式两层循环。执行器在 inner loop 内 use_skill/run_python;finish 交回 Planner。
+    # Framework entry: Planner delegates each subgoal to one configured runner.
     config = RoboMExConfig(
         library=library,
-        planner_policy=LLMPlannerPolicy(model=args.model, server_url=args.server_url, api_key=args.api_key),
-        code_policy=code_policy,
+        planner_policy=LLMPlannerPolicy(
+            model=role_models.planner,
+            server_url=args.server_url,
+            api_key=args.api_key,
+        ),
+        code_policy=manager_policy,
+        subagent_policy=subagent_policy,
         executor=CapXExecutorAdapter(env, vlm_backend=vlm_backend),
         max_turns=args.max_turns,
         max_subgoals=runtime.max_subgoals,
         inner_system_prompt=system_prompt,
-        subagent_system_prompt=subagent_system_prompt,
         code_policy_kind="json_action_adapter",
         observation_camera=runtime.act_observation_camera,
         subagent_max_turns=runtime.subagent_max_turns,
-        subagent_execution_policy=(
-            SubAgentExecutionPolicy(denied_calls=runtime.subagent_denied_calls)
-            if runtime.subagent_denied_calls is not None
-            else None
-        ),
         observation_summary=(
             f"A LIBERO tabletop scene. Planner snapshots use the {scene_camera_label!r} camera. "
             "Call get_observation() for available RGB/depth, intrinsics, and camera poses."
         ),
         artifacts_dir=str(out_dir),
+        dysc_online=dysc_online,
+        authoring_strategy=runtime.authoring_strategy,
+        swarm_manager_max_turns=runtime.swarm_manager_max_turns,
+        swarm_capability_ceiling=runtime.swarm_capability_ceiling,
+        authoring_environment=(
+            "Control a Franka arm in LIBERO. Ground physical decisions in the current "
+            "observation and treat image-derived geometry as observation-scoped."
+        ),
+        authoring_api_docs=api_docs,
     )
     agent = RoboMExAgent(config)
 

@@ -23,6 +23,10 @@ class SkillLibraryView:
     access_policy: SkillAccessPolicy
     contracts: dict[str, SkillContract]
 
+    @property
+    def root(self):
+        return getattr(self.library, "root", None)
+
     def get(self, skill_id: str) -> SkillRecord:
         if not self.allows(skill_id):
             raise KeyError(f"skill {skill_id!r} is not visible under policy {self.access_policy.name!r}")
@@ -54,6 +58,27 @@ class SkillLibraryView:
             return True
         if policy.allow_tags and tags.intersection(policy.allow_tags):
             return True
-        if not policy.allow and not policy.allow_tags and not policy.prefer:
+        if not policy.allow and not policy.allow_tags:
             return True
         return False
+
+
+def specialist_skill_view(
+    library: Any,
+    contracts: dict[str, SkillContract],
+    *,
+    required: tuple[str, ...],
+    preferred: tuple[str, ...] = (),
+) -> SkillLibraryView:
+    """Expose only the skills declared by one specialist contract."""
+
+    visible = tuple(dict.fromkeys((*required, *preferred)))
+    return SkillLibraryView(
+        library=library,
+        access_policy=SkillAccessPolicy(
+            name="specialist_contract",
+            allow=visible,
+            prefer=preferred,
+        ),
+        contracts=contracts,
+    )

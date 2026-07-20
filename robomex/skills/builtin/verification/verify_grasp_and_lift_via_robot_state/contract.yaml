@@ -1,0 +1,20 @@
+skill_id: verify_grasp_and_lift_via_robot_state
+tags: [verification, grasping]
+role: verifier
+changes_world: false
+capabilities: [perception_read, artifact_write]
+forbidden_capabilities: [robot_motion, gripper_control, object_manipulation]
+input_ports:
+  - {name: execution_evidence, schema: robomex.execution_evidence.v1}
+output_ports:
+  - {name: verifier_report, schema: robomex.verifier.v1}
+postconditions: [target visibly coupled to gripper after lift]
+budget: {max_turns: 4}
+exit_conditions:
+  success: "Verdict pass: the target is visibly coupled to the gripper after lift."
+  failed_grasp: "Verdict fail: the target is still on the surface or slipped out of the gripper."
+  wrong_grounding: "Verdict fail: the gripper holds a different object than the requested target."
+functions:
+  - name: verify_grasp_with_vlm
+    entry: "scripts/verify_grasp_state.py:verify_grasp_with_vlm"
+    description: "One scene-view VLM verification query with an occlusion-only wrist fallback; returns state, confidence, view_used, and a recovery branch."

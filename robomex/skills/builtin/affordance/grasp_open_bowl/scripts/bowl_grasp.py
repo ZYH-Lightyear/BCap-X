@@ -84,18 +84,32 @@ def propose_open_bowl_grasps(
             object_center = np.array([center_xy[0], center_xy[1], grasp_z], dtype=float)
             center_offset = object_center - pos
             quat = _quat_from_axes(tangent, outward, approach)
+            contact_depth = float(rim_height - grasp_z)
             candidate = {
                 "strategy": "open_bowl_rim_topdown",
                 "pos": _list(pos),
+                "position": _list(pos),
                 "quat": _list(quat),
+                "quaternion_wxyz": _list(quat),
                 "object_center": _list(object_center),
+                "object_center_at_grasp": _list(object_center),
                 "object_center_offset_from_grasp": _list(center_offset),
                 "approach_axis": _list(approach),
                 "jaw_axis": _list(tangent),
                 "radial_axis": _list(outward),
                 "pregrasp_pos": _list(pos - approach * standoff_m),
+                "approach_position": _list(pos - approach * standoff_m),
+                "lift_position": _list(
+                    pos + np.array([0.0, 0.0, max(0.15, standoff_m)], dtype=float)
+                ),
                 "source_rim_point_xy": _list(rim_point_xy),
+                "grasp_z": float(grasp_z),
+                "bottom_z": bottom_z,
+                "top_z": top_z,
+                "rim_height": rim_height,
                 "rim_z_margin": float(margin),
+                "contact_depth": contact_depth,
+                "estimated_radius": radius,
                 "score": float(1.0 - 0.035 * angle_rank - 0.025 * margin_rank),
                 "ik_ok": True,
                 "ik_error": None,

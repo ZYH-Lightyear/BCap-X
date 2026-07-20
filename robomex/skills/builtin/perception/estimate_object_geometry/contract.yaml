@@ -1,0 +1,18 @@
+skill_id: estimate_object_geometry
+tags: [perception, geometry]
+role: geometry_analyzer
+changes_world: false
+capabilities: [perception_read, geometry_compute, artifact_write]
+forbidden_capabilities: [robot_motion, gripper_control, object_manipulation]
+input_ports:
+  - {name: object_points, schema: robomex.points3d.v1, frame: world}
+output_ports:
+  - {name: object_geometry, schema: robomex.object_geometry.v1, frame: world}
+budget: {max_turns: 5}
+exit_conditions:
+  success: "Published a finite robust geometry summary for the supplied target points."
+  infeasible: "The point set was empty, non-finite, or too sparse for reliable geometry."
+functions:
+  - name: estimate_object_geometry
+    entry: "scripts/object_geometry.py:estimate_object_geometry"
+    description: "Robust AABB/PCA summary from finite segmented world-frame points."

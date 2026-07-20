@@ -1,0 +1,17 @@
+skill_id: verify_placement
+tags: [verification, placement]
+role: verifier
+changes_world: false
+capabilities: [perception_read, artifact_write]
+forbidden_capabilities: [robot_motion, gripper_control, object_manipulation]
+input_ports:
+  - {name: execution_evidence, schema: robomex.execution_evidence.v1}
+output_ports:
+  - {name: verifier_report, schema: robomex.verifier.v1}
+postconditions: [requested placement relation holds in fresh observations]
+budget: {max_turns: 4}
+exit_conditions:
+  success: "Fresh multimodal evidence confirms the requested placement relation."
+  failed_placement: "The target is visible but still held, misplaced, or outside the requested relation."
+  wrong_grounding: "Fresh evidence shows that the inspected or manipulated object is not the requested target."
+functions: []

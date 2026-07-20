@@ -1,0 +1,20 @@
+skill_id: top_grasp_with_tcp_to_bottom_offset
+tags: [affordance, grasping, geometry]
+role: affordance
+changes_world: false
+capabilities: [perception_read, geometry_compute, artifact_write]
+forbidden_capabilities: [robot_motion, gripper_control, object_manipulation]
+input_ports:
+  - {name: object_points, schema: robomex.points3d.v1, frame: world}
+  - {name: object_geometry, schema: robomex.object_geometry.v1, frame: world, required: false}
+output_ports:
+  - {name: grasp_affordance, schema: robomex.affordance.v1, frame: world}
+  - {name: held_object_frame, schema: robomex.held_object_frame.v1, frame: world, required: false}
+budget: {max_turns: 5}
+exit_conditions:
+  success: "Published a finite top-down grasp with explicit approach, lift, and held-object frame."
+  infeasible: "Target points were empty, non-finite, or incompatible with a safe top grasp."
+functions:
+  - name: compute_top_grasp_with_tcp_to_bottom_offset
+    entry: "scripts/top_grasp_offset.py:compute_top_grasp_with_tcp_to_bottom_offset"
+    description: "Canonical top grasp with explicit approach/lift positions and TCP-to-object-bottom compensation."

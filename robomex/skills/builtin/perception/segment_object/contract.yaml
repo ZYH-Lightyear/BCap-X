@@ -1,0 +1,20 @@
+skill_id: segment_object
+tags: [perception, grounding]
+role: grounding
+changes_world: false
+capabilities: [perception_read, geometry_compute, artifact_write]
+forbidden_capabilities: [robot_motion, gripper_control, object_manipulation]
+required_skills: []
+preferred_skills: [estimate_object_geometry]
+input_ports: []
+output_ports:
+  - {name: object_mask, schema: robomex.mask.v1}
+  - {name: object_points, schema: robomex.points3d.v1, frame: world}
+budget: {max_turns: 7}
+exit_conditions:
+  success: "Published a target-specific mask and finite world-frame point cloud from one fresh observation epoch."
+  wrong_grounding: "The referring expression resolved to a different object or an ambiguous multi-object region."
+functions:
+  - name: ground_object_from_observation
+    entry: "scripts/segment_object.py:ground_object_from_observation"
+    description: "Canonical language grounding helper that publishes mask, points, and inspectable overlays from one observation."

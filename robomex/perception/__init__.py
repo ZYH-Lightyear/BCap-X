@@ -11,6 +11,7 @@ from robomex.perception.render import (
     render_before_after,
     save_grasp_affordance_3d,
     save_grasp_affordance_overlay,
+    save_mask_overlay,
     save_rgb,
     save_video,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "render_before_after",
     "save_grasp_affordance_3d",
     "save_grasp_affordance_overlay",
+    "save_mask_overlay",
     "save_rgb",
     "save_video",
 ]

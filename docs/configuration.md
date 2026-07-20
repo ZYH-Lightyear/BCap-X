@@ -90,19 +90,26 @@ uv run --no-sync --active capx/serving/launch_servers.py --profile default
 
 CaP-X queries language models through a local proxy server that exposes an OpenAI-compatible `/chat/completions` endpoint.
 
-### OpenRouter (recommended for getting started)
+### Routed OpenAI-compatible providers
 
-1. Get an API key at [openrouter.ai/keys](https://openrouter.ai/keys)
-2. Save it to a file in the project root:
+Provider endpoints and API-key environment variables are declared in
+`configs/services/llm_routes.json`. RoboMEx and CapX always call the same local
+proxy endpoint; the model prefix selects the upstream route, for example
+`openrouter/qwen/qwen3.6-plus` or `vapi/claude-opus-4-8`.
+
+1. Put the keys referenced by the route file in `.env` (or use the configured key file):
    ```bash
-   echo "sk-or-v1-your-key-here" > .openrouterkey
+   OPENROUTER_API_KEY=...
+   V_API_KEY=...
    ```
-3. Start the proxy (supports automatic key rotation across multiple keys):
+2. Start the single proxy:
    ```bash
-   uv run --no-sync --active capx/serving/openrouter_server.py --key-file .openrouterkey --port 8110
+   python -m capx.serving.openrouter_server \
+     --routes-file configs/services/llm_routes.json --port 8110
    ```
 
-OpenRouter provides access to Gemini, GPT, Claude, DeepSeek, Qwen, and other models through a single API key.
+The proxy translates route-specific token and reasoning fields. Application code
+must not branch on provider names or override the configured proxy URL.
 
 ### Option B: vLLM (local models)
 

@@ -1,0 +1,21 @@
+skill_id: plan_bounded_motion
+tags: [motion_planning, geometry]
+role: motion_planner
+changes_world: false
+capabilities: [perception_read, geometry_compute, artifact_write]
+forbidden_capabilities: [robot_motion, gripper_control, object_manipulation]
+input_ports:
+  - {name: affordance, schema: robomex.affordance.v1, frame: world}
+output_ports:
+  - {name: trajectory, schema: robomex.trajectory.v1, frame: world}
+budget: {max_turns: 5}
+exit_conditions:
+  success: "Published one IK-feasible bounded trajectory for the supplied affordance."
+  infeasible: "IK or workspace bounds rejected the affordance; route back to an affordance node instead of rewriting poses here."
+functions:
+  - name: build_grasp_trajectory
+    entry: "scripts/grasp_trajectory.py:build_grasp_trajectory"
+    description: "Canonical grasp template with approach and lift structurally constrained above the grasp TCP."
+  - name: build_place_trajectory
+    entry: "scripts/place_trajectory.py:build_place_trajectory"
+    description: "Canonical place template: transport_hover -> release_descend -> open_settle -> retreat_up from one placement affordance."

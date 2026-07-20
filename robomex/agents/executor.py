@@ -12,12 +12,11 @@ from __future__ import annotations
 
 import ast
 import json
-import re
 from pathlib import Path
 from typing import Any
 
-from robomex.agents.subagents import SubAgentRegistry, SubAgentRequest, SubAgentResult, write_subagent_result_artifact
 from robomex.core.coder import CodingAgent, SkillEntry, parse_action_payload
+from robomex.core.coder.agent import _compact_stream_for_prompt
 from robomex.core.context import (
     AttemptRecord,
     Diagnosis,
@@ -25,8 +24,7 @@ from robomex.core.context import (
     EvidenceTimelineItem,
     LocalVerdict,
     PrimitiveTrace,
-    StatePatch,
-    WorkspaceArtifact,
+    ArtifactRef,
     compact_json,
 )
 from robomex.core.coder.policy import CompletionPolicy
@@ -103,7 +101,6 @@ class CodeAsPolicyAgent(CodingAgent):
         collector: EvidenceCollector | None = None,
         max_turns: int = 6,
         system_prompt: str = BASE_ACT_SYSTEM_PROMPT,
-        subagents: SubAgentRegistry | None = None,
         observation_camera: str | None = None,
     ) -> None:
         super().__init__(
@@ -114,7 +111,6 @@ class CodeAsPolicyAgent(CodingAgent):
             system_prompt=system_prompt,
         )
         self.collector = collector
-        self.subagents = subagents
         self.observation_camera = observation_camera
         self._task = ""
         self._expected_postcondition = ""
@@ -122,13 +118,11 @@ class CodeAsPolicyAgent(CodingAgent):
         self._video_dir: Path | None = None
         self._clips: list[dict] = []
         self._feedback = ""
-        self._subagent_call_index = 0
-        self._subagent_calls: list[dict[str, Any]] = []
         self._primitive_traces: list[PrimitiveTrace] = []
         self._attempt_records: list[AttemptRecord] = []
         self._diagnoses: list[Diagnosis] = []
         self._local_verdicts: list[LocalVerdict] = []
-        self._artifact_refs: list[WorkspaceArtifact] = []
+        self._artifact_refs: list[ArtifactRef] = []
         self._evidence_packets: list[dict[str, Any]] = []
         self._evidence_timeline: list[dict[str, Any]] = []
         self._local_context_notes: list[str] = []
@@ -149,8 +143,6 @@ class CodeAsPolicyAgent(CodingAgent):
         self._scene_image_path = scene_image_path
         self._clips = []
         self._feedback = feedback or ""
-        self._subagent_call_index = 0
-        self._subagent_calls = []
         self._primitive_traces = []
         self._attempt_records = []
         self._diagnoses = []
@@ -210,15 +202,6 @@ class CodeAsPolicyAgent(CodingAgent):
                 "Feedback from a previous unresolved attempt/review. Use it to fix your approach:\n"
                 f"{self._feedback}"
             )
-        if self.subagents is not None and self.subagents.has_runtime():
-            parts.append(
-                "A read-only Verifier SubAgent is available. Use call_subagent only for "
-                "state verification or diagnosis, such as checking whether the object is "
-                "held, whether a placement succeeded, whether a candidate pose is visibly "
-                "aligned, or why a just-executed attempt failed. Do not delegate grounding, "
-                "affordance generation, placement-point generation, or motion planning; "
-                "Act must load skills and write that code itself."
-            )
         text = "\n\n".join(parts)
 
         if self._scene_image_path:
@@ -243,11 +226,7 @@ class CodeAsPolicyAgent(CodingAgent):
         return self._video_dir / "llm_io"
 
     def _allowed_action_kinds(self) -> set[str]:
-        allowed = super()._allowed_action_kinds()
-        if self.subagents is not None:
-            allowed = set(allowed)
-            allowed.add("call_subagent")
-        return allowed
+        return super()._allowed_action_kinds()
 
     def _python_gate_message(self, code: str, loaded: tuple[str, ...]) -> str:
         if _opens_gripper_after_home(code):
@@ -271,142 +250,6 @@ class CodeAsPolicyAgent(CodingAgent):
             "delegation, VLM state checks, geometry, and IK checks may run before loading a "
             "skill; physical execution must first consult a relevant skill with use_skill. "
             f"Available skills: {available}."
-        )
-
-    def _handle_meta_action(self, action, loaded: tuple[str, ...]) -> str:
-        if action.name != "call_subagent":
-            return super()._handle_meta_action(action, loaded)
-        if self.subagents is None or not self.subagents.has_runtime():
-            return "No SubAgent registry is configured. Continue with use_skill, run_python, or finish."
-        task = str(action.args.get("task", ""))
-        inputs = action.args.get("inputs") if isinstance(action.args.get("inputs"), dict) else {}
-        task_id = action.args.get("task_id") if isinstance(action.args.get("task_id"), str) else None
-        if not _looks_like_verifier_request(task):
-            return (
-                "call_subagent is verifier-only in this RoboMEx loop. Do not delegate "
-                "grounding, segmentation, affordance generation, placement-point generation, "
-                "or motion planning. Load the relevant skill and write the Act code yourself; "
-                "use call_subagent only for a concrete state-check or failure-diagnosis claim."
-            )
-        call_index = self._subagent_call_index
-        sub_dir = None
-        if self._video_dir is not None:
-            sub_dir = self._video_dir / "subagents" / f"{call_index:02d}_{_slug(task)}"
-            sub_dir.mkdir(parents=True, exist_ok=True)
-        self._subagent_call_index += 1
-        request = SubAgentRequest(
-            task=task,
-            inputs=inputs,
-            artifacts_dir=str(sub_dir) if sub_dir is not None else None,
-            task_id=task_id,
-            context={
-                "act_task": self._task,
-                "expected_postcondition": self._expected_postcondition,
-                "role_contract": "Verifier only: check the current state or diagnose the last attempt; do not produce execution candidates.",
-            },
-        )
-        try:
-            result = self.subagents.run(request)
-        except Exception as exc:  # noqa: BLE001 - bad delegation should be recoverable by Act
-            payload = {
-                "schema": "robomex.subagent_call.v1",
-                "call_index": call_index,
-                "subagent": "verifier_subagent",
-                "task": task,
-                "request": {
-                    "task": task,
-                    "inputs": compact_json(inputs),
-                    "artifacts_dir": request.artifacts_dir,
-                    "task_id": request.task_id,
-                    "context": compact_json(request.context),
-                },
-                "ok": False,
-                "error": str(exc),
-                "artifacts_dir": request.artifacts_dir,
-            }
-            failure_packet = EvidencePacket.from_any(
-                {
-                    "claim": f"SubAgent call failed: {task}",
-                    "confidence": 1.0,
-                    "evidence": {"error": str(exc), "task": task},
-                    "verdict": {
-                        "status": "fail",
-                        "confidence": 1.0,
-                        "reason": str(exc),
-                        "verdict_type": "subagent_call",
-                    },
-                    "recommended_next": "Retry with a narrower task or continue without this evidence.",
-                },
-                default_source="verifier_subagent",
-                default_turn=f"subagent:{task_id or call_index}",
-            )
-            self._record_evidence_packet(f"subagent:{call_index}:error", failure_packet, call_index=call_index)
-            payload["evidence_packet"] = failure_packet.to_json_dict()
-            failure_result = SubAgentResult(
-                name="verifier_subagent",
-                ok=False,
-                result=failure_packet.to_json_dict(),
-                state_patch=StatePatch(),
-                loaded_skill_ids=(),
-                turns=0,
-                error=str(exc),
-                artifacts_dir=request.artifacts_dir,
-                task_id=request.task_id,
-            )
-            write_subagent_result_artifact(request, failure_result)
-        else:
-            write_subagent_result_artifact(request, result)
-            packet = result.resolved_evidence_packet()
-            payload = {
-                "schema": "robomex.subagent_call.v1",
-                "call_index": call_index,
-                "subagent": result.name,
-                "task": task,
-                "request": {
-                    "task": task,
-                    "inputs": compact_json(inputs),
-                    "artifacts_dir": request.artifacts_dir,
-                    "task_id": request.task_id,
-                    "context": compact_json(request.context),
-                },
-                **result.to_json_dict(),
-            }
-            self._record_evidence_packet(f"subagent:{call_index}", packet, call_index=call_index)
-            if not result.state_patch.is_empty or not packet.to_state_patch().is_empty:
-                self._append_local_context_note(
-                    f"subagent:{call_index} returned state_patch-like data, ignored by Act context. "
-                    "Treat only its verifier verdict and artifacts as useful."
-                )
-            self._primitive_traces.extend(result.primitive_traces)
-            self._attempt_records.extend(result.attempt_records)
-            self._diagnoses.extend(result.diagnoses)
-            self._artifact_refs.extend(result.artifact_refs)
-            if packet.artifact_refs:
-                self._artifact_refs.extend(packet.artifact_refs)
-            if result.local_verdict is not None:
-                self._local_verdicts.append(result.local_verdict)
-            elif packet.verdict is not None:
-                self._local_verdicts.append(packet.verdict)
-        if sub_dir is not None:
-            (sub_dir / "subagent_call.json").write_text(
-                json.dumps(payload, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        self._subagent_calls.append(payload)
-        emit_event(
-            "subagent_result",
-            "SubAgent returned",
-            call_index=call_index,
-            subagent=payload.get("subagent"),
-            ok=payload.get("ok"),
-            result=payload,
-        )
-        return (
-            "Verifier SubAgent result JSON:\n"
-            f"{json.dumps(compact_json(payload), ensure_ascii=False, indent=2)}\n\n"
-            f"{self._local_context_for_prompt()}"
-            "Use this as a verifier verdict, not persistent state. Continue with exactly one JSON action: use_skill, "
-            "call_subagent, run_python, or finish."
         )
 
     def _record_evidence_packet(
@@ -455,11 +298,16 @@ class CodeAsPolicyAgent(CodingAgent):
     def _feedback_message(self, execution: BlockExecutionResult) -> str | list:
         from robomex.perception.render import image_content_part, save_rgb
 
+        stdout = _compact_stream_for_prompt("stdout", execution.stdout)
+        stderr = _compact_stream_for_prompt("stderr", execution.stderr)
         text = (
-            f"stdout:\n{execution.stdout}\n\nstderr:\n{execution.stderr}\n\n"
+            f"stdout:\n{stdout}\n\nstderr:\n{stderr}\n\n"
             "Continue from the loaded skill guidance. Reply with exactly one JSON action: "
             "use_skill if the next step needs different guidance, run_python for the next "
-            "code block, or finish."
+            "code block, or finish. Keep stdout compact: print at most a short stage "
+            "report with selected candidate, success/failure reason, and artifact paths; "
+            "store large masks, arrays, candidate lists, and raw debug dumps in "
+            "EVIDENCE or artifact files."
         )
         local_context = self._local_context_for_prompt()
         if local_context:
@@ -634,7 +482,6 @@ class CodeAsPolicyAgent(CodingAgent):
                 "terminal_result": terminal_result,
                 "evidence_packets": tuple(terminal_evidence_entries),
                 "evidence_timeline": tuple(terminal_timeline_entries),
-                "subagent_calls": tuple(self._subagent_calls),
                 "artifact_refs": tuple(a.to_json_dict() for a in self._artifact_refs),
                 "primitive_traces": tuple(t.to_json_dict() for t in self._primitive_traces),
                 "attempt_records": tuple(a.to_json_dict() for a in self._attempt_records),
@@ -716,14 +563,14 @@ def _attempt_from_execution(
     else:
         outcome = "failed"
         confidence = 0.9
-    artifacts: list[WorkspaceArtifact] = []
+    artifacts: list[ArtifactRef] = []
     for clip in clips:
         if int(clip.get("turn", -1)) != turn_idx:
             continue
         path = str(clip.get("path") or "")
         if path:
             artifacts.append(
-                WorkspaceArtifact(
+                ArtifactRef(
                     artifact_id=f"act:t{turn_idx}:video",
                     kind="video",
                     path=path,
@@ -809,6 +656,8 @@ def _diagnosis_from_exhaustion(
     )
 
 
+
+
 def _result_payload(raw: dict[str, Any]) -> dict[str, Any]:
     result = raw.get("result")
     if isinstance(result, dict):
@@ -817,10 +666,10 @@ def _result_payload(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _merge_artifacts(
-    *groups: tuple[WorkspaceArtifact, ...],
-) -> tuple[WorkspaceArtifact, ...]:
+    *groups: tuple[ArtifactRef, ...],
+) -> tuple[ArtifactRef, ...]:
     seen: set[str] = set()
-    out: list[WorkspaceArtifact] = []
+    out: list[ArtifactRef] = []
     for group in groups:
         for artifact in group:
             key = artifact.artifact_id
@@ -831,7 +680,7 @@ def _merge_artifacts(
     return tuple(out)
 
 
-def _extract_artifact_refs(raw: dict[str, Any], *, default_producer: str = "") -> tuple[WorkspaceArtifact, ...]:
+def _extract_artifact_refs(raw: dict[str, Any], *, default_producer: str = "") -> tuple[ArtifactRef, ...]:
     payload = _result_payload(raw)
     items: list[Any] = []
     for key in ("artifact_refs", "artifacts"):
@@ -840,9 +689,9 @@ def _extract_artifact_refs(raw: dict[str, Any], *, default_producer: str = "") -
             items.extend({"artifact_id": k, "path": v, "kind": k} for k, v in value.items())
         elif isinstance(value, (list, tuple)):
             items.extend(value)
-    artifacts: list[WorkspaceArtifact] = []
+    artifacts: list[ArtifactRef] = []
     for item in items:
-        artifact = WorkspaceArtifact.from_any(item, default_producer=default_producer)
+        artifact = ArtifactRef.from_any(item, default_producer=default_producer)
         if artifact is not None:
             artifacts.append(artifact)
     return tuple(artifacts)
@@ -890,75 +739,13 @@ def _extract_local_verdict(raw: dict[str, Any]) -> LocalVerdict | None:
     return LocalVerdict.from_any(payload)
 
 
-_VERIFY_INTENT_WORDS = (
-    "verify",
-    "check",
-    "diagnose",
-    "diagnosis",
-    "review",
-    "inspect",
-    "confirm",
-    "whether",
-    "judge",
-    "classify",
-    "is ",
-    "are ",
-    "是否",
-    "验证",
-    "检查",
-    "诊断",
-    "判断",
-)
-
-_GENERATION_INTENT_WORDS = (
-    "localize",
-    "locate",
-    "ground",
-    "segment",
-    "detect",
-    "propose",
-    "generate",
-    "compute",
-    "estimate",
-    "plan a grasp",
-    "grasp candidate",
-    "affordance",
-    "placement affordance",
-    "placement point",
-    "place point",
-    "motion plan",
-    "find grasp",
-    "find placement",
-    "定位",
-    "分割",
-    "检测",
-    "生成",
-    "计算",
-    "规划",
-    "候选",
-    "抓取点",
-    "放置点",
-)
-
-
-def _looks_like_verifier_request(task: str) -> bool:
-    text = f" {task.strip().lower()} "
-    if not text.strip():
-        return False
-    has_verify = any(word in text for word in _VERIFY_INTENT_WORDS)
-    has_generation = any(word in text for word in _GENERATION_INTENT_WORDS)
-    if has_verify:
-        return True
-    return not has_generation
-
-
 def _opens_gripper_after_home(code: str) -> bool:
     try:
         tree = ast.parse(code)
     except SyntaxError:
         return False
     calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
-    calls.sort(key=lambda n: (getattr(n, "lineno", 0), getattr(n, "col_offset", 0)))
+    calls.sort(key=lambda node: (getattr(node, "lineno", 0), getattr(node, "col_offset", 0)))
     saw_home = False
     for node in calls:
         name = _call_name(node.func)
@@ -974,14 +761,12 @@ def _state_changing_calls(code: str) -> tuple[str, ...]:
         tree = ast.parse(code)
     except SyntaxError:
         return ()
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        name = _call_name(node.func)
-        if name in _STATE_CHANGING_API_CALLS:
-            names.add(name)
-    return tuple(sorted(names))
+    names = {
+        _call_name(node.func)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+    }
+    return tuple(sorted(names & _STATE_CHANGING_API_CALLS))
 
 
 def _parse_terminal_result(raw: str | None) -> dict[str, Any]:
@@ -990,15 +775,13 @@ def _parse_terminal_result(raw: str | None) -> dict[str, Any]:
     data = parse_action_payload(raw)
     if data is None:
         return {"claim": raw}
-    if not isinstance(data, dict):
-        return {"raw": data}
     args = data.get("args")
     if isinstance(args, dict):
         result = args.get("result")
         base = {
             key: value
             for key, value in args.items()
-            if key in {"claim", "state_patch", "uncertainty", "recommended_next", "error", "ok"}
+            if key in {"claim", "uncertainty", "recommended_next", "error", "ok"}
         }
         if isinstance(result, dict):
             return {**result, **base}
@@ -1012,8 +795,3 @@ def _call_name(func: ast.AST) -> str:
     if isinstance(func, ast.Attribute):
         return func.attr
     return ""
-
-
-def _slug(text: str, *, max_len: int = 40) -> str:
-    slug = re.sub(r"[^0-9A-Za-z]+", "_", text.strip().lower()).strip("_")
-    return slug[:max_len].strip("_") or "task"

@@ -18,13 +18,18 @@ def test_find_placement_declares_object_center_affordance_contract() -> None:
 
     assert "EVIDENCE[\"placement_affordance\"]" in text
     assert "desired_object_center" in text
+    assert "compute_drop_affordance" in text
     assert "open_container" in text
     assert "support_surface" in text
     assert "bowl on a plate" in text.lower()
-    assert "object's center" in text
+    assert "object center" in text
+    assert "TCP drop" in text or "TCP drop pose" in text
     assert "Prohibited Shortcuts" in text
+    assert "rim + 0.10" in text or "rim + 0.10 m" in text
     assert "place_pos` can still be used" not in text
-    assert "target_points" not in text
+    # target_points is the declared input port; referencing INPUTS["target_points"]
+    # is correct, but it must never appear as a sidecar kwarg (the param is `points`).
+    assert "target_points=" not in text
     assert "bowl_points" not in text
 
 
@@ -60,24 +65,41 @@ def test_skill_frontmatter_id_fields_do_not_define_routing_id() -> None:
     assert skill.meta["skill_id"] == "stale_skill_id"
 
 
-def test_task_skills_keep_grounding_and_affordance_in_act() -> None:
+def test_task_skills_guide_dynamic_specialist_graphs() -> None:
     pick = _read("task/pick_object")
     place = _read("task/place_object")
 
-    assert "Act generates grounding and grasp candidates itself" in pick
-    assert "Use the Verifier SubAgent only for state checks or failure diagnosis" in pick
-    assert "Act computes placement affordance itself" in place
-    assert "Verifier outputs are verdicts only" in place
+    assert "generate a graph that fits the live scene" in pick
+    assert "Add geometry analysis only when" in pick
+    assert "Only its hard passed report" in pick
+    assert "MotionPlanner owns trajectory feasibility" in place
+    assert "validated edges generated" in place
+    assert "build_place_trajectory" in place
+    assert "desired_object_center" in place
+    assert "settle" in place.lower()
 
 
-def test_release_at_declares_offset_compensated_release_contract() -> None:
+def test_release_at_is_action_execution_not_replanning() -> None:
     text = _read("motion/release_at")
 
-    assert "EVIDENCE[\"placement_affordance\"]" in text
-    assert "EVIDENCE[\"held_object_frame\"]" in text
-    assert "object_center_offset_from_grasp" in text
-    assert "tcp_release_pos = desired_object_center - offset" in text
-    assert "Do not align the" in text
+    assert "supplied trajectory artifact" in text
+    assert "Placement" in text and "MotionPlanner" in text
+    assert "Do not ground" in text
+    assert "do not combine planning and execution" in text
+    assert "stops the sequence immediately" in text
+    assert "settle_after_open" in text
+    assert "Do not open the gripper and immediately retreat" in text
+
+
+def test_plan_bounded_motion_requires_place_template() -> None:
+    text = _read("motion/plan_bounded_motion")
+
+    assert "build_place_trajectory" in text
+    assert "transport_hover" in text
+    assert "release_descend" in text
+    assert "open_settle" in text
+    assert "desired_object_center" in text
+    assert "Do not treat `desired_object_center` as TCP" in text
 
 
 def test_open_bowl_declares_held_object_frame_contract() -> None:
@@ -99,6 +121,7 @@ def test_all_builtin_skills_use_workflow_memory_template() -> None:
     required = (
         "## Purpose",
         "## When to use",
+        "## When NOT to use",
         "## Workflow",
         "## Candidate Generation",
         "## Local Checks",
@@ -107,12 +130,27 @@ def test_all_builtin_skills_use_workflow_memory_template() -> None:
         "## Weak Priors",
         "## Prohibited Shortcuts",
         "## Artifacts to Save",
+        "## Multimodal Evidence Contract",
     )
     for skill_md in sorted(ROOT.glob("*/*/SKILL.md")):
         text = skill_md.read_text(encoding="utf-8")
         for section in required:
             assert section in text, (skill_md, section)
-        assert "```python" not in text, skill_md
+
+
+def test_skills_with_sidecar_scripts_document_reference_code() -> None:
+    """A sidecar without an exact signature forces the agent to probe it at
+    runtime (dir()/inspect), burning turn budget; the reference block is the
+    single evolving place where discovered call patterns are written back."""
+
+    for skill_md in sorted(ROOT.glob("*/*/SKILL.md")):
+        scripts_dir = skill_md.parent / "scripts"
+        if not scripts_dir.is_dir():
+            continue
+        text = skill_md.read_text(encoding="utf-8")
+        assert "## Reference Code" in text, skill_md
+        section = text.split("## Reference Code", 1)[1]
+        assert "```python" in section, skill_md
 
 
 def test_skill_guidance_does_not_reintroduce_fixed_subagent_roles_or_camera_indexing() -> None:
@@ -133,7 +171,14 @@ def test_skill_guidance_does_not_reintroduce_fixed_subagent_roles_or_camera_inde
 
 
 def test_builtin_skill_packages_use_only_claude_style_sidecar_layout() -> None:
-    allowed_entries = {"SKILL.md", "assets", "references", "scripts"}
+    allowed_entries = {
+        "SKILL.md",
+        "assets",
+        "references",
+        "scripts",
+        "prompts",
+        "contract.yaml",
+    }
     for skill_dir in sorted(path.parent for path in ROOT.glob("*/*/SKILL.md")):
         entries = {p.name for p in skill_dir.iterdir()}
         assert "reference" not in entries, skill_dir

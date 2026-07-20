@@ -36,6 +36,19 @@ class SkillAccessPolicy:
             raw=data,
         )
 
+    def to_mapping(self) -> dict[str, Any]:
+        data = dict(self.raw)
+        data["allow"] = list(self.allow)
+        data["allow_tags"] = list(self.allow_tags)
+        data["prefer"] = list(self.prefer)
+        data["forbid"] = list(self.forbid)
+        data["forbid_tags"] = list(self.forbid_tags)
+        if self.conditional:
+            data["conditional"] = [dict(item) for item in self.conditional]
+        elif "conditional" in data:
+            data.pop("conditional", None)
+        return _drop_empty(data)
+
 
 @dataclass(frozen=True)
 class RoleSpec:
@@ -53,6 +66,10 @@ class RoleSpec:
     execution_boundary: str = "read_only"
     model_policy: str = ""
     budget: dict[str, Any] = field(default_factory=dict)
+    capabilities: tuple[str, ...] = ()
+    required_skills: tuple[str, ...] = ()
+    preferred_skills: tuple[str, ...] = ()
+    verifier: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -67,8 +84,29 @@ class RoleSpec:
             execution_boundary=str(data.get("execution_boundary") or "read_only"),
             model_policy=str(data.get("model_policy") or ""),
             budget=dict(data.get("budget") or {}),
+            capabilities=tuple(str(item) for item in (data.get("capabilities") or ())),
+            required_skills=tuple(str(item) for item in (data.get("required_skills") or ())),
+            preferred_skills=tuple(str(item) for item in (data.get("preferred_skills") or ())),
+            verifier=bool(data.get("verifier", False)),
             raw=data,
         )
+
+    def to_mapping(self) -> dict[str, Any]:
+        data = dict(self.raw)
+        data.update(
+            objective=self.objective,
+            skill_access_policy=self.skill_access_policy,
+            consumes=list(self.consumes),
+            emits=list(self.emits),
+            execution_boundary=self.execution_boundary,
+            model_policy=self.model_policy,
+            budget=dict(self.budget),
+            capabilities=list(self.capabilities),
+            required_skills=list(self.required_skills),
+            preferred_skills=list(self.preferred_skills),
+            verifier=self.verifier,
+        )
+        return _drop_empty(data)
 
 
 @dataclass(frozen=True)
@@ -89,6 +127,14 @@ class SocietySpec:
             return SkillAccessPolicy(name=policy_name)
         return self.skill_access_policies[policy_name]
 
+    def motion_role_name(self) -> str | None:
+        for name, role in self.roles.items():
+            if role.execution_boundary == "motion_allowed":
+                return name
+        if "act_executor" in self.roles:
+            return "act_executor"
+        return next(iter(self.roles), None)
+
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "SocietySpec":
         roles = {
@@ -108,7 +154,33 @@ class SocietySpec:
             raw=dict(data),
         )
 
+    def to_mapping(self) -> dict[str, Any]:
+        data = dict(self.raw)
+        data["name"] = self.name
+        data["roles"] = {name: role.to_mapping() for name, role in self.roles.items()}
+        data["skill_access_policies"] = {
+            name: policy.to_mapping() for name, policy in self.skill_access_policies.items()
+        }
+        data["topology"] = [dict(item) for item in self.topology]
+        data["budget_policy"] = dict(self.budget_policy)
+        return _drop_empty(data)
+
+    def to_yaml(self) -> str:
+        return yaml.safe_dump(self.to_mapping(), sort_keys=False, allow_unicode=True, width=100)
+
 
 def load_society_spec(path: str | Path) -> SocietySpec:
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     return SocietySpec.from_mapping(data)
+
+
+def dump_society_spec(spec: SocietySpec, path: str | Path) -> None:
+    Path(path).write_text(spec.to_yaml(), encoding="utf-8")
+
+
+def _drop_empty(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in data.items()
+        if value not in ("", None, [], {}, ())
+    }

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from robomex.core.coder.protocol import ParsedActionFrame, parse_action_frame
 from robomex.core.sandbox import BlockExecutionResult, SemanticActionBlock
 
 
@@ -35,6 +36,8 @@ class AgentAction:
     args: dict[str, Any]
     raw: str = ""
     error: str = ""
+    prefix: str = ""
+    suffix: str = ""
 
     @property
     def signature(self) -> tuple[str, str]:
@@ -81,6 +84,9 @@ class ModelTurn:
     text: str = ""
     tool_calls: tuple[ToolCall, ...] = ()
     error: str = ""
+    canonical_json: str = ""
+    quarantined_prefix: str = ""
+    quarantined_suffix: str = ""
 
     @property
     def is_error(self) -> bool:
@@ -111,22 +117,104 @@ def render_available_skills(entries: list[SkillEntry]) -> str:
     return "\n".join(rows)
 
 
-def build_skill_llm_content(base_dir: Any, body: str) -> str:
-    """加载某技能时返回的文本(对应 qwen-code 的 ``buildSkillLlmContent``)。"""
+def build_skill_llm_content(
+    base_dir: Any,
+    body: str,
+    *,
+    scripts_on_sys_path: bool = False,
+    bound_functions: tuple[tuple[str, str, str], ...] = (),
+    prompt_names: tuple[str, ...] = (),
+) -> str:
+    """加载某技能时返回的文本(对应 qwen-code 的 ``buildSkillLlmContent``)。
+
+    qwen-code 只需注入 base directory,因为它的 agent 跑 bash、绝对路径即可执行;
+    这里的 agent 在同一个 exec 解释器里跑,所以 runtime 会先把 ``scripts/`` 挂上
+    ``sys.path``(M1.5 Fix C),让 agent 直接 ``import <module>`` 而不是每次手写
+    importlib 样板。M2 起,契约声明的 ``functions:`` 已直接绑定为沙箱内可调用名,
+    ``prompts:`` 模板放进 ``PROMPTS`` 字典;两者都随本消息如实告知。
+    """
 
     base = str(base_dir) if base_dir else "(in-memory skill; no base directory)"
     files = _render_skill_sidecar_files(base_dir)
+    modules = skill_script_modules(base_dir)
+    if scripts_on_sys_path and modules:
+        rendered = ", ".join(f"`import {m}`" for m in modules)
+        import_line = (
+            f"The skill's scripts/ directory is already on sys.path: use {rendered} "
+            "directly. Do NOT write importlib/spec_from_file_location boilerplate "
+            "and do not re-add sys.path entries.\n"
+        )
+    elif modules:
+        rendered = ", ".join(modules)
+        import_line = (
+            f"Python modules under scripts/ ({rendered}) must be loaded from the "
+            "absolute base directory above.\n"
+        )
+    else:
+        import_line = ""
+    bindings_block = _render_contract_bindings(bound_functions, prompt_names)
     return (
         f"Loaded skill. Base directory for this skill: {base}\n"
         "If the guidance references scripts/, references/, or assets/, resolve those "
         "paths as absolute paths under this base directory. Scripts are ordinary helper "
         "files, not hidden framework tools. Prefer the entry points and usage pattern "
-        "named in SKILL.md. Do not spend a turn printing sidecar source or probing API "
+        f"named in SKILL.md. {import_line}"
+        "Do not spend a turn printing sidecar source or probing API "
         "signatures; the runtime prompt already documents available sandbox APIs. Open "
         "sidecar source only after a concrete execution error requires a short targeted "
         "diagnostic. No RoboMEx-specific skill wrapper function is provided.\n"
+        f"{bindings_block}"
         f"{files}\n\n"
         f"{body.strip()}\n"
+    )
+
+
+def _render_contract_bindings(
+    bound_functions: tuple[tuple[str, str, str], ...],
+    prompt_names: tuple[str, ...],
+) -> str:
+    """Render the canonical-function / prompt-template section of a skill load."""
+
+    if not bound_functions and not prompt_names:
+        return ""
+    parts: list[str] = []
+    if bound_functions:
+        rows = "\n".join(
+            f"- {signature}" + (f" — {description}" if description else "")
+            for _, signature, description in bound_functions
+        )
+        parts.append(
+            "Canonical skill functions are already defined in your sandbox "
+            "namespace — call them directly (no import, no importlib):\n"
+            f"{rows}\n"
+            "Prefer these over re-implementing the same computation; write "
+            "custom code only where the canonical function does not cover the "
+            "current situation."
+        )
+    if prompt_names:
+        rendered = ", ".join(f"PROMPTS[{name!r}]" for name in prompt_names)
+        parts.append(
+            f"Curated prompt templates are available in the sandbox: {rendered}. "
+            "Reuse them (e.g. for query_vlm) instead of writing new question "
+            "wording from scratch."
+        )
+    return "\n".join(parts) + "\n"
+
+
+def skill_script_modules(base_dir: Any) -> tuple[str, ...]:
+    """Importable module names contributed by a skill's ``scripts/`` sidecar."""
+
+    if not base_dir:
+        return ()
+    folder = Path(str(base_dir)) / "scripts"
+    if not folder.is_dir():
+        return ()
+    return tuple(
+        sorted(
+            p.stem
+            for p in folder.glob("*.py")
+            if p.is_file() and not p.name.startswith("_")
+        )
     )
 
 
@@ -137,7 +225,7 @@ def _render_skill_sidecar_files(base_dir: Any, *, limit: int = 24) -> str:
     if not root.exists():
         return "Skill sidecar files: (base directory not found)"
     rows: list[str] = []
-    for child_dir in ("scripts", "references", "assets"):
+    for child_dir in ("scripts", "references", "assets", "prompts"):
         folder = root / child_dir
         if not folder.exists():
             continue
@@ -151,65 +239,20 @@ def _render_skill_sidecar_files(base_dir: Any, *, limit: int = 24) -> str:
     return "Skill sidecar files:\n" + ("\n".join(rows) if rows else "- (none)")
 
 
-def _strip_json_fence(text: str) -> str:
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        lines = stripped.splitlines()
-        if lines and lines[0].strip() in {"```json", "```"} and lines[-1].strip() == "```":
-            return "\n".join(lines[1:-1]).strip()
-    return stripped
-
-
-def _parse_json_object(text: str) -> dict[str, Any] | None:
-    stripped = _strip_json_fence(text)
-    try:
-        data = json.loads(stripped)
-    except json.JSONDecodeError:
-        data = _decode_first_json_object(stripped)
-    if isinstance(data, dict):
-        return data
-    data = _repair_json_object(text)
-    return data if isinstance(data, dict) else None
-
-
-def _decode_first_json_object(text: str) -> dict[str, Any] | None:
-    """Decode the first complete JSON object without repairing strings inside code.
-
-    This handles common LLM wrappers such as prose before/after a JSON action and a
-    harmless extra trailing brace. It deliberately runs before ``json_repair`` because
-    repair libraries can reinterpret Python dict literals inside ``args.code`` as JSON
-    structure and truncate executable code.
-    """
-
-    start = text.find("{")
-    if start < 0:
-        return None
-    decoder = json.JSONDecoder()
-    try:
-        data, end = decoder.raw_decode(text[start:])
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict):
-        return None
-    tail = text[start + end :].strip()
-    if tail and any(ch not in "}" for ch in tail):
-        return None
-    return data
-
-
-def _repair_json_object(text: str) -> Any:
-    try:
-        import json_repair
-    except ImportError:
-        return None
-    try:
-        return json_repair.loads(text)
-    except (ValueError, TypeError, json.JSONDecodeError):
-        return None
-
-
-def _invalid(raw: str, error: str) -> AgentAction:
-    return AgentAction(kind="invalid", args={}, raw=raw, error=error)
+def _invalid(
+    raw: str,
+    error: str,
+    *,
+    frame: ParsedActionFrame | None = None,
+) -> AgentAction:
+    return AgentAction(
+        kind="invalid",
+        args={},
+        raw=raw,
+        error=error,
+        prefix=frame.prefix if frame else "",
+        suffix=frame.suffix if frame else "",
+    )
 
 
 def parse_action(raw: str) -> AgentAction:
@@ -224,39 +267,49 @@ def parse_action(raw: str) -> AgentAction:
     if not text.strip():
         return AgentAction(kind="empty", args={}, raw=text)
 
-    data = _parse_json_object(text)
-    if data is None:
-        return _invalid(text, "Expected exactly one JSON object action.")
+    frame = parse_action_frame(text)
+    if frame.envelope is None:
+        return _invalid(text, frame.error or "Expected one JSON object action.", frame=frame)
 
-    tool = data.get("tool")
-    args = data.get("args", {})
-    if not isinstance(tool, str) or not tool.strip():
-        return _invalid(text, 'JSON action must include a string "tool" field.')
-    if not isinstance(args, dict):
-        return _invalid(text, 'JSON action "args" must be an object.')
-
-    kind = tool.strip()
+    kind = frame.envelope.tool
+    args = frame.envelope.args
     if kind == "use_skill" and not isinstance(args.get("name"), str):
-        return _invalid(text, 'use_skill requires args.name as a string.')
+        return _invalid(text, 'use_skill requires args.name as a string.', frame=frame)
     if kind == "run_python" and not isinstance(args.get("code"), str):
-        return _invalid(text, 'run_python requires args.code as a string.')
+        return _invalid(text, 'run_python requires args.code as a string.', frame=frame)
+    if kind == "spawn_subagent":
+        return _invalid(
+            text,
+            "spawn_subagent was removed; submit a validated dynamic specialist graph.",
+            frame=frame,
+        )
     if kind == "call_subagent":
-        if not isinstance(args.get("task"), str):
-            return _invalid(text, 'call_subagent requires args.task as a string.')
-        if "name" in args:
-            return _invalid(text, 'call_subagent no longer accepts args.name; describe the delegated work in args.task.')
-        if "profile" in args:
-            return _invalid(text, 'call_subagent no longer accepts args.profile; describe the delegated work in args.task.')
-        if "phase" in args:
-            return _invalid(text, 'call_subagent does not accept args.phase; describe the delegated work in args.task.')
-        if "inputs" in args and not isinstance(args.get("inputs"), dict):
-            return _invalid(text, 'call_subagent args.inputs must be an object when provided.')
-        if "task_id" in args and not isinstance(args.get("task_id"), str):
-            return _invalid(text, 'call_subagent args.task_id must be a string when provided.')
-    if kind == "finish" and "raw" not in args:
-        args = {**args, "raw": text}
+        return _invalid(
+            text,
+            "call_subagent was removed; submit a validated dynamic specialist graph.",
+            frame=frame,
+        )
+    if kind == "finish":
+        result = args.get("result")
+        if "state_patch" in args or (
+            isinstance(result, dict) and "state_patch" in result
+        ):
+            return _invalid(
+                text,
+                "finish no longer accepts state_patch; return typed outputs, evidence, "
+                "artifacts, and verdicts instead.",
+                frame=frame,
+            )
+        if "raw" not in args:
+            args = {**args, "raw": text}
 
-    return AgentAction(kind=kind, args=args, raw=text)
+    return AgentAction(
+        kind=kind,
+        args=args,
+        raw=text,
+        prefix=frame.prefix,
+        suffix=frame.suffix,
+    )
 
 
 def normalized_action_json(tool: str, args: dict[str, Any]) -> str:
@@ -271,7 +324,8 @@ def parse_action_payload(raw: str | None) -> dict[str, Any] | None:
 
     if not raw:
         return None
-    return _parse_json_object(raw)
+    frame = parse_action_frame(raw)
+    return frame.envelope.to_mapping() if frame.envelope is not None else None
 
 
 def parse_model_turn(raw: str) -> ModelTurn:
@@ -285,9 +339,17 @@ def parse_model_turn(raw: str) -> ModelTurn:
     if action.kind == "empty":
         return ModelTurn(raw=raw or "", error="Model returned empty content.")
     if action.kind == "invalid":
-        return ModelTurn(raw=raw or "", error=action.error or "Invalid model action.")
+        return ModelTurn(
+            raw=raw or "",
+            error=action.error or "Invalid model action.",
+            quarantined_prefix=action.prefix,
+            quarantined_suffix=action.suffix,
+        )
     return ModelTurn(
         raw=raw or "",
         text="",
         tool_calls=(ToolCall(name=action.kind, args=action.args, raw=action.raw),),
+        canonical_json=normalized_action_json(action.kind, action.args),
+        quarantined_prefix=action.prefix,
+        quarantined_suffix=action.suffix,
     )

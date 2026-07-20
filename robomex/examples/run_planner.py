@@ -1,7 +1,7 @@
 """离线两层 demo:反应式 ReactivePlanner -> 内层 Code Agent,逐步推进。
 
 展示外层 planner 参考 task 技能指导给出**下一个自然语言** sub-goal,再由
-``TwoLevelAgent`` 通过内层 ``CodeAsPolicyAgent`` 自主选技能执行它,如此循环直到 planner 说 DONE。
+``RoboMExAgent`` 通过统一 authoring runtime 执行它,如此循环直到 planner 说 DONE。
 全部是脚本/mock(无 env、LLM 或网络)。
 
 要跑真机:把 ``ScriptedPlannerPolicy`` 换成 ``LLMPlannerPolicy``,``MockExecutor``
@@ -15,7 +15,8 @@ import tempfile
 
 import numpy as np
 
-from robomex.agents import CodeAsPolicyAgent, ReactivePlanner, ScriptedPlannerPolicy, TwoLevelAgent
+from robomex.agents import ScriptedPlannerPolicy
+from robomex.core.session import RoboMExAgent, RoboMExConfig
 from robomex.core.coder import ScriptedCodePolicy
 from robomex.core.logging import configure_logging
 from robomex.core.sandbox import ActionBlockStatus, BlockExecutionResult, SemanticActionBlock
@@ -53,23 +54,21 @@ def main() -> None:
         for skill in load_builtin_skills():
             library.admit(skill, source="builtin")
 
-        planner = ReactivePlanner(library, ScriptedPlannerPolicy(PLANNER_REPLIES))
-        print("task skill guidance:")
-        print(planner.menu())
-
         task = "pick up the black bowl"
-        # 内层每个 sub-goal 产出一个代码块;随后 MockExecutor 直接终止它。
-        inner = CodeAsPolicyAgent(
-            executor=MockExecutor(),
-            policy=ScriptedCodePolicy([
+        agent = RoboMExAgent(
+            RoboMExConfig(
+                library=library,
+                planner_policy=ScriptedPlannerPolicy(PLANNER_REPLIES),
+                executor=MockExecutor(),
+                code_policy=ScriptedCodePolicy([
                 '{"tool":"use_skill","args":{"name":"pick_object"}}',
                 '{"tool":"run_python","args":{"code":"obs = get_observation()","intent":"inspect scene"}}',
-            ]),
-            library=library,
+                ]),
+            )
         )
-        execution = TwoLevelAgent(planner, inner).run(task)
+        execution = agent.run(task).execution
 
-        print(f"\nexecution success={execution.success}")
+        print(f"\nplanner status={execution.planner_status}")
         for r in execution.results:
             flag = "OK  " if r.success else "FAIL"
             print(f"  [{flag}] {r.subgoal.goal}  "

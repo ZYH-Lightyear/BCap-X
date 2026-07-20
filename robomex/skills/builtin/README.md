@@ -1,9 +1,9 @@
 # RoboMEx Skill Library
 
 Each skill is a self-contained package. The runtime loads `SKILL.md` through
-progressive disclosure; optional sidecars are ordinary files resolved from the loaded
-skill's base directory. Categories organize the library for humans and menus. They are
-not fixed execution phases, SubAgent profiles, or routing rules.
+progressive disclosure; optional sidecars are ordinary files resolved from the
+loaded skill's base directory. Categories are not fixed execution phases or
+SubAgent profiles.
 
 ## Package Structure
 
@@ -17,73 +17,35 @@ not fixed execution phases, SubAgent profiles, or routing rules.
 
 ## Standard SKILL.md Shape
 
-Every built-in skill should use the same short workflow-memory shape:
-
-- `Purpose`
-- `When to use`
-- `Workflow`
-- `Candidate Generation`
-- `Local Checks`
-- `Failure Modes`
-- `Clean Reusable Rules`
-- `Weak Priors`
-- `Prohibited Shortcuts`
-- `Artifacts to Save`
-- `Optional Sidecars` when the package has helper files
-
-Keep the main file concise. Long code templates, object prompt registries, benchmark
-case notes, and failed-trial logs belong in `references/` or trace artifacts, not in
-the main `SKILL.md`.
-
-## Runtime Memory Contract
-
-`EVIDENCE` is local scratchpad memory inside the current Act/sub-goal or Verifier
-call. Use it for masks, point clouds, candidate lists, and intermediate variables that
-should not be copied into prompts. Geometry produced by a skill is local working
-memory, not promoted world state. Cross-turn communication should stay compact:
-
-- `artifact_refs` for overlays, masks, videos, or 3D review images.
-- `primitive_traces` for action or sidecar execution summaries.
-- `attempt_records` for tried strategies and outcomes.
-- verifier `local_verdict` / `diagnoses` for focused checks and failure attribution.
-
-Do not use `state_patch` to promote bbox, masks, points, grasp poses, or placement
-poses into persistent control context.
-
-## Skill Design Rules
-
-Skills are workflow memory, not a callable API catalog. A good skill records how to
-generate candidates, how to check them locally, which failure modes matter, which weak
-priors are acceptable, and which shortcuts are forbidden.
-
-Sidecar scripts are optional convenience code. Prefer the entry points and usage
-patterns named in `SKILL.md`; do not spend agent turns printing full source before
-trying a documented call. If a script is not directly runnable in the live sandbox,
-put it under `references/` instead of `scripts/`.
-
-Fixed pixel thresholds, seed-specific coordinates, object order tables, and benchmark
-answer sheets must not become default skill rules. If a past run suggests a useful
-lesson, rewrite it as a clean rule, weak prior, or shortcut rejection before admitting
-it into a skill.
+Every built-in skill should include Purpose, When to use, When NOT to use, Workflow, Candidate
+Generation, Local Checks, Failure Modes, Clean Reusable Rules, Weak Priors,
+Prohibited Shortcuts, Artifacts to Save, and Optional Sidecars when relevant.
 
 ## Inventory
 
 | Category | Count | Skills |
 |----------|------:|--------|
 | perception | 2 | `estimate_object_geometry` (Estimate Object Geometry); `segment_object` (Segment Object by Language) |
-| affordance | 4 | `find_placement` (Find Placement); `grasp_graspnet` (GraspNet Candidate Grasp); `grasp_open_bowl` (Open Bowl Rim Grasp); `grasp_pca_side` (PCA / Side Grasp) |
-| motion | 2 | `grasp_object` (Grasp Object); `release_at` (Release At) |
+| affordance | 6 | `compute_obb_short_axis_grasp` (Compute OBB Short Axis Grasp); `find_placement` (Find Placement); `grasp_graspnet` (GraspNet Candidate Grasp); `grasp_open_bowl` (Open Bowl Rim Grasp); `grasp_pca_side` (PCA / Side Grasp); `top_grasp_with_tcp_to_bottom_offset` (Top Grasp With TCP To Bottom Offset) |
+| motion | 4 | `grasp_object` (Grasp Object); `plan_bounded_motion` (Plan Bounded Motion); `release_at` (Release At); `safe_return_home` (Safe Return Home) |
+| verification | 2 | `verify_grasp_and_lift_via_robot_state` (Verify Grasp And Lift Via Robot State); `verify_placement` (Verify Placement) |
 | task | 2 | `pick_object` (Pick Object); `place_object` (Place Object) |
 
 ## Directories
 
-- `perception/segment_object` — Ground a language-described object with dedicated bbox/point/SAM3 APIs, categorical VLM checks, and compact bbox/mask/point evidence.
-- `perception/estimate_object_geometry` — Summarize segmented points into coarse shape, pose, and dimensions.
-- `affordance/find_placement` — Estimate object-center placement affordance for open containers and support surfaces.
-- `affordance/grasp_open_bowl` — Propose top-down rim or side-wall grasp candidates and held-object center offsets for upward-facing bowls.
-- `affordance/grasp_pca_side` — Propose side/body grasps from PCA or OBB geometry.
-- `affordance/grasp_graspnet` — Use Contact-GraspNet as read-only 6-DoF candidate evidence with IK and artifact checks.
-- `motion/grasp_object` — Execute one bounded grasp attempt and check post-lift state.
-- `motion/release_at` — Execute center-aware release and post-release state checking.
-- `task/pick_object` — Compose grounding, affordance, grasp execution, and lift-state checks for picking.
-- `task/place_object` — Compose placement affordance, center-aware release, and object-target state checks for placing.
+- `affordance/compute_obb_short_axis_grasp` — Compute a top-down grasp pose aligned to the short horizontal axis of an object's oriented bounding box.
+- `affordance/find_placement` — GaP-style drop affordance: object center in zone + executable TCP pose.
+- `affordance/grasp_graspnet` — Use Contact-GraspNet candidates as read-only 6-DoF grasp affordance evidence.
+- `affordance/grasp_open_bowl` — Propose top-down rim or side-wall grasp candidates for an upward-facing open bowl.
+- `affordance/grasp_pca_side` — Propose side or body grasp candidates from object point-cloud principal geometry.
+- `affordance/top_grasp_with_tcp_to_bottom_offset` — Compute a top grasp and the TCP-to-object-bottom offset needed for later center-aware placement.
+- `motion/grasp_object` — Execute a bounded grasp attempt from grounding and affordance evidence, with lift-state checking.
+- `motion/plan_bounded_motion` — Convert one affordance into a canonical, bounded trajectory without changing the world.
+- `motion/release_at` — Release a held object at a placement affordance, compensating off-center grasps when available.
+- `motion/safe_return_home` — Retreat vertically before returning home to avoid sweeping through tabletop objects.
+- `perception/estimate_object_geometry` — Summarize segmented 3D points into coarse shape, pose, dimensions, and grasp-relevant geometry hints.
+- `perception/segment_object` — Ground a language-described object into compact bbox, mask, point-cloud, and artifact evidence.
+- `task/pick_object` — Compose perception, affordance, motion, and state checks to pick up a named object.
+- `task/place_object` — Compose placement affordance, release motion, and state checks to put a held object on or in a target.
+- `verification/verify_grasp_and_lift_via_robot_state` — Fuse gripper width, end-effector lift state, external view, and wrist view to judge whether the target is held.
+- `verification/verify_placement` — Independently verify the requested post-release object-target relation.

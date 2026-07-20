@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import copy
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from robomex.agents import CodeAsPolicyAgent
+from robomex.authoring.capabilities import CapabilityBoundBlockExecutor, CapabilityPolicy
+from robomex.authoring.capabilities import CapabilityBoundBlockExecutor, CapabilityPolicy
 from robomex.agents.subagents import (
     CodingAgentSubAgent,
-    PolicyBoundBlockExecutor,
-    SubAgentExecutionPolicy,
-    SubAgentRegistry,
     SubAgentRequest,
     SubAgentResult,
 )
@@ -24,10 +25,7 @@ from robomex.core.context import (
     EvidencePacket,
     LocalVerdict,
     PrimitiveTrace,
-    StateFact,
-    StatePatch,
-    WorkspaceArtifact,
-    WorldState,
+    ArtifactRef,
 )
 from robomex.core.sandbox import ActionBlockStatus, BlockExecutionResult, SemanticActionBlock
 from robomex.skills import Skill
@@ -83,7 +81,7 @@ class RecordingPolicy:
         self._index = 0
 
     def complete(self, prompt: list[dict]) -> str:
-        self.prompts.append(prompt)
+        self.prompts.append(copy.deepcopy(prompt))
         if self._index >= len(self._responses):
             return _finish("recording policy exhausted")
         response = self._responses[self._index]
@@ -131,7 +129,16 @@ def _finish(claim: str = "done") -> str:
 
 
 def _finish_result(claim: str, result: dict) -> str:
-    return json.dumps({"tool": "finish", "args": {"claim": claim, "result": result}})
+    payload = {
+        **result,
+        "outputs": {
+            "verifier_report": {
+                "payload": dict(result),
+                "confidence": result.get("confidence", 0.0),
+            }
+        },
+    }
+    return json.dumps({"tool": "finish", "args": {"claim": claim, "result": payload}})
 
 
 def _call_subagent(
@@ -139,63 +146,10 @@ def _call_subagent(
     inputs: dict | None = None,
     task_id: str | None = None,
 ) -> str:
-    args = {"task": task, "inputs": inputs or {}}
+    args = {"task": task, "task_kind": "verify", "inputs": inputs or {}}
     if task_id:
         args["task_id"] = task_id
     return json.dumps({"tool": "call_subagent", "args": args})
-
-
-def _finish_with_state_patch(claim: str, key: str, value, confidence: float = 1.0) -> str:
-    return json.dumps({
-        "tool": "finish",
-        "args": {
-            "claim": claim,
-            "result": {"checked": True},
-            "state_patch": {
-                "upsert_facts": [
-                    {"key": key, "value": value, "confidence": confidence, "provenance": {"test": True}}
-                ]
-            },
-        },
-    })
-
-
-def test_world_state_merge_preserves_higher_confidence_fact() -> None:
-    world = WorldState()
-    world.merge_patch(StatePatch(upsert_facts=(StateFact("robot.held_object", "can", confidence=0.9),)))
-    world.merge_patch(StatePatch(upsert_facts=(StateFact("robot.held_object", None, confidence=0.2),)))
-
-    assert world.facts["robot.held_object"].value == "can"
-    assert world.history[-1]["ignored_low_confidence"] == ["robot.held_object"]
-
-
-def test_world_state_invalidated_facts_remove_promoted_beliefs() -> None:
-    world = WorldState()
-    world.merge_patch(StatePatch(upsert_facts=(StateFact("robot.held_object", "can", confidence=0.9),)))
-    world.merge_patch(StatePatch(invalidated_facts=("robot.held_object",)), source="diagnosis")
-
-    assert "robot.held_object" not in world.facts
-    assert world.history[-1]["invalidated"] == ["robot.held_object"]
-
-
-def test_world_state_invalidates_observation_scoped_grounding_after_motion() -> None:
-    world = WorldState()
-    world.merge_patch(StatePatch(upsert_facts=(
-        StateFact(
-            "target_object.generic_item",
-            {"bbox_px": [1, 2, 3, 4], "world_centroid": [0.1, 0.2, 0.3]},
-            confidence=0.8,
-        ),
-        StateFact("held_object.generic_item", {"state": "held_in_gripper"}, confidence=0.9),
-    )))
-
-    assert world.facts["target_object.generic_item"].validity["scope"] == "observation"
-
-    invalidated = world.invalidate_observation_scoped_facts(source="test:motion")
-
-    assert invalidated == ("target_object.generic_item",)
-    assert "target_object.generic_item" not in world.facts
-    assert "held_object.generic_item" in world.facts
 
 
 def test_evidence_packet_compacts_large_payloads_for_trace_metadata() -> None:
@@ -240,27 +194,29 @@ def test_parse_json_action_variants() -> None:
     invalid = parse_action("not json")
     assert invalid.kind == "invalid"
 
-    subagent = parse_action(_call_subagent("localize target"))
-    assert subagent.kind == "call_subagent"
-    assert subagent.args["task"] == "localize target"
-
-    profiled = parse_action(
-        json.dumps({"tool": "call_subagent", "args": {"task": "find grasp", "profile": "affordance"}}),
+    spawned = parse_action(
+        json.dumps(
+            {
+                "tool": "spawn_subagent",
+                "args": {
+                    "spec": {
+                        "id": "localizer",
+                        "role": "visual-localizer",
+                        "objective": "Localize the target.",
+                        "task": "localize target",
+                    }
+                },
+            }
+        )
     )
-    assert profiled.kind == "invalid"
-    assert "no longer accepts args.profile" in (profiled.error or "")
+    assert spawned.kind == "invalid"
+    assert "dynamic specialist graph" in spawned.error
 
-    old_named = parse_action(
-        json.dumps({"tool": "call_subagent", "args": {"name": "grounding_object", "task": "find can"}}),
+    incomplete = parse_action(
+        '{"tool":"spawn_subagent","args":{"spec":{"id":"x","role":"r"}}}'
     )
-    assert old_named.kind == "invalid"
-    assert "no longer accepts args.name" in (old_named.error or "")
-
-    phased = parse_action(
-        json.dumps({"tool": "call_subagent", "args": {"task": "find can", "phase": "grounding"}}),
-    )
-    assert phased.kind == "invalid"
-    assert "does not accept args.phase" in (phased.error or "")
+    assert incomplete.kind == "invalid"
+    assert "dynamic specialist graph" in (incomplete.error or "")
     assert invalid.error
 
     invalid_turn = parse_model_turn("not json")
@@ -288,6 +244,67 @@ def test_parse_prose_wrapped_json_action_with_json_repair() -> None:
     assert len(turn.tool_calls) == 1
     assert turn.tool_calls[0].name == "run_python"
     assert turn.tool_calls[0].args["code"] == "print('grasp')"
+
+
+def test_first_action_frame_quarantines_hallucinated_turns() -> None:
+    from robomex.core.coder import parse_model_turn
+
+    raw = (
+        _run_python("print('move')", intent="execute")
+        + '\n\nuser{"status":"succeeded"}'
+        + '\nassistant{"tool":"finish","args":{"claim":"fabricated"}}'
+    )
+
+    turn = parse_model_turn(raw)
+
+    assert not turn.is_error
+    assert turn.tool_calls[0].name == "run_python"
+    assert json.loads(turn.canonical_json) == json.loads(
+        _run_python("print('move')", intent="execute")
+    )
+    assert "fabricated" in turn.quarantined_suffix
+    assert "fabricated" not in turn.canonical_json
+
+
+def test_coding_agent_history_contains_only_canonical_action_frame() -> None:
+    fake_tail = '\nuser{"status":"succeeded"}\nassistant{"tool":"finish","args":{}}'
+    policy = RecordingPolicy([
+        _run_python("print('real')") + fake_tail,
+        _finish(),
+    ])
+    agent = CodeAsPolicyAgent(
+        executor=FakeExecutor(),
+        policy=policy,
+        library=FakeLibrary([]),
+        max_turns=2,
+    )
+
+    trace = agent.run(task="inspect")
+
+    assert trace.success
+    second_prompt = json.dumps(policy.prompts[1], ensure_ascii=False)
+    assert "print('real')" in second_prompt
+    assert '"status":"succeeded"' not in second_prompt
+    assert "assistant{" not in second_prompt
+
+
+def test_turn_engine_stops_on_explicit_protocol_error_budget() -> None:
+    from robomex.core.coder import TurnBudget, TurnEngine
+
+    engine = TurnEngine(
+        ScriptedCodePolicy(["not-json", _finish()]),
+        allowed_tools={"finish"},
+        budget=TurnBudget(max_model_calls=5, max_protocol_errors=1),
+    )
+    prompt = [{"role": "user", "content": "finish"}]
+
+    first = engine.next(prompt)
+
+    assert first is not None and first.tool_call is None
+    assert engine.ledger.model_calls == 1
+    assert engine.ledger.protocol_errors == 1
+    assert not engine.can_call_model
+    assert engine.next(prompt) is None
 
 
 def test_parse_run_python_with_extra_trailing_brace_does_not_repair_code_dict_literal() -> None:
@@ -481,6 +498,101 @@ def test_executor_does_not_special_case_sidecar_imports() -> None:
     assert executed == ["import importlib.util\nprint('ordinary sidecar loading is model-controlled')"]
 
 
+def _skill_package(tmp_path: Path, skill_id: str, module: str) -> Skill:
+    root = tmp_path / skill_id
+    (root / "scripts").mkdir(parents=True)
+    (root / "SKILL.md").write_text(
+        f"---\nname: {skill_id}\ncategory: verification\ndescription: verify things\n---\n\n"
+        f"Use `{module}` helpers from scripts/.",
+        encoding="utf-8",
+    )
+    (root / "scripts" / f"{module}.py").write_text(
+        "def helper():\n    return {'ok': True}\n",
+        encoding="utf-8",
+    )
+    return Skill.from_dir(root)
+
+
+def test_skill_load_injects_scripts_sys_path_without_budget(tmp_path: Path) -> None:
+    """M1.5 Fix C: the runtime wires scripts/ imports; the agent never pays for it."""
+
+    skill = _skill_package(tmp_path, "verify_grasp", "verify_helpers")
+    lib = FakeLibrary([skill])
+    policy = RecordingPolicy([
+        _use_skill("verify_grasp"),
+        _run_python("import verify_helpers\nprint(verify_helpers.helper())"),
+        _finish(),
+    ])
+    ex = FakeExecutor()
+    agent = CodeAsPolicyAgent(executor=ex, policy=policy, library=lib, max_turns=1)
+
+    trace = agent.run(task="verify the grasp")
+
+    setup_blocks = [b for b in ex.blocks if b.metadata.get("runtime_setup")]
+    assert len(setup_blocks) == 1
+    scripts_dir = str((tmp_path / "verify_grasp" / "scripts").resolve())
+    assert scripts_dir in setup_blocks[0].code
+    assert "sys.path.insert" in setup_blocks[0].code
+    # The agent's own python action still fits in a max_turns=1 budget: the
+    # setup block did not consume it.
+    assert len(trace.turns) == 1
+    # The loaded-skill message tells the agent to import directly.
+    prompt_text = "\n".join(
+        str(msg.get("content", ""))
+        for prompt in policy.prompts
+        for msg in prompt
+        if isinstance(msg, dict)
+    )
+    assert "already on sys.path" in prompt_text
+    assert "import verify_helpers" in prompt_text
+
+
+def test_preloaded_skill_scripts_are_injected_once(tmp_path: Path) -> None:
+    skill = _skill_package(tmp_path, "verify_grasp", "verify_helpers")
+    lib = FakeLibrary([skill])
+    policy = ScriptedCodePolicy([
+        _use_skill("verify_grasp"),  # re-loading the same skill must not re-inject
+        _finish_result("done", {"ok": True}),
+    ])
+    ex = FakeExecutor()
+    agent = CodingAgentSubAgent(
+        executor=ex,
+        policy=policy,
+        library=lib,
+        max_turns=2,
+        preloaded_skills=("verify_grasp",),
+    )
+
+    result = agent.run(SubAgentRequest(task="verify the grasp"))
+
+    assert result.ok
+    # Seed also uses runtime_setup; skill scripts must still inject only once.
+    skill_setup_blocks = [
+        b for b in ex.blocks if b.name.startswith("skill_setup_")
+    ]
+    assert len(skill_setup_blocks) == 1
+
+
+def test_runtime_setup_block_bypasses_capability_policy() -> None:
+    ex = FakeExecutor()
+    guarded = CapabilityBoundBlockExecutor(
+        ex,
+        CapabilityPolicy(allowed=frozenset(), unknown_calls="deny"),
+        node_id="verify",
+    )
+    block = SemanticActionBlock(
+        name="skill_setup_verify",
+        intent="runtime skill setup",
+        code="import sys\nsys.path.insert(0, '/tmp/x')",
+        metadata={"runtime_setup": True},
+    )
+
+    result = guarded.run_block(block)
+
+    assert result.ok
+    assert len(ex.blocks) == 1
+
+
 def test_act_treats_verify_as_invalid_action() -> None:
     lib = FakeLibrary([_skill("segment_object", "segment objects", category="perception")])
     policy = RecordingPolicy([
@@ -502,6 +614,7 @@ def test_act_treats_verify_as_invalid_action() -> None:
     )
 
 
+@pytest.mark.skip(reason="Act inline delegation was replaced by SubgoalSwarmManager")
 def test_act_can_call_subagent_without_consuming_action_budget() -> None:
     class FakeSubAgent:
         name = "verifier_subagent"
@@ -545,69 +658,7 @@ def test_act_can_call_subagent_without_consuming_action_budget() -> None:
     assert [b.name for b in ex.blocks if b.name != "evidence_seed"] == ["turn_2"]
 
 
-def test_act_finish_state_patch_is_not_promoted_to_trace_context() -> None:
-    lib = FakeLibrary([_skill("observe", "observe state", category="perception")])
-    policy = ScriptedCodePolicy([
-        _use_skill("observe"),
-        _finish_with_state_patch("can is held", "robot.held_object", "alphabet_soup_can", 0.91),
-    ])
-    agent = CodeAsPolicyAgent(executor=FakeExecutor(), policy=policy, library=lib)
-
-    trace = agent.run(task="check held object")
-
-    assert trace.success
-    terminal = trace.metadata["terminal_result"]
-    assert terminal["claim"] == "can is held"
-    assert "state_patches" not in trace.metadata
-
-
-def test_subagent_state_patch_is_ignored_by_act_context() -> None:
-    class FakeSubAgent:
-        name = "verifier_subagent"
-
-        def __init__(self) -> None:
-            self.requests: list[SubAgentRequest] = []
-
-        def run(self, request: SubAgentRequest) -> SubAgentResult:
-            self.requests.append(request)
-            return SubAgentResult(
-                name=self.name,
-                ok=True,
-                claim="object is visible on table",
-                result={"state": "on_table"},
-                state_patch=StatePatch(upsert_facts=(
-                    StateFact("objects.alphabet_soup_can.state", "on_table", confidence=0.8),
-                )),
-                turns=1,
-                task_id=request.task_id,
-            )
-
-    subagent = FakeSubAgent()
-    lib = FakeLibrary([_skill("observe", "observe state", category="perception")])
-    policy = ScriptedCodePolicy([
-        _use_skill("observe"),
-        _call_subagent("verify whether the alphabet soup can is on the table", {"object": "alphabet_soup_can"}, task_id="track-can"),
-        _finish(),
-    ])
-    agent = CodeAsPolicyAgent(
-        executor=FakeExecutor(),
-        policy=policy,
-        library=lib,
-        subagents=SubAgentRegistry(default_agent=subagent),
-    )
-
-    trace = agent.run(task="check can")
-
-    assert trace.success
-    assert subagent.requests[0].task_id == "track-can"
-    assert "world_state" not in subagent.requests[0].context
-    assert subagent.requests[0].context["act_task"] == "check can"
-    call = trace.metadata["subagent_calls"][0]
-    assert call["claim"] == "object is visible on table"
-    assert call["state_patch"]["upsert_facts"][0]["key"] == "objects.alphabet_soup_can.state"
-    assert "state_patches" not in trace.metadata
-
-
+@pytest.mark.skip(reason="Act inline delegation was replaced by SubgoalSwarmManager")
 def test_subagent_structured_outputs_are_returned_to_act_trace() -> None:
     class FakeSubAgent:
         name = "verifier_subagent"
@@ -620,7 +671,7 @@ def test_subagent_structured_outputs_are_returned_to_act_trace() -> None:
                 claim="side grasp candidate is visually aligned",
                 result={"target": "bowl"},
                 local_verdict=LocalVerdict("candidate_alignment", "pass", confidence=0.8, reason="clear side rim"),
-                artifact_refs=(WorkspaceArtifact("verifier_overlay", path="overlay.png", producer=self.name),),
+                artifact_refs=(ArtifactRef("verifier_overlay", path="overlay.png", producer=self.name),),
                 primitive_traces=(
                     PrimitiveTrace(
                         trace_id="verifier:t0:block",
@@ -702,6 +753,7 @@ def test_act_auto_records_physical_attempt_and_exhaustion_diagnosis() -> None:
     assert diagnoses[0]["failure_type"] == "action_budget_exhausted"
 
 
+@pytest.mark.skip(reason="SwarmRuntime owns dynamic SubAgent manifests")
 def test_act_persists_subagent_call_manifests(tmp_path) -> None:
     class FakeSubAgent:
         name = "verifier_subagent"
@@ -743,6 +795,7 @@ def test_act_persists_subagent_call_manifests(tmp_path) -> None:
     assert result_payload["request"]["task"] == "verify whether the can is visibly held"
 
 
+@pytest.mark.skip(reason="SwarmRuntime owns dynamic SubAgent manifests")
 def test_act_persists_failed_subagent_call_manifest(tmp_path) -> None:
     class FailingSubAgent:
         name = "verifier_subagent"
@@ -775,10 +828,9 @@ def test_act_persists_failed_subagent_call_manifest(tmp_path) -> None:
     assert "subagent backend failed" in result_payload["result"]["error"]
 
 
-def test_session_writes_subagent_runtime_manifest(tmp_path) -> None:
+def test_session_does_not_write_legacy_inline_subagent_manifest(tmp_path) -> None:
     from robomex import RoboMExAgent, RoboMExConfig
     from robomex.agents import ScriptedPlannerPolicy
-    from robomex.agents.subagents import SubAgentExecutionPolicy
     from robomex.skills import SkillLibrary
 
     library = SkillLibrary(tmp_path / "library")
@@ -797,9 +849,6 @@ def test_session_writes_subagent_runtime_manifest(tmp_path) -> None:
             executor=FakeExecutor(),
             artifacts_dir=str(tmp_path / "episode"),
             subagent_max_turns=7,
-            subagent_execution_policy=SubAgentExecutionPolicy(
-                denied_calls=frozenset({"custom_motion"}),
-            ),
             code_policy_kind="json_action_adapter",
         )
     )
@@ -807,12 +856,9 @@ def test_session_writes_subagent_runtime_manifest(tmp_path) -> None:
     result = agent.run("Pick the can")
 
     assert result.success
-    manifest = json.loads((tmp_path / "episode" / "subagents.json").read_text(encoding="utf-8"))
-    assert manifest["schema"] == "robomex.subagents.v1"
-    assert manifest["subagent_runtime_enabled"] is True
-    assert manifest["subagent_runtime"] == "coding_agent"
-    assert manifest["subagent_max_turns"] == 7
-    assert manifest["execution_policy"]["denied_calls"] == ["custom_motion"]
+    assert not (tmp_path / "episode" / "subagents.json").exists()
+    summary = json.loads((tmp_path / "episode" / "summary.json").read_text(encoding="utf-8"))
+    assert summary["authoring_strategy"] == "universal"
 
 
 def test_session_keeps_structured_trace_without_promoting_world_facts(tmp_path) -> None:
@@ -827,20 +873,18 @@ def test_session_keeps_structured_trace_without_promoting_world_facts(tmp_path) 
         "args": {
             "claim": "grasp candidate failed; retry with a different rim point",
             "result": {
-                "state_patch": {
-                    "upsert_facts": [
-                        {
-                            "key": "robot.held_object",
-                            "value": "bowl",
-                            "confidence": 0.9,
-                        },
-                        {
-                            "key": "robot.last_grasp_strategy",
-                            "value": "rim_top_down",
-                            "confidence": 0.8,
-                        },
-                    ]
-                },
+                "facts": [
+                    {
+                        "key": "robot.held_object",
+                        "value": "bowl",
+                        "confidence": 0.9,
+                    },
+                    {
+                        "key": "robot.last_grasp_strategy",
+                        "value": "rim_top_down",
+                        "confidence": 0.8,
+                    },
+                ],
                 "primitive_traces": [
                     {
                         "trace_id": "act:t0:grasp",
@@ -876,7 +920,6 @@ def test_session_keeps_structured_trace_without_promoting_world_facts(tmp_path) 
             code_policy=ScriptedCodePolicy([_use_skill("pick_object"), finish]),
             executor=FakeExecutor(),
             artifacts_dir=str(tmp_path / "episode"),
-            enable_default_subagents=False,
         )
     )
 
@@ -906,15 +949,14 @@ def test_session_keeps_structured_trace_without_promoting_world_facts(tmp_path) 
     assert summary["subgoals"][0]["evidence_timeline"][0]["packet"]["claim"] == (
         "grasp candidate failed; retry with a different rim point"
     )
-    report = (root / "report.html").read_text(encoding="utf-8")
-    assert "RoboMEx Debug Report" in report
-    assert "grasp candidate failed" in report
+    assert not (root / "report.html").exists()
     candidates = json.loads((root / "skill_evolution_candidates.json").read_text(encoding="utf-8"))
     assert candidates["schema"] == "robomex.skill_evolution_candidates.v1"
     assert candidates["subgoals"][0]["goal"] == "Pick the bowl"
     assert candidates["subgoals"][0]["evidence_timeline"][0]["source"] == "act:finish"
 
 
+@pytest.mark.skip(reason="Act no longer exposes call_subagent")
 def test_missing_subagent_runtime_returns_recoverable_feedback() -> None:
     lib = FakeLibrary([_skill("grasp", "grasp objects", category="motion")])
     policy = RecordingPolicy([
@@ -940,9 +982,13 @@ def test_missing_subagent_runtime_returns_recoverable_feedback() -> None:
     )
 
 
-def test_subagent_guard_blocks_motion_calls() -> None:
+def test_capability_guard_blocks_ungranted_motion_calls() -> None:
     ex = FakeExecutor()
-    guarded = PolicyBoundBlockExecutor(ex)
+    guarded = CapabilityBoundBlockExecutor(
+        ex,
+        CapabilityPolicy(allowed=frozenset({"perception_read"})),
+        node_id="observer",
+    )
     block = SemanticActionBlock(
         name="sub",
         intent="bad motion",
@@ -958,9 +1004,13 @@ def test_subagent_guard_blocks_motion_calls() -> None:
     assert ex.blocks == []
 
 
-def test_subagent_guard_allows_ordinary_sidecar_code() -> None:
+def test_capability_guard_allows_ordinary_sidecar_code() -> None:
     ex = FakeExecutor()
-    guarded = PolicyBoundBlockExecutor(ex)
+    guarded = CapabilityBoundBlockExecutor(
+        ex,
+        CapabilityPolicy(allowed=frozenset({"perception_read"})),
+        node_id="observer",
+    )
     block = SemanticActionBlock(
         name="sub",
         intent="sidecar code",
@@ -973,20 +1023,6 @@ def test_subagent_guard_allows_ordinary_sidecar_code() -> None:
     assert len(ex.blocks) == 1
 
 
-def test_subagent_execution_policy_can_customize_denied_calls() -> None:
-    ex = FakeExecutor()
-    guarded = PolicyBoundBlockExecutor(
-        ex,
-        SubAgentExecutionPolicy(denied_calls=frozenset({"custom_motion"})),
-    )
-
-    blocked = guarded.run_block(SemanticActionBlock(name="sub", intent="custom", code="custom_motion()"))
-    allowed = guarded.run_block(SemanticActionBlock(name="sub", intent="motion not denied here", code="goto_pose([0, 0, 0])"))
-
-    assert not blocked.ok
-    assert "custom_motion" in blocked.stderr
-    assert allowed.ok
-    assert len(ex.blocks) == 1
 
 
 def test_coding_subagent_returns_finish_result_json() -> None:
@@ -1116,10 +1152,10 @@ def test_default_subagent_runtime_uses_eight_turn_budget_and_bounded_prompt() ->
         for msg in prompt
         if isinstance(msg, dict)
     )
-    assert "Do not take over Act's role" in prompt_text
-    assert "do not localize a new target for execution" in prompt_text
-    assert "Treat request inputs as claims" in prompt_text
-    assert "sidecar" in prompt_text
+    assert "Treat input artifacts as claims" in prompt_text
+    assert "capability classes" in prompt_text
+    assert "typed hand-off" in prompt_text
+    assert "base directory" in prompt_text
 
 
 def test_act_prompt_and_loaded_skill_content_explain_sidecar_paths() -> None:
@@ -1129,7 +1165,7 @@ def test_act_prompt_and_loaded_skill_content_explain_sidecar_paths() -> None:
     skill_text = build_skill_llm_content("/tmp/skill", "Body")
 
     assert "base directory" in LIBERO_ACT_SYSTEM_PROMPT
-    assert "usage patterns named in the skill" in LIBERO_ACT_SYSTEM_PROMPT
+    assert "resolve their relative scripts" in LIBERO_ACT_SYSTEM_PROMPT
     assert "Loaded skills provide a base directory" in LIBERO_ACT_SYSTEM_PROMPT
     assert "No RoboMEx-specific skill wrapper function is provided" in skill_text
     assert "Do not spend a turn printing sidecar source" in skill_text
@@ -1147,7 +1183,7 @@ def test_subagent_rejects_role_selection_in_prompt_contract() -> None:
 
     result = agent.run(SubAgentRequest(task="Check whether the bowl is centered on the plate"))
 
-    assert result.ok
+    assert not result.ok
     prompt_text = "\n".join(
         str(msg.get("content", ""))
         for prompt in policy.prompts
@@ -1155,7 +1191,7 @@ def test_subagent_rejects_role_selection_in_prompt_contract() -> None:
         if isinstance(msg, dict)
     )
     assert '"profile"' not in prompt_text
-    assert "You are the RoboMEx Verifier SubAgent" in prompt_text
+    assert "You are the RoboMEx verifier node." in prompt_text
     assert "Verifier output requirement" not in prompt_text
     assert "Grounding output requirement" not in prompt_text
     assert "Affordance output requirement" not in prompt_text
@@ -1186,29 +1222,47 @@ def test_subagent_uses_task_first_prompt_without_profile() -> None:
     assert "Affordance output requirement" not in prompt_text
 
 
-def test_act_prompt_limits_subagent_to_verification() -> None:
+def test_act_prompt_matches_universal_authoring_contract() -> None:
     from robomex.prompts import BASE_ACT_SYSTEM_PROMPT, LIBERO_ACT_SYSTEM_PROMPT
 
-    assert "Use call_subagent only as a read-only verifier/diagnoser" in LIBERO_ACT_SYSTEM_PROMPT
-    assert "Do not delegate grounding" in LIBERO_ACT_SYSTEM_PROMPT
-    assert "Before writing any Python" not in BASE_ACT_SYSTEM_PROMPT
-    assert "Before writing any Python" not in LIBERO_ACT_SYSTEM_PROMPT
-    assert "Before physical execution" in BASE_ACT_SYSTEM_PROMPT
-    assert "before motion or gripper execution" in LIBERO_ACT_SYSTEM_PROMPT
-    assert "read-only observation" in BASE_ACT_SYSTEM_PROMPT
-    assert "read-only observation" in LIBERO_ACT_SYSTEM_PROMPT
+    assert "stage-sized block" in BASE_ACT_SYSTEM_PROMPT
+    assert "stage-sized block" in LIBERO_ACT_SYSTEM_PROMPT
+    assert "Never print raw arrays" in LIBERO_ACT_SYSTEM_PROMPT
+    assert "Before motion or gripper execution" in BASE_ACT_SYSTEM_PROMPT
+    assert "capability classes" in LIBERO_ACT_SYSTEM_PROMPT
     assert "state_patch" not in BASE_ACT_SYSTEM_PROMPT
-    assert "persistent world state" in LIBERO_ACT_SYSTEM_PROMPT
+    assert "persistent world facts" in LIBERO_ACT_SYSTEM_PROMPT
 
 
-def test_subagent_prompt_prefers_sidecar_paths_over_schema_probing() -> None:
+def test_execution_feedback_truncates_verbose_streams_for_llm() -> None:
+    from robomex.core.coder.agent import CodingAgent
+
+    block = SemanticActionBlock(name="t", intent="test", code="print('x')")
+    result = BlockExecutionResult(
+        block=block,
+        ok=True,
+        status=ActionBlockStatus.SUCCEEDED,
+        stdout="A" * 2500,
+        stderr="",
+    )
+
+    feedback = CodingAgent._feedback_message(result)
+
+    assert isinstance(feedback, str)
+    assert "stdout truncated for LLM feedback" in feedback
+    assert "full stream is saved" in feedback
+    assert "A" * 2500 not in feedback
+    assert "large arrays, masks, candidates" in feedback
+
+
+def test_subagent_prompt_uses_shared_runtime_contract() -> None:
     from robomex.agents.subagents import _SUBAGENT_SYSTEM_PROMPT, render_subagent_system_prompt
 
-    assert "sidecar scripts, references, or assets" in _SUBAGENT_SYSTEM_PROMPT
-    assert "entry points and usage patterns" in _SUBAGENT_SYSTEM_PROMPT
-    assert "Do not read or print a whole sidecar" in _SUBAGENT_SYSTEM_PROMPT
-    assert "do not spend turns printing obs.keys()" in _SUBAGENT_SYSTEM_PROMPT
-    assert "inspect.signature" in _SUBAGENT_SYSTEM_PROMPT
+    assert "stage-sized block" in _SUBAGENT_SYSTEM_PROMPT
+    assert "Treat input artifacts as claims" in _SUBAGENT_SYSTEM_PROMPT
+    assert "perception_read" in _SUBAGENT_SYSTEM_PROMPT
+    assert "output key `verifier_report`" in _SUBAGENT_SYSTEM_PROMPT
+    assert "schema `robomex.verifier.v1`" in _SUBAGENT_SYSTEM_PROMPT
 
     rendered = render_subagent_system_prompt("Core APIs:\nget_observation()")
     assert "Available sandbox API functions" in rendered
@@ -1328,6 +1382,47 @@ def test_skill_library_admit_copies_claude_style_sidecars() -> None:
 
         copied = Path(dst_td) / "perception" / "segment_object" / "references" / "grounding_object.md"
         assert copied.read_text(encoding="utf-8") == "reference"
+
+
+def test_skill_library_admit_is_idempotent_with_existing_sidecars(tmp_path) -> None:
+    """M1.5 Fix G (B9): concurrent/repeated admits must not crash on existing dirs."""
+
+    from robomex.skills import SkillLibrary
+
+    src = tmp_path / "src" / "verify_x"
+    (src / "scripts" / "__pycache__").mkdir(parents=True)
+    (src / "SKILL.md").write_text(
+        "---\nname: verify_x\ncategory: verification\n---\n\nBody.", encoding="utf-8"
+    )
+    (src / "scripts" / "helper.py").write_text("X = 1\n", encoding="utf-8")
+    (src / "scripts" / "__pycache__" / "helper.cpython-311.pyc").write_bytes(b"junk")
+
+    lib = SkillLibrary(tmp_path / "lib")
+    skill = Skill.from_dir(src)
+    lib.admit(skill)
+    # Second admit hits the already-populated destination — must not raise.
+    lib.admit(skill)
+
+    dest = tmp_path / "lib" / "verification" / "verify_x" / "scripts"
+    assert (dest / "helper.py").read_text(encoding="utf-8") == "X = 1\n"
+    assert not (dest / "__pycache__").exists()
+
+
+def test_compact_json_is_idempotent_on_its_own_summaries() -> None:
+    """M1.5 Fix G: re-compacting a manifest never nests {"type":"dict","repr":...}."""
+
+    from robomex.core.context import compact_json
+
+    deep = {"a": {"b": {"c": {"d": {"e": {"f": {"points": np.ones((100, 3))}}}}}}}
+    once = compact_json(deep)
+    twice = compact_json(once)
+    assert twice == once
+
+    arr_summary = compact_json({"points": np.ones((50, 3), dtype=np.float32)})
+    assert arr_summary["points"]["type"] == "ndarray"
+    again = compact_json(arr_summary, max_depth=1)
+    assert again["points"] == arr_summary["points"]
+    assert "repr" not in json.dumps(again)
 
 
 def test_act_has_no_review_specific_code_gate() -> None:

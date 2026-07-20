@@ -52,6 +52,11 @@ def _compact_json(value: Any, *, max_depth: int, max_items: int, max_string: int
             "length": len(value),
             "preview": value[:max_string].rstrip() + "...",
         }
+    # Idempotency (M1.5 Fix G): a summary produced by an earlier compaction pass
+    # is atomic. Without this, re-compacting manifests nests summaries into
+    # {"type": "dict", "repr": "{'type': 'ndarray', ...}"} garbage on disk.
+    if isinstance(value, dict) and _is_compaction_summary(value):
+        return value
     if max_depth <= 0:
         return _value_summary(value)
     try:
@@ -102,6 +107,17 @@ def _compact_json(value: Any, *, max_depth: int, max_items: int, max_string: int
             out.append({"_truncated_items": len(seq) - max_items})
         return out
     return _value_summary(value)
+
+
+_SUMMARY_DETAIL_KEYS = frozenset({"repr", "shape", "length", "preview"})
+
+
+def _is_compaction_summary(value: dict) -> bool:
+    """Detect the summary dicts emitted by this module's own compaction."""
+
+    if not isinstance(value.get("type"), str):
+        return False
+    return bool(_SUMMARY_DETAIL_KEYS.intersection(value))
 
 
 def _value_summary(value: Any) -> JsonDict:
@@ -177,77 +193,7 @@ class StateFact:
 
 
 @dataclass(frozen=True)
-class StatePatch:
-    """A compact state update produced by an Agent."""
-
-    upsert_facts: tuple[StateFact, ...] = ()
-    remove_facts: tuple[str, ...] = ()
-    artifact_refs: tuple[JsonDict, ...] = ()
-    notes: tuple[str, ...] = ()
-    invalidated_facts: tuple[str, ...] = ()
-
-    @classmethod
-    def from_any(cls, raw: Any, *, source_agent: str = "", source_turn: str = "") -> "StatePatch":
-        if not isinstance(raw, dict):
-            return cls()
-        facts: list[StateFact] = []
-        for item in raw.get("upsert_facts") or raw.get("facts") or []:
-            if not isinstance(item, dict):
-                continue
-            fact = StateFact.from_dict(item)
-            if not fact.key:
-                continue
-            if source_agent and not fact.source_agent:
-                fact = StateFact(
-                    key=fact.key,
-                    value=fact.value,
-                    confidence=fact.confidence,
-                    source_agent=source_agent,
-                    source_turn=fact.source_turn or source_turn,
-                    timestamp=fact.timestamp,
-                    provenance=fact.provenance,
-                    validity=fact.validity,
-                    expires_after_subgoal=fact.expires_after_subgoal,
-                )
-            facts.append(fact)
-        removals = tuple(str(k) for k in raw.get("remove_facts", ()) if str(k).strip())
-        invalidated = tuple(
-            str(k)
-            for k in (raw.get("invalidated_facts", ()) or raw.get("invalidate_facts", ()) or ())
-            if str(k).strip()
-        )
-        artifacts = tuple(_json_safe(v) for v in raw.get("artifact_refs", ()) if isinstance(v, dict))
-        notes = tuple(str(v) for v in raw.get("notes", ()) if str(v).strip())
-        return cls(
-            upsert_facts=tuple(facts),
-            remove_facts=removals,
-            artifact_refs=artifacts,
-            notes=notes,
-            invalidated_facts=invalidated,
-        )
-
-    @property
-    def is_empty(self) -> bool:
-        return not (
-            self.upsert_facts
-            or self.remove_facts
-            or self.artifact_refs
-            or self.notes
-            or self.invalidated_facts
-        )
-
-    def to_json_dict(self) -> JsonDict:
-        return {
-            "upsert_facts": [f.to_json_dict() for f in self.upsert_facts],
-            "remove_facts": list(self.remove_facts),
-            "artifact_refs": [_json_safe(v) for v in self.artifact_refs],
-            "notes": list(self.notes),
-            "invalidated_facts": list(self.invalidated_facts),
-        }
-
-
-@dataclass(frozen=True)
-class WorkspaceArtifact:
+class ArtifactRef:
     """A persisted or addressable multimodal artifact.
 
     Large masks, point clouds, videos, and overlays should be referenced through this
@@ -262,7 +208,7 @@ class WorkspaceArtifact:
     metadata: JsonDict = field(default_factory=dict)
 
     @classmethod
-    def from_any(cls, raw: Any, *, default_producer: str = "") -> "WorkspaceArtifact | None":
+    def from_any(cls, raw: Any, *, default_producer: str = "") -> "ArtifactRef | None":
         if isinstance(raw, str):
             text = raw.strip()
             if not text:
@@ -351,7 +297,7 @@ class EvidencePacket:
     claim: str = ""
     confidence: float = 0.0
     evidence: JsonDict = field(default_factory=dict)
-    artifact_refs: tuple[WorkspaceArtifact, ...] = ()
+    artifact_refs: tuple[ArtifactRef, ...] = ()
     facts: tuple[StateFact, ...] = ()
     verdict: LocalVerdict | None = None
     recommended_next: str = ""
@@ -404,7 +350,7 @@ class EvidencePacket:
         artifacts = tuple(
             artifact
             for artifact in (
-                WorkspaceArtifact.from_any(item, default_producer=default_source)
+                ArtifactRef.from_any(item, default_producer=default_source)
                 for item in _iter_artifact_items(payload)
             )
             if artifact is not None
@@ -451,12 +397,6 @@ class EvidencePacket:
             or self.verdict is not None
             or self.recommended_next
             or self.uncertainty
-        )
-
-    def to_state_patch(self) -> StatePatch:
-        return StatePatch(
-            upsert_facts=self.facts,
-            artifact_refs=tuple(a.to_json_dict() for a in self.artifact_refs),
         )
 
     def to_json_dict(self) -> JsonDict:
@@ -731,9 +671,8 @@ class PrimitiveTrace:
     inputs_summary: JsonDict = field(default_factory=dict)
     outputs_summary: JsonDict = field(default_factory=dict)
     error: str = ""
-    artifact_refs: tuple[WorkspaceArtifact, ...] = ()
+    artifact_refs: tuple[ArtifactRef, ...] = ()
     local_verdict: LocalVerdict | None = None
-    state_patch: StatePatch = field(default_factory=StatePatch)
     timestamp: float = field(default_factory=time.time)
 
     @classmethod
@@ -748,13 +687,12 @@ class PrimitiveTrace:
         artifacts = tuple(
             artifact
             for artifact in (
-                WorkspaceArtifact.from_any(item, default_producer=default_producer)
+                ArtifactRef.from_any(item, default_producer=default_producer)
                 for item in raw.get("artifact_refs", ()) or raw.get("artifacts", ()) or ()
             )
             if artifact is not None
         )
         verdict = LocalVerdict.from_any(raw.get("local_verdict") or raw.get("verdict"))
-        patch = StatePatch.from_any(raw.get("state_patch")) if isinstance(raw.get("state_patch"), dict) else StatePatch()
         return cls(
             trace_id=trace_id,
             primitive_name=primitive_name or "primitive",
@@ -767,7 +705,6 @@ class PrimitiveTrace:
             error=str(raw.get("error") or raw.get("stderr") or ""),
             artifact_refs=artifacts,
             local_verdict=verdict,
-            state_patch=patch,
             timestamp=float(raw.get("timestamp", time.time())),
         )
 
@@ -784,7 +721,6 @@ class PrimitiveTrace:
             "error": self.error,
             "artifact_refs": [a.to_json_dict() for a in self.artifact_refs],
             "local_verdict": None if self.local_verdict is None else self.local_verdict.to_json_dict(),
-            "state_patch": self.state_patch.to_json_dict(),
             "timestamp": float(self.timestamp),
         }
 
@@ -803,7 +739,7 @@ class AttemptRecord:
     invalidated_facts: tuple[str, ...] = ()
     recommended_repair: str = ""
     confidence: float = 0.0
-    artifact_refs: tuple[WorkspaceArtifact, ...] = ()
+    artifact_refs: tuple[ArtifactRef, ...] = ()
     timestamp: float = field(default_factory=time.time)
 
     @classmethod
@@ -815,7 +751,7 @@ class AttemptRecord:
             return None
         artifacts = tuple(
             artifact
-            for artifact in (WorkspaceArtifact.from_any(item) for item in raw.get("artifact_refs", ()) or ())
+            for artifact in (ArtifactRef.from_any(item) for item in raw.get("artifact_refs", ()) or ())
             if artifact is not None
         )
         try:
@@ -995,222 +931,11 @@ class DiagnosisStore:
         return "\n".join(lines)
 
 
-@dataclass
-class WorldState:
-    """Episode-level belief store shared through rendered context, not globals."""
-
-    facts: dict[str, StateFact] = field(default_factory=dict)
-    artifact_refs: list[JsonDict] = field(default_factory=list)
-    history: list[JsonDict] = field(default_factory=list)
-
-    def merge_patch(self, patch: StatePatch, *, source: str = "") -> None:
-        if patch.is_empty:
-            return
-        removed: list[str] = []
-        invalidated: list[str] = []
-        for key in patch.remove_facts:
-            if key in self.facts:
-                del self.facts[key]
-                removed.append(key)
-        for key in patch.invalidated_facts:
-            if key in self.facts:
-                del self.facts[key]
-                invalidated.append(key)
-        upserted: list[str] = []
-        ignored: list[str] = []
-        for fact in patch.upsert_facts:
-            fact = self._with_inferred_validity(fact)
-            current = self.facts.get(fact.key)
-            if current is not None and fact.confidence < current.confidence:
-                ignored.append(fact.key)
-                continue
-            self.facts[fact.key] = fact
-            upserted.append(fact.key)
-        self.artifact_refs.extend(_json_safe(v) for v in patch.artifact_refs)
-        self.history.append(
-            {
-                "source": source,
-                "upserted": upserted,
-                "removed": removed,
-                "invalidated": invalidated,
-                "ignored_low_confidence": ignored,
-                "notes": list(patch.notes),
-                "timestamp": time.time(),
-            }
-        )
-
-    def invalidate_observation_scoped_facts(self, *, reason: str = "", source: str = "") -> tuple[str, ...]:
-        """Remove facts that are only valid for a previous observation frame.
-
-        Pixel boxes, masks, and one-frame point-cloud candidates are useful evidence,
-        but they should not survive a physical scene-changing action as episode truth.
-        This intentionally avoids object-specific rules: producers can opt in through
-        ``validity.scope == "observation"``, and the runtime also infers that scope
-        for common pixel/mask grounding payloads.
-        """
-
-        stale = [
-            key
-            for key, fact in self.facts.items()
-            if self._fact_is_observation_scoped(fact)
-        ]
-        for key in stale:
-            del self.facts[key]
-        if stale:
-            self.history.append(
-                {
-                    "source": source or "world_state:observation_scope",
-                    "upserted": [],
-                    "removed": [],
-                    "invalidated": stale,
-                    "ignored_low_confidence": [],
-                    "notes": [reason or "observation-scoped facts invalidated after physical scene change"],
-                    "timestamp": time.time(),
-                }
-            )
-        return tuple(stale)
-
-    def expire_subgoal_facts(self) -> None:
-        for key in [k for k, v in self.facts.items() if v.expires_after_subgoal]:
-            del self.facts[key]
-
-    def to_json_dict(self) -> JsonDict:
-        return {
-            "facts": {k: v.to_json_dict() for k, v in sorted(self.facts.items())},
-            "artifact_refs": [_json_safe(v) for v in self.artifact_refs],
-            "history": [_json_safe(v) for v in self.history],
-        }
-
-    def compact_snapshot(self, *, max_facts: int = 24, max_artifacts: int = 8) -> JsonDict:
-        facts = sorted(self.facts.values(), key=lambda f: f.timestamp, reverse=True)[:max_facts]
-        return {
-            "facts": [f.to_json_dict() for f in facts],
-            "artifact_refs": self.artifact_refs[-max_artifacts:],
-        }
-
-    def render_compact(self) -> str:
-        if not self.facts and not self.artifact_refs:
-            return "(no promoted episode-level facts yet)"
-        lines = []
-        for fact in sorted(self.facts.values(), key=lambda f: f.key):
-            source = f" from {fact.source_agent}" if fact.source_agent else ""
-            validity = ""
-            if fact.validity:
-                scope = fact.validity.get("scope")
-                stale_after = fact.validity.get("stale_after")
-                bits = []
-                if scope:
-                    bits.append(f"scope={scope}")
-                if stale_after:
-                    bits.append(f"stale_after={stale_after}")
-                if bits:
-                    validity = ", " + ", ".join(bits)
-            lines.append(
-                f"- {fact.key} = {_json_safe(fact.value)!r} "
-                f"(conf={fact.confidence:.2f}{source}{validity})"
-            )
-        if self.artifact_refs:
-            lines.append("Artifacts:")
-            for artifact in self.artifact_refs[-8:]:
-                label = artifact.get("label") or artifact.get("kind") or "artifact"
-                path = artifact.get("path") or artifact.get("uri") or artifact
-                lines.append(f"- {label}: {path}")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _with_inferred_validity(fact: StateFact) -> StateFact:
-        if fact.validity or not _looks_observation_scoped_fact(fact):
-            return fact
-        return StateFact(
-            key=fact.key,
-            value=fact.value,
-            confidence=fact.confidence,
-            source_agent=fact.source_agent,
-            source_turn=fact.source_turn,
-            timestamp=fact.timestamp,
-            provenance=fact.provenance,
-            validity={"scope": "observation", "stale_after": "physical_scene_change"},
-            expires_after_subgoal=fact.expires_after_subgoal,
-        )
-
-    @staticmethod
-    def _fact_is_observation_scoped(fact: StateFact) -> bool:
-        validity = fact.validity or {}
-        return validity.get("scope") == "observation" or _looks_observation_scoped_fact(fact)
-
-
-def extract_state_patch(raw: Any, *, source_agent: str = "", source_turn: str = "") -> StatePatch:
-    """Find a StatePatch in a permissive Agent result payload."""
-
-    if not isinstance(raw, dict):
-        return StatePatch()
-    candidates = []
-    if isinstance(raw.get("state_patch"), dict):
-        candidates.append(raw["state_patch"])
-    result = raw.get("result")
-    if isinstance(result, dict) and isinstance(result.get("state_patch"), dict):
-        candidates.append(result["state_patch"])
-    if not candidates:
-        return StatePatch()
-    facts: list[StateFact] = []
-    removals: list[str] = []
-    artifacts: list[JsonDict] = []
-    notes: list[str] = []
-    invalidated: list[str] = []
-    for candidate in candidates:
-        patch = StatePatch.from_any(candidate, source_agent=source_agent, source_turn=source_turn)
-        facts.extend(patch.upsert_facts)
-        removals.extend(patch.remove_facts)
-        artifacts.extend(patch.artifact_refs)
-        notes.extend(patch.notes)
-        invalidated.extend(patch.invalidated_facts)
-    return StatePatch(
-        upsert_facts=tuple(facts),
-        remove_facts=tuple(removals),
-        artifact_refs=tuple(artifacts),
-        notes=tuple(notes),
-        invalidated_facts=tuple(invalidated),
-    )
-
-
 def _result_payload(raw: JsonDict) -> JsonDict:
     result = raw.get("result")
     if isinstance(result, dict):
         return {**result, **{k: v for k, v in raw.items() if k != "result"}}
     return raw
-
-
-def _looks_observation_scoped_fact(fact: StateFact) -> bool:
-    """Heuristically classify one-frame visual grounding facts.
-
-    This is intentionally about evidence shape, not object class. Pixel bboxes,
-    image centroids, masks, and point-cloud files are observation products; they
-    should be revalidated after physical motion. Stable semantic state facts such
-    as ``held_object.*`` or ``*.state`` are not classified here.
-    """
-
-    key = fact.key.lower()
-    if key.endswith(".state") or key.startswith(("held_object.", "placement_affordance.")):
-        return False
-    if isinstance(fact.value, dict):
-        keys = {str(k).lower() for k in fact.value.keys()}
-        observation_keys = {
-            "bbox_px",
-            "bbox",
-            "box",
-            "centroid_px",
-            "pixel",
-            "mask",
-            "mask_path",
-            "points_path",
-            "world_points_path",
-            "point_cloud_path",
-        }
-        if keys & observation_keys:
-            return True
-        if any(k.endswith("_px") for k in keys):
-            return True
-    return False
 
 
 def _coerce_confidence(value: Any) -> float:
@@ -1264,13 +989,46 @@ def _make_packet_id(
 
 
 def _iter_artifact_items(payload: JsonDict) -> list[Any]:
+    """Collect artifact references from nested typed outputs and evidence.
+
+    Agent finish payloads commonly place files below
+    ``outputs.<port>.artifacts``.  Only inspecting the top level silently
+    discarded those references and forced downstream agents to recompute
+    perception products.
+    """
+
     items: list[Any] = []
-    for key in ("artifact_refs", "artifacts"):
-        value = payload.get(key)
+
+    def visit(value: Any, *, key_hint: str = "") -> None:
         if isinstance(value, dict):
-            items.extend({"artifact_id": k, "path": v, "kind": k} for k, v in value.items())
+            looks_like_ref = any(k in value for k in ("artifact_id", "path", "uri"))
+            if looks_like_ref:
+                items.append(value)
+                return
+            for key, nested in value.items():
+                if key in {"artifact_refs", "artifacts"}:
+                    if isinstance(nested, dict):
+                        for name, item in nested.items():
+                            if isinstance(item, dict):
+                                items.append({"artifact_id": name, "kind": name, **item})
+                            else:
+                                items.append(
+                                    {"artifact_id": name, "path": item, "kind": name}
+                                )
+                    elif isinstance(nested, (list, tuple)):
+                        for item in nested:
+                            visit(item, key_hint=key)
+                    elif isinstance(nested, str):
+                        items.append(nested)
+                elif key in {"outputs", "evidence", "result", "payload"}:
+                    visit(nested, key_hint=key)
+                elif isinstance(nested, (dict, list, tuple)):
+                    visit(nested, key_hint=key)
         elif isinstance(value, (list, tuple)):
-            items.extend(value)
+            for item in value:
+                visit(item, key_hint=key_hint)
+
+    visit(payload)
     return items
 
 
@@ -1281,15 +1039,9 @@ def _iter_packet_facts(
     default_turn: str = "",
 ) -> list[StateFact]:
     raw_facts: list[Any] = []
-    for key in ("facts", "upsert_facts"):
-        value = payload.get(key)
-        if isinstance(value, (list, tuple)):
-            raw_facts.extend(value)
-    patch = payload.get("state_patch")
-    if isinstance(patch, dict):
-        value = patch.get("upsert_facts") or patch.get("facts")
-        if isinstance(value, (list, tuple)):
-            raw_facts.extend(value)
+    value = payload.get("facts")
+    if isinstance(value, (list, tuple)):
+        raw_facts.extend(value)
 
     facts: list[StateFact] = []
     for item in raw_facts:
@@ -1323,8 +1075,6 @@ def _implicit_evidence(payload: JsonDict) -> JsonDict:
         "artifact_refs",
         "artifacts",
         "facts",
-        "upsert_facts",
-        "state_patch",
         "verdict",
         "local_verdict",
         "recommended_next",

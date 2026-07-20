@@ -22,6 +22,11 @@ available.
 Act runs this affordance analysis directly and keeps candidates local. Use the Verifier
 SubAgent only to check a concrete visual alignment or diagnose a failed attempt.
 
+## When NOT to use
+
+Do not use on multi-object/noisy masks, compact upright objects already suited to a
+top grasp, or open rims whose contact geometry needs a rim-specific skill.
+
 ## Workflow
 
 1. Compute an OBB or PCA summary from the filtered target points.
@@ -79,9 +84,23 @@ SubAgent only to check a concrete visual alignment or diagnose a failed attempt.
 - Return actual image paths in `artifact_refs`; a directory path alone is not enough
   for Act to review the affordance.
 
+## Multimodal Evidence Contract
+
+Consume finite same-epoch target points. Publish both side hypotheses, selected
+body contact, exact quaternion, explicit approach/lift positions, and an overlay.
+Degenerate PCA emits `infeasible`; it never falls back to a hardcoded yaw.
+
 ## Optional Sidecars
 
-No sidecar is required. Implement the PCA/OBB candidate generation directly with the
-current segmented points and available geometry/overlay utilities such as
-`robomex.perception.save_grasp_affordance_overlay` and
-`robomex.perception.save_grasp_affordance_3d`.
+`compute_pca_side_grasps` is contracted and pre-bound from
+`scripts/pca_side_grasp.py`. Use overlay utilities only to visualize its candidates.
+
+## Reference Code
+
+```python
+import numpy as np
+
+points = np.load(INPUTS["object_points"]["refs"][0]["path"])
+result = compute_pca_side_grasps(points)
+selected = result["selected_candidate"]
+```

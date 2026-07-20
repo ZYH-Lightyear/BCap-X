@@ -1,0 +1,14 @@
+skill_id: safe_return_home
+tags: [motion_execution, recovery]
+role: action_executor
+changes_world: true
+capabilities: [perception_read, robot_motion, artifact_write]
+forbidden_capabilities: [gripper_control, object_manipulation, geometry_compute]
+input_ports: []
+output_ports:
+  - {name: execution_evidence, schema: robomex.execution_evidence.v1}
+budget: {max_turns: 4}
+exit_conditions:
+  success: "Completed a vertical retreat followed by home motion and published primitive evidence."
+  execution_fault: "A retreat or home primitive failed; motion stopped without changing gripper state."
+functions: []

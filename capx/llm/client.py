@@ -66,6 +66,8 @@ OPENROUTER_MODELS = [
     "openrouter/qwen/qwen3-235b-a22b",
     "openrouter/qwen/qwen3.6-plus",
 ]
+# Deprecated compatibility constant. Callers must use ``ModelQueryArgs.server_url``;
+# upstream selection belongs to the configured local proxy, not this client.
 OPENROUTER_SERVER_URL = "http://localhost:8110/chat/completions"
 
 # 单次 HTTP 请求的读超时(秒)与重试上限,均可用环境变量覆盖。默认放大到 600s 以容忍慢
@@ -133,22 +135,6 @@ def is_vapi_model(model: str) -> bool:
     return model.startswith("vapi/")
 
 
-def _native_model_name(model: str) -> str:
-    """Strip the local routing prefix used by the proxy, if present."""
-    if "/" not in model:
-        return model
-    prefix, native = model.split("/", 1)
-    if prefix in {"openrouter", "vapi"}:
-        return native
-    return model
-
-
-def _supports_openai_reasoning_controls(model: str) -> bool:
-    """Whether this model should use OpenAI reasoning-token request fields."""
-    native = _native_model_name(model).lower()
-    return native.startswith("gpt-5") or native.startswith(("o1", "o3", "o4"))
-
-
 @dataclass
 class ModelQueryArgs:
     """Arguments for querying a model."""
@@ -158,69 +144,32 @@ class ModelQueryArgs:
     api_key: str | None = None
     temperature: float = 0.2
     max_tokens: int = 4096
-    reasoning_effort: str = "medium"
+    reasoning_effort: str | None = None
     debug: bool = False
 
 
 def _build_chat_payload(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> dict[str, Any]:
-    """Build an OpenAI-compatible chat payload for the configured backend.
+    """Build one provider-neutral OpenAI-compatible proxy request.
 
-    ``vapi/...`` and ``openrouter/...`` are local proxy routing prefixes. OpenRouter
-    expects its native ``max_tokens`` surface; V-API can expose OpenAI reasoning
-    models (for example ``vapi/gpt-5.5``), where ``max_completion_tokens`` is the
-    correct budget field because it covers both hidden reasoning and visible output.
+    Model prefixes are opaque routing keys here. The local proxy strips them and
+    translates token/reasoning fields according to its route profile.
     """
     model = args.model
-    if model in GPT_MODELS:
-        if "codex" in model:
-            return {
-                "model": model,
-                "input": _completions_to_responses_convert_prompt(prompt),
-            }
+    if model in GPT_MODELS and "codex" in model:
         return {
             "model": model,
-            "reasoning_effort": args.reasoning_effort,
-            "max_completion_tokens": args.max_tokens,
-            "messages": prompt,
+            "input": _completions_to_responses_convert_prompt(prompt),
         }
-    if is_vapi_model(model) and _supports_openai_reasoning_controls(model):
-        payload: dict[str, Any] = {
-            "model": model,
-            "max_completion_tokens": args.max_tokens,
-            "messages": prompt,
-        }
-        effort = (args.reasoning_effort or "").strip()
-        if effort and effort.lower() not in {"none", "off"}:
-            payload["reasoning_effort"] = effort
-        return payload
-    if is_openrouter_model(model):
-        return {
-            "model": model,
-            "messages": prompt,
-            "temperature": args.temperature,
-            "max_tokens": args.max_tokens,
-        }
-    if model in CLAUDE_MODELS:
-        return {
-            "model": model,
-            "temperature": args.temperature,
-            "max_tokens": args.max_tokens,
-            "thinking": {"type": "enabled", "budget_tokens": 4096},
-            "messages": prompt,
-        }
-    if model in OSS_MODELS:
-        return {
-            "model": model,
-            "messages": prompt,
-            "temperature": args.temperature,
-            "max_tokens": args.max_tokens,
-        }
-    return {
+    payload: dict[str, Any] = {
         "model": model,
         "temperature": args.temperature,
         "max_tokens": args.max_tokens,
         "messages": prompt,
     }
+    effort = (getattr(args, "reasoning_effort", None) or "").strip()
+    if effort and effort.lower() not in {"none", "off"}:
+        payload["reasoning_effort"] = effort
+    return payload
 
 
 def collapse_text_image_inputs(messages: list[dict]) -> list[dict]:
@@ -340,7 +289,9 @@ def _write_raw_llm_log(
     (path / name).write_text(json.dumps(record, ensure_ascii=False, indent=2))
 
 
-def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
+def query_model(
+    args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]
+) -> dict[str, Any]:
     """Query vLLM server for code generation.
 
     Args:
@@ -350,12 +301,7 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         Model response content
     """
 
-    # Route OpenRouter models to the OpenRouter proxy server
-    if is_openrouter_model(args.model):
-        server_url = OPENROUTER_SERVER_URL
-    else:
-        server_url = args.server_url
-
+    server_url = args.server_url
     payload = _build_chat_payload(args, prompt)
     headers = {"Content-Type": "application/json"}
     if args.api_key:
@@ -421,31 +367,8 @@ def query_model_streaming(
     Yields:
         Partial response chunks as they arrive
     """
-    if args.model in GPT_MODELS:
-        payload = {
-            "model": args.model,
-            "reasoning_effort": args.reasoning_effort,
-            "max_completion_tokens": args.max_tokens,
-            "messages": prompt,
-            "stream": True,
-        }
-    elif args.model in CLAUDE_MODELS:
-        payload = {
-            "model": args.model,
-            "temperature": args.temperature,
-            "max_tokens": args.max_tokens,
-            "thinking": {"type": "enabled", "budget_tokens": 4096},
-            "messages": prompt,
-            "stream": True,
-        }
-    else:
-        payload = {
-            "model": args.model,
-            "temperature": args.temperature,
-            "max_tokens": args.max_tokens,
-            "messages": prompt,
-            "stream": True,
-        }
+    payload = _build_chat_payload(args, prompt)
+    payload["stream"] = True
 
     headers = {"Content-Type": "application/json"}
     if args.api_key:

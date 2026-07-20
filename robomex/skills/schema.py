@@ -10,8 +10,9 @@
 正文 markdown 原样注入 agent 提示词。没有 typed claim 接口、没有 API 白名单、没有校验——
 串联是 agent/planner 的事,从 prose 读取,而非由 schema 强制。
 
-技能包可以携带 Claude-style 侧车目录 ``assets/``、``references/``、``scripts/``。
-``scripts/`` 放普通可运行/可检查的 helper 文件;``references/`` 放非直接运行的参考材料。
+技能包可以携带 Claude-style 侧车目录 ``assets/``、``references/``、``scripts/``、``prompts/``。
+``scripts/`` 放普通可运行/可检查的 helper 文件;``references/`` 放非直接运行的参考材料;
+``prompts/`` 放契约声明的 prompt 模板(M2,由 runtime 注入沙箱 ``PROMPTS``)。
 运行时不会自动把侧车内容注入上下文;技能正文需要显式引用,agent 再根据加载 skill 时给出的
 base directory 按需读取、导入或执行。
 
@@ -58,7 +59,8 @@ class SkillCategory(str, Enum):
 _FRONTMATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
 
 SKILL_FILE = "SKILL.md"
-SKILL_PACKAGE_EXTRA_DIRS = ("assets", "references", "scripts")
+SKILL_PACKAGE_EXTRA_DIRS = ("assets", "references", "scripts", "prompts")
+SKILL_PACKAGE_EXTRA_FILES = ("contract.yaml",)
 
 
 def _parse_category(meta: dict[str, Any]) -> SkillCategory:
@@ -87,6 +89,19 @@ class Skill:
         """注入提示词的文本(即 markdown 正文,原样)。"""
 
         return self.body
+
+    @property
+    def recommended_min_actions(self) -> int:
+        """技能作者声明的最少 action 轮数(0 表示未声明)。
+
+        这是给 Manager 的数据,不是 runtime 强制的下限:预算决策始终归
+        Manager/contract(M1.5 Fix E, "budget as data")。
+        """
+
+        try:
+            return max(0, int(self.meta.get("recommended_min_actions", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
 
     def with_note(self, note: str) -> Skill:
         """在正文末尾追加一条自由文本备注(用于打补丁记录失败教训)。"""

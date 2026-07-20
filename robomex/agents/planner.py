@@ -2,11 +2,11 @@
 
 planner 刻意做得很薄(grounding 比 planning 更重要)。每一步它读取任务、*当前*场景图、
 task 技能的规划指导、以及已完成的 sub-goals,然后做一次 LLM 调用,返回单个
-Markdown 两字段 sub-goal——或在任务完成时返回 ``DONE``。内层 Code Agent
-再根据这个 sub-goal 自主选择并组合技能,场景随之刷新,再次询问 planner。
+Markdown 两字段 sub-goal——或在任务完成时返回 ``DONE``。
 
-这个反应式循环取代了旧的“一次性把整张 To-Do 表规划出来”设计:每步都在实时场景上
-重新 grounding,正是恢复/终止能 work 的关键。
+场景图只用于判断进度(是否 DONE、下一步该 pick 还是 place),**不**用于改写/
+扩写对象外观。对象消歧与视觉 grounding 交给内层 Agent Swarm。Goal 应尽量沿用
+任务用语,只做步骤粒度分解,不添加颜色、纹理或自创空间描述。
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from typing import Protocol
 
 from robomex.perception.render import image_content_part
 
-from robomex.agents.executor import CodeAsPolicyAgent
 from robomex.core.coder.trace import AgentTrace
 from robomex.core.logging import get_logger
 from robomex.skills import SkillLibrary
@@ -26,20 +25,25 @@ from robomex.skills import SkillLibrary
 _log = get_logger("planner")
 
 _SYSTEM_PROMPT = (
-    "You are a reactive robot task planner. Given a task, the current scene image, the "
-    "task skill guidance, and a concise execution history, first assess the CURRENT "
-    "scene state, then decide the SINGLE next natural-language sub-goal to do now. The "
-    "task skills are planning "
-    "patterns that help you choose the right granularity; do NOT merely name a skill or "
-    "force the executor into one skill. "
-    "Always inspect the current scene image before planning another manipulation. If the "
-    "task goal is already visually satisfied, reply with exactly DONE. Do not repeat a "
-    "pick/place just because a prior checkpoint was uncertain; uncertainty is not observed "
-    "failure. "
+    "You are a thin reactive robot task planner. Your job is to understand the task and "
+    "emit the SINGLE next high-level sub-goal step — not to rewrite, paraphrase, or "
+    "visually expand the task. "
+    "Given a task, the current scene image, task skill guidance, and a concise execution "
+    "history, first assess whether the task is already complete, then choose the next "
+    "step at skill-pattern granularity (e.g. pick then place). Task skills are planning "
+    "patterns only; do NOT merely name a skill or force the executor into one skill. "
+    "Use the scene image ONLY as a progress check: decide DONE vs which next step is "
+    "still needed. Do NOT invent or append appearance/spatial glosses that are absent "
+    "from the task text — no color, texture, label, brand markup, or self-authored "
+    "phrases like 'red/green labeled', 'blue can', 'front-center', 'behind the bottle'. "
+    "Keep object names as they appear in the task (or a minimal imperative split of that "
+    "wording). Visual disambiguation belongs to the downstream Agent Swarm, not you. "
+    "Do not repeat a pick/place just because a prior checkpoint was uncertain; uncertainty "
+    "is not observed failure. "
     "If the task is not complete, reply with exactly two Markdown-style fields and no "
     "extra prose:\n"
-    "Goal: <the concrete imperative next sub-goal>\n"
-    "Postcondition: <one visually-checkable condition that means it succeeded>\n"
+    "Goal: <short imperative next sub-goal using task wording; >\n"
+    "Postcondition: <one short success condition in the same vocabulary; >\n"
     "If the task is already complete, reply with exactly the word DONE and nothing else."
 )
 
@@ -60,27 +64,31 @@ class SubGoal:
 
 @dataclass(frozen=True)
 class SubGoalResult:
-    """通过内层 Code Agent 执行一个 sub-goal 的结果。
-
-    ``success`` 表示 Act 是否完成了这次 sub-goal 尝试并把控制权交回 Planner,
-    不是物理任务已经成功的证明。``note`` 是 Act 返回给 planner 的短反馈,
-    让反应式 planner 据此重试 / 改写 / 推进。
-    """
+    """One subgoal result projected from the runtime-owned outcome."""
 
     subgoal: SubGoal
     trace: AgentTrace
     success: bool
+    motion_attempted: bool = False
+    authoring_status: str = "uncertain"
+    verification_status: str = "not_run"
     note: str = ""
 
 
 @dataclass(frozen=True)
 class PlanExecution:
-    """完整的两层 episode:走过的每个 sub-goal 及其结果。"""
+    """A reactive episode; planner completion is not environment success."""
 
     task: str
     subgoals: tuple[SubGoal, ...]
     results: tuple[SubGoalResult, ...] = ()
-    success: bool = False
+    planner_status: str = "exhausted"
+
+    @property
+    def success(self) -> bool:
+        """Deprecated compatibility alias; use ``planner_status``."""
+
+        return self.planner_status == "done"
 
 
 class PlannerPolicy(Protocol):
@@ -158,15 +166,15 @@ class ScriptedPlannerPolicy:
 
 
 def parse_next_subgoal(text: str) -> SubGoal | None:
-    """把一条 planner 回复解析成下一个 SubGoal;DONE/空 则返回 ``None``。
+    """Parse one strict planner response; invalid/empty replies return ``None``.
 
     Planner 的首选格式是轻量 Markdown 两字段::
 
         Goal: ...
         Postcondition: ...
 
-    严格 ``DONE`` 表示没有下一个 sub-goal。非空但不合首选格式的回复会作为自然语言
-    sub-goal 交给 Act,不能静默当作 DONE。
+    Strict ``DONE`` is the only completion signal. Arbitrary prose is not executed as
+    robot intent; the session records it as an invalid planner response.
     """
 
     stripped = (text or "").strip()
@@ -179,7 +187,7 @@ def parse_next_subgoal(text: str) -> SubGoal | None:
     if md is not None:
         return md
 
-    return SubGoal(goal=stripped)
+    return None
 
 
 def _parse_markdown_subgoal(text: str) -> SubGoal | None:
@@ -217,7 +225,15 @@ def _render_history(history: list[SubGoalResult]) -> str:
     lines = []
     for i, r in enumerate(history, start=1):
         meta = r.trace.metadata or {}
-        act_status = meta.get("act_status") or ("finished" if r.success else "stopped")
+        if r.success:
+            execution_status = "succeeded"
+        elif r.authoring_status == "uncertain":
+            # An undecided checkpoint is not a failure (M1.5 Fix D); surface it
+            # as such so the planner reasons from the evidence, not from a
+            # generic "not_succeeded".
+            execution_status = "checkpoint_uncertain (actions executed; outcome unverified, not a failure)"
+        else:
+            execution_status = "not_succeeded"
         terminal = meta.get("terminal_result") if isinstance(meta, dict) else None
         claim = ""
         if isinstance(terminal, dict):
@@ -226,8 +242,11 @@ def _render_history(history: list[SubGoalResult]) -> str:
                 claim = claim[:177].rstrip() + "..."
         skills = ", ".join(r.trace.loaded_skill_ids) or "none"
         lines.append(
-            f"{i}. {r.subgoal.goal}: Act {act_status}; skills: {skills}"
+            f"{i}. {r.subgoal.goal}: execution {execution_status}; "
+            f"motion_attempted={r.motion_attempted}; skills: {skills}"
             + (f"; claim: {claim}" if claim else "")
+            + (f"; verification: {r.verification_status}" if r.verification_status else "")
+            + (f"; note: {r.note[:180]}" if r.note else "")
             + "."
         )
     return "\n".join(lines)
@@ -276,12 +295,14 @@ class ReactivePlanner:
                 f"{self.menu()}\n\n"
                 f"Execution history (most recent last; checkpoint uncertainty is not failure):\n"
                 f"{_render_history(history)}\n\n"
-                "The current scene image is attached below when available. First decide whether "
-                "the task is already visually complete from the current scene and execution history. "
-                "Do not repeat a pick/place solely because a previous checkpoint was uncertain; "
-                "use a natural next sub-goal grounded in the current scene image. "
+                "The current scene image is attached below when available. Use it only to "
+                "decide whether the task is already complete and which next high-level step "
+                "remains. Do not rewrite or expand the task with colors, textures, labels, or "
+                "spatial glosses from the image; keep Goal/Postcondition in the task's own "
+                "vocabulary so the Agent Swarm can do visual grounding. "
+                "Do not repeat a pick/place solely because a previous checkpoint was uncertain. "
                 "Output DONE if complete; otherwise output exactly two fields: "
-                "Goal: <next sub-goal> and Postcondition: <visual success condition>."
+                "Goal: <short next sub-goal> and Postcondition: <short success condition>."
             ),
         }]
         if scene_image_path:
@@ -293,49 +314,3 @@ class ReactivePlanner:
         self.last_raw = self.policy.propose(prompt) or ""
         _log.debug("planner 原始回复: %s", self.last_raw.strip()[:600])
         return parse_next_subgoal(self.last_raw)
-
-
-class TwoLevelAgent:
-    """外层反应式 planner + 内层 Code Agent:逐步执行直到 planner 说 DONE。
-
-    每一步,planner 给出下一个自然语言 sub-goal(基于到目前为止的历史),内层
-    ``CodeAsPolicyAgent`` 自主选择并组合技能执行它,其 trace 是否成功即为
-    该 sub-goal 的结果。``max_subgoals`` 给循环封顶,这样一个从不说 DONE 的 planner
-    也不会永远跑下去。场景图刷新交给持有 env 的真机入口;离线时场景固定不变。
-    """
-
-    def __init__(
-        self,
-        planner: ReactivePlanner,
-        inner: CodeAsPolicyAgent,
-        max_subgoals: int = 8,
-    ) -> None:
-        self.planner = planner
-        self.inner = inner
-        self.max_subgoals = max_subgoals
-
-    def run(
-        self,
-        task: str,
-        scene_image_path: str | None = None,
-        observation_summary: str = "",
-    ) -> PlanExecution:
-        results: list[SubGoalResult] = []
-        planner_done = False
-        for _ in range(self.max_subgoals):
-            sg = self.planner.next_subgoal(task, results, scene_image_path)
-            if sg is None:
-                planner_done = self.planner.last_raw.strip().upper() == "DONE"
-                break
-            trace = self.inner.run(
-                sg.goal,
-                observation_summary,
-                scene_image_path=scene_image_path,
-            )
-            results.append(SubGoalResult(subgoal=sg, trace=trace, success=trace.success))
-        return PlanExecution(
-            task=task,
-            subgoals=tuple(r.subgoal for r in results),
-            results=tuple(results),
-            success=planner_done,
-        )

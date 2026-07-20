@@ -45,23 +45,40 @@ def test_placement_affordance_support_surface_outputs_object_center_contract() -
     )
 
     assert result["mode"] == "support_surface"
-    assert result["place_quat"] == [0.0, 1.0, 0.0, 0.0]
+    assert result["quaternion_wxyz"] == [0.0, 1.0, 0.0, 0.0]
     assert np.allclose(result["desired_object_center"][:2], [0.4, 0.2], atol=0.005)
     assert evidence["placement_affordance"] == result
     assert "place_point" not in evidence
     assert "place_strategy" not in evidence
 
 
+def _basket_points(center=(0.4, 0.2), rim_z=0.12, floor_z=0.02, radius=0.06):
+    angles = np.linspace(0, 2 * np.pi, 72, endpoint=False)
+    rim = np.column_stack(
+        [
+            center[0] + radius * np.cos(angles),
+            center[1] + radius * np.sin(angles),
+            np.full_like(angles, rim_z),
+        ]
+    )
+    floor = _disc_points(center=(center[0], center[1], floor_z), radius=radius * 0.8, z=floor_z)
+    return np.vstack([rim, floor])
+
+
 def test_placement_affordance_open_container_mode() -> None:
     mod = _load("affordance/find_placement/scripts/placement_affordance.py", "placement_affordance_test2")
 
     result = mod.estimate_placement_affordance(
-        _disc_points(z=0.04),
+        _basket_points(),
         target_name="basket",
     )
 
     assert result["mode"] == "open_container"
-    assert result["desired_object_center"][2] > 0.10
+    # The desired object center sits inside the container: above the interior
+    # floor (plus clearance) and strictly below the rim. No rim + 0.10 default.
+    z = result["desired_object_center"][2]
+    assert result["zone_floor"] < z < result["rim_top"]
+    assert z > 0.10
 
 
 def test_placement_3d_visualization_saves_artifact(tmp_path) -> None:

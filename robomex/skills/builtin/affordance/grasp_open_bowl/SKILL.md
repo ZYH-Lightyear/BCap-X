@@ -23,6 +23,11 @@ For difficult bowl grasps, Act should run the geometry/candidate analysis itself
 loading this skill. Use the Verifier SubAgent only to check a concrete visual claim,
 for example whether the current fingertips visibly straddle the rim.
 
+## When NOT to use
+
+Do not use for closed containers, flat supports, sparse/non-rim masks, or when the
+opening orientation is not upward-facing.
+
 ## Workflow
 
 1. Read the target mask/points and estimate bowl center, rim height, visible radius, and
@@ -97,6 +102,13 @@ Conventional local keys are `EVIDENCE["object_grounding"]` for input,
 - Return actual image paths in `artifact_refs`; a directory path alone is not enough
   for Act to review the affordance.
 
+## Multimodal Evidence Contract
+
+Consume a fresh target mask, points, and optional geometry. Publish observed rim
+support, selected contact, exact quaternion, explicit approach/lift positions, and
+an overlay. Route `wrong_grounding` when the evidence is not the requested open
+container and `infeasible` when rim support is insufficient.
+
 ## Optional Sidecars
 
 `scripts/bowl_grasp.py` contains `propose_open_bowl_grasps`, a pure geometry helper.
@@ -118,11 +130,58 @@ Returned candidate keys:
 - `pos`: grasp TCP position in world frame.
 - `quat`: grasp TCP quaternion in world-frame `wxyz` order.
 - `object_center`: estimated object center at grasp height.
+- `object_center_at_grasp`: alias for `object_center`, intended for held-object frame evidence.
 - `object_center_offset_from_grasp`: `object_center - pos`; pass this forward for
   center-aware placement.
 - `pregrasp_pos`: suggested approach position above the contact pose.
 - `approach_axis`, `jaw_axis`, `radial_axis`: compact geometry axes for review.
+- `grasp_z`, `bottom_z`, `top_z`, `rim_height`, `contact_depth`: compact vertical
+  geometry. `contact_depth` is the selected depth below the estimated rim.
 - `ik_ok`, `ik_error`, `score`: feasibility and ranking signals.
 
 Do not assume keys named `grasp_pos`, `position`, or `quaternion_wxyz` unless the
 returned dict actually contains them.
+
+## Reference Code
+
+The skill's `scripts/` directory is already on `sys.path`; call the helper exactly as
+below — do not probe it with `dir()` or `inspect`.
+
+```python
+import numpy as np
+from bowl_grasp import propose_open_bowl_grasps
+
+points = np.load(INPUTS["object_points"]["refs"][0]["path"])  # arrays arrive as file refs
+out = propose_open_bowl_grasps(points, solve_ik_fn=solve_ik)
+best = out["selected_candidate"]           # candidate keys documented above
+# All values are plain JSON-safe lists/floats — no .tolist() needed.
+EVIDENCE["grasp_affordance"] = best
+EVIDENCE["held_object_frame"] = {
+    "object_center_at_grasp": best["object_center_at_grasp"],
+    "object_center_offset_from_grasp": best["object_center_offset_from_grasp"],
+    "top_z": best["top_z"],
+    "bottom_z": best["bottom_z"],
+}
+NODE_RESULT = {
+    "outputs": {
+        "grasp_affordance": {
+            "payload": {
+                "position": best["pos"],
+                "quaternion_wxyz": best["quat"],  # reference, do not retype
+                "grasp_family": "open_bowl_rim",
+            },
+            "confidence": 0.8,
+            "frame": "world",
+            "artifacts": {},
+        },
+        "held_object_frame": {
+            "payload": EVIDENCE["held_object_frame"],
+            "confidence": 0.8,
+            "frame": "world",
+            "artifacts": {},
+        },
+    },
+    "recommended_next": "plan_motion",
+}
+# finish with: {"tool":"finish","args":{"claim":"...","result_var":"NODE_RESULT"}}
+```

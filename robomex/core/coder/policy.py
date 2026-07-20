@@ -8,10 +8,8 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from robomex.core.coder.action import ModelTurn
-from robomex.core.logging import get_logger
-
-_log = get_logger("coder.policy")
+from robomex.core.coder.action import ModelTurn, parse_model_turn
+from robomex.core.coder.protocol import StructuredOutputConfig
 
 
 class CompletionPolicy(Protocol):
@@ -25,8 +23,7 @@ class CompletionPolicy(Protocol):
 class LLMCodePolicy:
     """基于 ``capx.llm.client.query_model`` 的真实 LLM 策略。
 
-    ``model``/``server_url`` 沿用 CapX 约定;OpenRouter 模型由底层 client
-    自动经本地代理转发。
+    ``model``/``server_url`` 沿用 CapX 约定；provider 路由由统一代理配置处理。
     """
 
     def __init__(
@@ -36,12 +33,12 @@ class LLMCodePolicy:
         api_key: str | None = None,
         temperature: float = 0.2,
         max_tokens: int = 20480,  # 对齐 capx baseline(2048*10);含 reasoning 预算
-        empty_retries: int = 1,
+        structured_output: StructuredOutputConfig = StructuredOutputConfig(),
     ) -> None:
         from capx.llm.client import ModelQueryArgs, query_model
 
         self._query_model = query_model
-        self._empty_retries = max(0, empty_retries)
+        self.structured_output = structured_output
         self._args = ModelQueryArgs(
             model=model,
             server_url=server_url,
@@ -51,27 +48,17 @@ class LLMCodePolicy:
         )
 
     def complete(self, prompt: list[dict]) -> str:
-        active_prompt = prompt
-        for attempt in range(self._empty_retries + 1):
-            out = self._query_model(self._args, active_prompt)
-            content = out.get("content") or ""
-            if content.strip():
-                return content
-            if attempt >= self._empty_retries:
-                return content
-            active_prompt = [
-                *prompt,
-                {
-                    "role": "user",
-                    "content": (
-                        "Your previous response contained no visible content. "
-                        "Reply now with exactly one JSON action object using tool use_skill, "
-                        "call_subagent, run_python, or finish. Do not leave the message empty."
-                    ),
-                },
-            ]
-            _log.warning("empty model content; retrying once with an explicit action nudge")
-        return ""
+        out = self._query_model(self._args, prompt)
+        return out.get("content") or ""
+
+    def complete_turn(
+        self,
+        prompt: list[dict],
+        tool_names: set[str] | None = None,
+    ) -> ModelTurn:
+        # text_json is the only active transport. Other modes are intentionally
+        # configuration placeholders until the proxy forwards response_format.
+        return parse_model_turn(self.complete(prompt))
 
 
 class ScriptedCodePolicy:
@@ -87,3 +74,10 @@ class ScriptedCodePolicy:
         response = self._responses[self._index]
         self._index += 1
         return response
+
+    def complete_turn(
+        self,
+        prompt: list[dict],
+        tool_names: set[str] | None = None,
+    ) -> ModelTurn:
+        return parse_model_turn(self.complete(prompt))

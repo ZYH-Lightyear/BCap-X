@@ -1,4 +1,8 @@
-"""Placement affordance helpers for top-down place actions."""
+"""Deterministic GaP-style placement geometry helpers.
+
+The public affordance ``position`` is always the executable TCP drop target.
+``desired_object_center`` is retained as evidence, never as a motion target.
+"""
 
 from __future__ import annotations
 
@@ -15,49 +19,188 @@ def estimate_placement_affordance(
     evidence: dict[str, Any] | None = None,
     mode: str | None = None,
     place_quat: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 0.0),
+    held_object_frame: dict[str, Any] | None = None,
+    grasp_ee_z: float | None = None,
+    drop_clearance: float = 0.05,
+    approach_height: float = 0.20,
 ) -> dict[str, Any]:
-    """Estimate where the held object's center should go.
+    """Compatibility entry point for :func:`compute_drop_affordance`."""
 
-    Returns a compact affordance and writes it to ``evidence`` when provided.
-    ``mode`` is either ``open_container`` or ``support_surface``.
+    return compute_drop_affordance(
+        points,
+        target_name=target_name,
+        evidence=evidence,
+        mode=mode,
+        place_quat=place_quat,
+        held_object_frame=held_object_frame,
+        grasp_ee_z=grasp_ee_z,
+        drop_clearance=drop_clearance,
+        approach_height=approach_height,
+    )
+
+
+def estimate_container_zone(
+    points: np.ndarray,
+    mode: str,
+    *,
+    interior_lip: float = 0.02,
+) -> dict[str, Any]:
+    """Estimate a bounded placement zone from target points.
+
+    For an open container, ``zone_floor`` models a shallow interior lip and
+    ``zone_ceiling`` is the rim.  For a support surface both are anchored to
+    the live top surface.
     """
 
     pts = _validate_points(points)
-    target_mode = mode or infer_place_mode(target_name)
-    if target_mode not in {"open_container", "support_surface"}:
-        raise ValueError(f"unsupported placement mode: {target_mode!r}")
+    if mode not in {"open_container", "support_surface"}:
+        raise ValueError(f"unsupported placement mode: {mode!r}")
 
-    z80 = np.percentile(pts[:, 2], 80)
-    rim_points = pts[pts[:, 2] >= z80]
-    if target_mode == "open_container" and len(rim_points) >= 30:
-        xy_source = rim_points[:, :2]
-        top_z = float(np.percentile(rim_points[:, 2], 75))
-        strategy = "rim_top_percentile_center"
-    else:
-        core = _trimmed_core(pts)
-        xy_source = core[:, :2]
-        top_z = float(np.percentile(pts[:, 2], 90))
-        strategy = "support_surface_center" if target_mode == "support_surface" else "trimmed_point_cloud_center"
+    z05 = float(np.percentile(pts[:, 2], 5))
+    z90 = float(np.percentile(pts[:, 2], 90))
+    z95 = float(np.percentile(pts[:, 2], 95))
+    rim_cut = float(np.percentile(pts[:, 2], 80))
+    rim_points = pts[pts[:, 2] >= rim_cut]
 
-    center_xy = np.median(xy_source, axis=0)
-    if target_mode == "open_container":
+    if mode == "open_container":
+        center_xy = np.median(rim_points[:, :2], axis=0) if len(rim_points) >= 30 else np.median(pts[:, :2], axis=0)
         refined = _free_space_center(pts, rim_points)
+        strategy = "rim_center"
         if refined is not None:
             center_xy = refined
             strategy = "topdown_free_space_grid"
+        zone_floor = min(z05 + max(0.0, float(interior_lip)), z95 - 0.001)
+        zone_ceiling = z95
+    else:
+        core = _trimmed_core(pts)
+        center_xy = np.median(core[:, :2], axis=0)
+        zone_floor = z90
+        zone_ceiling = z90
+        strategy = "support_surface_center"
 
-    clearance = 0.10 if target_mode == "open_container" else 0.045
-    desired_object_center = np.array([center_xy[0], center_xy[1], top_z + clearance], dtype=float)
+    return {
+        "mode": mode,
+        "center_xy": _list(center_xy),
+        "zone_floor": float(zone_floor),
+        "zone_ceiling": float(zone_ceiling),
+        "rim_top": z95,
+        "strategy": strategy,
+        "point_count": int(len(pts)),
+    }
+
+
+def compute_drop_affordance(
+    points: np.ndarray,
+    *,
+    target_name: str,
+    evidence: dict[str, Any] | None = None,
+    mode: str | None = None,
+    place_quat: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 0.0),
+    held_object_frame: dict[str, Any] | None = None,
+    grasp_ee_z: float | None = None,
+    drop_clearance: float = 0.05,
+    approach_height: float = 0.20,
+) -> dict[str, Any]:
+    """Compute object-in-zone geometry and the corresponding TCP drop pose."""
+
+    target_mode = mode or infer_place_mode(target_name)
+    zone = estimate_container_zone(points, target_mode)
+    held = held_object_frame or {}
+    half_height = _held_half_height(held)
+    center_xy = np.asarray(zone["center_xy"], dtype=float)
+
+    if target_mode == "open_container":
+        margin = max(0.03, float(drop_clearance))
+        desired_z = float(zone["zone_floor"]) + margin + half_height
+        desired_z = min(desired_z, float(zone["zone_ceiling"]) - 0.001)
+        desired_z = max(desired_z, float(zone["zone_floor"]) + 0.001)
+    else:
+        margin = max(0.005, min(float(drop_clearance), 0.045))
+        desired_z = float(zone["zone_floor"]) + margin + half_height
+
+    desired_object_center = np.array([center_xy[0], center_xy[1], desired_z], dtype=float)
+    tcp_position = _tcp_from_held_frame(
+        desired_object_center,
+        held,
+        grasp_ee_z=grasp_ee_z,
+        zone_floor=float(zone["zone_floor"]),
+        bottom_margin=margin,
+    )
+    quat = _yaw_only_topdown(held.get("grasp_quaternion_wxyz"), place_quat)
+    approach_position = tcp_position.copy()
+    approach_position[2] += float(approach_height)
+
     affordance = {
+        "position": _list(tcp_position),
+        "quaternion_wxyz": _list(quat),
+        "approach_dir_world": [0.0, 0.0, -1.0],
         "target": target_name,
         "mode": target_mode,
         "desired_object_center": _list(desired_object_center),
-        "place_quat": [float(v) for v in place_quat],
-        "strategy": strategy,
+        "approach_position": _list(approach_position),
+        "approach_height": float(approach_height),
+        "zone_floor": float(zone["zone_floor"]),
+        "zone_ceiling": float(zone["zone_ceiling"]),
+        "rim_top": float(zone["rim_top"]),
+        "object_half_height": half_height,
+        "tcp_compensated": bool(held),
+        "strategy": f"gap_style_{zone['strategy']}",
+        "note": "position is the executable TCP drop target; desired_object_center is evidence only",
     }
     if evidence is not None:
         evidence["placement_affordance"] = affordance
     return affordance
+
+
+def _held_half_height(held: dict[str, Any]) -> float:
+    for height_key in ("height", "object_height"):
+        value = held.get(height_key)
+        if value is not None and float(value) > 0:
+            return 0.5 * float(value)
+    top = held.get("top_z")
+    bottom = held.get("bottom_z")
+    if top is not None and bottom is not None and float(top) > float(bottom):
+        return 0.5 * (float(top) - float(bottom))
+    return 0.03
+
+
+def _tcp_from_held_frame(
+    desired_object_center: np.ndarray,
+    held: dict[str, Any],
+    *,
+    grasp_ee_z: float | None,
+    zone_floor: float,
+    bottom_margin: float,
+) -> np.ndarray:
+    tcp = desired_object_center.copy()
+    offset = held.get("object_center_offset_from_grasp")
+    if offset is not None:
+        values = np.asarray(offset, dtype=float).reshape(3)
+        if np.isfinite(values).all():
+            tcp = desired_object_center - values
+
+    object_at_grasp = held.get("object_center_at_grasp")
+    if grasp_ee_z is not None and object_at_grasp is not None:
+        object_z = float(np.asarray(object_at_grasp, dtype=float).reshape(3)[2])
+        tcp[2] = desired_object_center[2] + float(grasp_ee_z) - object_z
+    elif offset is None and held.get("tcp_to_bottom") is not None:
+        tcp[2] = zone_floor + bottom_margin + float(held["tcp_to_bottom"])
+    return tcp
+
+
+def _yaw_only_topdown(
+    grasp_quaternion_wxyz: Any,
+    default: tuple[float, float, float, float],
+) -> np.ndarray:
+    if grasp_quaternion_wxyz is None:
+        return np.asarray(default, dtype=float)
+    q = np.asarray(grasp_quaternion_wxyz, dtype=float).reshape(4)
+    if not np.isfinite(q).all() or np.linalg.norm(q) < 1e-8:
+        return np.asarray(default, dtype=float)
+    q = q / np.linalg.norm(q)
+    w, x, y, z = q
+    yaw = float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+    return np.array([0.0, np.cos(yaw / 2.0), np.sin(yaw / 2.0), 0.0], dtype=float)
 
 
 def save_placement_overlay(
@@ -120,6 +263,12 @@ def save_placement_3d_visualization(
 
     pts = _validate_points(points)
     desired = np.asarray(placement_affordance["desired_object_center"], dtype=float)
+    if placement_affordance.get("position") is not None:
+        tcp = np.asarray(placement_affordance["position"], dtype=float)
+    elif held_object_frame and held_object_frame.get("object_center_offset_from_grasp") is not None:
+        tcp = desired - np.asarray(held_object_frame["object_center_offset_from_grasp"], dtype=float)
+    else:
+        tcp = desired.copy()
     art = Path(artifacts_dir)
     art.mkdir(parents=True, exist_ok=True)
     out = str(art / filename)
@@ -132,10 +281,12 @@ def save_placement_3d_visualization(
         sample = sample[idx]
     ax.scatter(sample[:, 0], sample[:, 1], sample[:, 2], s=4, c="#888888", alpha=0.35, label="target points")
     ax.scatter([desired[0]], [desired[1]], [desired[2]], s=90, c="#00c8ff", marker="o", label="desired object center")
+    ax.scatter([tcp[0]], [tcp[1]], [tcp[2]], s=70, c="#ff3b30", marker="^", label="tcp drop pose")
+    ax.plot([tcp[0], desired[0]], [tcp[1], desired[1]], [tcp[2], desired[2]], c="#ff3b30", linewidth=2)
     ax.quiver(
-        desired[0],
-        desired[1],
-        desired[2] + 0.08,
+        tcp[0],
+        tcp[1],
+        tcp[2] + 0.08,
         0,
         0,
         -0.06,
@@ -145,12 +296,6 @@ def save_placement_3d_visualization(
         label="top-down release",
     )
 
-    if held_object_frame and held_object_frame.get("object_center_offset_from_grasp") is not None:
-        offset = np.asarray(held_object_frame["object_center_offset_from_grasp"], dtype=float)
-        tcp = desired - offset
-        ax.scatter([tcp[0]], [tcp[1]], [tcp[2]], s=70, c="#ff3b30", marker="^", label="tcp release pos")
-        ax.plot([tcp[0], desired[0]], [tcp[1], desired[1]], [tcp[2], desired[2]], c="#ff3b30", linewidth=2)
-
     mode = placement_affordance.get("mode", "unknown")
     strategy = placement_affordance.get("strategy", "unknown")
     ax.set_title(f"placement affordance: {mode} / {strategy}")
@@ -158,7 +303,7 @@ def save_placement_3d_visualization(
     ax.set_ylabel("y")
     ax.set_zlabel("z")
     ax.legend(loc="best")
-    _set_equal_3d(ax, np.vstack([sample, desired.reshape(1, 3)]))
+    _set_equal_3d(ax, np.vstack([sample, desired.reshape(1, 3), tcp.reshape(1, 3)]))
     fig.tight_layout()
     fig.savefig(out, dpi=160)
     plt.close(fig)
