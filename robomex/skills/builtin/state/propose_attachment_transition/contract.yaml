@@ -1,0 +1,21 @@
+skill_id: propose_attachment_transition
+tags: [state, attachment, proposal, v2]
+role: state_proposal_author
+changes_world: false
+capabilities: [artifact_write]
+forbidden_capabilities: [perception_read, geometry_compute, simulation_probe, active_perception, robot_motion, gripper_control, object_manipulation]
+input_ports:
+  - {name: observation, schema: robomex.bowl_place_observation.v1, frame: world}
+  - {name: attachment_evidence, schema: robomex.attachment_evidence.v1}
+output_ports:
+  - {name: proposal, schema: robomex.state_transition_proposal.v1}
+postconditions: [one strict evidence-bound proposal is emitted and no state is committed]
+budget: {max_turns: 3, max_model_calls: 3, max_tokens: 64000, max_wall_time_ms: 60000}
+exit_conditions:
+  success: "Published one strict verified_held or not_held transition proposal."
+  stale_observation: "Evidence, observation, causal lineage, or base state revision is inconsistent."
+  wrong_grounding: "The evidence entity or track does not match the admitted bowl."
+functions:
+  - name: build_attachment_transition_proposal
+    entry: "scripts/attachment_transition.py:build_attachment_transition_proposal"
+    description: "Preserve admitted refs and causal lineage while constructing the exact reducer wire schema."

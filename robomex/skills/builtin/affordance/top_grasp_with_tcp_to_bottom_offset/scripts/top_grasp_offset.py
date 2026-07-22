@@ -30,7 +30,10 @@ def compute_top_grasp_with_tcp_to_bottom_offset(
     lift_pos[2] += float(lift_height)
     approach_pos = pos.copy()
     approach_pos[2] += float(approach_height)
-    quat = np.array([0.0, 0.0, 1.0, 0.0], dtype=float)
+    # Canonical no-yaw top-down pose for the single-arm Franka / LIBERO setup.
+    # [0, 0, 1, 0] also points the tool down, but adds a 180-degree wrist yaw
+    # that is needlessly far from the environment's default joint posture.
+    quat = np.array([0.0, 1.0, 0.0, 0.0], dtype=float)
     return {
         "ok": True,
         "strategy": "top_grasp_with_tcp_to_bottom_offset",

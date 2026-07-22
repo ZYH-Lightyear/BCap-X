@@ -1,0 +1,20 @@
+skill_id: author_sealed_phase_motion
+tags: [motion_planning, sealed_action, phased, v2]
+role: sealed_motion_proposal_author
+changes_world: false
+capabilities: [perception_read, geometry_compute, simulation_probe, artifact_write]
+forbidden_capabilities: [active_perception, robot_motion, gripper_control, object_manipulation]
+input_ports:
+  - {name: snapshot, schema: robomex.admission_snapshot.v1}
+output_ports:
+  - {name: action_spec, schema: robomex.motion_plan.v2}
+postconditions: [one phase is represented as an immutable exact joint path bound to its admission snapshot]
+budget: {max_turns: 3, max_model_calls: 3, max_tokens: 64000, max_wall_time_ms: 60000}
+exit_conditions:
+  success: "Published one schema-valid sealed MotionPlan.v2 for the requested phase."
+  infeasible: "No collision-free IK/planner result exists inside the phase bounds."
+  stale_observation: "Snapshot, attachment guard, or phase evidence is stale or inconsistent."
+functions:
+  - name: build_sealed_phase_motion
+    entry: "scripts/sealed_phase_motion.py:build_sealed_phase_motion"
+    description: "Seal a pre-solved joint path into one digest-bound MotionPlan.v2; never executes or re-solves it."

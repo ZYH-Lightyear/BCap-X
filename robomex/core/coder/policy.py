@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import time
+from dataclasses import replace
 from typing import Protocol
 
 from robomex.core.coder.action import ModelTurn, parse_model_turn
@@ -17,7 +19,30 @@ class CompletionPolicy(Protocol):
 
     def complete(self, prompt: list[dict]) -> str: ...
 
-    def complete_turn(self, prompt: list[dict], tool_names: set[str] | None = None) -> ModelTurn: ...
+    def complete_turn(
+        self, prompt: list[dict], tool_names: set[str] | None = None
+    ) -> ModelTurn: ...
+
+
+class BoundedCompletionPolicy(Protocol):
+    """Completion boundary that enforces an output-token ceiling at request time."""
+
+    def complete_bounded(
+        self,
+        prompt: list[dict],
+        *,
+        max_tokens: int,
+        deadline_monotonic_s: float | None = None,
+    ) -> str: ...
+
+    def complete_turn_bounded(
+        self,
+        prompt: list[dict],
+        *,
+        max_tokens: int,
+        deadline_monotonic_s: float | None = None,
+        tool_names: set[str] | None = None,
+    ) -> ModelTurn: ...
 
 
 class LLMCodePolicy:
@@ -33,12 +58,12 @@ class LLMCodePolicy:
         api_key: str | None = None,
         temperature: float = 0.2,
         max_tokens: int = 20480,  # 对齐 capx baseline(2048*10);含 reasoning 预算
-        structured_output: StructuredOutputConfig = StructuredOutputConfig(),
+        structured_output: StructuredOutputConfig | None = None,
     ) -> None:
         from capx.llm.client import ModelQueryArgs, query_model
 
         self._query_model = query_model
-        self.structured_output = structured_output
+        self.structured_output = structured_output or StructuredOutputConfig()
         self._args = ModelQueryArgs(
             model=model,
             server_url=server_url,
@@ -51,6 +76,30 @@ class LLMCodePolicy:
         out = self._query_model(self._args, prompt)
         return out.get("content") or ""
 
+    def complete_bounded(
+        self,
+        prompt: list[dict],
+        *,
+        max_tokens: int,
+        deadline_monotonic_s: float | None = None,
+    ) -> str:
+        if isinstance(max_tokens, bool) or max_tokens < 1:
+            raise ValueError("max_tokens must be a positive integer")
+        timeout_s = None
+        if deadline_monotonic_s is not None:
+            timeout_s = deadline_monotonic_s - time.monotonic()
+            if timeout_s <= 0:
+                raise TimeoutError("bounded completion deadline expired before API entry")
+        args = replace(
+            self._args,
+            max_tokens=min(self._args.max_tokens, max_tokens),
+            request_timeout_s=timeout_s,
+            max_retries=1 if timeout_s is not None else None,
+            deadline_monotonic_s=deadline_monotonic_s,
+        )
+        out = self._query_model(args, prompt)
+        return out.get("content") or ""
+
     def complete_turn(
         self,
         prompt: list[dict],
@@ -59,6 +108,23 @@ class LLMCodePolicy:
         # text_json is the only active transport. Other modes are intentionally
         # configuration placeholders until the proxy forwards response_format.
         return parse_model_turn(self.complete(prompt))
+
+    def complete_turn_bounded(
+        self,
+        prompt: list[dict],
+        *,
+        max_tokens: int,
+        deadline_monotonic_s: float | None = None,
+        tool_names: set[str] | None = None,
+    ) -> ModelTurn:
+        del tool_names
+        return parse_model_turn(
+            self.complete_bounded(
+                prompt,
+                max_tokens=max_tokens,
+                deadline_monotonic_s=deadline_monotonic_s,
+            )
+        )
 
 
 class ScriptedCodePolicy:
@@ -75,9 +141,39 @@ class ScriptedCodePolicy:
         self._index += 1
         return response
 
+    def complete_bounded(
+        self,
+        prompt: list[dict],
+        *,
+        max_tokens: int,
+        deadline_monotonic_s: float | None = None,
+    ) -> str:
+        if isinstance(max_tokens, bool) or max_tokens < 1:
+            raise ValueError("max_tokens must be a positive integer")
+        if deadline_monotonic_s is not None and time.monotonic() >= deadline_monotonic_s:
+            raise TimeoutError("bounded scripted completion deadline expired")
+        return self.complete(prompt)
+
     def complete_turn(
         self,
         prompt: list[dict],
         tool_names: set[str] | None = None,
     ) -> ModelTurn:
         return parse_model_turn(self.complete(prompt))
+
+    def complete_turn_bounded(
+        self,
+        prompt: list[dict],
+        *,
+        max_tokens: int,
+        deadline_monotonic_s: float | None = None,
+        tool_names: set[str] | None = None,
+    ) -> ModelTurn:
+        del tool_names
+        return parse_model_turn(
+            self.complete_bounded(
+                prompt,
+                max_tokens=max_tokens,
+                deadline_monotonic_s=deadline_monotonic_s,
+            )
+        )

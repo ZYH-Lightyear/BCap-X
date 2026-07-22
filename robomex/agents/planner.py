@@ -12,14 +12,15 @@ Markdown 两字段 sub-goal——或在任务完成时返回 ``DONE``。
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
-from robomex.perception.render import image_content_part
-
 from robomex.core.coder.trace import AgentTrace
 from robomex.core.logging import get_logger
+from robomex.core.token_budget import conservative_chat_prompt_tokens
+from robomex.perception.render import image_content_part
 from robomex.skills import SkillLibrary
 
 _log = get_logger("planner")
@@ -55,8 +56,7 @@ _MD_FIELD_RE = re.compile(
 
 @dataclass(frozen=True)
 class SubGoal:
-    """一个反应式步骤:一个自然语言 sub-goal,外加“如何判断它成功了”。
-    """
+    """一个反应式步骤:一个自然语言 sub-goal,外加“如何判断它成功了”。"""
 
     goal: str
     postcondition: str = ""
@@ -95,6 +95,19 @@ class PlannerPolicy(Protocol):
     """把 chat 形式的 prompt 变成 planner 的原始回复(Markdown fields or DONE)。"""
 
     def propose(self, prompt: list[dict]) -> str: ...
+
+
+class BoundedPlannerPolicy(Protocol):
+    """Planner policy whose complete external-call envelope is explicit."""
+
+    def propose_bounded(
+        self,
+        prompt: list[dict],
+        *,
+        max_tokens: int,
+        max_model_calls: int,
+        deadline_monotonic_s: float | None = None,
+    ) -> str: ...
 
 
 class LLMPlannerPolicy:
@@ -145,6 +158,88 @@ class LLMPlannerPolicy:
             _log.warning("empty model content; retrying once with an explicit planner nudge")
         return ""
 
+    def propose_bounded(
+        self,
+        prompt: list[dict],
+        *,
+        max_tokens: int,
+        max_model_calls: int,
+        deadline_monotonic_s: float | None = None,
+    ) -> str:
+        """Call the model within one total input+output token grant.
+
+        Empty-response retries are part of the same boundary.  Before the
+        first API call we reserve conservative input cost for every permitted
+        retry and split the remaining output ceiling across those calls.
+        """
+
+        if isinstance(max_tokens, bool) or max_tokens < 1:
+            raise ValueError("max_tokens must be a positive integer")
+        if isinstance(max_model_calls, bool) or max_model_calls < 1:
+            raise ValueError("max_model_calls must be a positive integer")
+        retry_prompt = self._retry_prompt(prompt)
+        maximum_calls = min(max_model_calls, self._empty_retries + 1)
+        call_count = 0
+        input_costs: list[int] = []
+        for candidate_count in range(maximum_calls, 0, -1):
+            candidate_costs = [conservative_chat_prompt_tokens(prompt)] + [
+                conservative_chat_prompt_tokens(retry_prompt)
+            ] * (candidate_count - 1)
+            if sum(candidate_costs) + candidate_count <= max_tokens:
+                call_count = candidate_count
+                input_costs = candidate_costs
+                break
+        if call_count == 0:
+            raise ValueError(
+                "Planner prompt exceeds the bounded total token grant before API entry"
+            )
+
+        remaining_output = max_tokens - sum(input_costs)
+        output_ceilings: list[int] = []
+        for index in range(call_count):
+            remaining_slots = call_count - index
+            ceiling = max(1, remaining_output // remaining_slots)
+            ceiling = min(self._args.max_tokens, ceiling)
+            output_ceilings.append(ceiling)
+            remaining_output -= ceiling
+
+        active_prompt = prompt
+        for attempt, output_ceiling in enumerate(output_ceilings):
+            timeout_s = None
+            if deadline_monotonic_s is not None:
+                timeout_s = deadline_monotonic_s - time.monotonic()
+                if timeout_s <= 0:
+                    raise TimeoutError("bounded planner deadline expired before API entry")
+            args = replace(
+                self._args,
+                max_tokens=output_ceiling,
+                request_timeout_s=timeout_s,
+                max_retries=1 if timeout_s is not None else None,
+                deadline_monotonic_s=deadline_monotonic_s,
+            )
+            out = self._query_model(args, active_prompt)
+            content = out.get("content") or ""
+            if content.strip() or attempt == call_count - 1:
+                return content
+            active_prompt = retry_prompt
+            _log.warning("empty model content; retrying within the sealed planner call budget")
+        return ""
+
+    @staticmethod
+    def _retry_prompt(prompt: list[dict]) -> list[dict]:
+        return [
+            *prompt,
+            {
+                "role": "user",
+                "content": (
+                    "Your previous response contained no visible content. "
+                    "Reply now with either DONE or two fields: "
+                    "Goal: <next sub-goal> and Postcondition: <visual success condition>. "
+                    "Do not leave the message empty."
+                ),
+            },
+        ]
+
 
 class ScriptedPlannerPolicy:
     """回放一组固定回复(每步一个),用尽后返回 ``DONE``。
@@ -163,6 +258,22 @@ class ScriptedPlannerPolicy:
         reply = self._replies[self._i]
         self._i += 1
         return reply
+
+    def propose_bounded(
+        self,
+        prompt: list[dict],
+        *,
+        max_tokens: int,
+        max_model_calls: int,
+        deadline_monotonic_s: float | None = None,
+    ) -> str:
+        if isinstance(max_tokens, bool) or max_tokens < 1:
+            raise ValueError("max_tokens must be a positive integer")
+        if isinstance(max_model_calls, bool) or max_model_calls < 1:
+            raise ValueError("max_model_calls must be a positive integer")
+        if deadline_monotonic_s is not None and time.monotonic() >= deadline_monotonic_s:
+            raise TimeoutError("bounded scripted planner deadline expired")
+        return self.propose(prompt)
 
 
 def parse_next_subgoal(text: str) -> SubGoal | None:
@@ -194,7 +305,7 @@ def _parse_markdown_subgoal(text: str) -> SubGoal | None:
     if not re.match(r"^\s*Goal\s*:", text, re.IGNORECASE):
         starts = list(re.finditer(r"(?im)^\s*Goal\s*:", text))
         if starts:
-            text = text[starts[-1].start():].strip()
+            text = text[starts[-1].start() :].strip()
     match = _MD_FIELD_RE.match(text)
     if not match:
         return None
@@ -231,7 +342,9 @@ def _render_history(history: list[SubGoalResult]) -> str:
             # An undecided checkpoint is not a failure (M1.5 Fix D); surface it
             # as such so the planner reasons from the evidence, not from a
             # generic "not_succeeded".
-            execution_status = "checkpoint_uncertain (actions executed; outcome unverified, not a failure)"
+            execution_status = (
+                "checkpoint_uncertain (actions executed; outcome unverified, not a failure)"
+            )
         else:
             execution_status = "not_succeeded"
         terminal = meta.get("terminal_result") if isinstance(meta, dict) else None
@@ -286,31 +399,78 @@ class ReactivePlanner:
     ) -> SubGoal | None:
         """依据 任务 + 高层技能指导 + 历史 + 当前场景,决定下一个 sub-goal。"""
 
-        history = history or []
-        parts: list[dict] = [{
-            "type": "text",
-            "text": (
-                f"Task: {task}\n\n"
-                f"High-level skill guidance (planning patterns, not forced executor choices):\n"
-                f"{self.menu()}\n\n"
-                f"Execution history (most recent last; checkpoint uncertainty is not failure):\n"
-                f"{_render_history(history)}\n\n"
-                "The current scene image is attached below when available. Use it only to "
-                "decide whether the task is already complete and which next high-level step "
-                "remains. Do not rewrite or expand the task with colors, textures, labels, or "
-                "spatial glosses from the image; keep Goal/Postcondition in the task's own "
-                "vocabulary so the Agent Swarm can do visual grounding. "
-                "Do not repeat a pick/place solely because a previous checkpoint was uncertain. "
-                "Output DONE if complete; otherwise output exactly two fields: "
-                "Goal: <short next sub-goal> and Postcondition: <short success condition>."
-            ),
-        }]
+        prompt = self._planning_prompt(
+            task,
+            history or [],
+            scene_image_path=scene_image_path,
+        )
+        self.last_raw = self.policy.propose(prompt) or ""
+        _log.debug("planner 原始回复: %s", self.last_raw.strip()[:600])
+        return parse_next_subgoal(self.last_raw)
+
+    def next_subgoal_bounded(
+        self,
+        task: str,
+        history: list[SubGoalResult] | None = None,
+        scene_image_path: str | None = None,
+        *,
+        max_tokens: int,
+        max_model_calls: int,
+        deadline_monotonic_s: float | None = None,
+    ) -> SubGoal | None:
+        """Bound the complete policy call before crossing the model API."""
+
+        bounded = getattr(self.policy, "propose_bounded", None)
+        if not callable(bounded):
+            raise TypeError("A manifest-budgeted planner requires policy.propose_bounded")
+        prompt = self._planning_prompt(
+            task,
+            history or [],
+            scene_image_path=scene_image_path,
+        )
+        self.last_raw = (
+            bounded(
+                prompt,
+                max_tokens=max_tokens,
+                max_model_calls=max_model_calls,
+                deadline_monotonic_s=deadline_monotonic_s,
+            )
+            or ""
+        )
+        _log.debug("planner 原始回复: %s", self.last_raw.strip()[:600])
+        return parse_next_subgoal(self.last_raw)
+
+    def _planning_prompt(
+        self,
+        task: str,
+        history: list[SubGoalResult],
+        *,
+        scene_image_path: str | None,
+    ) -> list[dict]:
+        parts: list[dict] = [
+            {
+                "type": "text",
+                "text": (
+                    f"Task: {task}\n\n"
+                    f"High-level skill guidance (planning patterns, not forced executor choices):\n"
+                    f"{self.menu()}\n\n"
+                    f"Execution history (most recent last; checkpoint uncertainty is not failure):\n"
+                    f"{_render_history(history)}\n\n"
+                    "The current scene image is attached below when available. Use it only to "
+                    "decide whether the task is already complete and which next high-level step "
+                    "remains. Do not rewrite or expand the task with colors, textures, labels, or "
+                    "spatial glosses from the image; keep Goal/Postcondition in the task's own "
+                    "vocabulary so the Agent Swarm can do visual grounding. "
+                    "Do not repeat a pick/place solely because a previous checkpoint was uncertain. "
+                    "Output DONE if complete; otherwise output exactly two fields: "
+                    "Goal: <short next sub-goal> and Postcondition: <short success condition>."
+                ),
+            }
+        ]
         if scene_image_path:
             parts.append(_image_part(scene_image_path))
         prompt = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": parts},
         ]
-        self.last_raw = self.policy.propose(prompt) or ""
-        _log.debug("planner 原始回复: %s", self.last_raw.strip()[:600])
-        return parse_next_subgoal(self.last_raw)
+        return prompt

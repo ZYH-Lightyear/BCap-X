@@ -8,28 +8,28 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from robomex.core.artifact_paths import finish_artifact_path_errors
 from robomex.core.coder import CodingAgent, CompletionPolicy, SkillEntry, parse_action_payload
 from robomex.core.coder.agent import _compact_stream_for_prompt
+from robomex.core.coder.trace import AgentTrace, TurnRecord
 from robomex.core.context import (
+    ArtifactRef,
     AttemptRecord,
     Diagnosis,
     EvidencePacket,
     LocalVerdict,
     PrimitiveTrace,
-    ArtifactRef,
     compact_json,
 )
-from robomex.core.coder.trace import AgentTrace, TurnRecord
+from robomex.core.payload_specs import validate_payload
 from robomex.core.sandbox import (
     BlockExecutionResult,
     SemanticActionBlock,
 )
+from robomex.prompts.authoring import build_agent_system_prompt, output_contract_for_ports
 from robomex.skills import (
     SkillLibrary,
 )
-from robomex.core.artifact_paths import finish_artifact_path_errors
-from robomex.core.payload_specs import validate_payload
-from robomex.prompts.authoring import build_agent_system_prompt, output_contract_for_ports
 
 
 @dataclass(frozen=True)
@@ -84,7 +84,8 @@ class SubAgentResult:
             "confidence": self.result.get("confidence", 0.0),
             "artifact_refs": [a.to_json_dict() for a in self.artifact_refs],
             "uncertainty": list(self.uncertainty),
-            "recommended_next": self.recommended_next or str(self.result.get("recommended_next", "")),
+            "recommended_next": self.recommended_next
+            or str(self.result.get("recommended_next", "")),
         }
         if self.local_verdict is not None:
             payload["local_verdict"] = self.local_verdict.to_json_dict()
@@ -102,7 +103,9 @@ class SubAgentResult:
             "result_type": self.result_type,
             "claim": self.claim,
             "result": compact_json(self.result),
-            "local_verdict": None if self.local_verdict is None else self.local_verdict.to_json_dict(),
+            "local_verdict": None
+            if self.local_verdict is None
+            else self.local_verdict.to_json_dict(),
             "artifact_refs": [a.to_json_dict() for a in self.artifact_refs],
             "trace_refs": list(self.trace_refs),
             "primitive_traces": [t.to_json_dict() for t in self.primitive_traces],
@@ -148,7 +151,9 @@ def write_subagent_result_artifact(request: SubAgentRequest, result: SubAgentRes
         },
         "result": result.to_json_dict(),
     }
-    (d / "result.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    (d / "result.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
 
 _SUBAGENT_SYSTEM_PROMPT = build_agent_system_prompt(
@@ -169,9 +174,7 @@ def render_subagent_system_prompt(api_docs: str = "") -> str:
     if not docs:
         return _SUBAGENT_SYSTEM_PROMPT
     return (
-        f"{_SUBAGENT_SYSTEM_PROMPT}\n\n"
-        "Available sandbox API functions (already imported):\n"
-        f"{docs}"
+        f"{_SUBAGENT_SYSTEM_PROMPT}\n\nAvailable sandbox API functions (already imported):\n{docs}"
     )
 
 
@@ -185,14 +188,16 @@ class CodingAgentSubAgent(CodingAgent):
         library: SkillLibrary,
         *,
         max_turns: int = 8,
+        max_model_calls: int = 32,
+        max_tokens: int = 262_144,
+        deadline_monotonic_s: float | None = None,
+        require_bounded_model_calls: bool = False,
         system_prompt: str | None = None,
         name: str = "verifier",
         description: str = "",
         objective: str = "",
         task_kind: str = "verify",
-        output_ports: tuple[tuple[str, ...], ...] = (
-            ("verifier_report", "robomex.verifier.v1"),
-        ),
+        output_ports: tuple[tuple[str, ...], ...] = (("verifier_report", "robomex.verifier.v1"),),
         preloaded_skills: tuple[str, ...] = (),
     ) -> None:
         self.name = name
@@ -216,6 +221,10 @@ class CodingAgentSubAgent(CodingAgent):
             policy=policy,
             library=library,
             max_turns=max_turns,
+            max_model_calls=max_model_calls,
+            max_tokens=max_tokens,
+            deadline_monotonic_s=deadline_monotonic_s,
+            require_bounded_model_calls=require_bounded_model_calls,
             system_prompt=effective_prompt,
             force_terminal_on_exhaust=True,
             preloaded_skills=preloaded_skills,
@@ -248,8 +257,7 @@ class CodingAgentSubAgent(CodingAgent):
             f"ARTIFACTS_DIR = {str(art_dir)!r}\n"
             f"SKILL_LIBRARY_ROOT = {library_root!r}\n"
             f"OBSERVATION_EPOCH = {observation_epoch}\n"
-            f"INPUTS = {inputs_literal}\n"
-            + "try:\n"
+            f"INPUTS = {inputs_literal}\n" + "try:\n"
             "    EVIDENCE\n"
             "except NameError:\n"
             "    EVIDENCE = {}\n"
@@ -345,9 +353,7 @@ class CodingAgentSubAgent(CodingAgent):
             self._materialized_result = None
             parsed = _promote_verifier_report(_parse_finish_result(raw))
         outputs = parsed.get("outputs") if isinstance(parsed.get("outputs"), dict) else {}
-        normalized = {
-            str(name).split(":", 1)[0]: value for name, value in outputs.items()
-        }
+        normalized = {str(name).split(":", 1)[0]: value for name, value in outputs.items()}
         required = tuple(item[0] for item in self.output_ports)
         # A finish that honestly declares failure (failure_kind, a fail/uncertain
         # verdict, or ok:false) is exempt from the required-ports check: the port
@@ -355,11 +361,7 @@ class CodingAgentSubAgent(CodingAgent):
         # here would only teach agents to fabricate payloads (M2). Ports the
         # agent does include are still validated below.
         declares_failure = _declares_failure(parsed)
-        missing = (
-            []
-            if declares_failure
-            else [name for name in required if name not in normalized]
-        )
+        missing = [] if declares_failure else [name for name in required if name not in normalized]
         invalid_payloads = [
             name
             for name in required
@@ -382,8 +384,7 @@ class CodingAgentSubAgent(CodingAgent):
                 )
             if invalid_payloads:
                 details.append(
-                    "payload must be a compact JSON object for: "
-                    + ", ".join(invalid_payloads)
+                    "payload must be a compact JSON object for: " + ", ".join(invalid_payloads)
                 )
             return (
                 False,
@@ -394,15 +395,12 @@ class CodingAgentSubAgent(CodingAgent):
             )
         # Validate artifact file refs inside the producer's own budget: a
         # path-convention mistake is repairable here, but fatal after finish.
-        artifacts_dir = (
-            Path(self._request.artifacts_dir) if self._request.artifacts_dir else None
-        )
+        artifacts_dir = Path(self._request.artifacts_dir) if self._request.artifacts_dir else None
         path_errors = finish_artifact_path_errors(normalized, artifacts_dir)
         if path_errors:
             return (
                 False,
-                "typed_finish_rejected: artifact path violation(s) — "
-                + "; ".join(path_errors),
+                "typed_finish_rejected: artifact path violation(s) — " + "; ".join(path_errors),
             )
         # Enforce canonical payload specs inside the producer's own budget so
         # a schema violation is repaired here, not discovered downstream.
@@ -441,9 +439,7 @@ class CodingAgentSubAgent(CodingAgent):
                 )
         return True, ""
 
-    def _materialize_result_var(
-        self, var_name: str
-    ) -> tuple[dict[str, Any] | None, str]:
+    def _materialize_result_var(self, var_name: str) -> tuple[dict[str, Any] | None, str]:
         """Load a finish payload from a sandbox variable (mechanical data plane).
 
         Prefer a direct namespace read when the executor exposes
@@ -571,7 +567,9 @@ class CodingAgentSubAgent(CodingAgent):
             "debug data to artifacts. Respect the enforced capability policy."
         )
 
-    def _finalize(self, *, turns: list[Any], loaded: tuple[str, ...], terminal_raw: str | None) -> SubAgentResult:
+    def _finalize(
+        self, *, turns: list[Any], loaded: tuple[str, ...], terminal_raw: str | None
+    ) -> SubAgentResult:
         if self._materialized_result is not None:
             parsed = _promote_verifier_report(dict(self._materialized_result))
             # Preserve claim / envelope fields from the finish action itself.
@@ -610,7 +608,10 @@ class CodingAgentSubAgent(CodingAgent):
         elif verdict_status in {"fail", "failed", "error", "uncertain", "unknown"} and not error:
             error = f"SubAgent returned non-success verdict {verdict_status!r}."
         result_type = str(parsed.get("result_type") or parsed.get("type") or "")
-        trace_refs = tuple(str(v) for v in parsed.get("trace_refs", ()) or parsed.get("related_trace_ids", ()) or ())
+        trace_refs = tuple(
+            str(v)
+            for v in parsed.get("trace_refs", ()) or parsed.get("related_trace_ids", ()) or ()
+        )
         uncertainty = parsed.get("uncertainty", ())
         if isinstance(uncertainty, str):
             uncertainty = (uncertainty,)
@@ -674,7 +675,9 @@ def _result_payload(raw: dict[str, Any]) -> dict[str, Any]:
     return raw
 
 
-def _extract_artifact_refs(raw: dict[str, Any], *, default_producer: str = "") -> tuple[ArtifactRef, ...]:
+def _extract_artifact_refs(
+    raw: dict[str, Any], *, default_producer: str = ""
+) -> tuple[ArtifactRef, ...]:
     payload = _result_payload(raw)
     items: list[Any] = []
     for key in ("artifact_refs", "artifacts"):
@@ -691,11 +694,17 @@ def _extract_artifact_refs(raw: dict[str, Any], *, default_producer: str = "") -
     return tuple(out)
 
 
-def _extract_primitive_traces(raw: dict[str, Any], *, default_producer: str = "") -> tuple[PrimitiveTrace, ...]:
+def _extract_primitive_traces(
+    raw: dict[str, Any], *, default_producer: str = ""
+) -> tuple[PrimitiveTrace, ...]:
     payload = _result_payload(raw)
     traces = []
-    for i, item in enumerate(payload.get("primitive_traces", ()) or payload.get("traces", ()) or ()):
-        trace = PrimitiveTrace.from_any(item, default_id=f"{default_producer}:trace:{i}", default_producer=default_producer)
+    for i, item in enumerate(
+        payload.get("primitive_traces", ()) or payload.get("traces", ()) or ()
+    ):
+        trace = PrimitiveTrace.from_any(
+            item, default_id=f"{default_producer}:trace:{i}", default_producer=default_producer
+        )
         if trace is not None:
             traces.append(trace)
     return tuple(traces)
@@ -704,7 +713,9 @@ def _extract_primitive_traces(raw: dict[str, Any], *, default_producer: str = ""
 def _extract_attempt_records(raw: dict[str, Any]) -> tuple[AttemptRecord, ...]:
     payload = _result_payload(raw)
     attempts = []
-    for i, item in enumerate(payload.get("attempt_records", ()) or payload.get("attempts", ()) or ()):
+    for i, item in enumerate(
+        payload.get("attempt_records", ()) or payload.get("attempts", ()) or ()
+    ):
         attempt = AttemptRecord.from_any(item, default_id=f"attempt:{i}")
         if attempt is not None:
             attempts.append(attempt)
@@ -861,8 +872,7 @@ def _promote_verifier_report(parsed: dict[str, Any]) -> dict[str, Any]:
         (
             value
             for name, value in outputs.items()
-            if str(name).split(":", 1)[0] == "verifier_report"
-            and isinstance(value, dict)
+            if str(name).split(":", 1)[0] == "verifier_report" and isinstance(value, dict)
         ),
         None,
     )

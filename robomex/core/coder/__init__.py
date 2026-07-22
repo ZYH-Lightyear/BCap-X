@@ -14,23 +14,24 @@ from robomex.core.coder.action import (
     ToolCall,
     build_skill_llm_content,
     normalized_action_json,
+    parse_action,
     parse_action_payload,
     parse_model_turn,
-    parse_action,
     render_available_skills,
 )
 from robomex.core.coder.agent import CodingAgent
+from robomex.core.coder.policy import (
+    BoundedCompletionPolicy,
+    CompletionPolicy,
+    LLMCodePolicy,
+    ScriptedCodePolicy,
+)
 from robomex.core.coder.protocol import (
     ActionEnvelope,
     ActionSchema,
     ParsedActionFrame,
     StructuredOutputConfig,
     parse_action_frame,
-)
-from robomex.core.coder.policy import (
-    CompletionPolicy,
-    LLMCodePolicy,
-    ScriptedCodePolicy,
 )
 from robomex.core.coder.trace import AgentTrace, TurnRecord
 from robomex.core.coder.turn_engine import EngineTurn, TurnBudget, TurnEngine, TurnLedger
@@ -41,6 +42,7 @@ __all__ = [
     "ActionEnvelope",
     "ActionSchema",
     "BlockExecutor",
+    "BoundedCompletionPolicy",
     "CodingAgent",
     "CompletionPolicy",
     "LLMCodePolicy",

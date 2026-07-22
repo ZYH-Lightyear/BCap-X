@@ -219,6 +219,8 @@ def test_affordance_motion_sidecars_are_callable_after_plain_import() -> None:
 
     top = top_mod.compute_top_grasp_with_tcp_to_bottom_offset(points, obb=obb)
     assert top["ok"]
+    assert top["quat"] == [0.0, 1.0, 0.0, 0.0]
+    assert top["quaternion_wxyz"] == top["quat"]
     assert "tcp_to_bottom" in top
     assert "object_center_offset_from_grasp" in top
 

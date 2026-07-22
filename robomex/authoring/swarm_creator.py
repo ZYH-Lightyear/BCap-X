@@ -49,6 +49,7 @@ class SubgoalSwarmManager:
         capability_ceiling: frozenset[str],
         safety_state: RuntimeSafetyState,
         max_turns: int = 4,
+        max_tokens: int = 1_048_576,
         max_spawns: int = 0,
         max_protocol_errors: int = 3,
         max_finish_rejections: int = 0,
@@ -63,7 +64,10 @@ class SubgoalSwarmManager:
         self.factory = factory
         self.capability_ceiling = capability_ceiling
         self.safety_state = safety_state
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
+            raise ValueError("max_tokens must be a positive integer")
         self.max_turns = max_turns
+        self.max_tokens = max_tokens
         self.max_protocol_errors = max_protocol_errors
         root = getattr(library, "root", None)
         self.contracts = (
@@ -104,6 +108,7 @@ class SubgoalSwarmManager:
             allowed_tools={"use_skill", "submit_graph"},
             budget=TurnBudget(
                 max_model_calls=self.max_turns,
+                max_tokens=self.max_tokens,
                 max_protocol_errors=self.max_protocol_errors,
             ),
         )
@@ -220,7 +225,7 @@ class SubgoalSwarmManager:
             )
             return replace(
                 outcome,
-                node_results=tuple((manager_result, *outcome.node_results)),
+                node_results=(manager_result, *outcome.node_results),
                 cost=outcome.cost + manager_result.cost,
                 creator_status="composed_graph",
             )

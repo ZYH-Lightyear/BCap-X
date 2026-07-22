@@ -16,9 +16,9 @@ function-calling schema。
 
 from __future__ import annotations
 
+import inspect
 import json
 import time
-import inspect
 from pathlib import Path
 from typing import Any
 
@@ -141,6 +141,9 @@ class CodingAgent:
         repeat_limit: int = 3,
         force_terminal_on_exhaust: bool = False,
         max_model_calls: int = 32,
+        max_tokens: int = 262_144,
+        deadline_monotonic_s: float | None = None,
+        require_bounded_model_calls: bool = False,
         max_protocol_errors: int = 4,
         preloaded_skills: tuple[str, ...] = (),
     ) -> None:
@@ -152,6 +155,9 @@ class CodingAgent:
         self.repeat_limit = repeat_limit
         self.force_terminal_on_exhaust = force_terminal_on_exhaust
         self.max_model_calls = max_model_calls
+        self.max_tokens = max_tokens
+        self.deadline_monotonic_s = deadline_monotonic_s
+        self.require_bounded_model_calls = require_bounded_model_calls
         self.max_protocol_errors = max_protocol_errors
         self.preloaded_skills = tuple(dict.fromkeys(preloaded_skills))
         # scripts/ dirs already injected into the sandbox sys.path (M1.5 Fix C).
@@ -174,9 +180,8 @@ class CodingAgent:
             self._load_skill_message(skill_id, loaded) for skill_id in self.preloaded_skills
         ]
         if preloaded_content:
-            system_content = (
-                f"{system_content}\n\n# Preloaded specialist skills\n"
-                + "\n\n".join(preloaded_content)
+            system_content = f"{system_content}\n\n# Preloaded specialist skills\n" + "\n\n".join(
+                preloaded_content
             )
         prompt: list[dict] = [
             {"role": "system", "content": system_content},
@@ -210,6 +215,9 @@ class CodingAgent:
                 allowed_tools=self._allowed_action_kinds(),
                 budget=TurnBudget(
                     max_model_calls=self.max_model_calls,
+                    max_tokens=self.max_tokens,
+                    deadline_monotonic_s=self.deadline_monotonic_s,
+                    require_bounded=self.require_bounded_model_calls,
                     max_protocol_errors=self.max_protocol_errors,
                     action_limits={"run_python": self.max_turns},
                 ),
@@ -245,7 +253,9 @@ class CodingAgent:
                         "llm_request",
                         f"{label} requesting model turn {turn_idx}",
                         prompt_messages=len(prompt),
-                        prompt_preview=_preview_content(prompt[-1].get("content", "")) if prompt else "",
+                        prompt_preview=_preview_content(prompt[-1].get("content", ""))
+                        if prompt
+                        else "",
                         llm_request_path=str(request_dump) if request_dump is not None else None,
                         action_turns=action_turns,
                         max_action_turns=self.max_turns,
@@ -266,7 +276,11 @@ class CodingAgent:
                         raw=turn.raw,
                         raw_preview=preview(turn.raw),
                         tool_calls=[
-                            {"id": call.id, "name": call.name, "args_preview": preview(call.payload_preview, 300)}
+                            {
+                                "id": call.id,
+                                "name": call.name,
+                                "args_preview": preview(call.payload_preview, 300),
+                            }
                             for call in turn.tool_calls
                         ],
                         parser_error=turn.error,
@@ -287,7 +301,9 @@ class CodingAgent:
                     if tool_call is None:
                         log.info("turn %d: 无可执行工具调用,轻推重试", turn_idx)
                         engine.append_feedback(prompt, self._nudge_message(turn))
-                        emit_event("agent_nudge", "No actionable tool call parsed", reason=turn.error)
+                        emit_event(
+                            "agent_nudge", "No actionable tool call parsed", reason=turn.error
+                        )
                         continue
 
                     if tool_call.name == "finish":
@@ -378,7 +394,10 @@ class CodingAgent:
                         log.info("turn %d: 写出 python 代码块(%d 行),执行中…", turn_idx, line_count)
                         block = SemanticActionBlock(
                             name=f"turn_{turn_idx}",
-                            intent=str(tool_call.args.get("intent", "agent-generated code") or "agent-generated code"),
+                            intent=str(
+                                tool_call.args.get("intent", "agent-generated code")
+                                or "agent-generated code"
+                            ),
                             code=code,
                             metadata=self._block_metadata(),
                         )
@@ -410,10 +429,10 @@ class CodingAgent:
                         engine.append_feedback(prompt, self._feedback_message(execution))
                         if self._should_stop_after_python(execution):
                             stopped = True
-                            terminal_raw = (
-                                '{"tool":"finish","args":{"claim":"environment signalled completion"}}'
+                            terminal_raw = '{"tool":"finish","args":{"claim":"environment signalled completion"}}'
+                            emit_event(
+                                "agent_stop_after_python", "Agent stopped after python execution"
                             )
-                            emit_event("agent_stop_after_python", "Agent stopped after python execution")
                             break
                         if action_turns >= self.max_turns:
                             emit_event(
@@ -466,9 +485,12 @@ class CodingAgent:
 
             result = self._finalize(turns=turns, loaded=tuple(loaded), terminal_raw=terminal_raw)
             result_trace = result if hasattr(result, "metadata") else getattr(result, "trace", None)
-            if result_trace is not None and isinstance(getattr(result_trace, "metadata", None), dict):
+            if result_trace is not None and isinstance(
+                getattr(result_trace, "metadata", None), dict
+            ):
                 result_trace.metadata["runtime_budget"] = {
                     "model_calls": engine.ledger.model_calls,
+                    "tokens_committed": engine.ledger.tokens_committed,
                     "protocol_errors": engine.ledger.protocol_errors,
                     "actions": dict(engine.ledger.actions),
                 }
@@ -704,9 +726,7 @@ class CodingAgent:
         stderr = _compact_stream_for_prompt("stderr", execution.stderr)
         terminal_state = ""
         robot_state = (
-            execution.info.get("terminal_robot_state")
-            if isinstance(execution.info, dict)
-            else None
+            execution.info.get("terminal_robot_state") if isinstance(execution.info, dict) else None
         )
         if isinstance(robot_state, dict) and robot_state:
             terminal_state = (
@@ -774,7 +794,9 @@ class CodingAgent:
         }
         path = self._write_llm_io_json(out_dir / f"turn_{turn_idx:02d}_response.json", payload)
         if path is not None:
-            self._write_llm_io_text(out_dir / f"turn_{turn_idx:02d}_response.txt", turn.raw or turn.text)
+            self._write_llm_io_text(
+                out_dir / f"turn_{turn_idx:02d}_response.txt", turn.raw or turn.text
+            )
         return path
 
     @staticmethod
@@ -905,5 +927,7 @@ class CodingAgent:
     def _should_stop_after_python(self, execution: BlockExecutionResult) -> bool:
         return False
 
-    def _finalize(self, *, turns: list[Any], loaded: tuple[str, ...], terminal_raw: str | None) -> Any:
+    def _finalize(
+        self, *, turns: list[Any], loaded: tuple[str, ...], terminal_raw: str | None
+    ) -> Any:
         raise NotImplementedError

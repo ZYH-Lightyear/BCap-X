@@ -1,0 +1,284 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1100" viewBox="0 0 1800 1100" role="img" aria-labelledby="title desc">
+  <title id="title">RoboMEx Original Idea: Dynamic Coding-Agent Swarm and Skill Evolution</title>
+  <desc id="desc">Paper-style diagram of the original RoboMEx idea: a reactive planner creates embodied subgoals; a swarm manager dynamically composes specialist coding agents into a graph; typed artifacts and verification support local physical correction; successful code traces are distilled into reusable skill functions. A soup-can grasp case illustrates correction and skill crystallization.</desc>
+  <defs>
+    <linearGradient id="pageBg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F8FAFD"/>
+      <stop offset="1" stop-color="#F1F5FA"/>
+    </linearGradient>
+    <linearGradient id="swarmBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#EDF4FF"/>
+      <stop offset="0.55" stop-color="#F6F3FF"/>
+      <stop offset="1" stop-color="#EFFAF7"/>
+    </linearGradient>
+    <linearGradient id="evolveBg" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#F3EDFF"/>
+      <stop offset="1" stop-color="#E9F7F1"/>
+    </linearGradient>
+    <marker id="arrowBlue" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L10 5 L0 10 z" fill="#3D72CE"/>
+    </marker>
+    <marker id="arrowGray" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L10 5 L0 10 z" fill="#6B7B91"/>
+    </marker>
+    <marker id="arrowPurple" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L10 5 L0 10 z" fill="#7759C7"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L10 5 L0 10 z" fill="#269879"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L10 5 L0 10 z" fill="#D7842A"/>
+    </marker>
+    <marker id="arrowRed" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L10 5 L0 10 z" fill="#D4545F"/>
+    </marker>
+    <style>
+      text { font-family: Inter, "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; }
+      .title { font-size: 31px; font-weight: 760; letter-spacing: -0.4px; fill: #182235; }
+      .subtitle { font-size: 16px; fill: #5C687B; }
+      .panel-title { font-size: 20px; font-weight: 760; fill: #182235; }
+      .kicker { font-size: 12px; font-weight: 760; letter-spacing: 1.45px; }
+      .card-title { font-size: 16px; font-weight: 730; fill: #182235; }
+      .body { font-size: 13px; fill: #46556B; }
+      .small { font-size: 12px; fill: #64748B; }
+      .tiny { font-size: 10.5px; fill: #718096; }
+      .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+      .white { fill: #FFFFFF; }
+      .blue { fill: #2F63B9; }
+      .purple { fill: #6745B4; }
+      .green { fill: #1F7E64; }
+      .orange { fill: #A8621E; }
+      .red { fill: #B33E49; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="1100" fill="url(#pageBg)"/>
+  <text x="52" y="52" class="title">RoboMEx Original Idea: Dynamic Coding-Agent Swarm + Skill Evolution</text>
+  <text x="52" y="82" class="subtitle">Adapt online in a live physical scene; crystallize successful flexibility into reusable robot skills.</text>
+  <g transform="translate(1488,39)">
+    <rect width="258" height="38" rx="19" fill="#E7F4EF"/>
+    <circle cx="21" cy="19" r="6" fill="#2B9A7B"/>
+    <text x="38" y="24" font-size="12" font-weight="740" fill="#28765F">FLEX WHEN NOVEL · REUSE WHEN REPEATED</text>
+  </g>
+
+  <!-- Main left architecture panel -->
+  <rect x="38" y="108" width="1120" height="947" rx="24" fill="#FFFFFF" stroke="#D8E1EC" stroke-width="1.5"/>
+  <text x="68" y="146" class="panel-title">A. Original method: subgoal-level Coding-Agent Swarm</text>
+
+  <!-- Outer planner row -->
+  <rect x="66" y="168" width="1064" height="117" rx="18" fill="#F7F9FC" stroke="#CDD7E5" stroke-width="1.5"/>
+  <text x="86" y="194" class="kicker" fill="#68768B">OUTER REACTIVE LOOP</text>
+  <g transform="translate(88,211)">
+    <rect x="0" y="0" width="205" height="52" rx="13" fill="#263A58"/>
+    <text x="103" y="21" text-anchor="middle" font-size="13" font-weight="720" fill="#FFFFFF">Language Task</text>
+    <text x="103" y="39" text-anchor="middle" font-size="11" fill="#D7E2F3">“put the soup can in basket”</text>
+    <path d="M209 26 L257 26" stroke="#64748B" stroke-width="2.2" marker-end="url(#arrowGray)"/>
+    <rect x="263" y="0" width="238" height="52" rx="13" fill="#3E70C5"/>
+    <text x="382" y="22" text-anchor="middle" font-size="14" font-weight="740" fill="#FFFFFF">Reactive Planner</text>
+    <text x="382" y="40" text-anchor="middle" font-size="11" fill="#E3ECFB">scene + history → next subgoal</text>
+    <path d="M505 26 L553 26" stroke="#3D72CE" stroke-width="2.2" marker-end="url(#arrowBlue)"/>
+    <rect x="559" y="0" width="274" height="52" rx="13" fill="#EAF1FC" stroke="#9CB7E1"/>
+    <text x="696" y="21" text-anchor="middle" font-size="13" font-weight="720" fill="#315FAD">Embodied Subgoal</text>
+    <text x="696" y="40" text-anchor="middle" font-size="11" fill="#4B6287">goal + observable postcondition</text>
+    <path d="M837 26 L885 26" stroke="#64748B" stroke-width="2.2" marker-end="url(#arrowGray)"/>
+    <rect x="891" y="0" width="127" height="52" rx="13" fill="#EDF7F4" stroke="#91C9BA"/>
+    <text x="955" y="21" text-anchor="middle" font-size="12" font-weight="720" fill="#25755E">Session</text>
+    <text x="955" y="39" text-anchor="middle" font-size="10.5" fill="#4F756B">refresh + continue</text>
+  </g>
+
+  <!-- Swarm area -->
+  <rect x="66" y="306" width="1064" height="460" rx="20" fill="url(#swarmBg)" stroke="#BFCFEC" stroke-width="1.5"/>
+  <text x="88" y="334" class="kicker blue">DYNAMIC CODING-AGENT SWARM · 每个活场景动态生成</text>
+  <text x="1103" y="334" class="small" text-anchor="end">universal single Agent remains the matched baseline</text>
+
+  <!-- Manager -->
+  <rect x="375" y="352" width="444" height="82" rx="16" fill="#446FC4"/>
+  <circle cx="408" cy="380" r="14" fill="#FFFFFF" opacity="0.22"/>
+  <path d="M401 380 l5 5 l10 -12" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="437" y="380" font-size="17" font-weight="750" fill="#FFFFFF">SubgoalSwarmManager</text>
+  <text x="437" y="404" font-size="12.5" fill="#E3EDFF">current image + task skill + specialist contracts</text>
+  <text x="597" y="423" text-anchor="middle" font-size="10.5" fill="#D6E4FF">select roles · bind typed ports · generate conditional recovery graph</text>
+
+  <!-- Progressive disclosure -->
+  <rect x="87" y="358" width="245" height="67" rx="14" fill="#FFFFFF" stroke="#C4B6E3"/>
+  <text x="105" y="382" class="card-title">Task Skill Menu</text>
+  <text x="105" y="403" class="small">name/description → use_skill</text>
+  <text x="105" y="419" class="tiny">progressive disclosure, not full prompt dump</text>
+  <path d="M334 392 L367 392" stroke="#7759C7" stroke-width="2.1" marker-end="url(#arrowPurple)"/>
+
+  <!-- Agent graph line -->
+  <path d="M597 434 L597 459" stroke="#3D72CE" stroke-width="2.2" marker-end="url(#arrowBlue)"/>
+  <text x="615" y="452" class="tiny">author graph</text>
+
+  <g transform="translate(86,472)">
+    <!-- Agent cards -->
+    <rect x="0" y="0" width="174" height="110" rx="14" fill="#FFFFFF" stroke="#70A5D5" stroke-width="1.5"/>
+    <circle cx="22" cy="25" r="9" fill="#4B90C6"/>
+    <text x="39" y="31" class="card-title">Grounding</text>
+    <text x="16" y="57" class="small">locate entity</text>
+    <text x="16" y="77" class="small">mask / points / OBB</text>
+    <text x="16" y="98" class="tiny mono">read-only Coding Agent</text>
+
+    <path d="M177 55 L206 55" stroke="#6B7B91" stroke-width="2" marker-end="url(#arrowGray)"/>
+    <text x="192" y="42" text-anchor="middle" class="tiny mono">geometry</text>
+
+    <rect x="210" y="0" width="174" height="110" rx="14" fill="#FFFFFF" stroke="#9175D2" stroke-width="1.5"/>
+    <circle cx="232" cy="25" r="9" fill="#7759C7"/>
+    <text x="249" y="31" class="card-title">Affordance</text>
+    <text x="226" y="57" class="small">choose contact + pose</text>
+    <text x="226" y="77" class="small">approach / grasp / offset</text>
+    <text x="226" y="98" class="tiny mono">local code + repair loop</text>
+
+    <path d="M387 55 L416 55" stroke="#6B7B91" stroke-width="2" marker-end="url(#arrowGray)"/>
+    <text x="402" y="42" text-anchor="middle" class="tiny mono">target pose</text>
+
+    <rect x="420" y="0" width="174" height="110" rx="14" fill="#FFFFFF" stroke="#5CB2A0" stroke-width="1.5"/>
+    <circle cx="442" cy="25" r="9" fill="#289B82"/>
+    <text x="459" y="31" class="card-title">Motion</text>
+    <text x="436" y="57" class="small">IK + collision-aware path</text>
+    <text x="436" y="77" class="small">short Cartesian segments</text>
+    <text x="436" y="98" class="tiny mono">planner Coding Agent</text>
+
+    <path d="M597 55 L626 55" stroke="#6B7B91" stroke-width="2" marker-end="url(#arrowGray)"/>
+    <text x="612" y="42" text-anchor="middle" class="tiny mono">trajectory</text>
+
+    <rect x="630" y="0" width="174" height="110" rx="14" fill="#FFF9F0" stroke="#DB9A48" stroke-width="1.5"/>
+    <circle cx="652" cy="25" r="9" fill="#D8872E"/>
+    <text x="669" y="31" class="card-title">Action</text>
+    <text x="646" y="57" class="small">call bounded robot APIs</text>
+    <text x="646" y="77" class="small">only world-changing role</text>
+    <text x="646" y="98" class="tiny mono">execute + evidence</text>
+
+    <path d="M807 55 L836 55" stroke="#6B7B91" stroke-width="2" marker-end="url(#arrowGray)"/>
+    <text x="822" y="42" text-anchor="middle" class="tiny mono">evidence</text>
+
+    <rect x="840" y="0" width="174" height="110" rx="14" fill="#FFFFFF" stroke="#E17C84" stroke-width="1.5"/>
+    <circle cx="862" cy="25" r="9" fill="#D85B65"/>
+    <text x="879" y="31" class="card-title">Verifier</text>
+    <text x="856" y="57" class="small">judge observable outcome</text>
+    <text x="856" y="77" class="small">independent of executor</text>
+    <text x="856" y="98" class="tiny mono">success / failure_kind</text>
+
+    <!-- Code loop hints -->
+    <g transform="translate(228,120)">
+      <rect x="0" y="0" width="558" height="37" rx="18" fill="#FFFFFF" stroke="#D2CAE8"/>
+      <text x="279" y="24" text-anchor="middle" font-size="11.5" font-weight="680" fill="#604E91">each leaf: write code → run → observe output → repair locally → terminal result</text>
+    </g>
+
+    <!-- Recovery edge -->
+    <path d="M927 111 C927 184, 351 184, 305 113" fill="none" stroke="#D4545F" stroke-width="2.3" stroke-dasharray="7 5" marker-end="url(#arrowRed)"/>
+    <rect x="478" y="166" width="324" height="31" rx="15" fill="#FBEAEC"/>
+    <text x="640" y="187" text-anchor="middle" font-size="11" font-weight="720" fill="#B33E49">failed_grasp → adjust left/right · rotate · change approach</text>
+  </g>
+
+  <!-- Typed data / physical loop note -->
+  <rect x="88" y="704" width="1018" height="44" rx="13" fill="#FFFFFF" stroke="#C8D5E7"/>
+  <text x="105" y="731" class="card-title">Typed ArtifactStore</text>
+  <text x="258" y="731" class="body">mask/points → geometry → affordance → trajectory → execution evidence → verifier report</text>
+  <rect x="897" y="714" width="190" height="24" rx="12" fill="#EDF3FC"/>
+  <text x="992" y="731" text-anchor="middle" class="tiny" font-weight="700" fill="#315FAD">numbers do not travel in prose</text>
+
+  <!-- Physical action loop -->
+  <path d="M957 766 L957 791" stroke="#D7842A" stroke-width="2.2" marker-end="url(#arrowOrange)"/>
+  <rect x="66" y="793" width="1064" height="73" rx="16" fill="#253954"/>
+  <text x="88" y="820" class="kicker white">CAP-X APIs + SKILLS → ROBOT + LIVE PHYSICAL WORLD</text>
+  <text x="88" y="846" font-size="12" fill="#D9E4F2">The swarm authors local Code-as-Policy; action evidence and verifier result return to the planner/session.</text>
+  <path d="M1078 829 C1140 829, 1140 248, 1071 248" fill="none" stroke="#4EA98F" stroke-width="2.2" stroke-dasharray="8 6" marker-end="url(#arrowGreen)"/>
+
+  <!-- Evolution zone -->
+  <rect x="66" y="887" width="1064" height="143" rx="18" fill="url(#evolveBg)" stroke="#C8BBE4" stroke-width="1.5"/>
+  <text x="88" y="914" class="kicker purple">SKILL EVOLUTION · 成功的灵活性自动结晶</text>
+  <g transform="translate(90,930)">
+    <rect x="0" y="0" width="180" height="58" rx="13" fill="#FFFFFF" stroke="#9E87D4"/>
+    <text x="90" y="23" text-anchor="middle" font-size="12.5" font-weight="720" fill="#6549A8">Successful Tier-2 Trace</text>
+    <text x="90" y="43" text-anchor="middle" class="tiny">novel code + evidence</text>
+    <path d="M184 29 L224 29" stroke="#7759C7" stroke-width="2" marker-end="url(#arrowPurple)"/>
+    <rect x="230" y="0" width="170" height="58" rx="13" fill="#FFFFFF" stroke="#9E87D4"/>
+    <text x="315" y="23" text-anchor="middle" font-size="12.5" font-weight="720" fill="#6549A8">Parameterize</text>
+    <text x="315" y="43" text-anchor="middle" class="tiny">replace scene constants</text>
+    <path d="M404 29 L444 29" stroke="#7759C7" stroke-width="2" marker-end="url(#arrowPurple)"/>
+    <rect x="450" y="0" width="170" height="58" rx="13" fill="#FFFFFF" stroke="#9E87D4"/>
+    <text x="535" y="23" text-anchor="middle" font-size="12.5" font-weight="720" fill="#6549A8">Fixtures + Gate</text>
+    <text x="535" y="43" text-anchor="middle" class="tiny">test before promotion</text>
+    <path d="M624 29 L664 29" stroke="#269879" stroke-width="2" marker-end="url(#arrowGreen)"/>
+    <rect x="670" y="0" width="190" height="58" rx="13" fill="#F6FCF9" stroke="#69B9A3"/>
+    <text x="765" y="23" text-anchor="middle" font-size="12.5" font-weight="720" fill="#1F7E64">Canonical Skill Function</text>
+    <text x="765" y="43" text-anchor="middle" class="tiny">promoted Tier 0 / 1</text>
+    <path d="M864 29 L904 29" stroke="#269879" stroke-width="2" marker-end="url(#arrowGreen)"/>
+    <rect x="910" y="0" width="108" height="58" rx="13" fill="#2B8E72"/>
+    <text x="964" y="23" text-anchor="middle" font-size="12.5" font-weight="720" fill="#FFFFFF">Next Episode</text>
+    <text x="964" y="43" text-anchor="middle" font-size="10.5" fill="#DDF4ED">fewer tokens</text>
+  </g>
+  <path d="M1091 988 C1144 988, 1144 384, 821 384" fill="none" stroke="#7759C7" stroke-width="2.1" stroke-dasharray="8 6" marker-end="url(#arrowPurple)"/>
+
+  <!-- Right case panel -->
+  <rect x="1182" y="108" width="580" height="947" rx="24" fill="#FFFFFF" stroke="#D8E1EC" stroke-width="1.5"/>
+  <text x="1212" y="146" class="panel-title">B. Case: grasp is consistently too far forward</text>
+  <text x="1212" y="171" class="small">The original loop repairs a local policy, then turns it into a reusable skill.</text>
+
+  <!-- Simple scene schematic -->
+  <rect x="1212" y="194" width="516" height="176" rx="17" fill="#F7F9FC" stroke="#D5DFEB"/>
+  <text x="1232" y="220" class="kicker" fill="#6A778B">LIVE SCENE</text>
+  <line x1="1260" y1="336" x2="1688" y2="336" stroke="#AEBBCD" stroke-width="3"/>
+  <!-- can -->
+  <ellipse cx="1515" cy="280" rx="37" ry="10" fill="#E2A349"/>
+  <rect x="1478" y="280" width="74" height="55" fill="#EDB560"/>
+  <ellipse cx="1515" cy="335" rx="37" ry="10" fill="#D8953E"/>
+  <path d="M1515 243 L1515 265" stroke="#51647D" stroke-width="4"/>
+  <path d="M1497 264 q18 14 36 0" fill="none" stroke="#51647D" stroke-width="5" stroke-linecap="round"/>
+  <!-- wrong grasp marker -->
+  <circle cx="1542" cy="278" r="8" fill="#D9535E"/>
+  <path d="M1575 254 L1551 273" stroke="#D9535E" stroke-width="2" marker-end="url(#arrowRed)"/>
+  <text x="1582" y="249" class="small red">predicted grasp</text>
+  <path d="M1540 304 C1584 304, 1584 291, 1602 291" fill="none" stroke="#D9535E" stroke-width="2" stroke-dasharray="5 4"/>
+  <text x="1610" y="295" class="tiny red">too far forward</text>
+  <circle cx="1514" cy="278" r="7" fill="#289B82"/>
+  <text x="1232" y="355" class="tiny">object center / OBB</text>
+
+  <!-- Case timeline -->
+  <line x1="1238" y1="412" x2="1238" y2="973" stroke="#CAD5E2" stroke-width="3"/>
+
+  <circle cx="1238" cy="425" r="17" fill="#4B90C6"/>
+  <text x="1238" y="431" text-anchor="middle" font-size="13" font-weight="750" fill="#FFFFFF">1</text>
+  <rect x="1272" y="395" width="456" height="75" rx="14" fill="#FFFFFF" stroke="#AFC9E5"/>
+  <text x="1292" y="422" class="card-title">Grounding Agent estimates object geometry</text>
+  <text x="1292" y="447" class="body">mask + points + OBB → typed geometry artifact</text>
+
+  <circle cx="1238" cy="513" r="17" fill="#7759C7"/>
+  <text x="1238" y="519" text-anchor="middle" font-size="13" font-weight="750" fill="#FFFFFF">2</text>
+  <rect x="1272" y="483" width="456" height="75" rx="14" fill="#FFFFFF" stroke="#C5B4E5"/>
+  <text x="1292" y="510" class="card-title">Affordance Agent proposes top grasp</text>
+  <text x="1292" y="535" class="body">Motion + Action Agents plan and execute it</text>
+
+  <circle cx="1238" cy="603" r="17" fill="#D85B65"/>
+  <text x="1238" y="609" text-anchor="middle" font-size="13" font-weight="750" fill="#FFFFFF">3</text>
+  <rect x="1272" y="573" width="456" height="80" rx="14" fill="#FFF9F9" stroke="#E4A4AA"/>
+  <text x="1292" y="600" class="card-title">Post-action Verifier returns failed_grasp</text>
+  <text x="1292" y="626" class="body">Evidence localizes the failure to grasp alignment</text>
+
+  <circle cx="1238" cy="700" r="17" fill="#D8872E"/>
+  <text x="1238" y="706" text-anchor="middle" font-size="13" font-weight="750" fill="#FFFFFF">4</text>
+  <rect x="1272" y="667" width="456" height="95" rx="14" fill="#FFFBF5" stroke="#E1B579"/>
+  <text x="1292" y="694" class="card-title">Swarm runs a bounded local repair</text>
+  <rect x="1292" y="710" width="397" height="31" rx="8" fill="#FFF0DD"/>
+  <text x="1306" y="731" class="mono" font-size="12" font-weight="700" fill="#A8621E">center += Δx; yaw += Δθ; replan()</text>
+  <text x="1292" y="754" class="tiny">left/right · slightly rotate · change approach height</text>
+
+  <circle cx="1238" cy="805" r="17" fill="#289B82"/>
+  <text x="1238" y="811" text-anchor="middle" font-size="13" font-weight="750" fill="#FFFFFF">5</text>
+  <rect x="1272" y="775" width="456" height="75" rx="14" fill="#F7FCFA" stroke="#8CCABA"/>
+  <text x="1292" y="802" class="card-title">Re-execution succeeds and is verified</text>
+  <text x="1292" y="827" class="body">Successful code + parameters + evidence become a trace</text>
+
+  <circle cx="1238" cy="913" r="17" fill="#6846B6"/>
+  <text x="1238" y="919" text-anchor="middle" font-size="13" font-weight="750" fill="#FFFFFF">6</text>
+  <rect x="1272" y="866" width="456" height="128" rx="14" fill="#F8F5FD" stroke="#BCA9DE" stroke-width="1.5"/>
+  <text x="1292" y="894" class="card-title">Distill the repair into a reusable skill</text>
+  <rect x="1292" y="909" width="408" height="32" rx="8" fill="#EEE7FA"/>
+  <text x="1306" y="930" class="mono" font-size="11.5" font-weight="700" fill="#6549A8">top_grasp_with_tcp_offset(geometry, offset)</text>
+  <text x="1292" y="962" class="body">Next cans: canonical function first; small Agent only adapts if needed.</text>
+
+  <rect x="1212" y="1010" width="516" height="28" rx="12" fill="#253954"/>
+  <text x="1470" y="1029" text-anchor="middle" font-size="12" font-weight="730" fill="#FFFFFF">novel scene → flexible code → verified repair → evolved skill</text>
+</svg>

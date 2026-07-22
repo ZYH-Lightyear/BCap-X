@@ -79,8 +79,14 @@ _RETRYABLE_STATUS = (404, 429, 500, 502, 503, 504)
 
 
 def _post_with_retries(
-    server_url: str, headers: dict[str, str], payload: dict[str, Any]
-) -> "requests.Response":
+    server_url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    *,
+    request_timeout_s: float = REQUEST_TIMEOUT,
+    max_retries: int = MAX_RETRIES,
+    deadline_monotonic_s: float | None = None,
+) -> requests.Response:
     """POST 到 LLM 端点,对网络异常与可重试状态码做有上限的指数退避重试。
 
     旧实现只在收到特定状态码时重试,``ReadTimeout`` / ``ConnectionError`` 等异常会直接
@@ -89,28 +95,56 @@ def _post_with_retries(
 
     last_exc: Exception | None = None
     response: requests.Response | None = None
-    for attempt in range(MAX_RETRIES):
+    if request_timeout_s <= 0 or max_retries < 1:
+        raise ValueError("request timeout and retry count must be positive")
+    for attempt in range(max_retries):
+        remaining = (
+            None if deadline_monotonic_s is None else deadline_monotonic_s - time.monotonic()
+        )
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError("LLM request deadline expired before HTTP entry")
+        timeout = request_timeout_s if remaining is None else min(request_timeout_s, remaining)
         try:
             response = requests.post(
-                server_url, headers=headers, data=json.dumps(payload), timeout=REQUEST_TIMEOUT
+                server_url, headers=headers, data=json.dumps(payload), timeout=timeout
             )
         except requests.exceptions.RequestException as exc:
             last_exc = exc
-            sleep_time = min(60.0, 5.0 * (2 ** attempt)) + random.uniform(0, 5)
-            print(f"[query_model] 请求异常 {exc!r};{attempt + 1}/{MAX_RETRIES} 次,"
-                  f"{sleep_time:.0f}s 后重试…")
+            if attempt + 1 >= max_retries:
+                continue
+            sleep_time = min(60.0, 5.0 * (2**attempt)) + random.uniform(0, 5)
+            sleep_time = _bounded_retry_sleep(sleep_time, deadline_monotonic_s)
+            print(
+                f"[query_model] 请求异常 {exc!r};{attempt + 1}/{max_retries} 次,"
+                f"{sleep_time:.0f}s 后重试…"
+            )
             time.sleep(sleep_time)
             continue
         if response.status_code in _RETRYABLE_STATUS:
-            sleep_time = min(60.0, 5.0 * (2 ** attempt)) + random.uniform(0, 5)
-            print(f"[query_model] 状态码 {response.status_code}: {response.text[:200]};"
-                  f"{attempt + 1}/{MAX_RETRIES} 次,{sleep_time:.0f}s 后重试…")
+            if attempt + 1 >= max_retries:
+                continue
+            sleep_time = min(60.0, 5.0 * (2**attempt)) + random.uniform(0, 5)
+            sleep_time = _bounded_retry_sleep(sleep_time, deadline_monotonic_s)
+            print(
+                f"[query_model] 状态码 {response.status_code}: {response.text[:200]};"
+                f"{attempt + 1}/{max_retries} 次,{sleep_time:.0f}s 后重试…"
+            )
             time.sleep(sleep_time)
             continue
         return response
     if response is not None:
         return response  # 用尽重试仍是坏状态码:交给 raise_for_status 报错
     raise last_exc if last_exc is not None else RuntimeError("query_model: 重试用尽且无响应")
+
+
+def _bounded_retry_sleep(requested_s: float, deadline_monotonic_s: float | None) -> float:
+    if deadline_monotonic_s is None:
+        return requested_s
+    remaining = deadline_monotonic_s - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("LLM request deadline expired before retry")
+    return min(requested_s, remaining)
+
 
 # ---------------------------------------------------------------------------
 # Ensemble configuration
@@ -146,9 +180,12 @@ class ModelQueryArgs:
     max_tokens: int = 4096
     reasoning_effort: str | None = None
     debug: bool = False
+    request_timeout_s: float | None = None
+    max_retries: int | None = None
+    deadline_monotonic_s: float | None = None
 
 
-def _build_chat_payload(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> dict[str, Any]:
+def _build_chat_payload(args: LaunchArgs | ModelQueryArgs, prompt: list[dict]) -> dict[str, Any]:
     """Build one provider-neutral OpenAI-compatible proxy request.
 
     Model prefixes are opaque routing keys here. The local proxy strips them and
@@ -233,7 +270,7 @@ def _completions_to_responses_convert_prompt(prompt: list[dict]) -> list[dict]:
 
     for message in prompt:
         for content in message["content"]:
-            if type(content) == str:
+            if isinstance(content, str):
                 continue
             if content.get("type") == "text":
                 content["type"] = "input_text"
@@ -289,9 +326,7 @@ def _write_raw_llm_log(
     (path / name).write_text(json.dumps(record, ensure_ascii=False, indent=2))
 
 
-def query_model(
-    args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]
-) -> dict[str, Any]:
+def query_model(args: LaunchArgs | ModelQueryArgs, prompt: list[dict]) -> dict[str, Any]:
     """Query vLLM server for code generation.
 
     Args:
@@ -311,7 +346,16 @@ def query_model(
     start_time = time.time()
 
     # 网络异常 + 可重试状态码都走有上限的指数退避(见 _post_with_retries)。
-    response = _post_with_retries(server_url, headers, payload)
+    request_timeout_s = getattr(args, "request_timeout_s", None)
+    max_retries = getattr(args, "max_retries", None)
+    response = _post_with_retries(
+        server_url,
+        headers,
+        payload,
+        request_timeout_s=(REQUEST_TIMEOUT if request_timeout_s is None else request_timeout_s),
+        max_retries=(MAX_RETRIES if max_retries is None else max_retries),
+        deadline_monotonic_s=getattr(args, "deadline_monotonic_s", None),
+    )
 
     end_time = time.time()
     print(f"Time taken to query model: {end_time - start_time:.2f} seconds")
@@ -350,7 +394,7 @@ def query_model(
 
 
 def query_model_streaming(
-    args: "LaunchArgs | ModelQueryArgs",
+    args: LaunchArgs | ModelQueryArgs,
     prompt: list[dict],
 ) -> Iterable[dict]:
     """Query model with streaming enabled, yielding partial responses.
@@ -397,7 +441,9 @@ def query_model_streaming(
         # If it's a regular JSON response (server doesn't support streaming),
         # fall back to non-streaming behavior
         if is_json and not is_sse:
-            print("Warning: Server returned JSON instead of SSE stream, falling back to non-streaming")
+            print(
+                "Warning: Server returned JSON instead of SSE stream, falling back to non-streaming"
+            )
             body = response.json()
             try:
                 full_content = body["choices"][0]["message"]["content"]
@@ -416,7 +462,9 @@ def query_model_streaming(
                 "reasoning": full_reasoning if full_reasoning else None,
             }
             end_time = time.time()
-            print(f"Time taken to query model (streaming fallback): {end_time - start_time:.2f} seconds")
+            print(
+                f"Time taken to query model (streaming fallback): {end_time - start_time:.2f} seconds"
+            )
             return
 
         for line in response.iter_lines():
@@ -483,10 +531,10 @@ def query_model_streaming(
 
 
 def query_model_ensemble(
-    args: "LaunchArgs | ModelQueryArgs",
+    args: LaunchArgs | ModelQueryArgs,
     prompt: list[dict],
     synthesis_model: str = "openrouter/qwen/qwen3.6-plus",
-    is_multiturn = False
+    is_multiturn=False,
 ) -> dict[str, Any]:
     """Query 9 models (3 models x 3 temperatures) and synthesize final output."""
 
@@ -515,7 +563,7 @@ def query_model_ensemble(
         for future in concurrent.futures.as_completed(futures):
             resp = future.result()
             responses.append(resp)
-            if resp['ok']:
+            if resp["ok"]:
                 print(f"[Multimodel Ensemble] {resp['model']} temp={resp['temp']} ok={resp['ok']}")
 
     successful = [r for r in responses if r["ok"]]
@@ -537,13 +585,16 @@ def query_model_ensemble(
                 original_text += c
 
     candidates = "\n\n".join(
-        f"--- Candidate ({r['model']}, temp={r['temp']}) ---\n{r['content']}"
-        for r in successful
+        f"--- Candidate ({r['model']}, temp={r['temp']}) ---\n{r['content']}" for r in successful
     )
 
     # Detect if this is a multiturn decision (candidates contain REGENERATE/FINISH)
-    regenerate_count = sum(1 for r in successful if isinstance(r.get("content"), str) and "REGENERATE" in r["content"])
-    finish_count = sum(1 for r in successful if isinstance(r.get("content"), str) and "FINISH" in r["content"])
+    regenerate_count = sum(
+        1 for r in successful if isinstance(r.get("content"), str) and "REGENERATE" in r["content"]
+    )
+    finish_count = sum(
+        1 for r in successful if isinstance(r.get("content"), str) and "FINISH" in r["content"]
+    )
 
     if is_multiturn:
         synthesis_system_prompt = f"""You are synthesizing {len(successful)} candidate responses for a multi-turn robot control task.
@@ -616,12 +667,12 @@ def query_model_ensemble(
 
     # Build text content for saving
     candidates_txt = "\n\n".join(
-        f"{'='*60}\nModel: {r['model']}\nTemperature: {r['temp']}\nSuccess: {r['ok']}\n{'='*60}\n{r['content']}"
+        f"{'=' * 60}\nModel: {r['model']}\nTemperature: {r['temp']}\nSuccess: {r['ok']}\n{'=' * 60}\n{r['content']}"
         for r in responses
     )
     synthesis_txt = f"Model: {synthesis_model}\n\n"
-    synthesis_txt += f"{'='*60}\nREASONING\n{'='*60}\n{final.get('reasoning') or '(none)'}\n\n"
-    synthesis_txt += f"{'='*60}\nOUTPUT\n{'='*60}\n{final['content']}"
+    synthesis_txt += f"{'=' * 60}\nREASONING\n{'=' * 60}\n{final.get('reasoning') or '(none)'}\n\n"
+    synthesis_txt += f"{'=' * 60}\nOUTPUT\n{'=' * 60}\n{final['content']}"
 
     return {
         "content": final["content"],
@@ -633,10 +684,10 @@ def query_model_ensemble(
 
 
 def query_single_model_ensemble(
-    args: "LaunchArgs | ModelQueryArgs",
+    args: LaunchArgs | ModelQueryArgs,
     prompt: list[dict],
     model: str,
-    is_multiturn = False,
+    is_multiturn=False,
 ) -> dict[str, Any]:
     """Query the same model 9 times (with temperatures 0.1 to 0.9) and synthesize final output.
 
@@ -674,8 +725,10 @@ def query_single_model_ensemble(
         for future in concurrent.futures.as_completed(futures):
             resp = future.result()
             responses.append(resp)
-            if resp['ok']:
-                print(f"[Single Model Ensemble] {resp['model']} temp={resp['temp']} ok={resp['ok']}")
+            if resp["ok"]:
+                print(
+                    f"[Single Model Ensemble] {resp['model']} temp={resp['temp']} ok={resp['ok']}"
+                )
 
     successful = [r for r in responses if r["ok"]]
     if not successful:
@@ -696,13 +749,16 @@ def query_single_model_ensemble(
                 original_text += c
 
     candidates = "\n\n".join(
-        f"--- Candidate (temp={r['temp']}) ---\n{r['content']}"
-        for r in successful
+        f"--- Candidate (temp={r['temp']}) ---\n{r['content']}" for r in successful
     )
 
     # Detect if this is a multiturn decision (candidates contain REGENERATE/FINISH)
-    regenerate_count = sum(1 for r in successful if isinstance(r.get("content"), str) and "REGENERATE" in r["content"])
-    finish_count = sum(1 for r in successful if isinstance(r.get("content"), str) and "FINISH" in r["content"])
+    regenerate_count = sum(
+        1 for r in successful if isinstance(r.get("content"), str) and "REGENERATE" in r["content"]
+    )
+    finish_count = sum(
+        1 for r in successful if isinstance(r.get("content"), str) and "FINISH" in r["content"]
+    )
 
     if is_multiturn:
         synthesis_system_prompt = f"""You are synthesizing {len(successful)} candidate responses for a multi-turn robot control task.
@@ -722,7 +778,7 @@ def query_single_model_ensemble(
     - You may include brief reasoning first
     - Then output "REGENERATE" on its own line followed by exactly ONE fenced code block, OR output "FINISH" on its own line
     """
-    else: # first generation has no REGEN/FINISH candidates
+    else:  # first generation has no REGEN/FINISH candidates
         synthesis_system_prompt = f"""You are synthesizing {len(successful)} candidate Python solutions into one optimal program.
 
     SYNTHESIS RULES:
@@ -776,12 +832,12 @@ def query_single_model_ensemble(
 
     # Build text content for saving
     candidates_txt = "\n\n".join(
-        f"{'='*60}\nModel: {r['model']}\nTemperature: {r['temp']}\nSuccess: {r['ok']}\n{'='*60}\n{r['content']}"
+        f"{'=' * 60}\nModel: {r['model']}\nTemperature: {r['temp']}\nSuccess: {r['ok']}\n{'=' * 60}\n{r['content']}"
         for r in responses
     )
     synthesis_txt = f"Model: {model}\n\n"
-    synthesis_txt += f"{'='*60}\nREASONING\n{'='*60}\n{final.get('reasoning') or '(none)'}\n\n"
-    synthesis_txt += f"{'='*60}\nOUTPUT\n{'='*60}\n{final['content']}"
+    synthesis_txt += f"{'=' * 60}\nREASONING\n{'=' * 60}\n{final.get('reasoning') or '(none)'}\n\n"
+    synthesis_txt += f"{'=' * 60}\nOUTPUT\n{'=' * 60}\n{final['content']}"
 
     return {
         "content": final["content"],
