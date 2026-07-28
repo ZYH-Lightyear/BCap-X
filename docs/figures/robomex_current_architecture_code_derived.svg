@@ -1,0 +1,376 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2200" height="1500" viewBox="0 0 2200 1500" role="img" aria-labelledby="title desc">
+  <title id="title">RoboMEx current architecture — code-derived three-time-scale agent swarm</title>
+  <desc id="desc">The left side presents the high-level Planner, Manager, Agent Swarm, Selector, Executor, Environment and AgentWorld feedback loop. The right side maps that design to the current RoboMEx source modules and highlights incomplete wiring.</desc>
+  <defs>
+    <linearGradient id="headerGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#17243d"/>
+      <stop offset="52%" stop-color="#233b67"/>
+      <stop offset="100%" stop-color="#245b78"/>
+    </linearGradient>
+    <linearGradient id="swarmGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f1edff"/>
+      <stop offset="100%" stop-color="#e7f3ff"/>
+    </linearGradient>
+    <filter id="shadow" x="-15%" y="-15%" width="130%" height="140%">
+      <feDropShadow dx="0" dy="5" stdDeviation="6" flood-color="#17243d" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrowBlue" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#2f6feb"/>
+    </marker>
+    <marker id="arrowPurple" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#7357d8"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#238a63"/>
+    </marker>
+    <marker id="arrowAmber" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#cf7a18"/>
+    </marker>
+    <marker id="arrowGray" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#7b879b"/>
+    </marker>
+    <style>
+      .title { font: 700 34px Inter, "Noto Sans SC", "Microsoft YaHei", sans-serif; fill: #ffffff; }
+      .subtitle { font: 400 16px Inter, "Noto Sans SC", "Microsoft YaHei", sans-serif; fill: #dbe8f6; }
+      .panel-title { font: 700 19px Inter, "Noto Sans SC", "Microsoft YaHei", sans-serif; fill: #17243d; letter-spacing: 1px; }
+      .section { font: 700 17px Inter, "Noto Sans SC", "Microsoft YaHei", sans-serif; fill: #17243d; }
+      .label { font: 650 15px Inter, "Noto Sans SC", "Microsoft YaHei", sans-serif; fill: #17243d; }
+      .body { font: 400 13.5px Inter, "Noto Sans SC", "Microsoft YaHei", sans-serif; fill: #39485f; }
+      .small { font: 400 12px Inter, "Noto Sans SC", "Microsoft YaHei", sans-serif; fill: #526077; }
+      .tiny { font: 400 11px Inter, "Noto Sans SC", "Microsoft YaHei", sans-serif; fill: #526077; }
+      .mono { font: 500 12px "SFMono-Regular", Consolas, monospace; fill: #30415d; }
+      .white-mono { font: 500 12px "SFMono-Regular", Consolas, monospace; fill: #ffffff; }
+      .white-label { font: 650 15px Inter, "Noto Sans SC", "Microsoft YaHei", sans-serif; fill: #ffffff; }
+      .white-small { font: 400 12px Inter, "Noto Sans SC", "Microsoft YaHei", sans-serif; fill: #eef5ff; }
+      .badge { font: 700 10.5px Inter, "Noto Sans SC", "Microsoft YaHei", sans-serif; letter-spacing: .5px; }
+      .box { fill: #ffffff; stroke: #cbd5e4; stroke-width: 1.4; rx: 12; }
+      .wired { fill: #eef5ff; stroke: #6e9ee8; stroke-width: 1.5; rx: 12; }
+      .agent { fill: #f5f1ff; stroke: #9b83e6; stroke-width: 1.4; rx: 10; }
+      .physical { fill: #ecf8f3; stroke: #57ab89; stroke-width: 1.5; rx: 12; }
+      .partial { fill: #fff8e8; stroke: #e0a34b; stroke-width: 1.5; rx: 10; }
+      .gap { fill: #fff0ef; stroke: #dc706b; stroke-width: 1.5; rx: 10; }
+      .legacy { fill: #f1f3f6; stroke: #9aa5b5; stroke-width: 1.3; rx: 10; }
+      .line-blue { fill: none; stroke: #2f6feb; stroke-width: 2.3; marker-end: url(#arrowBlue); }
+      .line-purple { fill: none; stroke: #7357d8; stroke-width: 2.3; marker-end: url(#arrowPurple); }
+      .line-green { fill: none; stroke: #238a63; stroke-width: 2.3; marker-end: url(#arrowGreen); }
+      .line-amber { fill: none; stroke: #cf7a18; stroke-width: 2.1; stroke-dasharray: 7 5; marker-end: url(#arrowAmber); }
+      .line-gray { fill: none; stroke: #7b879b; stroke-width: 1.9; stroke-dasharray: 7 5; marker-end: url(#arrowGray); }
+    </style>
+  </defs>
+
+  <rect width="2200" height="1500" fill="#f5f7fb"/>
+  <rect width="2200" height="78" fill="url(#headerGrad)"/>
+  <text id="svg-title" x="34" y="42" class="title">RoboMEx 当前架构｜Code-derived Agent Swarm</text>
+  <text x="34" y="65" class="subtitle">当前工作树 • 三时间尺度闭环 • 实线 = 已接通　虚线 = 部分/待接通　红色 = 关键实现缺口</text>
+  <text x="2160" y="42" text-anchor="end" class="subtitle">2026-07-24</text>
+
+  <!-- Main panels -->
+  <rect x="24" y="98" width="708" height="1374" rx="18" fill="#ffffff" stroke="#d8dfeb" filter="url(#shadow)"/>
+  <rect x="754" y="98" width="1422" height="1374" rx="18" fill="#ffffff" stroke="#d8dfeb" filter="url(#shadow)"/>
+  <text x="50" y="132" class="panel-title">HIGH-LEVEL DESIGN</text>
+  <text x="780" y="132" class="panel-title">CODE-LEVEL DESIGN — 当前 <tspan class="mono">--engine swarm</tspan> 实际路径</text>
+  <line x1="50" y1="145" x2="706" y2="145" stroke="#e1e6ef"/>
+  <line x1="780" y1="145" x2="2148" y2="145" stroke="#e1e6ef"/>
+
+  <!-- LEFT: scale rails -->
+  <rect x="50" y="170" width="10" height="247" rx="5" fill="#2f6feb"/>
+  <rect x="50" y="437" width="10" height="470" rx="5" fill="#7357d8"/>
+  <rect x="50" y="927" width="10" height="456" rx="5" fill="#238a63"/>
+  <text x="70" y="190" class="badge" fill="#2f6feb">TASK SCALE</text>
+  <text x="70" y="457" class="badge" fill="#7357d8">INTENT SCALE</text>
+  <text x="70" y="947" class="badge" fill="#238a63">ACTION SCALE</text>
+
+  <!-- LEFT: task + planner -->
+  <rect x="105" y="170" width="570" height="68" class="wired"/>
+  <text x="390" y="196" text-anchor="middle" class="label">Task Language</text>
+  <text x="390" y="219" text-anchor="middle" class="body">自然语言任务 + episode history</text>
+  <path d="M390 238 L390 258" class="line-blue"/>
+
+  <rect x="105" y="260" width="570" height="112" class="wired"/>
+  <rect x="119" y="274" width="98" height="22" rx="11" fill="#2f6feb"/>
+  <text x="168" y="289" text-anchor="middle" class="badge" fill="#ffffff">PLANNER</text>
+  <text x="390" y="316" text-anchor="middle" class="section">Reactive Planner（VLM Agent）</text>
+  <text x="390" y="340" text-anchor="middle" class="body">一次只提出一个细粒度 embodied ActionIntent</text>
+  <text x="390" y="360" text-anchor="middle" class="small">不写 Graph / pose / trajectory / Python</text>
+  <path d="M390 372 L390 390" class="line-blue"/>
+
+  <rect x="175" y="392" width="430" height="52" rx="26" fill="#e7efff" stroke="#84a8e9"/>
+  <text x="390" y="414" text-anchor="middle" class="label">ActionIntent</text>
+  <text x="390" y="433" text-anchor="middle" class="small">instruction + expected_effect + world revision</text>
+  <path d="M390 444 L390 474" class="line-purple"/>
+
+  <!-- LEFT: manager -->
+  <rect x="105" y="476" width="570" height="116" class="agent"/>
+  <rect x="119" y="490" width="106" height="22" rx="11" fill="#7357d8"/>
+  <text x="172" y="505" text-anchor="middle" class="badge" fill="#ffffff">META-AGENT</text>
+  <text x="390" y="533" text-anchor="middle" class="section">Swarm Manager</text>
+  <text x="390" y="557" text-anchor="middle" class="body">围绕当前 Intent 自主组织角色、模型、Skill、依赖与预算</text>
+  <text x="390" y="578" text-anchor="middle" class="small">同一 Intent 内观察执行结果后可重组；完成/放弃才唤醒 Planner</text>
+  <path d="M390 592 L390 615" class="line-purple"/>
+
+  <!-- LEFT: graph as swarm implementation -->
+  <rect x="105" y="617" width="570" height="286" rx="15" fill="url(#swarmGrad)" stroke="#8d83d7" stroke-width="1.5"/>
+  <text x="125" y="645" class="section">Dynamic Agent Swarm</text>
+  <text x="655" y="644" text-anchor="end" class="small">Graph = 生命周期 / 依赖 / 数据流 / 并发</text>
+
+  <rect x="126" y="670" width="156" height="68" class="agent"/>
+  <text x="204" y="694" text-anchor="middle" class="label">Grounding /</text>
+  <text x="204" y="715" text-anchor="middle" class="label">Perception Agent</text>
+
+  <rect x="311" y="670" width="156" height="68" class="agent"/>
+  <text x="389" y="694" text-anchor="middle" class="label">Affordance</text>
+  <text x="389" y="715" text-anchor="middle" class="label">Agent</text>
+
+  <rect x="496" y="670" width="156" height="68" class="agent"/>
+  <text x="574" y="694" text-anchor="middle" class="label">Evidence /</text>
+  <text x="574" y="715" text-anchor="middle" class="label">Verification Agent</text>
+
+  <path d="M282 704 L307 704" class="line-purple"/>
+  <path d="M467 704 L492 704" class="line-purple"/>
+
+  <rect x="168" y="774" width="190" height="74" class="agent"/>
+  <text x="263" y="798" text-anchor="middle" class="label">Motion Agent A</text>
+  <text x="263" y="820" text-anchor="middle" class="small">strategy / code A</text>
+  <text x="263" y="838" text-anchor="middle" class="tiny">candidate A</text>
+
+  <rect x="423" y="774" width="190" height="74" class="agent"/>
+  <text x="518" y="798" text-anchor="middle" class="label">Motion Agent B</text>
+  <text x="518" y="820" text-anchor="middle" class="small">strategy / code B</text>
+  <text x="518" y="838" text-anchor="middle" class="tiny">candidate B</text>
+
+  <path d="M389 738 C389 755 263 751 263 770" class="line-purple"/>
+  <path d="M389 738 C389 755 518 751 518 770" class="line-purple"/>
+  <rect x="175" y="864" width="430" height="24" rx="12" fill="#7357d8"/>
+  <text x="390" y="880" text-anchor="middle" class="white-small">Coding Agents 写代码 + 调用 read-only Cap-X 工具 → 候选</text>
+
+  <path d="M390 903 L390 928" class="line-green"/>
+
+  <!-- LEFT: imagination + selector -->
+  <rect x="105" y="930" width="570" height="112" class="partial"/>
+  <text x="125" y="956" class="section">Candidate Arena + Action Imagination + Selector</text>
+  <text x="125" y="980" class="body">理想语义：比较真实 IK gripper overlay 与 3D trajectory render</text>
+  <text x="125" y="1002" class="body">选择唯一 candidate；所有影子渲染均无 physical authority</text>
+  <rect x="510" y="1010" width="145" height="20" rx="10" fill="#f4c46b"/>
+  <text x="582" y="1024" text-anchor="middle" class="badge" fill="#70430a">当前未接 imagination</text>
+  <path d="M390 1042 L390 1068" class="line-green"/>
+
+  <rect x="105" y="1070" width="570" height="98" class="physical"/>
+  <text x="390" y="1097" text-anchor="middle" class="section">Deterministic Gates → Single Physical Executor</text>
+  <text x="390" y="1121" text-anchor="middle" class="body">只能执行 Selector 已选择的一条 motion / gripper / wait candidate</text>
+  <text x="390" y="1143" text-anchor="middle" class="small">执行结束立刻重新观测；物理异常返回失败</text>
+  <path d="M390 1168 L390 1191" class="line-green"/>
+
+  <rect x="105" y="1193" width="270" height="92" class="physical"/>
+  <text x="240" y="1220" text-anchor="middle" class="section">LIBERO / Cap-X</text>
+  <text x="240" y="1244" text-anchor="middle" class="body">唯一真实环境</text>
+  <text x="240" y="1265" text-anchor="middle" class="small">joint path / gripper / wait</text>
+
+  <rect x="405" y="1193" width="270" height="92" class="wired"/>
+  <text x="540" y="1220" text-anchor="middle" class="section">AgentWorld</text>
+  <text x="540" y="1244" text-anchor="middle" class="body">最新 RGB-D + robot state</text>
+  <text x="540" y="1265" text-anchor="middle" class="small">revision-pinned role views</text>
+  <path d="M375 1239 L401 1239" class="line-blue"/>
+
+  <path d="M540 1193 C540 1168 695 1177 695 1110 C695 1015 700 760 675 542" class="line-purple"/>
+  <text x="699" y="853" class="small" transform="rotate(-90 699 853)">同一 Intent：新 observation → Manager 再决策</text>
+  <path d="M105 1241 C79 1241 80 544 101 544" class="line-purple"/>
+  <text x="78" y="910" class="small" transform="rotate(-90 78 910)">执行失败 / 候选失败 → Manager 重组 Swarm</text>
+  <path d="M105 531 C80 531 78 315 101 315" class="line-blue"/>
+  <text x="80" y="421" class="small" transform="rotate(-90 80 421)">Intent terminal → Planner</text>
+
+  <rect x="105" y="1310" width="570" height="105" class="box"/>
+  <text x="125" y="1337" class="section">核心方法定义</text>
+  <text x="125" y="1362" class="body">Agent Swarm 是 policy reasoning layer；Code 是 VLM 到机器人 API 的</text>
+  <text x="125" y="1383" class="body">中间 action language；Graph 只承载组织与执行，不是第二个大脑。</text>
+  <text x="125" y="1404" class="small">一个真实动作发生后，世界变化必须先进入 AgentWorld，再继续决策。</text>
+
+  <!-- RIGHT: CLI and branch -->
+  <rect x="780" y="164" width="1368" height="92" class="box"/>
+  <text x="802" y="190" class="section">1｜入口与装配</text>
+  <rect x="802" y="202" width="343" height="38" rx="9" fill="#17243d"/>
+  <text x="973" y="226" text-anchor="middle" class="white-mono">robomex run --engine swarm</text>
+  <path d="M1145 221 L1201 221" class="line-blue"/>
+  <rect x="1205" y="202" width="352" height="38" class="wired"/>
+  <text x="1381" y="226" text-anchor="middle" class="mono">build_swarm_episode()</text>
+  <path d="M1557 221 L1611 221" class="line-gray"/>
+  <rect x="1615" y="193" width="511" height="56" class="legacy"/>
+  <text x="1635" y="215" class="label">classic 分支仍存在且目前是 CLI 默认值</text>
+  <text x="1635" y="236" class="small">ActionEpisodeOrchestrator（旧 AW4/Graph 路径）</text>
+
+  <!-- RIGHT: substrate -->
+  <rect x="780" y="276" width="1368" height="142" class="wired"/>
+  <text x="802" y="303" class="section">2｜复用的 LIBERO Substrate</text>
+  <text x="802" y="325" class="mono">robomex/libero_app.py :: build_libero_substrate()</text>
+  <rect x="802" y="340" width="200" height="54" class="box"/>
+  <text x="902" y="362" text-anchor="middle" class="label">LIBERO Env</text>
+  <text x="902" y="381" text-anchor="middle" class="small">initial RGB-D / task</text>
+  <rect x="1017" y="340" width="248" height="54" class="box"/>
+  <text x="1141" y="362" text-anchor="middle" class="label">EpisodeDataPlane</text>
+  <text x="1141" y="381" text-anchor="middle" class="small">evidence / revision / artifacts</text>
+  <rect x="1280" y="340" width="206" height="54" class="box"/>
+  <text x="1383" y="362" text-anchor="middle" class="label">AgentWorld</text>
+  <text x="1383" y="381" text-anchor="middle" class="small">current() / role view()</text>
+  <rect x="1501" y="340" width="264" height="54" class="box"/>
+  <text x="1633" y="362" text-anchor="middle" class="label">CapX Action Backend</text>
+  <text x="1633" y="381" text-anchor="middle" class="small">env binding / low-level guards</text>
+  <rect x="1780" y="330" width="346" height="74" class="partial"/>
+  <text x="1798" y="352" class="label">已构建但新 Swarm 主链未消费</text>
+  <text x="1798" y="372" class="small">ImaginationRenderer / SkillCodingAgentProvider</text>
+  <text x="1798" y="390" class="small">ArenaCodingProvider / CapXFeasibilityChecker</text>
+
+  <!-- RIGHT: Planner -->
+  <rect x="780" y="438" width="390" height="274" class="wired"/>
+  <text x="802" y="466" class="section">3｜Task-scale Planner</text>
+  <text x="802" y="488" class="mono">swarm/policy_adapters.py</text>
+  <rect x="802" y="506" width="346" height="72" class="box"/>
+  <text x="819" y="528" class="label">CompletionIntentPlanner</text>
+  <text x="819" y="549" class="small">输入：task + completed IntentOutcome</text>
+  <text x="819" y="568" class="small">LLM 输出：instruction + expected_effect / done</text>
+  <path d="M975 578 L975 599" class="line-blue"/>
+  <rect x="802" y="601" width="346" height="49" rx="10" fill="#e7efff" stroke="#84a8e9"/>
+  <text x="975" y="622" text-anchor="middle" class="label">ActionIntent</text>
+  <text x="975" y="641" text-anchor="middle" class="tiny">随后用 current digest / sequence 绑定</text>
+  <rect x="802" y="662" width="346" height="36" class="gap"/>
+  <text x="975" y="685" text-anchor="middle" class="small" fill="#a03936">缺口：Planner prompt 尚未包含多模态 AgentWorld</text>
+
+  <!-- RIGHT: Manager -->
+  <rect x="1190" y="438" width="492" height="274" class="agent"/>
+  <text x="1212" y="466" class="section">4｜Intent-scale Meta-Agent</text>
+  <text x="1212" y="488" class="mono">swarm/manager.py :: SwarmManager.next()</text>
+  <text x="1212" y="518" class="label">Manager 输入</text>
+  <text x="1212" y="540" class="body">• current Manager AgentWorldView（JSON + artifact refs）</text>
+  <text x="1212" y="561" class="body">• ActionIntent + skill catalog + available models</text>
+  <text x="1212" y="582" class="body">• prior failure signatures + attempt budget</text>
+  <text x="1212" y="614" class="label">自主控制边界</text>
+  <text x="1212" y="636" class="body">LLM 自主决定角色、目标、并发/依赖、策略差异</text>
+  <text x="1212" y="657" class="body">不输出代码 / pose / raw Graph / 物理命令</text>
+  <text x="1212" y="686" class="small">early stop：max_attempts=4；重复 signature=2</text>
+
+  <!-- RIGHT: SwarmConfig -->
+  <rect x="1702" y="438" width="446" height="274" class="box"/>
+  <text x="1724" y="466" class="section">5｜唯一声明式组织对象</text>
+  <text x="1724" y="488" class="mono">swarm/config.py :: SwarmConfig</text>
+  <text x="1724" y="518" class="body">roles[]</text>
+  <text x="1743" y="540" class="small">id · kind · objective · model · skills</text>
+  <text x="1743" y="560" class="small">capabilities · depends_on · policy_hint</text>
+  <text x="1743" y="580" class="small">produces_candidates · stop_condition</text>
+  <text x="1724" y="607" class="body">selector · budget · source · parent_config_id</text>
+  <text x="1724" y="635" class="label">确定性结构校验</text>
+  <text x="1724" y="657" class="small">known model/skill · unique roles · acyclic DAG</text>
+  <text x="1724" y="677" class="small">≥1 motion producer · sealed config digest</text>
+  <rect x="1724" y="686" width="399" height="18" rx="9" fill="#eee9ff"/>
+  <text x="1923" y="699" text-anchor="middle" class="tiny">seed / mutation / crossover 仅为 AW5 接口占位，尚无演化循环</text>
+
+  <!-- Connections planner manager config -->
+  <path d="M1170 605 L1186 605" class="line-blue"/>
+  <path d="M1682 575 L1698 575" class="line-purple"/>
+
+  <!-- RIGHT: Runtime -->
+  <rect x="780" y="734" width="1368" height="333" rx="14" fill="#f8f6ff" stroke="#9b8de0" stroke-width="1.4"/>
+  <text x="802" y="762" class="section">6｜Action-scale Graph Runtime（解释 SwarmConfig，不参与语义思考）</text>
+  <text x="802" y="784" class="mono">swarm/runtime.py :: dependency layers + asyncio.gather</text>
+
+  <rect x="802" y="807" width="430" height="227" class="box"/>
+  <text x="822" y="833" class="label">SwarmRuntime：DAG → dependency layers</text>
+  <rect x="824" y="857" width="116" height="49" class="agent"/>
+  <text x="882" y="877" text-anchor="middle" class="small">Grounding</text>
+  <text x="882" y="895" text-anchor="middle" class="tiny">role view</text>
+  <rect x="958" y="857" width="116" height="49" class="agent"/>
+  <text x="1016" y="877" text-anchor="middle" class="small">Perception</text>
+  <text x="1016" y="895" text-anchor="middle" class="tiny">parallel</text>
+  <path d="M940 881 L954 881" class="line-purple"/>
+  <rect x="1092" y="857" width="116" height="49" class="agent"/>
+  <text x="1150" y="877" text-anchor="middle" class="small">Affordance</text>
+  <text x="1150" y="895" text-anchor="middle" class="tiny">upstream</text>
+  <path d="M1074 881 L1088 881" class="line-purple"/>
+  <rect x="860" y="939" width="140" height="54" class="agent"/>
+  <text x="930" y="961" text-anchor="middle" class="small">Motion A</text>
+  <text x="930" y="980" text-anchor="middle" class="tiny">candidate producer</text>
+  <rect x="1030" y="939" width="140" height="54" class="agent"/>
+  <text x="1100" y="961" text-anchor="middle" class="small">Motion B</text>
+  <text x="1100" y="980" text-anchor="middle" class="tiny">candidate producer</text>
+  <path d="M1150 906 C1150 924 930 918 930 935" class="line-purple"/>
+  <path d="M1150 906 C1150 924 1100 918 1100 935" class="line-purple"/>
+  <text x="822" y="1020" class="tiny">每个角色获取 revision-pinned role view；上游失败则下游 fail closed</text>
+
+  <path d="M1232 919 L1251 919" class="line-purple"/>
+  <rect x="1255" y="807" width="434" height="227" class="partial"/>
+  <text x="1275" y="833" class="label">ProposalSandboxWorker（当前真实 Worker）</text>
+  <text x="1275" y="855" class="mono">swarm/libero_edges.py</text>
+  <rect x="1275" y="873" width="394" height="28" rx="8" fill="#fff"/>
+  <text x="1472" y="892" text-anchor="middle" class="small">一次 LLM completion → 一个 fenced Python block</text>
+  <path d="M1472 901 L1472 915" class="line-amber"/>
+  <rect x="1275" y="918" width="394" height="42" rx="8" fill="#fff"/>
+  <text x="1472" y="936" text-anchor="middle" class="small">IsolatedCapXProposalExecutor（read-only）</text>
+  <text x="1472" y="953" text-anchor="middle" class="tiny">禁止 env.step；运行代码并读取全局 RESULT</text>
+  <path d="M1472 960 L1472 974" class="line-amber"/>
+  <rect x="1275" y="977" width="394" height="35" rx="8" fill="#fff"/>
+  <text x="1472" y="999" text-anchor="middle" class="small">RESULT dict → ActionCandidate</text>
+  <rect x="1275" y="1018" width="394" height="10" rx="5" fill="#e0a34b"/>
+
+  <path d="M1689 919 L1708 919" class="line-purple"/>
+  <rect x="1712" y="807" width="414" height="227" class="box"/>
+  <text x="1732" y="833" class="label">RoleResult / Candidate Arena（内存）</text>
+  <text x="1732" y="856" class="small">候选类型：motion / gripper / wait</text>
+  <text x="1732" y="877" class="small">motion：joint_names + exact waypoints_rad</text>
+  <text x="1732" y="898" class="small">lineage：role_id + evidence_refs + digest</text>
+  <line x1="1732" y1="913" x2="2105" y2="913" stroke="#e0e5ed"/>
+  <text x="1732" y="937" class="label" fill="#a03936">当前 Worker 接线缺口</text>
+  <text x="1732" y="959" class="small">• 不是多轮 Coding Agent；无自动读 Skill / 修复循环</text>
+  <text x="1732" y="980" class="small">• role.skills / capabilities 尚未真正约束 Worker</text>
+  <text x="1732" y="1001" class="small">• support role 不能只交 evidence artifact</text>
+  <text x="1732" y="1022" class="small">• 当前每个成功 role 都被要求产生 ActionCandidate</text>
+
+  <!-- RIGHT: selector/executor/feedback -->
+  <rect x="780" y="1088" width="408" height="252" class="partial"/>
+  <text x="802" y="1115" class="section">7｜Selector</text>
+  <text x="802" y="1137" class="mono">swarm/selector.py</text>
+  <text x="802" y="1167" class="label">已实际接通</text>
+  <text x="802" y="1189" class="body">✓ JointLimitGate（名为 ik_reachable 的 proxy）</text>
+  <text x="802" y="1210" class="body">✓ TrajectoryContinuityGate</text>
+  <text x="802" y="1231" class="body">✓ UNKNOWN 惩罚 + path length tie-break</text>
+  <text x="802" y="1262" class="label" fill="#a03936">未接通</text>
+  <text x="802" y="1284" class="body">× collision / workspace gate = UNKNOWN</text>
+  <text x="802" y="1305" class="body">× renderer=None；require_imagination=False</text>
+  <text x="802" y="1326" class="small">输出唯一 chosen CandidateEvaluation</text>
+
+  <path d="M1188 1214 L1210 1214" class="line-green"/>
+  <rect x="1214" y="1088" width="428" height="252" class="physical"/>
+  <text x="1236" y="1115" class="section">8｜Single Executor + Cap-X</text>
+  <text x="1236" y="1137" class="mono">swarm/executor.py + libero_edges.py</text>
+  <text x="1236" y="1167" class="label">执行路径</text>
+  <text x="1236" y="1189" class="body">chosen candidate → final JointLimitGate</text>
+  <text x="1236" y="1210" class="body">→ execute_joint_path / set_gripper / wait</text>
+  <text x="1236" y="1231" class="body">→ capture post-action observation</text>
+  <text x="1236" y="1252" class="body">→ new AgentWorld frame → Manager</text>
+  <text x="1236" y="1283" class="label" fill="#a03936">当前物理边界</text>
+  <text x="1236" y="1305" class="small">绕过旧 Arena/Authority/完整 admission；无 WAL/lease</text>
+  <text x="1236" y="1326" class="small">仅依赖 Cap-X backend 自身低层 binding/guard</text>
+
+  <path d="M1642 1214 L1664 1214" class="line-green"/>
+  <rect x="1668" y="1088" width="480" height="252" class="wired"/>
+  <text x="1690" y="1115" class="section">9｜Observe → Verify → Loop</text>
+  <text x="1690" y="1145" class="label">AgentWorldSource</text>
+  <text x="1690" y="1167" class="body">每次 manager_view / role_view 都重绑最新 revision</text>
+  <text x="1690" y="1197" class="label">PermissiveVerifier</text>
+  <text x="1690" y="1219" class="body">当前仅把 execution.converged 当作 expected effect 成立</text>
+  <text x="1690" y="1249" class="label">控制回路</text>
+  <text x="1690" y="1271" class="body">verified → Intent complete → Planner</text>
+  <text x="1690" y="1292" class="body">failure → signature → Manager 重写 SwarmConfig</text>
+  <text x="1690" y="1318" class="small">max_intents 约束外环；attempt/repeat 约束内环</text>
+
+  <path d="M2058 1088 C2148 1080 2158 1032 2158 946 L2158 724 L1438 724 L1438 716" class="line-purple"/>
+  <text x="1845" y="719" class="tiny">new observation / attempt outcome → Manager</text>
+
+  <!-- RIGHT: observability and implementation status -->
+  <rect x="780" y="1360" width="1368" height="84" class="box"/>
+  <text x="802" y="1387" class="section">10｜Trace 与当前架构判读</text>
+  <rect x="802" y="1400" width="354" height="27" rx="7" fill="#eef5ff"/>
+  <text x="979" y="1418" text-anchor="middle" class="small">TraceEventSink → trace/events.jsonl</text>
+  <rect x="1172" y="1400" width="299" height="27" rx="7" fill="#ecf8f3"/>
+  <text x="1321" y="1418" text-anchor="middle" class="small">蓝/绿：当前新主链已接通</text>
+  <rect x="1487" y="1400" width="278" height="27" rx="7" fill="#fff8e8"/>
+  <text x="1626" y="1418" text-anchor="middle" class="small">黄：接口存在但被降级/旁路</text>
+  <rect x="1781" y="1400" width="345" height="27" rx="7" fill="#fff0ef"/>
+  <text x="1953" y="1418" text-anchor="middle" class="small">红：与设计目标存在实质实现缺口</text>
+</svg>

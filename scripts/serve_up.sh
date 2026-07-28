@@ -4,7 +4,7 @@
 #   window 0 "proxy" : OpenAI-compatible LLM proxy on :8110 (the port every client expects)
 #   window 1 "gpu"   : sam3 / graspnet / pyroki via capx.serving.launch_servers
 #   window 2 "webui" : Cap-X chat Web UI on :8200
-#   window 3 "trace" : RoboMEx Trace UI (API + static SPA) on :8300
+#   window 3 "trace" : RoboMEx Swarm Observatory on :8300
 #
 # Usage:
 #   scripts/serve_up.sh [CONFIG_YAML]
@@ -20,7 +20,7 @@
 #   LOG_DIR       per-server log directory (default: ./logs/servers)
 #   WEBUI_PORT    Cap-X web UI port        (default: 8200)
 #   TRACE_PORT    RoboMEx Trace UI port    (default: 8300)
-#   TRACE_ROOT    run scan root            (default: outputs/robomex_planner_live)
+#   TRACE_ROOT    run scan root            (default: outputs/robomex_libero_live)
 set -euo pipefail
 
 ARG="${1:-}"
@@ -72,7 +72,7 @@ KEY_FILE="${KEY_FILE:-${OPENROUTER_KEY_FILE:-.openrouterkey}}"
 LOG_DIR="${LOG_DIR:-./logs/servers}"
 WEBUI_PORT="${WEBUI_PORT:-8200}"
 TRACE_PORT="${TRACE_PORT:-8300}"
-TRACE_ROOT="${TRACE_ROOT:-outputs/robomex_planner_live}"
+TRACE_ROOT="${TRACE_ROOT:-outputs/robomex_libero_live}"
 # Virtualenv to run inside. .venv-libero is the complete env (torch + sam3 +
 # graspnet + pyroki); the bare project .venv is incomplete.
 VENV="${VENV:-.venv-libero}"
@@ -147,7 +147,7 @@ tmux new-window -t "$SESSION" -n webui
 tmux send-keys -t "$SESSION:webui" \
     "$PREP && python -m capx.web.server --host 0.0.0.0 --port $WEBUI_PORT" C-m
 
-# RoboMEx Trace UI: build SPA if missing, then serve API + static on TRACE_PORT.
+# Swarm Observatory: build SPA if missing, then serve read-only API + static UI.
 # Access from your laptop via http://<server-ip>:$TRACE_PORT (not localhost).
 TRACE_BOOT='if [ ! -f robomex-ui/dist/index.html ]; then'
 TRACE_BOOT+=' if command -v npm >/dev/null 2>&1; then'
@@ -155,7 +155,7 @@ TRACE_BOOT+=' (cd robomex-ui && npm install --no-fund --no-audit && npm run buil
 TRACE_BOOT+=' else echo "WARN: robomex-ui/dist missing and npm not found"; fi; fi'
 tmux new-window -t "$SESSION" -n trace
 tmux send-keys -t "$SESSION:trace" \
-    "$PREP && $TRACE_BOOT && $RUN python -m robomex.web --host 0.0.0.0 --port $TRACE_PORT --root $TRACE_ROOT" C-m
+    "$PREP && $TRACE_BOOT && $RUN robomex ui --host 0.0.0.0 --port $TRACE_PORT --root $TRACE_ROOT" C-m
 
 # Wait for the LLM proxy to accept connections (the GPU launcher waits on its own ports).
 echo -n "waiting for LLM proxy on :$LLM_PORT "
@@ -175,7 +175,7 @@ echo
 echo "services starting in tmux session '$SESSION'"
 echo "  LLM proxy:   :$LLM_PORT -> $LLM_BASE_URL"
 echo "  Cap-X WebUI: :$WEBUI_PORT -> http://$HOST_IP:$WEBUI_PORT"
-echo "  Trace UI:    :$TRACE_PORT -> http://$HOST_IP:$TRACE_PORT"
+echo "  Observatory: :$TRACE_PORT -> http://$HOST_IP:$TRACE_PORT"
 echo "  LIBERO config: $CONFIG"
 echo "  attach: tmux attach -t $SESSION   (Ctrl-b d to detach, Ctrl-b n to switch window)"
 echo "  stop:   scripts/serve_down.sh"

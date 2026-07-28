@@ -1,6 +1,8 @@
-# RoboMEx Trace UI
+# RoboMEx Swarm Observatory
 
-独立的前后端分离 Trace Explorer：只读投影 RoboMEx run 产物，并通过 SSE 尾随 `events.jsonl`。
+独立、常驻、只读的 Agent Swarm 可观测界面。它以 ActionIntent 为主导航，
+展示 Planner、Manager、真实 Swarm DAG、Agent 代码/结果、Candidate Arena、
+Selector 和物理执行证据，并通过 SSE 尾随 `trace/events.jsonl`。
 
 ## 推荐：跟 RoboMEx tmux 一键启动
 
@@ -30,19 +32,20 @@ ssh -L 8300:127.0.0.1:8300 <user>@<服务器>
 
 ```bash
 cd robomex-ui && npm run build
-cd .. && python -m robomex.web --host 0.0.0.0 --port 8300 --root outputs/robomex_planner_live
+cd .. && robomex ui --host 0.0.0.0 --port 8300 --root outputs/robomex_libero_live
 ```
 
 ## 可选：Vite 热更新开发（:5174）
 
 ```bash
-python -m robomex.web --host 0.0.0.0 --port 8300
+robomex ui --host 0.0.0.0 --port 8300 --root outputs/robomex_libero_live
 cd robomex-ui && npm run dev
 # 浏览器: http://<服务器IP>:5174
 ```
 
 ## 说明
 
-- 后端：`robomex/web`（FastAPI，默认 `0.0.0.0:8300`）
+- 后端：`robomex/web`（FastAPI v2，默认 `0.0.0.0:8300`）
 - 前端：本目录；`npm run build` 产物由 API 挂载在 `/`
-- 不修改 Session / Swarm 执行逻辑，不生成 HTML report
+- 数据源：`RunObservabilityStore` 生成的 v2 run bundle
+- 不修改 Session / Swarm 执行逻辑，不提供物理控制，不生成静态 HTML report

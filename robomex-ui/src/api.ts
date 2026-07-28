@@ -1,53 +1,29 @@
-import type {
-  AgentDetail,
-  RunDetail,
-  RunSummary,
-  SwarmView,
-  TurnDetail,
-} from './types'
+import type { AgentDetail, RunSummary, Snapshot } from './types'
 
 async function getJson<T>(url: string): Promise<T> {
-  const resp = await fetch(url)
-  if (!resp.ok) {
-    throw new Error(await resp.text())
-  }
-  return resp.json() as Promise<T>
+  const response = await fetch(url)
+  if (!response.ok) throw new Error(await response.text())
+  return response.json() as Promise<T>
 }
 
-export function listRuns(root: string) {
-  return getJson<{ root: string; runs: RunSummary[] }>(
-    `/api/v1/runs?root=${encodeURIComponent(root)}`,
-  )
+export function listRuns() {
+  return getJson<{ root: string; runs: RunSummary[] }>('/api/v2/runs')
 }
 
-export function fetchRun(dir: string) {
-  return getJson<RunDetail>(`/api/v1/runs/by-path?dir=${encodeURIComponent(dir)}`)
+export function fetchSnapshot(runId: string) {
+  return getJson<Snapshot>(`/api/v2/runs/${encodeURIComponent(runId)}/snapshot`)
 }
 
-export function fetchSwarm(dir: string, subgoal: number) {
-  return getJson<SwarmView>(
-    `/api/v1/runs/by-path/swarm?dir=${encodeURIComponent(dir)}&subgoal=${subgoal}`,
-  )
-}
-
-export function fetchAgent(dir: string, subgoal: number, agent: string) {
+export function fetchAgent(runId: string, agentRunId: string) {
   return getJson<AgentDetail>(
-    `/api/v1/runs/by-path/agent?dir=${encodeURIComponent(dir)}&subgoal=${subgoal}&agent=${encodeURIComponent(agent)}`,
+    `/api/v2/runs/${encodeURIComponent(runId)}/agents/${encodeURIComponent(agentRunId)}`,
   )
 }
 
-export function fetchTurn(dir: string, subgoal: number, agent: string, turn: number) {
-  return getJson<TurnDetail>(
-    `/api/v1/runs/by-path/turn?dir=${encodeURIComponent(dir)}&subgoal=${subgoal}&agent=${encodeURIComponent(agent)}&turn=${turn}`,
-  )
+export function artifactUrl(runId: string, artifactId: string) {
+  return `/api/v2/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}`
 }
 
-export function fetchLlm(dir: string, path: string, view: 'text' | 'meta' | 'full' = 'text') {
-  return getJson<{ path: string; view: string; size: number; content: unknown }>(
-    `/api/v1/runs/by-path/llm?dir=${encodeURIComponent(dir)}&path=${encodeURIComponent(path)}&view=${view}`,
-  )
-}
-
-export function liveUrl(dir: string, fromStart = false) {
-  return `/api/v1/runs/by-path/live?dir=${encodeURIComponent(dir)}&from_start=${fromStart ? 'true' : 'false'}`
+export function streamUrl(runId: string, afterSeq: number) {
+  return `/api/v2/runs/${encodeURIComponent(runId)}/stream?after_seq=${afterSeq}`
 }

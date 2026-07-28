@@ -1,0 +1,220 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1120" viewBox="0 0 1800 1120" role="img" aria-labelledby="title desc">
+  <title id="title">RoboMEx Coding Agent implementation</title>
+  <desc id="desc">The live multi-turn Coding Agent loop, progressive Skill loading, persistent proposal sandboxes, multimodal execution feedback, contract validation, and observability files.</desc>
+  <defs>
+    <linearGradient id="header" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#172554"/>
+      <stop offset="1" stop-color="#312e81"/>
+    </linearGradient>
+    <linearGradient id="agentFill" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#eef2ff"/>
+      <stop offset="1" stop-color="#e0e7ff"/>
+    </linearGradient>
+    <linearGradient id="sandboxFill" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ecfeff"/>
+      <stop offset="1" stop-color="#cffafe"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="7" flood-color="#0f172a" flood-opacity=".12"/>
+    </filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#475569"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#4f46e5"/>
+    </marker>
+    <style>
+      .bg { fill:#f8fafc; }
+      .title { font:700 28px Inter,Arial,sans-serif; fill:#fff; }
+      .subtitle { font:400 14px Inter,Arial,sans-serif; fill:#cbd5e1; }
+      .section { font:700 18px Inter,Arial,sans-serif; fill:#172554; }
+      .node-title { font:700 15px Inter,Arial,sans-serif; fill:#0f172a; }
+      .body { font:400 13px Inter,Arial,sans-serif; fill:#334155; }
+      .small { font:400 11px Inter,Arial,sans-serif; fill:#475569; }
+      .mono { font:500 11px ui-monospace,SFMono-Regular,Consolas,monospace; fill:#334155; }
+      .white-mono { font:500 11px ui-monospace,SFMono-Regular,Consolas,monospace; fill:#e2e8f0; }
+      .box { fill:#fff; stroke:#cbd5e1; stroke-width:1.5; rx:12; }
+      .agent { fill:url(#agentFill); stroke:#818cf8; stroke-width:1.6; rx:12; }
+      .tool { fill:#f0fdf4; stroke:#86efac; stroke-width:1.5; rx:10; }
+      .sandbox { fill:url(#sandboxFill); stroke:#22d3ee; stroke-width:1.5; rx:12; }
+      .disk { fill:#fff7ed; stroke:#fdba74; stroke-width:1.5; rx:10; }
+      .decision { fill:#fefce8; stroke:#facc15; stroke-width:1.5; }
+      .error { fill:#fff1f2; stroke:#fda4af; stroke-width:1.5; rx:10; }
+      .success { fill:#ecfdf5; stroke:#6ee7b7; stroke-width:1.5; rx:10; }
+      .lane { fill:#f1f5f9; stroke:#e2e8f0; stroke-width:1; rx:14; }
+      .arrow { fill:none; stroke:#475569; stroke-width:1.7; marker-end:url(#arrow); }
+      .arrow-blue { fill:none; stroke:#4f46e5; stroke-width:2; marker-end:url(#arrowBlue); }
+      .feedback { fill:none; stroke:#db2777; stroke-width:2; stroke-dasharray:7 5; marker-end:url(#arrow); }
+      .dashed { fill:none; stroke:#94a3b8; stroke-width:1.5; stroke-dasharray:5 5; marker-end:url(#arrow); }
+      .badge { fill:#4338ca; rx:8; }
+      .badge-text { font:700 10px Inter,Arial,sans-serif; fill:#fff; letter-spacing:.4px; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1800" height="1120"/>
+  <rect width="1800" height="86" fill="url(#header)"/>
+  <text class="title" x="42" y="39">RoboMEx Coding Agent — 当前真实实现</text>
+  <text class="subtitle" x="42" y="65">OpenCode/Qwen-Code 风格：渐进式 Skill 披露 + 有状态工具循环 + 多模态执行反馈 + 领域结果验证</text>
+  <rect x="1516" y="23" width="236" height="40" rx="20" fill="#ffffff" fill-opacity=".1" stroke="#ffffff" stroke-opacity=".25"/>
+  <text class="white-mono" x="1540" y="48">use_skill → run_python → finish</text>
+
+  <!-- left: high-level -->
+  <text class="section" x="42" y="125">A. 在 Swarm 中的位置</text>
+  <rect class="lane" x="30" y="142" width="450" height="924"/>
+
+  <rect class="box" x="74" y="178" width="360" height="82" filter="url(#shadow)"/>
+  <text class="node-title" x="96" y="207">Swarm Runtime 调度一个 Role</text>
+  <text class="body" x="96" y="230">Grounding / Affordance / Motion / Selector</text>
+  <text class="small" x="96" y="248">输入：ActionIntent + AgentWorldView + upstream results</text>
+
+  <path class="arrow-blue" d="M254 260 L254 306"/>
+  <rect class="agent" x="62" y="308" width="384" height="126" filter="url(#shadow)"/>
+  <text class="node-title" x="84" y="338">SwarmRoleCodingAgent</text>
+  <text class="body" x="84" y="363">每个 Role 一个 action-scoped 会话</text>
+  <text class="body" x="84" y="384">独立 persistent Python namespace（同进程）</text>
+  <text class="body" x="84" y="405">独立模型预算、Skill 视图与输出目录</text>
+  <rect class="badge" x="326" y="326" width="96" height="22"/>
+  <text class="badge-text" x="344" y="341">CODING AGENT</text>
+
+  <path class="arrow-blue" d="M254 434 L254 480"/>
+  <polygon class="decision" points="254,480 410,555 254,630 98,555"/>
+  <text class="node-title" x="182" y="538">TurnEngine</text>
+  <text class="body" x="155" y="560">模型选择一个 JSON Tool</text>
+  <text class="mono" x="139" y="582">use_skill | run_python | finish</text>
+
+  <path class="arrow" d="M126 568 C54 610,54 694,116 724"/>
+  <rect class="tool" x="66" y="718" width="178" height="104"/>
+  <text class="node-title" x="88" y="747">按需加载 Skill</text>
+  <text class="small" x="88" y="770">只允许 Role 已分配的 Skill</text>
+  <text class="small" x="88" y="790">正文、base dir、sidecars</text>
+  <text class="small" x="88" y="808">加载后返回模型继续决策</text>
+
+  <path class="arrow" d="M382 568 C454 610,454 694,392 724"/>
+  <rect class="sandbox" x="264" y="718" width="178" height="104"/>
+  <text class="node-title" x="286" y="747">运行 Python</text>
+  <text class="small" x="286" y="770">调用感知/几何/规划工具</text>
+  <text class="small" x="286" y="790">得到 stdout / stderr / 图像</text>
+  <text class="small" x="286" y="808">错误会进入下一模型轮修复</text>
+
+  <path class="feedback" d="M342 718 C350 650,330 632,306 615"/>
+  <path class="feedback" d="M144 718 C128 660,157 625,199 604"/>
+
+  <path class="arrow-blue" d="M254 630 L254 864"/>
+  <rect class="success" x="72" y="864" width="364" height="124" filter="url(#shadow)"/>
+  <text class="node-title" x="94" y="894">finish → 领域 Contract 验证</text>
+  <text class="body" x="94" y="919">Producer：RESULT → ActionCandidate</text>
+  <text class="body" x="94" y="941">Selector：SELECTION → CandidateSelection</text>
+  <text class="small" x="94" y="965">无效：反馈错误并继续；有效：返回 RoleResult</text>
+  <path class="feedback" d="M78 894 C30 820,27 596,102 559"/>
+
+  <text class="small" x="72" y="1028">Planner / Manager 不是 CodingAgent；</text>
+  <text class="small" x="72" y="1047">Swarm 内执行具体工作的所有 Role 统一走这条链。</text>
+
+  <!-- right: detailed implementation -->
+  <text class="section" x="526" y="125">B. 一次 Coding Agent 会话的详细数据流</text>
+
+  <!-- initial context -->
+  <rect class="box" x="520" y="148" width="1218" height="136" filter="url(#shadow)"/>
+  <text class="node-title" x="546" y="178">1 · Prompt 初始化：信息充分，但不预灌 Skill 正文</text>
+  <rect class="agent" x="546" y="195" width="356" height="66"/>
+  <text class="mono" x="564" y="218">&lt;available_skills&gt;</text>
+  <text class="small" x="564" y="239">仅 name + description + category</text>
+  <rect class="box" x="922" y="195" width="372" height="66"/>
+  <text class="body" x="940" y="218">Role Context</text>
+  <text class="small" x="940" y="239">objective / world / upstream / API docs</text>
+  <rect class="box" x="1314" y="195" width="398" height="66"/>
+  <text class="body" x="1332" y="218">Output Contract + Tool Schema</text>
+  <text class="small" x="1332" y="239">RESULT / SELECTION 与三个 JSON actions</text>
+
+  <path class="arrow-blue" d="M1128 284 L1128 326"/>
+
+  <!-- turn engine -->
+  <rect class="agent" x="520" y="328" width="1218" height="116" filter="url(#shadow)"/>
+  <text class="node-title" x="546" y="359">2 · TurnEngine：规范化模型输出并维护完整会话历史</text>
+  <text class="body" x="546" y="384">每轮：保存 request → 调用模型 → 解析唯一 JSON tool call → 保存 raw response → 执行工具 → append feedback</text>
+  <text class="small" x="546" y="410">边界：max_model_calls · max_tokens · max run_python turns · wall-time deadline · protocol error limit · repeat detection</text>
+  <rect class="badge" x="1578" y="347" width="132" height="22"/>
+  <text class="badge-text" x="1594" y="362">CANONICAL HISTORY</text>
+
+  <!-- three branches -->
+  <path class="arrow" d="M816 444 L816 486"/>
+  <path class="arrow" d="M1128 444 L1128 486"/>
+  <path class="arrow" d="M1452 444 L1452 486"/>
+
+  <rect class="tool" x="520" y="488" width="580" height="210"/>
+  <text class="node-title" x="546" y="520">3A · use_skill：真正的渐进式披露</text>
+  <text class="mono" x="546" y="548">SkillLibrary.get(assigned_skill_id)</text>
+  <text class="body" x="546" y="575">① 校验 Skill 必须在该 Role 的 compact catalog 中</text>
+  <text class="body" x="546" y="598">② 注入完整 SKILL.md 与 skill base directory</text>
+  <text class="body" x="546" y="621">③ 列出 scripts / references / assets / prompts sidecars</text>
+  <text class="body" x="546" y="644">④ scripts/ 加入 sandbox sys.path；contract functions 可绑定</text>
+  <text class="small" x="546" y="674">重复或未知 Skill 不加载，并将拒绝原因反馈给模型。</text>
+
+  <rect class="sandbox" x="1120" y="488" width="388" height="210"/>
+  <text class="node-title" x="1146" y="520">3B · run_python：持久沙箱</text>
+  <text class="body" x="1146" y="548">Producer / Support sandbox</text>
+  <text class="small" x="1146" y="568">设计为 proposal-only；当前权限边界仍需收紧</text>
+  <text class="body" x="1146" y="597">Selector sandbox</text>
+  <text class="small" x="1146" y="617">Immutable Candidate Arena + imagination APIs</text>
+  <text class="body" x="1146" y="646">同一 Role 多轮共享 Python globals</text>
+  <text class="small" x="1146" y="670">可复用变量、工具结果与中间计算。</text>
+
+  <polygon class="decision" points="1622,488 1738,593 1622,698 1506,593"/>
+  <text class="node-title" x="1567" y="572">3C · finish</text>
+  <text class="small" x="1544" y="596">当前 RESULT / SELECTION</text>
+  <text class="small" x="1562" y="617">能否通过领域验证？</text>
+
+  <!-- execution feedback -->
+  <path class="arrow-blue" d="M1314 698 L1314 742"/>
+  <rect class="box" x="776" y="744" width="962" height="172" filter="url(#shadow)"/>
+  <text class="node-title" x="802" y="776">4 · BlockExecutionResult：Agent 看到真实执行事实，而不是自己猜</text>
+  <rect class="error" x="802" y="794" width="202" height="92"/>
+  <text class="body" x="820" y="818">stdout / stderr</text>
+  <text class="small" x="820" y="840">Python traceback</text>
+  <text class="small" x="820" y="860">成功/失败状态</text>
+  <rect class="tool" x="1020" y="794" width="250" height="92"/>
+  <text class="body" x="1038" y="818">tool_results</text>
+  <text class="small" x="1038" y="840">API 名 + 精确字段/路径</text>
+  <text class="small" x="1038" y="860">大数组仅做 shape/range 摘要</text>
+  <rect class="agent" x="1286" y="794" width="244" height="92"/>
+  <text class="body" x="1304" y="818">image_paths → VLM</text>
+  <text class="small" x="1304" y="840">最多 4 张，最长边 1280</text>
+  <text class="small" x="1304" y="860">旧图移除，artifact path 保留</text>
+  <rect class="disk" x="1546" y="794" width="166" height="92"/>
+  <text class="body" x="1564" y="818">observation/info</text>
+  <text class="small" x="1564" y="840">proposal_only</text>
+  <text class="small" x="1564" y="860">metadata 声明，不等于强隔离证明</text>
+
+  <path class="feedback" d="M1128 744 C1000 712,988 508,1108 414"/>
+  <text class="small" x="852" y="720">作为下一条 user/tool feedback 回到模型：报错后自然进入修复轮</text>
+
+  <!-- persistence -->
+  <rect class="disk" x="520" y="744" width="232" height="290" filter="url(#shadow)"/>
+  <text class="node-title" x="546" y="776">每轮立即持久化</text>
+  <text class="mono" x="546" y="806">agents/&lt;role&gt;/turns/</text>
+  <text class="mono" x="546" y="835">turn_XX.py</text>
+  <text class="mono" x="546" y="858">turn_XX.stdout.txt</text>
+  <text class="mono" x="546" y="881">turn_XX.stderr.txt</text>
+  <text class="mono" x="546" y="904">turn_XX.result.json</text>
+  <text class="mono" x="546" y="936">turn_XX_request.json</text>
+  <text class="mono" x="546" y="959">turn_XX_response.json</text>
+  <text class="small" x="546" y="990">代码在执行前写盘；崩溃、</text>
+  <text class="small" x="546" y="1008">语法错误也不会丢失。</text>
+  <path class="dashed" d="M776 830 L752 830"/>
+
+  <!-- terminal outcomes -->
+  <path class="arrow" d="M1622 698 L1622 744"/>
+  <rect class="error" x="1422" y="940" width="316" height="94"/>
+  <text class="node-title" x="1446" y="970">无效结果</text>
+  <text class="body" x="1446" y="994">验证错误回灌模型 → 修复代码</text>
+  <text class="small" x="1446" y="1015">预算耗尽则 agent_incomplete</text>
+  <path class="feedback" d="M1450 956 C1340 918,1378 620,1499 592"/>
+
+  <rect class="success" x="796" y="940" width="594" height="94" filter="url(#shadow)"/>
+  <text class="node-title" x="820" y="970">有效结果 → RoleResult</text>
+  <text class="body" x="820" y="994">ActionCandidate / findings / CandidateSelection + code + streams + lineage</text>
+  <text class="small" x="820" y="1015">后续进入 Candidate Arena、Selector 或 Swarm Runtime；这里不执行真实机器人动作。</text>
+  <path class="arrow-blue" d="M1515 642 C1438 744,1358 892,1278 938"/>
+
+  <text class="small" x="520" y="1082">核心原则：LLM 负责选择 Skill、写代码、观察证据与修复；Runtime 只负责工具执行、预算、持久化和最终 contract 边界。</text>
+</svg>

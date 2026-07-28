@@ -3,7 +3,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import List, Literal, Optional, Union
+from typing import Any, Literal
 
 import tyro
 import uvicorn
@@ -31,6 +31,11 @@ class ContentItem(BaseModel):
 class Message(BaseModel):
     role: str
     content: str | list[ContentItem] | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
+    reasoning: Any | None = None
+    reasoning_content: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -45,6 +50,9 @@ class ChatCompletionRequest(BaseModel):
     # OpenRouter 统一的 reasoning 控制(如 {"effort": "low"} / {"max_tokens": N} /
     # {"exclude": true})。客户端可显式传;不传则用服务端默认(见 create_app)。
     reasoning: dict | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    parallel_tool_calls: bool | None = None
 
 
 class ChatCompletionResponseChoice(BaseModel):
@@ -59,6 +67,32 @@ class ChatCompletionResponse(BaseModel):
     created: int
     model: str
     choices: list[ChatCompletionResponseChoice]
+    usage: dict[str, Any] | None = None
+
+
+def _response_message(message: Any) -> Message:
+    """Preserve tool calls instead of reducing upstream replies to plain text."""
+
+    if hasattr(message, "model_dump"):
+        raw = message.model_dump(mode="json", exclude_none=True)
+    elif isinstance(message, dict):
+        raw = message
+    else:
+        raw = {
+            "role": getattr(message, "role", "assistant"),
+            "content": getattr(message, "content", None),
+            "tool_calls": getattr(message, "tool_calls", None),
+        }
+    return Message.model_validate(raw)
+
+
+def _response_usage(response: Any) -> dict[str, Any] | None:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    if hasattr(usage, "model_dump"):
+        return usage.model_dump(mode="json", exclude_none=True)
+    return dict(usage) if isinstance(usage, dict) else None
 
 
 def _load_dotenv(path: str = ".env") -> None:
@@ -285,14 +319,18 @@ def create_app(
                 choices = [
                     ChatCompletionResponseChoice(
                         index=c.index,
-                        message=Message(role=c.message.role, content=c.message.content),
+                        message=_response_message(c.message),
                         finish_reason=c.finish_reason,
                     )
                     for c in response.choices
                 ]
 
                 return ChatCompletionResponse(
-                    id=response.id, created=response.created, model=response.model, choices=choices
+                    id=response.id,
+                    created=response.created,
+                    model=response.model,
+                    choices=choices,
+                    usage=_response_usage(response),
                 )
 
             except HTTPException:
@@ -319,14 +357,18 @@ def create_app(
                 choices = [
                     ChatCompletionResponseChoice(
                         index=c.index,
-                        message=Message(role=c.message.role, content=c.message.content),
+                        message=_response_message(c.message),
                         finish_reason=c.finish_reason,
                     )
                     for c in response.choices
                 ]
 
                 return ChatCompletionResponse(
-                    id=response.id, created=response.created, model=response.model, choices=choices
+                    id=response.id,
+                    created=response.created,
+                    model=response.model,
+                    choices=choices,
+                    usage=_response_usage(response),
                 )
 
             except HTTPException:

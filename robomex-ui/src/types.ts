@@ -1,147 +1,139 @@
 export interface RunSummary {
-  path: string
-  name: string
-  mtime: number
+  run_id: string
   task: string
-  planner_status: string
-  env_success: boolean | null
-  n_subgoals: number
-  authoring_strategy: string
+  profile: string
+  status: string
+  started_at: number
+  updated_at: number
+  intent_count: number
 }
 
-export interface SubgoalIndex {
-  index: number
-  goal: string
-  postcondition: string
-  authoring_status: string
-  verification_status: string
-  success: boolean | null
-  motion_attempted: boolean | null
-  note: string
-  inner_turns: number
-  loaded_skill_ids: string[]
-  has_swarm: boolean
-}
-
-export interface RunDetail {
+export interface Artifact {
+  artifact_id: string
+  kind: string
   path: string
-  summary: Record<string, unknown>
-  subgoals: SubgoalIndex[]
-  media: string[]
+  mime: string
+  digest: string
+  producer: string
+  intent_id: string
+  world_revision?: number
+  candidate_id?: string
+}
+
+export interface AgentSummary {
+  agent_run_id: string
+  role_id: string
+  kind: string
+  objective: string
+  model: string
+  skills: string[]
+  capabilities: string[]
+  depends_on: string[]
+  status: string
+  failure_kind: string
+  detail: string
+  candidate_count: number
+  duration_s?: number
 }
 
 export interface GraphNode {
   id: string
-  role: string
-  specialist_skill: string
-  objective: string
+  label: string
+  kind: string
+  model: string
+  skills: string[]
   status: string
-  verifier: boolean
-  changes_world: boolean
+  agent_run_id: string
 }
 
 export interface GraphEdge {
   source: string
   target: string
-  on: string
 }
 
-export interface AgentInstance {
-  dir: string
-  node_id: string
-  role: string
-  status: string
-  attempt: number | null
-  turn_count: number
-  has_result: boolean
-  media: string[]
-}
-
-export interface ManagerTurn {
-  turn: number
-  request_path: string
-  response_path: string
-  response_preview: string
-}
-
-export interface MediaItem {
-  path: string
+export interface Candidate {
+  candidate_id: string
+  role_id: string
   kind: string
-  url: string
+  notes: string
+  candidate_digest: string
+  intent_id: string
+  config_id: string
+  gates: {
+    checks?: Record<string, string>
+    reasons?: Record<string, string>
+  }
 }
 
-export interface SwarmView {
-  run_dir: string
-  subgoal_index: number
-  task_skill: string
-  entry: string
-  success_node: string
-  outcome_status: string
-  verification: string
-  note: string
+export interface SwarmConfigView {
+  config_id: string
+  manager: {
+    request: unknown
+    response: string
+    swarm_config: Record<string, unknown>
+  }
   nodes: GraphNode[]
   edges: GraphEdge[]
-  agents: AgentInstance[]
-  manager_turns: ManagerTurn[]
-  media: MediaItem[]
-  artifact_keys: string[]
+  candidates: Candidate[]
+  selection: Record<string, unknown>
+  execution: {
+    admission: Record<string, unknown>
+    receipt: Record<string, unknown>
+    observation: Record<string, unknown>
+  }
 }
 
-export interface TurnIndex {
-  turn: number
-  has_code: boolean
-  has_out: boolean
-  has_llm: boolean
-  code_path: string
-  out_path: string
-  llm_request_path: string
-  llm_response_path: string
-  llm_response_txt_path: string
+export interface IntentView {
+  intent_id: string
+  instruction: string
+  expected_effect: string
+  observation_revision?: number
+  status: string
+  planner: {
+    request: unknown
+    response: string
+    decision: Record<string, unknown>
+  }
+  configs: SwarmConfigView[]
+}
+
+export interface ActivityEvent {
+  event_seq: number
+  ts: number
+  stage: string
+  event: string
+  intent_id: string
+  config_id: string
+  candidate_id: string
+  summary: string
+  status: string
+  details: Record<string, unknown>
+}
+
+export interface Snapshot {
+  schema_version: string
+  run: Record<string, unknown>
+  live: boolean
+  intents: IntentView[]
+  agents: Record<string, AgentSummary>
+  candidates: Candidate[]
+  artifacts: Artifact[]
+  latest_observations: Artifact[]
+  activity: ActivityEvent[]
+  last_event_seq: number
 }
 
 export interface AgentDetail {
-  run_dir: string
-  subgoal_index: number
-  agent_dir: string
-  node_id: string
-  role: string
-  status: string
-  request: Record<string, unknown>
-  result: Record<string, unknown>
-  turns: TurnIndex[]
-  media: MediaItem[]
-}
-
-export interface TurnDetail {
-  run_dir: string
-  subgoal_index: number
-  agent_dir: string
-  turn: number
+  agent_run_id: string
+  assignment: Record<string, unknown>
+  world_view: Record<string, unknown>
+  upstream: Record<string, unknown>
+  llm_request: unknown
+  llm_response: string
   code: string
-  out: string
-  code_path: string
-  out_path: string
-  llm_request_path: string
-  llm_response_path: string
-  llm_response_txt_path: string
-  response_preview: string
-}
-
-export interface LiveEvent {
-  id?: string
-  ts?: string
-  event: string
-  message?: string
-  subgoal_index?: number
-  agent_label?: string
-  agent_role?: string
-  node_id?: string
-  turn?: number
-  action?: string
-  status?: string
-  ok?: boolean
-  goal?: string
-  code?: string
-  raw?: string
-  [key: string]: unknown
+  stdout: string
+  stderr: string
+  result: Record<string, unknown>
+  artifacts: Artifact[]
+  log: string
 }

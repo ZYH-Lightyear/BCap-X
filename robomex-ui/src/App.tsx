@@ -1,375 +1,297 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import {
-  fetchAgent,
-  fetchLlm,
-  fetchRun,
-  fetchSwarm,
-  fetchTurn,
-  listRuns,
-  liveUrl,
-} from './api'
-import { EventStream } from './components/EventStream'
-import { LlmDrawer } from './components/LlmDrawer'
-import { MediaPanel } from './components/MediaPanel'
-import { RunPicker } from './components/RunPicker'
-import { SubgoalList } from './components/SubgoalList'
+import { artifactUrl, fetchAgent, fetchSnapshot, listRuns, streamUrl } from './api'
+import { AgentInspector } from './components/AgentInspector'
+import { CandidateArena } from './components/CandidateArena'
 import { SwarmGraph } from './components/SwarmGraph'
-import { TurnWorkbench } from './components/TurnWorkbench'
 import type {
+  ActivityEvent,
   AgentDetail,
-  LiveEvent,
-  RunDetail,
+  IntentView,
   RunSummary,
-  SwarmView,
-  TurnDetail,
+  Snapshot,
+  SwarmConfigView,
 } from './types'
 
-const DEFAULT_ROOT = 'outputs/robomex_planner_live'
-
-function readQuery() {
-  const params = new URLSearchParams(window.location.search)
+function initialQuery() {
+  const query = new URLSearchParams(window.location.search)
   return {
-    root: params.get('root') || DEFAULT_ROOT,
-    dir: params.get('dir') || '',
-    subgoal: Number(params.get('subgoal') || '0'),
-    agent: params.get('agent') || '',
-    turn: params.get('turn') != null && params.get('turn') !== '' ? Number(params.get('turn')) : null,
+    run: query.get('run') || '',
+    intent: query.get('intent') || '',
+    config: query.get('config') || '',
+    agent: query.get('agent') || '',
   }
-}
-
-function writeQuery(state: {
-  root: string
-  dir: string
-  subgoal: number
-  agent: string
-  turn: number | null
-}) {
-  const params = new URLSearchParams()
-  params.set('root', state.root)
-  if (state.dir) params.set('dir', state.dir)
-  params.set('subgoal', String(state.subgoal))
-  if (state.agent) params.set('agent', state.agent)
-  if (state.turn != null) params.set('turn', String(state.turn))
-  const next = `${window.location.pathname}?${params.toString()}`
-  window.history.replaceState(null, '', next)
 }
 
 export default function App() {
-  const initial = useMemo(() => readQuery(), [])
-  const [root, setRoot] = useState(initial.root)
+  const initial = useMemo(initialQuery, [])
   const [runs, setRuns] = useState<RunSummary[]>([])
-  const [runDir, setRunDir] = useState(initial.dir)
-  const [runDetail, setRunDetail] = useState<RunDetail | null>(null)
-  const [subgoal, setSubgoal] = useState(initial.subgoal)
-  const [swarm, setSwarm] = useState<SwarmView | null>(null)
-  const [agentDir, setAgentDir] = useState(initial.agent)
+  const [runId, setRunId] = useState(initial.run)
+  const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
+  const [intentId, setIntentId] = useState(initial.intent)
+  const [configId, setConfigId] = useState(initial.config)
+  const [agentId, setAgentId] = useState(initial.agent)
   const [agent, setAgent] = useState<AgentDetail | null>(null)
-  const [turn, setTurn] = useState<number | null>(initial.turn)
-  const [turnDetail, setTurnDetail] = useState<TurnDetail | null>(null)
-  const [liveEvents, setLiveEvents] = useState<LiveEvent[]>([])
-  const [liveConnected, setLiveConnected] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [llmOpen, setLlmOpen] = useState(false)
-  const [llmPath, setLlmPath] = useState('')
-  const [llmContent, setLlmContent] = useState<unknown>(null)
-  const [llmLoading, setLlmLoading] = useState(false)
-  const [llmError, setLlmError] = useState<string | null>(null)
-  const [refreshToken, setRefreshToken] = useState(0)
+  const [connected, setConnected] = useState(false)
+  const [consoleOpen, setConsoleOpen] = useState(true)
+  const [error, setError] = useState('')
 
   const refreshRuns = useCallback(async () => {
     try {
-      const data = await listRuns(root)
-      setRuns(data.runs)
-      if (!runDir && data.runs[0]) {
-        setRunDir(data.runs[0].path)
-      }
-      setError(null)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      const response = await listRuns()
+      setRuns(response.runs)
+      setRunId((current) => current || response.runs[0]?.run_id || '')
+    } catch (reason) {
+      setError(String(reason))
     }
-  }, [root, runDir])
+  }, [])
+
+  const refreshSnapshot = useCallback(async () => {
+    if (!runId) return
+    try {
+      const value = await fetchSnapshot(runId)
+      setSnapshot(value)
+      setIntentId((current) =>
+        value.intents.some((item) => item.intent_id === current)
+          ? current
+          : value.intents[value.intents.length - 1]?.intent_id || '',
+      )
+      setError('')
+    } catch (reason) {
+      setError(String(reason))
+    }
+  }, [runId])
 
   useEffect(() => {
-    refreshRuns()
+    void refreshRuns()
   }, [refreshRuns])
 
   useEffect(() => {
-    writeQuery({ root, dir: runDir, subgoal, agent: agentDir, turn })
-  }, [root, runDir, subgoal, agentDir, turn])
+    setSnapshot(null)
+    setAgent(null)
+    setAgentId('')
+    void refreshSnapshot()
+  }, [runId, refreshSnapshot])
+
+  const intent: IntentView | undefined = snapshot?.intents.find(
+    (item) => item.intent_id === intentId,
+  )
+  const config: SwarmConfigView | undefined =
+    intent?.configs.find((item) => item.config_id === configId) ||
+    intent?.configs[intent.configs.length - 1]
 
   useEffect(() => {
-    if (!runDir) return
-    let cancelled = false
-    ;(async () => {
-      try {
-        const detail = await fetchRun(runDir)
-        if (cancelled) return
-        setRunDetail(detail)
-        if (detail.subgoals.length && !detail.subgoals.some((sg) => sg.index === subgoal)) {
-          setSubgoal(detail.subgoals[0].index)
-        }
-        setError(null)
-      } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err))
-      }
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [runDir, refreshToken])
+    if (config && config.config_id !== configId) setConfigId(config.config_id)
+  }, [config, configId])
 
   useEffect(() => {
-    if (!runDir) return
-    let cancelled = false
-    ;(async () => {
-      try {
-        const view = await fetchSwarm(runDir, subgoal)
-        if (cancelled) return
-        setSwarm(view)
-        if (agentDir && !view.agents.some((a) => a.dir === agentDir)) {
-          setAgentDir(view.agents[0]?.dir || '')
-        } else if (!agentDir && view.agents[0]) {
-          setAgentDir(view.agents[0].dir)
-        }
-        setError(null)
-      } catch (err) {
-        if (!cancelled) {
-          setSwarm(null)
-          setError(err instanceof Error ? err.message : String(err))
-        }
-      }
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [runDir, subgoal, refreshToken])
+    const query = new URLSearchParams()
+    if (runId) query.set('run', runId)
+    if (intentId) query.set('intent', intentId)
+    if (config?.config_id) query.set('config', config.config_id)
+    if (agentId) query.set('agent', agentId)
+    window.history.replaceState(null, '', `?${query.toString()}`)
+  }, [runId, intentId, config, agentId])
 
   useEffect(() => {
-    if (!runDir || !agentDir) {
-      setAgent(null)
-      setTurnDetail(null)
-      return
-    }
-    let cancelled = false
-    ;(async () => {
-      try {
-        const detail = await fetchAgent(runDir, subgoal, agentDir)
-        if (cancelled) return
-        setAgent(detail)
-        const nextTurn =
-          turn != null && detail.turns.some((t) => t.turn === turn)
-            ? turn
-            : detail.turns[0]?.turn ?? null
-        setTurn(nextTurn)
-        setError(null)
-      } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err))
-      }
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [runDir, subgoal, agentDir, refreshToken])
-
-  useEffect(() => {
-    if (!runDir || !agentDir || turn == null) {
-      setTurnDetail(null)
-      return
-    }
-    let cancelled = false
-    ;(async () => {
-      try {
-        const detail = await fetchTurn(runDir, subgoal, agentDir, turn)
-        if (!cancelled) setTurnDetail(detail)
-      } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err))
-      }
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [runDir, subgoal, agentDir, turn, refreshToken])
-
-  useEffect(() => {
-    if (!runDir) {
-      setLiveConnected(false)
-      setLiveEvents([])
-      return
-    }
-    const source = new EventSource(liveUrl(runDir, false))
-    setLiveEvents([])
-    source.onopen = () => setLiveConnected(true)
-    source.onerror = () => setLiveConnected(false)
-    source.onmessage = (message) => {
-      try {
-        const event = JSON.parse(message.data) as LiveEvent
-        setLiveEvents((prev) => [...prev.slice(-199), event])
-        const name = event.event || ''
-        if (
-          name.startsWith('subgoal_') ||
-          name.startsWith('agent_') ||
-          name.startsWith('code_') ||
-          name.includes('swarm') ||
-          name.includes('graph')
-        ) {
-          setRefreshToken((n) => n + 1)
-        }
-      } catch {
-        // ignore malformed live frames
-      }
-    }
+    if (!runId || !snapshot) return
+    const source = new EventSource(streamUrl(runId, snapshot.last_event_seq))
+    source.onopen = () => setConnected(true)
+    source.onerror = () => setConnected(false)
+    source.addEventListener('swarm', () => void refreshSnapshot())
     return () => {
       source.close()
-      setLiveConnected(false)
+      setConnected(false)
     }
-  }, [runDir])
+  }, [runId, snapshot?.last_event_seq, refreshSnapshot])
 
-  const openLlm = async (path: string) => {
-    if (!runDir) return
-    setLlmOpen(true)
-    setLlmPath(path)
-    setLlmLoading(true)
-    setLlmError(null)
-    try {
-      const data = await fetchLlm(runDir, path, 'text')
-      setLlmContent(data.content)
-    } catch (err) {
-      setLlmError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setLlmLoading(false)
+  useEffect(() => {
+    if (!runId || !agentId) {
+      setAgent(null)
+      return
     }
-  }
-
-  const media = agent?.media?.length ? agent.media : swarm?.media || []
+    void fetchAgent(runId, agentId)
+      .then(setAgent)
+      .catch((reason) => setError(String(reason)))
+  }, [runId, agentId, snapshot?.last_event_seq])
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
-      <header className="flex flex-shrink-0 items-center justify-between border-b border-ink-200 bg-white px-4 py-3">
-        <div>
-          <div className="text-sm font-bold tracking-wide">RoboMEx Trace</div>
-          <div className="truncate text-xs text-ink-500">
-            {runDetail?.summary?.task ? String(runDetail.summary.task) : 'offline / live run explorer'}
+    <div className="observatory">
+      <header className="run-header">
+        <div className="brand">
+          <span className="brand-mark">RM</span>
+          <div>
+            <strong>Swarm Observatory</strong>
+            <small>read-only agentic manipulation trace</small>
           </div>
         </div>
-        <div className="flex items-center gap-2 text-xs">
-          <span className={`rounded border px-2 py-1 ${liveConnected ? 'border-blue-300 bg-blue-50 text-blue-800' : 'border-ink-200 bg-ink-50 text-ink-600'}`}>
-            {liveConnected ? 'live' : 'idle'}
-          </span>
-          <span className="rounded border border-ink-200 bg-ink-50 px-2 py-1 font-mono">
-            :8300 API · :5174 UI
-          </span>
+        <div className="task-title">
+          <span>Task</span>
+          <strong>{String(snapshot?.run.task || 'Select a run')}</strong>
+        </div>
+        <div className="observation-peek">
+          {snapshot?.latest_observations.slice(-2).map((artifact) => (
+            <img
+              key={artifact.artifact_id}
+              src={artifactUrl(runId, artifact.artifact_id)}
+              title={artifact.path}
+              alt="latest robot observation"
+            />
+          ))}
+        </div>
+        <select value={runId} onChange={(event) => setRunId(event.target.value)}>
+          <option value="">Select run</option>
+          {runs.map((run) => (
+            <option key={run.run_id} value={run.run_id}>
+              {run.run_id} · {run.status}
+            </option>
+          ))}
+        </select>
+        <div className={`live-pill ${connected ? 'connected' : ''}`}>
+          <i /> {snapshot?.live ? (connected ? 'LIVE' : 'RECONNECTING') : 'REPLAY'}
+        </div>
+        <div className="run-meta">
+          <span>{String(snapshot?.run.profile || '—')}</span>
+          <span>{String(snapshot?.run.status || 'idle')}</span>
+          <span>{elapsed(snapshot?.run.started_at, snapshot?.run.finished_at)}</span>
         </div>
       </header>
 
-      {error && (
-        <div className="flex-shrink-0 border-b border-red-200 bg-red-50 px-4 py-2 text-xs text-red-800">
-          {error}
-        </div>
-      )}
+      {error && <div className="error-banner">{error}</div>}
 
-      <main className="grid min-h-0 flex-1 grid-cols-[280px_minmax(0,1fr)_320px]">
-        <aside className="min-h-0 space-y-4 overflow-y-auto border-r border-ink-200 bg-white p-3">
-          <section>
-            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-700">Runs</div>
-            <RunPicker
-              root={root}
-              runs={runs}
-              selected={runDir}
-              onRootChange={setRoot}
-              onSelect={(path) => {
-                setRunDir(path)
-                setAgentDir('')
-                setTurn(null)
-                setSubgoal(0)
-              }}
-              onRefresh={refreshRuns}
-            />
-          </section>
-          <section>
-            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-700">Subgoals</div>
-            <SubgoalList
-              subgoals={runDetail?.subgoals || []}
-              selected={subgoal}
-              onSelect={(index) => {
-                setSubgoal(index)
-                setAgentDir('')
-                setTurn(null)
-              }}
-            />
-          </section>
-          {swarm?.manager_turns?.length ? (
-            <section>
-              <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-700">
-                Manager turns
-              </div>
-              <div className="space-y-1">
-                {swarm.manager_turns.map((mt) => (
-                  <button
-                    key={mt.turn}
-                    onClick={() => mt.response_path && openLlm(mt.response_path)}
-                    className="w-full rounded border border-ink-200 bg-ink-50 px-2 py-1.5 text-left text-[11px] hover:border-ink-400"
-                  >
-                    <div className="font-mono">manager t{mt.turn}</div>
-                    <div className="line-clamp-2 text-ink-500">{mt.response_preview}</div>
-                  </button>
-                ))}
-              </div>
-            </section>
-          ) : null}
+      <main className="workspace">
+        <aside className="intent-rail panel">
+          <div className="panel-title">
+            <span>ActionIntent rounds</span>
+            <b>{snapshot?.intents.length || 0}</b>
+          </div>
+          <div className="intent-list">
+            {snapshot?.intents.map((item, index) => (
+              <button
+                key={item.intent_id}
+                className={`intent-card ${item.intent_id === intentId ? 'active' : ''}`}
+                onClick={() => {
+                  setIntentId(item.intent_id)
+                  setConfigId(item.configs[item.configs.length - 1]?.config_id || '')
+                  setAgentId('')
+                }}
+              >
+                <span className="intent-index">{String(index + 1).padStart(2, '0')}</span>
+                <div>
+                  <strong>{item.instruction || item.intent_id}</strong>
+                  <small>{item.expected_effect || 'awaiting planner decision'}</small>
+                  <footer>
+                    <em className={`status ${item.status}`}>{item.status}</em>
+                    <span>world r{item.observation_revision ?? '—'}</span>
+                  </footer>
+                </div>
+              </button>
+            ))}
+          </div>
+          {intent && (
+            <details className="raw-details">
+              <summary>Planner decision</summary>
+              <label>Raw response</label>
+              <pre>{intent.planner.response}</pre>
+              <label>Parsed</label>
+              <pre>{pretty(intent.planner.decision)}</pre>
+            </details>
+          )}
         </aside>
 
-        <section className="grid min-h-0 grid-rows-[minmax(220px,0.9fr)_minmax(280px,1.2fr)] gap-3 overflow-hidden bg-ink-50 p-3">
-          <div className="grid min-h-0 grid-cols-[minmax(0,1.4fr)_280px] gap-3">
-            <div className="min-h-0 overflow-y-auto rounded border border-ink-200 bg-white p-3">
-              <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-700">
-                Swarm Graph
-              </div>
-              {swarm ? (
-                <SwarmGraph
-                  nodes={swarm.nodes}
-                  edges={swarm.edges}
-                  agents={swarm.agents}
-                  selectedAgent={agentDir}
-                  onSelectAgent={(dir) => {
-                    setAgentDir(dir)
-                    setTurn(null)
-                  }}
-                  entry={swarm.entry}
-                  successNode={swarm.success_node}
-                  outcomeStatus={swarm.outcome_status}
-                  note={swarm.note}
-                />
-              ) : (
-                <div className="text-sm text-ink-500">No swarm projection for this subgoal.</div>
+        <section className="center-stage">
+          <div className="intent-banner panel">
+            <div>
+              <span>Current embodied instruction</span>
+              <h1>{intent?.instruction || 'Waiting for Planner'}</h1>
+              <p>{intent?.expected_effect || 'No ActionIntent is available yet.'}</p>
+            </div>
+            <div className="config-picker">
+              <label>SwarmConfig revision</label>
+              <select
+                value={config?.config_id || ''}
+                onChange={(event) => {
+                  setConfigId(event.target.value)
+                  setAgentId('')
+                }}
+              >
+                {intent?.configs.map((item) => (
+                  <option key={item.config_id}>{item.config_id}</option>
+                ))}
+              </select>
+              {config && (
+                <details className="manager-details">
+                  <summary>Manager I/O</summary>
+                  <pre>{pretty(config.manager.request)}</pre>
+                  <pre>{config.manager.response}</pre>
+                  <pre>{pretty(config.manager.swarm_config)}</pre>
+                </details>
               )}
             </div>
-            <EventStream events={liveEvents} connected={liveConnected} />
           </div>
-          <div className="min-h-0 overflow-hidden">
-            <TurnWorkbench
-              agent={agent}
-              turns={agent?.turns || []}
-              selectedTurn={turn}
-              turnDetail={turnDetail}
-              onSelectTurn={setTurn}
-              onOpenLlm={openLlm}
+
+          <div className="graph-panel panel">
+            <div className="panel-title">
+              <span>Agent Swarm · actual dependency DAG</span>
+              <small>{config?.nodes.length || 0} agents</small>
+            </div>
+            <SwarmGraph
+              nodes={config?.nodes || []}
+              edges={config?.edges || []}
+              selectedAgent={agentId}
+              onSelect={setAgentId}
             />
           </div>
+
+          <CandidateArena
+            runId={runId}
+            config={config}
+            artifacts={snapshot?.artifacts || []}
+          />
         </section>
 
-        <aside className="min-h-0 border-l border-ink-200 bg-ink-50 p-3">
-          <MediaPanel media={media} title={agent ? `Media · ${agent.agent_dir}` : 'Media'} />
-        </aside>
+        <AgentInspector
+          summary={agentId ? snapshot?.agents[agentId] : undefined}
+          detail={agent}
+          runId={runId}
+          onArtifact={(artifactId) =>
+            window.open(artifactUrl(runId, artifactId), '_blank', 'noopener')
+          }
+        />
       </main>
 
-      <LlmDrawer
-        open={llmOpen}
-        path={llmPath}
-        content={llmContent}
-        loading={llmLoading}
-        error={llmError}
-        onClose={() => setLlmOpen(false)}
-      />
+      <section className={`activity-console ${consoleOpen ? 'open' : ''}`}>
+        <button onClick={() => setConsoleOpen((value) => !value)}>
+          Activity Console
+          <span>{snapshot?.activity.length || 0} events · seq {snapshot?.last_event_seq || 0}</span>
+        </button>
+        {consoleOpen && <Activity events={snapshot?.activity || []} />}
+      </section>
     </div>
   )
+}
+
+function Activity({ events }: { events: ActivityEvent[] }) {
+  return (
+    <div className="activity-lines">
+      {events.slice(-80).reverse().map((event) => (
+        <div key={event.event_seq}>
+          <time>#{event.event_seq}</time>
+          <b>{event.stage}/{event.event}</b>
+          <span>{event.summary}</span>
+          <em className={event.status}>{event.status}</em>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+export function pretty(value: unknown) {
+  return JSON.stringify(value, null, 2)
+}
+
+function elapsed(start: unknown, finish: unknown) {
+  const startNumber = Number(start || 0)
+  const finishNumber = Number(finish || Date.now() / 1000)
+  if (!startNumber) return '—'
+  return `${Math.max(0, finishNumber - startNumber).toFixed(0)}s`
 }

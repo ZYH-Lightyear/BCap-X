@@ -155,7 +155,7 @@ class FrankaLiberoEnv(BaseEnv):
 
         # We call handle.reset, but then we might want to override the init state
         libero_obs, libero_info = self.handle.reset(seed=seed)
-        
+
         # Override the init state based on the seed (which corresponds to trial ID)
         if self.handle.init_states is not None and len(self.handle.init_states) > 0:
             if seed is not None:
@@ -218,134 +218,55 @@ class FrankaLiberoEnv(BaseEnv):
         )
 
     def move_to_joints_blocking(
-        self,
-        joints: np.ndarray,
-        *,
-        tolerance: float = 0.01,
-        max_steps: int | None = None,
-        settle_steps: int = 10,
-        strict: bool = False,
-        vel_tolerance: float = 0.05,
-        max_joint_vel: float = 1.0,
-        stall_patience: int = 30,
-        stall_min_progress: float = 1e-4,
-    ) -> dict[str, Any]:
-        """Move to target joint positions by tracking a min-jerk reference.
-
-        Instead of pulling straight at the final target and counting a fixed
-        number of steps, this tracks a time-parameterized minimum-jerk
-        interpolant whose duration scales with the travel distance. That gives
-        a predictable velocity profile (near-zero velocity at arrival), makes
-        the step budget meaningful, and turns "blocked by contact" into an
-        explicit ``stalled`` outcome instead of a silent timeout.
+        self, joints: np.ndarray, *, tolerance: float = 0.01, max_steps: int = 160
+    ) -> None:
+        """Move to target joint positions using LIBERO's controller.
 
         Args:
             joints: (7,) target joint positions in radians
-            tolerance: Joint-space position tolerance for convergence
-            max_steps: Optional hard cap on tracking steps. ``None`` derives the
-                cap from the distance-adaptive interpolation budget.
-            settle_steps: Target-holding steps after position convergence, used
-                to bleed off residual velocity before reporting success
-            strict: Raise if the motion did not converge
-            vel_tolerance: Max joint-velocity norm (rad/s) to report ``settled``
-            max_joint_vel: Reference profile speed for the slowest joint (rad/s)
-            stall_patience: Abort after this many steps without progress
-                (position error not improving), which indicates contact or a
-                joint limit rather than normal tracking lag
-            stall_min_progress: Minimum per-step error decrease that counts as
-                progress
+            tolerance: Position tolerance for convergence
+            max_steps: Maximum simulation steps to reach target
         """
-        from capx.envs.simulators.motion_profiles import interp_step_budget, min_jerk
-
         target = np.asarray(joints, dtype=np.float64).reshape(7)
         self._current_joints = target
 
-        start = self._current_arm_joint_positions()
-        n_interp = interp_step_budget(
-            start,
-            target,
-            control_freq=float(self._control_freq),
-            max_joint_vel=float(max_joint_vel),
-        )
-        # LIBERO's JOINT_POSITION controller can lag substantially behind a
-        # moving reference during large orientation changes. Keep the adaptive
-        # budget, but never give a normally-progressing segment fewer than 240
-        # control steps. The stall watchdog still exits blocked motions early.
-        step_cap = (
-            int(max_steps)
-            if max_steps is not None
-            else max(180, n_interp + 60)
-        )
-
         steps = 0
-        stall_counter = 0
-        stalled = False
-        best_error = float("inf")
-        prev = start
-        joint_vel = 0.0
-        while steps < step_cap:
-            current = self._current_arm_joint_positions()
-            error = float(np.linalg.norm(current - target))
+        while steps < max_steps:
+            current = np.array(
+                self.handle.env.sim.data.qpos[self._panda_joint_qpos_addrs],
+                dtype=np.float64,
+            )
+
+            error = np.linalg.norm(current - target)
             if error < tolerance and steps > 0:
                 break
 
-            # Progress watchdog: tracking lag still improves the error every
-            # step; a plateau means the arm is physically blocked.
-            if error < best_error - stall_min_progress:
-                best_error = error
-                stall_counter = 0
-            else:
-                stall_counter += 1
-                if stall_counter >= int(stall_patience):
-                    stalled = True
-                    break
+            delta = (target - current) * self._control_freq
+            action = np.concatenate([delta, [self._gripper_fraction]])
+            action[-1] = 1.0 - action[-1] * 2.0
 
-            alpha = min_jerk((steps + 1) / n_interp)
-            reference = start + alpha * (target - start)
-            self._tracking_step(reference)
+            self._current_obs, self._current_reward, self._current_done, self._current_info = (
+                self.handle.step(action)
+            )
+
+            self._sim_step_count += 1
+            self.gripper_link_wxyz_xyz = np.concatenate(
+                [
+                    self.handle.env.sim.data.xquat[self.gripper_link_idx],
+                    self.handle.env.sim.data.xpos[self.gripper_link_idx],
+                ]
+            )
+
+            if self.viser_debug and self._sim_step_count % self._subsample_rate == 0:
+                if self._sim_step_count % self._full_viser_rate == 0:
+                    self._update_viser_server()
+                else:
+                    self._update_viser_robot_only()
+
+            if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
+                self._record_frame()
+
             steps += 1
-            joint_vel = float(
-                np.linalg.norm(self._current_arm_joint_positions() - prev) * self._control_freq
-            )
-            prev = self._current_arm_joint_positions()
-
-        final_error = float(np.linalg.norm(self._current_arm_joint_positions() - target))
-        if final_error < tolerance:
-            # Hold the target so residual velocity dies out before the caller
-            # issues the next command (no more corner-cutting between waypoints).
-            for _ in range(max(0, int(settle_steps))):
-                prev = self._current_arm_joint_positions()
-                self._tracking_step(target)
-                steps += 1
-                joint_vel = float(
-                    np.linalg.norm(self._current_arm_joint_positions() - prev)
-                    * self._control_freq
-                )
-            final_error = float(np.linalg.norm(self._current_arm_joint_positions() - target))
-
-        converged = final_error < tolerance
-        timed_out = not converged and not stalled
-        status = {
-            "converged": converged,
-            "settled": converged and joint_vel < float(vel_tolerance),
-            "stalled": stalled,
-            "timed_out": timed_out,
-            "steps": steps,
-            "step_cap": step_cap,
-            "final_error": final_error,
-            "final_joint_vel": joint_vel,
-            "tolerance": float(tolerance),
-            "target": target.copy(),
-            "current": self._current_arm_joint_positions().copy(),
-        }
-        if strict and not converged:
-            reason = "stalled (blocked by contact or joint limit)" if stalled else "timed out"
-            raise RuntimeError(
-                f"move_to_joints_blocking did not converge ({reason}): "
-                f"final_error={final_error:.6f}, tolerance={float(tolerance):.6f}, "
-                f"steps={steps}, step_cap={step_cap}"
-            )
-        return status
 
     def _tracking_step(self, reference: np.ndarray) -> None:
         """Advance one control step tracking ``reference`` joint positions."""
@@ -431,11 +352,13 @@ class FrankaLiberoEnv(BaseEnv):
         # Try exact match first, then fuzzy match on partial name
         if obj_pos_key not in self._current_obs:
             # Find all object names in the observation
-            available_obs = sorted(set(
-                k.rsplit("_1_pos", 1)[0]
-                for k in self._current_obs
-                if k.endswith("_1_pos") and not k.startswith("robot")
-            ))
+            available_obs = sorted(
+                set(
+                    k.rsplit("_1_pos", 1)[0]
+                    for k in self._current_obs
+                    if k.endswith("_1_pos") and not k.startswith("robot")
+                )
+            )
             # Try fuzzy match in obs keys
             query = obj_name.replace(" ", "_").lower()
             matches = [a for a in available_obs if query in a or a in query]
@@ -449,7 +372,9 @@ class FrankaLiberoEnv(BaseEnv):
                 body_matches = [b for b in body_names if b and query in b.lower()]
                 if body_matches:
                     # Prefer _main body, else first match
-                    body_name = next((b for b in body_matches if b.endswith("_main")), body_matches[0])
+                    body_name = next(
+                        (b for b in body_matches if b.endswith("_main")), body_matches[0]
+                    )
                     body_id = sim.model.body_name2id(body_name)
                     obj_pos = sim.data.xpos[body_id]
                     obj_quat_xyzw = sim.data.xquat[body_id]  # MuJoCo returns wxyz
@@ -461,12 +386,18 @@ class FrankaLiberoEnv(BaseEnv):
                     return obj_robot_base.translation(), obj_robot_base.rotation().wxyz
 
                 # List everything available
-                available_bodies = sorted(set(
-                    b for b in body_names
-                    if b and not any(x in b for x in ["robot", "world", "gripper", "mount", "base"])
-                    and "_main" in b
-                ))
-                available_bodies = [b.replace("_1_main", "").replace("_main", "") for b in available_bodies]
+                available_bodies = sorted(
+                    set(
+                        b
+                        for b in body_names
+                        if b
+                        and not any(x in b for x in ["robot", "world", "gripper", "mount", "base"])
+                        and "_main" in b
+                    )
+                )
+                available_bodies = [
+                    b.replace("_1_main", "").replace("_main", "") for b in available_bodies
+                ]
                 raise KeyError(
                     f"Object '{obj_name}' not found. Available objects: {available_obs + available_bodies}"
                 )
@@ -500,11 +431,13 @@ class FrankaLiberoEnv(BaseEnv):
         poses: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
         # Movable objects from observation keys
-        movable_names = sorted(set(
-            k.rsplit("_1_pos", 1)[0]
-            for k in self._current_obs
-            if k.endswith("_1_pos") and not k.startswith("robot")
-        ))
+        movable_names = sorted(
+            set(
+                k.rsplit("_1_pos", 1)[0]
+                for k in self._current_obs
+                if k.endswith("_1_pos") and not k.startswith("robot")
+            )
+        )
         for name in movable_names:
             obj_pos = self._current_obs[f"{name}_1_pos"]
             obj_quat_xyzw = self._current_obs[f"{name}_1_quat"]
@@ -595,8 +528,21 @@ class FrankaLiberoEnv(BaseEnv):
             if camera_name + "_image" in self._current_obs:
                 obs[camera_name]["images"]["rgb"] = self._current_obs[camera_name + "_image"][::-1]
             if camera_name + "_depth" in self._current_obs:
+                normalized_depth = np.asarray(
+                    self._current_obs[camera_name + "_depth"][::-1],
+                    dtype=np.float64,
+                )
+                if (
+                    not np.isfinite(normalized_depth).all()
+                    or normalized_depth.min() < -1e-6
+                    or normalized_depth.max() > 1.0 + 1e-6
+                ):
+                    raise ValueError(
+                        f"{camera_name} normalized depth is outside [0, 1]"
+                    )
                 depth_metric = get_real_depth_map(
-                    self.handle.env.sim, self._current_obs[camera_name + "_depth"][::-1]
+                    self.handle.env.sim,
+                    np.clip(normalized_depth, 0.0, 1.0),
                 )
                 obs[camera_name]["images"]["depth"] = depth_metric
             if camera_name + "_segmentation_" + self.segmentation_level in self._current_obs:
@@ -898,16 +844,69 @@ class FrankaLiberoTask(FrankaLiberoEnv):
 
 # Legacy convenience classes (kept for backward compatibility with existing configs)
 class FrankaLiberoPickPlace(FrankaLiberoEnv):
-    def __init__(self, privileged: bool = True, max_steps: int = 4000, seed: int | None = None, enable_render: bool = False, viser_debug: bool = False) -> None:
-        super().__init__(suite_name="libero_10", task_id=0, privileged=privileged, max_steps=max_steps, seed=seed, enable_render=enable_render, viser_debug=viser_debug)
+    def __init__(
+        self,
+        privileged: bool = True,
+        max_steps: int = 4000,
+        seed: int | None = None,
+        enable_render: bool = False,
+        viser_debug: bool = False,
+    ) -> None:
+        super().__init__(
+            suite_name="libero_10",
+            task_id=0,
+            privileged=privileged,
+            max_steps=max_steps,
+            seed=seed,
+            enable_render=enable_render,
+            viser_debug=viser_debug,
+        )
+
 
 class FrankaLiberoOpenMicrowave(FrankaLiberoEnv):
-    def __init__(self, privileged: bool = True, max_steps: int = 4000, seed: int | None = None, enable_render: bool = False, viser_debug: bool = False) -> None:
-        super().__init__(suite_name="libero_90", task_id=35, privileged=privileged, max_steps=max_steps, seed=seed, enable_render=enable_render, viser_debug=viser_debug)
+    def __init__(
+        self,
+        privileged: bool = True,
+        max_steps: int = 4000,
+        seed: int | None = None,
+        enable_render: bool = False,
+        viser_debug: bool = False,
+    ) -> None:
+        super().__init__(
+            suite_name="libero_90",
+            task_id=35,
+            privileged=privileged,
+            max_steps=max_steps,
+            seed=seed,
+            enable_render=enable_render,
+            viser_debug=viser_debug,
+        )
+
 
 class FrankaLiberoPickAlphabetSoup(FrankaLiberoEnv):
-    def __init__(self, privileged: bool = True, max_steps: int = 4000, seed: int | None = None, enable_render: bool = False, viser_debug: bool = False) -> None:
-        super().__init__(suite_name="libero_object", task_id=0, privileged=privileged, max_steps=max_steps, seed=seed, enable_render=enable_render, viser_debug=viser_debug)
+    def __init__(
+        self,
+        privileged: bool = True,
+        max_steps: int = 4000,
+        seed: int | None = None,
+        enable_render: bool = False,
+        viser_debug: bool = False,
+    ) -> None:
+        super().__init__(
+            suite_name="libero_object",
+            task_id=0,
+            privileged=privileged,
+            max_steps=max_steps,
+            seed=seed,
+            enable_render=enable_render,
+            viser_debug=viser_debug,
+        )
 
 
-__all__ = ["FrankaLiberoEnv", "FrankaLiberoTask", "FrankaLiberoPickPlace", "FrankaLiberoOpenMicrowave", "FrankaLiberoPickAlphabetSoup"]
+__all__ = [
+    "FrankaLiberoEnv",
+    "FrankaLiberoTask",
+    "FrankaLiberoPickPlace",
+    "FrankaLiberoOpenMicrowave",
+    "FrankaLiberoPickAlphabetSoup",
+]

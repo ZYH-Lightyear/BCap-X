@@ -57,6 +57,9 @@ dependencies = [
   "json-repair==0.*",
 ]
 
+[project.scripts]
+robomex = "robomex.cli:main"
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8",
@@ -173,7 +176,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["capx*", "robomex*", "capskillbench*"]
+include = ["capx*", "robomex*"]
 exclude = ["tests*", "configs*"]
 
 [tool.uv.extra-build-dependencies]

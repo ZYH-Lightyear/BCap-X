@@ -1,334 +1,89 @@
-# RoboMEx 高层设计：Belief-Guided Agent Swarm
-
-> 状态：方法级设计草案
->
-> 本文只回答“RoboMEx 应该是什么、如何运行、智能来自哪里”。
-> 暂不讨论 schema、class、文件结构、测试数量和代码迁移顺序。
-
-## 1. 一句话定义
-
-RoboMEx 是一个面向机器人操控的 belief-guided Coding Agent Swarm：
-
-> 它持续维护一个 Agent 可用的物理世界理解；Reactive Planner 决定当前要完成的物理 Subgoal；Swarm Manager 根据当前的不确定性、风险和任务需求动态组织 Coding Agents；Agents 用 Skills 和代码提出感知、几何、motion、monitor 与 verification 方案；Graph 把本轮 Swarm 的组织结果编译成可执行、可监控的物理闭环；真实环境中最终只执行一条经过验证的 action。
+# RoboMEx 高层设计
 
-## 2. RoboMEx 真正要解决的问题
+> 本文只记录核心命题。具体分层、契约与接口等想清楚后再逐步补充。
 
-Code-as-Policy 的瓶颈并不只是“模型会不会调用 API”，而是：
+## 核心命题：Code 是与 VLA 对齐的中间动作语言
 
-- 机器人关键数值会在图像、语言、代码变量、Agent 边界和动作 API 之间发生语义腐化；
-- 物体在动作后会移动、旋转、被遮挡、滑落，旧的 grounding 和 motion 很快失效；
-- 单个 Coding Agent 很难同时做好感知、几何、动作、监控和异常恢复；
-- 静态 Graph 可以执行计划，却很难决定物理世界变化后“现在应该换谁、补什么证据、是否继续”；
-- 简单堆叠更多 Agents 又会带来 token、延迟和错误传播。
-
-因此，RoboMEx 的核心问题是：
+把 Code-as-Policy 重新理解为一种**与 VLA 对齐的机器人控制范式**，而不是"让模型学会正确调 API"的工程问题。
 
-> 如何让一组会写代码、会调用机器人 Skills 的 Agents，围绕持续变化的物理世界形成一个低成本、可重组、可验证的闭环 policy。
-
-## 3. 总体架构
+传统 VLA：视觉观测 + 任务语言 → 神经网络 → 低层控制量。
 
-~~~text
-                         Task Prompt
-                              |
-                              v
-                    Reactive Task Planner
-                              |
-                    embodied Subgoal
-                              |
-                              v
-Agent World --------> Swarm Manager <-------- semantic events
-    |                         |
-    | role-specific context   | organize / recruit / retire
-    v                         v
-             Coding Agent Swarm
-  Grounding · Geometry · Affordance · Motion
-       Monitor · Verifier · Active Perception
-                         |
-              hypotheses / code / candidates
-                         |
-                         v
-                 Dynamic Graph Runtime
-       lifecycle · dataflow · loops · monitoring
-                         |
-                 one admitted action
-                         |
-                         v
-                   Robot / Environment
-                         |
-          observation · receipt · action video
-                         |
-                         v
-                     Agent World
-~~~
+RoboMEx：视觉观测 + 任务语言 → VLM Agent → **代码 + 机器人 API** → 动作。
 
-这套架构中：
+两者控制结构同构，差别只在动作的表达介质。动作不一定是神经网络生成的低层控制量，也可以由 VLM Agent 通过代码和机器人 API 表达。
 
-- Agent World 提供对当前物理世界的共同理解；
-- Planner 决定“下一步要达成什么”；
-- Manager 决定“为此刻的问题组织谁”；
-- Agents 决定“有哪些可行解释和方案”；
-- Graph 决定“这些工作如何安全、有序地运行”；
-- Runtime 决定“哪一条 action 被允许真正改变世界”。
+> **Code 是视觉语言推理与真实机器人能力之间的中间动作语言。**
 
-## 4. 六个高层模块
+## 真正的问题：语义腐化
 
-### 4.1 Agent World：共享的物理 belief
+现有 Code-as-Policy 方法的主要问题，并不只是模型能否正确调用 API，而是**机器人关键物理信息在传递链条中逐级失真**：
 
-Agent World 不是一张 RGB 图片，也不是全部聊天记录，更不是 simulator ground truth。
+```
+视觉观测  →  语言描述  →  代码变量  →  实际动作
+```
 
-它是当前 episode 中对物理世界的共享 belief，至少能够表达：
+腐化的危害在时间维度上放大。环境稍有变化——物体被遮挡、抓取姿态发生偏移、目标在移动中掉落——先前生成的代码并不知情，会**继续忠实地执行一个已经失效的策略**。
 
-- 机器人、夹爪、目标物体和环境当前大致处于什么状态；
-- 哪些事实是确定的，哪些是不确定或互相冲突的；
-- 某个物体是否仍被抓持、是否可见、是否被遮挡；
-- 最近执行了什么动作，预期发生什么，实际观察到什么；
-- 哪些策略已经尝试过，为什么失败；
-- 当前最阻碍下一步动作的未知量是什么。
+这是开环结构的固有缺陷，与模型能力无关。只要采用"一次生成长代码 → 盲执行"的形态，再强的模型也承受同样的缺陷。
 
-不同 Agents 不需要读取完整世界。Agent World 会针对角色提供不同视图：
+## 对策一：闭环，每次只决定一个 ActionIntent
 
-- Grounding Agent 关注目标身份、可见性、历史 track 和候选区域；
-- Motion Agent 关注物体 pose、碰撞、目标 affordance 和 robot state；
-- Monitor Agent 关注动作预期、关键约束和连续观测；
-- Manager 关注 Subgoal、主要不确定性、风险、已有 Agents 和成本。
+既然 Code 处在 VLA 中"动作"的位置上，它就必须继承 VLA 的闭环时序特性。VLA 不会一次性输出未来数百步再闭眼执行，它每一拍都重新看。
 
-Agent World 的价值不是“保存更多数据”，而是让物理状态在 Agents 之间保持同一个语义。
+机器人需要形成连续的 **观察 → 动作 → 再观察** 闭环：
 
-### 4.2 Reactive Planner：生成 embodied Subgoal
+```mermaid
+flowchart LR
+    Obs[最新观测] --> RP[Reactive Planner]
+    Task[任务语言] --> RP
+    RP -->|一个 ActionIntent| CA[Coding Agent<br/>写代码 + 调 API]
+    CA -->|执行| Env[环境]
+    Env -->|新观测| Obs
+```
 
-Planner 根据 Task Prompt、当前 Agent World 和上一阶段结果，生成下一个 embodied Subgoal。
+Reactive Planner 根据任务语言和最新观测，生成**细粒度、接近人类操作语义**的 ActionIntent。例如抓取瓶子被分为「移动到瓶盖上方」「抓住瓶盖」「抬起瓶子」。
 
-例如“把碗放到盘子上”可以在不同状态下产生：
+两条硬约束：
 
-- 找到并抓起目标碗；
-- 将已抓持的碗移动到盘子附近；
-- 根据当前抓持姿态精细对齐并释放；
-- 碗掉落后重新定位并恢复抓取。
+1. **每次只输出一个 ActionIntent**，绝不预先展开为固定流程。
+2. **每个 ActionIntent 都基于最新观测重新决策**，而不是沿着上一次的设想续接。
 
-Planner 管理任务语义，不管理 Agent roster，也不直接写 motion code。
+### 粒度判据
 
-### 4.3 Swarm Manager：围绕不确定性组织团队
+一个 ActionIntent 应当是**单次视觉落地的有效性可以覆盖的最大动作单元**。一旦需要重新看一眼才能安全推进，就必须切开。
 
-Manager 是 Subgoal 级的高层组织者。它的核心不是“画 Graph”，而是判断：
+- 过粗：「把瓶子拿起来」——跨越抓取前后两个不同物理状态，中间必须重新观测。
+- 过细：「关节 3 转 0.1 弧度」——低于推理层的抽象，属于代码内部。
 
-- 当前动作被什么未知量或风险阻塞；
-- 一个 Agent 是否已经足够；
-- 是否需要多个不同方法产生候选；
-- 是继续计算，还是先主动获取新证据；
-- 哪些 Agents 应短暂运行，哪些需要持续 tracking 或 monitoring；
-- 什么时候替换、暂停或结束某个 Agent；
-- 当前 Swarm 已经完成、无法完成，还是需要重新组织。
+ActionIntent 的粒度同时**约束了代码的爆炸半径**：Coding Agent 写的代码只服务于当前 intent，其时间跨度被 intent 边界卡死。这是抑制语义腐化的结构性手段——不是提示模型"小心点"，而是把可腐化的窗口物理缩短。
 
-Manager 应采用 risk-adaptive 策略：
+## 对策二：让 Agent 知道自己是一个身体
 
-- 简单、低风险、belief 清晰时，只启用最小团队；
-- grounding 冲突、motion 多解或风险升高时，再展开多个 Agents；
-- Agents 高度相关时，不把“多数一致”误认为独立证据；
-- 若现有信息不足，优先组织能够获得新证据的 Agent，而不是继续烧 token 猜测。
+VLA 之所以能"像身体一样使用自己的能力"，不是因为它更聪明，而是因为**本体状态天生就是它输入的一部分**——每一拍它都知道末端在哪、爪子开合、有没有夹住东西。
 
-这可以概括为 **Belief-Guided Swarm Allocation**：根据当前 belief 中真正阻塞动作的不确定性，分配最有价值且互补的 Agents。
+Coding Agent 没有这个。它每一轮都要从对话文本里重新推断自己的状态，并且经常推断错：重复已经做过的计算、沿用几拍之前就已失效的坐标、以为自己抓着东西而其实早就掉了。这是语义腐化在**自身状态**上的表现——前面讲的是对世界的认知腐化，这里是对自己的认知腐化。
 
-### 4.4 Coding Agent Swarm：完成真实工作
+对策是每一拍无条件注入一块**本体感觉**。设计原则如下。
 
-Swarm 中的 Grounding、Geometry、Affordance、Motion、Monitor 和 Verifier 仍然是 Coding Agents。
+**字段准入以行为为准。** 判据只有一条：缺了它 Agent 的行为会不会不同。末端位姿、夹爪开合与宽度、当前持有物、上一动作及其结果、已跟踪物体的位置与陈旧度、剩余步数预算——留下。关节角、相机内外参、速度、时间戳——砍掉。这一块必须短到每拍重复也不心疼；一旦臃肿，它自己就会成为淹没其他信息的噪声。
 
-它们：
+**系统算结论，模型读结论。** 上一拍的状态保留在系统侧，而不是把两块状态一起塞进提示。位移增量、命令位移与实际位移之差、物体是否跟着手在动，都由系统算好后以结论形式呈现。让模型自己做三维向量减法，等于引入一类不报错、但后续全错的失败。
 
-1. 检索自己的 Skills；
-2. 选择或组合 Skills；
-3. 编写局部代码；
-4. 在图像、点云、renderer、motion planner 或 replay 中运行；
-5. 修复局部 code/API 错误；
-6. 输出有类型的 hypothesis、monitor、verification 或 action candidate。
+**派生的判断比原始数字有用。** "持有物"不应是"爪子合上了所以大概拿着"，而应是**物体位移与末端位移是否一致**这一谓词的计算结果：两者背离就是掉了，系统在模型开口之前就知道。这是"把常数改写成关于观测的谓词"在自身状态上的应用，且对任意物体成立。
 
-Swarm 不是简单让多个相同模型重复回答。不同成员应当：
+**陈旧度是语义腐化唯一看得见的地方。** 每个被跟踪物体都带一个"距上次观测过了几拍"。语义腐化在别处都是抽象命题，只有这个字段把它变成模型每一拍都看得见、并据以决定要不要重新看一眼的东西。
 
-- 使用不同信息、模型、Skills 或观察视角；
-- 对同一个物理问题提出互补 hypotheses；
-- 可以竞争，也可以串联或相互验证；
-- 必要时在 shadow environment 中尝试 motion；
-- 任务完成后及时退出，避免长期占用上下文和预算。
+**不猜。** 把新的检测结果关联回已跟踪物体时，若出现无法区分的候选，如实上报歧义，绝不静默选一个。静默的错误关联是灾难性的：Agent 会正确地执行一个针对错误对象的动作，并且永远不知道。反过来，闭环本身让关联变容易——观测越频繁，每个物体在两拍之间移动得越少。
 
-### 4.5 Dynamic Graph Runtime：Swarm 的执行形式
+配套的**操作规程**同样要短：一拍一个有界动作、单次代码执行中最多一次改变世界状态的调用、不使用本拍之外观测到的坐标、动作前写下预期、同一种失败不重试第三次、有技能覆盖时先加载技能。其中第二条可由执行侧机械检查——这把闭环从一句劝告变成系统约束，比任何措辞都可靠。
 
-Graph 是 Agent Swarm 的 runtime representation，而不是论文中另一个独立“大脑”。
+## 当前状态
 
-Manager 先表达本轮需要怎样的团队和协作关系，系统再把这些承诺编译成 Graph。Graph 负责：
+闭环的两条边，观测边已通、执行边仍断：
 
-- 哪些 Agents 同时或依次运行；
-- 数据从谁流向谁；
-- 哪些 Agents 持续 tracking/monitoring；
-- 多个候选在哪里汇合并选择；
-- 哪些局部闭环可以反复运行；
-- 哪个异常事件会停止当前动作或唤醒 Manager；
-- 物理动作必须按什么顺序执行。
+- **观测边（通）**：`robomex/env.py` 每拍从 LIBERO-pro 渲染真实画面并落盘，以多模态 image part 随 prompt 送进 Reactive Planner。这是单步纪律能够成立的物质前提——没有画面可看，模型除了凭空展开流程别无选择。
+- **执行边（断）**：Coding Agent 与 robot port 尚未重建。环境不执行任何动作意图，反馈恒为 `IntentFeedback.status == "not_executed"`，文字说明恒为「没有执行成功」。
 
-Graph 可以随语义事件更新，但不需要每个控制帧都重新生成。
+由此产生一个看起来奇怪、实则正确的现象：连续多步运行时，planner 会**反复给出同一个动作意图**。因为画面确实没变，该做的那一步确实还没做。这正是闭环在执行层缺失下应有的表现，不是缺陷。
 
-因此：
-
-> Swarm 提供适应性，Graph 把适应性变成可执行的组织结构。
-
-### 4.6 Physical Runtime：唯一真实执行与反馈
-
-Agents 可以并行思考、写代码、渲染、replay 和模拟多个方案，但真实环境中一次只能有一条 action 获得物理执行权。
-
-Physical Runtime 负责：
-
-- 检查 action 是否仍基于当前有效的世界状态；
-- 检查 frame、IK、collision、workspace 和安全约束；
-- 保证 monitor 已经就位；
-- 执行唯一被选中的 action；
-- 收集 robot state、观测、action receipt 和视频；
-- 在异常时停止或中断；
-- 把结果送回 Agent World。
-
-“single physical writer”只限制真实机器人命令，不限制多个 Motion Agents 在点云、CuRobo 或 renderer 中并行尝试。
-
-## 5. 系统如何运行
-
-一次完整闭环分为七步：
-
-1. Planner 从任务和 Agent World 产生当前 Subgoal。
-2. Manager 找出阻塞这个 Subgoal 的关键不确定性和风险。
-3. Manager 组织一个最小 Swarm；必要时才扩展更多 Agents。
-4. Agents 使用 Skills 和代码产生 hypotheses、evidence、monitors 和 action candidates。
-5. 系统选择、融合、拒绝候选，或决定先获取新证据。
-6. Graph Runtime 执行一条被允许的 action，同时持续 monitoring。
-7. 新观测更新 Agent World：
-   - 普通误差由当前局部闭环继续修正；
-   - 歧义、遮挡、滑移等事件唤醒 Manager 重组 Swarm；
-   - Subgoal 完成或语义前提失效时返回 Planner。
-
-这里有三种不同时间尺度：
-
-- 控制帧：由 deterministic runtime、tracker 和 monitor 处理；
-- 语义事件：由 Manager 处理；
-- Subgoal 边界：由 Planner 处理。
-
-这样可以避免高层模型在每帧运行，也避免物理世界已经变化时仍盲目执行旧 Graph。
-
-## 6. 案例：将碗放到盘子上
-
-假设机器人已经抓住碗，但抓住的是碗边，碗相对夹爪的姿态不确定。
-
-### 正常路径
-
-1. Planner 产生“将已抓持的碗精细放到盘子上”的 Subgoal。
-2. Agent World 表示：
-   - 碗仍被抓住；
-   - 碗相对夹爪的姿态存在不确定性；
-   - 盘子中心与可放置区域已有候选；
-   - 直接使用固定 world-axis offset 风险较高。
-3. Manager 组织：
-   - attached-object pose Agent；
-   - plate grounding/placement Agent；
-   - 一个或多个 Motion Agents；
-   - 持续运行的 attachment/alignment Monitor；
-   - 必要的 Verifier。
-4. Agents 在点云或 2D 图上渲染夹爪与碗的候选状态，淘汰明显不合理的 motion。
-5. Graph 每次只执行一个小的对齐动作。
-6. 新观察更新碗底与盘子中心的相对误差。
-7. 达到放置条件后，Graph 执行下降、释放、撤离和验证。
-
-移动多少、向哪个方向、什么时候停止，来自当前 belief 下的闭环修正，而不是任务专用 offset。
-
-### 碗在运输中掉落
-
-1. Monitor code 发现 attachment 约束不再成立。
-2. Physical Runtime 中断当前动作，并使后续 release/place 失效。
-3. Agent World 更新为“attachment lost”，同时保存最后可信位置和新位置 hypotheses。
-4. Manager 不再沿旧 place Graph 继续：
-   - 若当前 Subgoal 允许恢复，它组织 locate + regrasp Swarm；
-   - 若原 Subgoal 前提已失效，则返回 Planner，由 Planner 生成恢复抓取 Subgoal。
-5. 新 Swarm 和新 Graph 从更新后的 Agent World 继续。
-
-这不是为“掉碗”硬编码一个 if 分支，而是统一规则：
-
-> 当动作结果破坏了当前 Subgoal 或 Graph 所依赖的物理 belief 时，旧执行承诺失效，系统根据新的 belief 重新组织。
-
-## 7. 与现有工作的高层区别
-
-### 相对 GaP
-
-GaP 的核心是 Graph-as-Policy：多 Agents 负责生成、仿真和优化可部署 Graph。
-
-RoboMEx 的核心应是：
-
-- 部署期间仍存在的、围绕当前物理 belief 动态组织的 Coding Agent Swarm；
-- Graph 只是本轮 Swarm 的编译后 runtime representation；
-- 物理语义事件可以改变 Agents 的生命周期与后续执行结构。
-
-因此不与 GaP 竞争“谁的 Graph 更复杂”，而是研究 Graph 之上的在线 Swarm policy。
-
-### 相对 ASPIRE
-
-ASPIRE 的核心是利用细粒度执行 trace 调试程序、演化可复用 Skills。
-
-RoboMEx 的核心应是：
-
-- 在一次正在进行的物理 episode 内维护世界 belief；
-- 在真正执行下一动作前组织互补 Agents、比较方案或主动取证；
-- 动作后根据物理变化立即重组，而不是主要依赖跨 rollout 的程序进化。
-
-### 相对 CaP-X
-
-CaP-X 证明 Coding Agent 可以通过 API 和 Skills 控制机器人。
-
-RoboMEx 要进一步证明：
-
-- code 可以成为多个 Agents 共享的、显式的机器人 action language；
-- Agent World 让 code 与持续变化的物理世界保持对齐；
-- Swarm 可以比单 Coding Agent 更可靠地处理不确定性和恢复。
-
-## 8. 论文故事
-
-RoboMEx 可以被理解成一种显式、agentic 的 VLA：
-
-~~~text
-Vision + Language + Agent World
-              |
-     Belief-Guided Agent Swarm
-              |
-        executable code
-              |
-    Graph + Physical Runtime
-              |
-             Action
-~~~
-
-其中：
-
-- Agent World 提供显式、持续的 embodied context；
-- Agent Swarm 承担可解释的 policy reasoning；
-- code 是连接 VLM reasoning 与机器人能力的 action language；
-- Graph/Runtime 把开放式 reasoning 收敛成安全、可执行的 action。
-
-最值得验证的三个方法主张是：
-
-1. **Shared embodied belief** 能减少跨 Agent、跨动作的物理语义腐化；
-2. **Belief-guided elastic swarm** 能以受控成本处理感知歧义、motion 多解和异常恢复；
-3. **Compiled graph execution** 能让动态 Swarm 在真实机器人上保持可监控、可恢复和单一物理权限。
-
-这套设计有成为强工作的潜力，但是否超过 GaP、ASPIRE，最终取决于三个实验事实：
-
-- Agent World 是否真的比 raw observation/history 更可靠；
-- 动态 Swarm 是否在同等成本下优于单 Agent 或固定 ensemble；
-- 遮挡、滑移、掉落和精细放置时，系统是否真的会改变策略，而不只是重新生成相似代码。
-
-## 9. 架构冻结条件
-
-在进入完整代码重构之前，只需要共同确认五件事：
-
-1. Agent World 是共享 belief，而不是全量黑板或 learned dynamics model；
-2. Planner 管 Subgoal，Manager 管 Swarm，Agents 做具体工作；
-3. Swarm 的扩展由不确定性与风险驱动，不默认全员并行；
-4. Graph 是编译后的 runtime structure，不是 Manager 的自由输出，也不是论文主体；
-5. 真实动作始终单写入，所有并行尝试都发生在 shadow/replay/render 层。
-
-确认这五点后，下一份文档才应该回答：
-
-- 当前 RoboMEx 哪些模块保留、重构或删除；
-- Agent World、Manager、Swarm 与 Graph 分别映射到哪些代码；
-- 如何从 Bowl baseline 逐步迁移到通用 live 系统；
-- 每个阶段如何测试与验收。
+代码只剩 Reactive Planner 一层：`contracts.py`（四个数据类）、`planner.py`（单步决策）、`env.py`（出图不执行）、`policy.py` / `images.py` / `trace.py` / `cli.py`（边界与落盘）。

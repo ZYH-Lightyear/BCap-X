@@ -177,14 +177,20 @@ class FrankaLiberoApiReduced(ApiBase):
     def functions(self) -> dict[str, Any]:
         fns = {}
         fns["get_observation"] = self.get_observation
-        fns["segment_sam3_text_prompt"] = self.segment_sam3_text_prompt
+        # The registrations commented out in this block are temporarily unexposed to
+        # save prompt tokens; the methods stay defined for internal use. The
+        # human-oracle configs resolve them by name from the sandbox namespace, so
+        # re-enable them before running those configs.
+         # fns["segment_sam3_text_prompt"] = self.segment_sam3_text_prompt
+        # fns["point_prompt_molmo"] = self.point_prompt_molmo
         fns["segment_sam3_point_prompt"] = self.segment_sam3_point_prompt
         fns["segment_sam3_box_prompt"] = self.segment_sam3_box_prompt
-        fns["point_prompt_molmo"] = self.point_prompt_molmo
         fns["query_vlm"] = self.query_vlm
         fns["vlm_bbox_detection"] = self.vlm_bbox_detection
         fns["vlm_point_detection"] = self.vlm_point_detection
-        fns["parse_vlm_detections"] = self.parse_vlm_detections
+        # parse_vlm_detections is deliberately unregistered: the two wrappers above
+        # already call it, so exposing it only spends prompt tokens on a parser the
+        # agent never needs to invoke itself.
         fns["plan_grasp"] = self.plan_grasp
         fns["plan_grasp_from_point_clouds"] = self.plan_grasp_from_point_clouds
         fns["get_oriented_bounding_box_from_3d_points"] = (
@@ -200,14 +206,13 @@ class FrankaLiberoApiReduced(ApiBase):
         fns["subsample_point_cloud"] = self.subsample_point_cloud
         fns["filter_noise"] = self.filter_noise
 
-        # Optional cuRobo backend. Imports stay lazy, so exposing these names does
-        # not require cuRobo unless an agent explicitly chooses this backend.
-        fns["parse_grasp_poses_for_curobo"] = self.parse_grasp_poses_for_curobo
-        fns["update_curobo_world"] = self.update_curobo_world
-        fns["update_curobo_world_with_object"] = self.update_curobo_world_with_object
-        fns["plan_grasp_trajectory"] = self.plan_grasp_trajectory
-        fns["plan_with_grasped_object"] = self.plan_with_grasped_object
-        fns["execute_joint_trajectory"] = self.execute_joint_trajectory
+        # # CuRobo, uncomment these for the coding agent to use them!
+        # fns["parse_grasp_poses_for_curobo"] = self.parse_grasp_poses_for_curobo
+        # fns["update_curobo_world"] = self.update_curobo_world
+        # fns["update_curobo_world_with_object"] = self.update_curobo_world_with_object
+        # fns["plan_grasp_trajectory"] = self.plan_grasp_trajectory
+        # fns["plan_with_grasped_object"] = self.plan_with_grasped_object
+        # fns["execute_joint_trajectory"] = self.execute_joint_trajectory
         return fns
 
 
@@ -409,8 +414,7 @@ class FrankaLiberoApiReduced(ApiBase):
         A thin, general-purpose bridge to the same LLM proxy the planner uses, so code
         blocks can do their own visual reasoning (e.g. read a label, classify scene
         state, sanity-check an annotated image). You parse the returned string yourself.
-        Do not use this API for spatial grounding. Use ``vlm_bbox_detection`` for boxes
-        and ``vlm_point_detection`` for points.
+        Do not use this API for spatial grounding.
 
         Model/endpoint come from the API instance configuration when RoboMEx launches
         the env. Other CapX launch paths may still use environment variables:
@@ -994,8 +998,9 @@ class FrankaLiberoApiReduced(ApiBase):
 
     # Single arm control APIs
 
-    def move_to_joints(self, joints: np.ndarray) -> dict[str, Any]:
+    def move_to_joints(self, joints: np.ndarray) -> None:
         """Move the robot to a given joint configuration in a blocking manner.
+        Interpolation is slightly rudimentary so it is recommended to keep pre-grasp cartesian offsets smaller e.g. 0.075m.
 
         Args:
             joints:
@@ -1003,19 +1008,16 @@ class FrankaLiberoApiReduced(ApiBase):
                 Shape: (7,), dtype float64.
 
         Returns:
-            dict: Motion status with keys ``converged`` (bool, target reached),
-            ``stalled`` (bool, motion blocked by contact or a joint limit before
-            reaching the target), ``final_error`` (float, joint-space error in
-            radians) and ``steps``. Always check ``converged``; a False value
-            means the arm is NOT at the requested configuration.
+            None
 
         Example:
             >>> joints = np.array([0.0, -0.5, 0.0, -2.0, 0.0, 1.5, 0.8]) # this is an example home joint configuration for the Franka arm
-            >>> status = move_to_joints(joints)
-            >>> assert status['converged'], f"move blocked: {status}"
+            >>> move_to_joints(joints)
         """
         joints = np.asarray(joints, dtype=np.float64).reshape(7)
-        return self._env.move_to_joints_blocking(joints)
+        self._env.move_to_joints_blocking(joints)
+
+        # self._env.move_to_joints_non_blocking(joints)
 
     def open_gripper(self) -> None:
         """Open gripper fully.
@@ -1038,92 +1040,40 @@ class FrankaLiberoApiReduced(ApiBase):
         position: np.ndarray,
         quaternion_wxyz: np.ndarray,
         z_approach: float = 0.0,
-    ) -> dict[str, Any]:
+    ) -> None:
         """Go to pose using Inverse Kinematics with optional approach motion.
 
         Combines solve_ik + move_to_joints into a single call. If z_approach > 0,
-        first moves to position offset by z_approach in world +Z, then moves to
-        the final position.
+        first moves to position offset by z_approach in the gripper's Z axis,
+        then moves to the final position.
 
         Args:
             position: (3,) XYZ target in meters (world frame).
             quaternion_wxyz: (4,) WXYZ unit quaternion (world frame).
-            z_approach: World +Z offset for approach motion (meters). Default 0.0.
-
-        Returns:
-            dict: Motion status of the final segment with keys ``converged``
-            (bool, pose reached), ``stalled`` (bool, blocked by contact or a
-            joint limit), ``final_error`` (float, joint-space error in radians)
-            and ``steps``. Always check ``converged`` before acting as if the
-            arm is at the requested pose (especially before close_gripper);
-            ``stalled=True`` during a descend usually means the fingers or hand
-            hit the object or the support surface.
+            z_approach: Z offset for approach motion (meters). Default 0.0.
 
         Example:
-            >>> status = goto_pose(np.array([0.5, 0.0, 0.3]), np.array([0.0, 1.0, 0.0, 0.0]), z_approach=0.075)
-            >>> assert status['converged'], f"goto_pose blocked: {status}"
+            >>> goto_pose(np.array([0.5, 0.0, 0.3]), np.array([0.0, 1.0, 0.0, 0.0]), z_approach=0.075)
         """
         pos = np.asarray(position, dtype=np.float64).reshape(3)
         quat = np.asarray(quaternion_wxyz, dtype=np.float64).reshape(4)
 
-        approach_status: dict[str, Any] | None = None
         if z_approach > 0.0:
             approach_pos = pos.copy()
             approach_pos[2] += z_approach
             joints = self.solve_ik(approach_pos, quat)
-            approach_status = self.move_to_joints(joints)
+            self.move_to_joints(joints)
 
         joints = self.solve_ik(pos, quat)
-        final_status = self.move_to_joints(joints)
-        if approach_status is not None:
-            final_status = {
-                **final_status,
-                "approach_status": approach_status,
-                "all_converged": bool(approach_status.get("converged"))
-                and bool(final_status.get("converged")),
-            }
-        return final_status
+        self.move_to_joints(joints)
     
-    def goto_home_joint_position(
-        self,
-        tolerance: float = 0.008,
-        max_steps: int = 360,
-        retries: int = 1,
-    ) -> None:
-        """Return the arm to its reset joint configuration with high manipulability.
-
-        This preserves the current gripper command. It must not be paired with
-        ``open_gripper()`` merely to get a clearer observation, because the robot may
-        already be holding an object.
-        """
+    def goto_home_joint_position(self) -> None:
+        """Return the arm to its reset joint configuration with high manipulability"""
         home = getattr(self._env, "home_joint_position", None)
         if home is None:
             raise RuntimeError("Home joint position is unavailable in the current environment.")
         joints = np.asarray(home, dtype=np.float64).reshape(7)
-        attempts = max(1, int(retries) + 1)
-        last_status = None
-        for _ in range(attempts):
-            last_status = self._env.move_to_joints_blocking(
-                joints,
-                tolerance=float(tolerance),
-                max_steps=int(max_steps),
-                settle_steps=8,
-                strict=False,
-            )
-            if isinstance(last_status, dict) and last_status.get("converged"):
-                return
-            if not isinstance(last_status, dict):
-                return
-        final_error = (
-            float(last_status.get("final_error", float("inf")))
-            if isinstance(last_status, dict)
-            else float("inf")
-        )
-        raise RuntimeError(
-            "goto_home_joint_position did not reach home: "
-            f"final_error={final_error:.6f}, tolerance={float(tolerance):.6f}, "
-            f"attempts={attempts}, max_steps={int(max_steps)}"
-        )
+        self._env.move_to_joints_blocking(joints)
     
     def subsample_point_cloud(self, pc: np.ndarray, max_points: int = 10000) -> np.ndarray:
         """Randomly subsample a point cloud to a maximum number of points.
@@ -1376,24 +1326,15 @@ class FrankaLiberoApiReduced(ApiBase):
         *,
         subsample: int = 1,
         tolerance: float = 0.01,
-        max_steps: int | None = None,
-    ) -> dict[str, Any]:
+        max_steps: int = 120,
+    ) -> None:
         """Execute a joint-space trajectory (T, 7) by moving to each waypoint with move_to_joints_blocking.
-
-        Intermediate waypoints are tracked without a settle phase; only the
-        final waypoint settles to zero velocity.
 
         Args:
             joint_trajectory: (T, 7) joint positions in radians.
             subsample: Use every Nth waypoint (1 = all). Larger values speed up execution. Default is 1.
             tolerance: Passed to move_to_joints_blocking. Default is 0.01.
-            max_steps: Optional hard cap passed to move_to_joints_blocking.
-                ``None`` uses its adaptive budget (with a 240-step floor).
-
-        Returns:
-            dict: Final-waypoint status plus ``waypoint_statuses``,
-            ``all_converged``, and ``completed_waypoints``. A failed waypoint
-            stops execution before later dependent waypoints.
+            max_steps: Passed to move_to_joints_blocking. Default is 120.
         """
         traj = np.asarray(joint_trajectory, dtype=np.float64)
         if traj.ndim != 2 or traj.shape[1] < 7:
@@ -1401,31 +1342,11 @@ class FrankaLiberoApiReduced(ApiBase):
         indices = list(range(0, len(traj), subsample))
         if indices and indices[-1] != len(traj) - 1:
             indices.append(len(traj) - 1)
-        status: dict[str, Any] = {}
-        waypoint_statuses: list[dict[str, Any]] = []
         for i in indices:
             joints = traj[i, :7]
-            is_last = i == indices[-1]
-            status = self._env.move_to_joints_blocking(
-                joints,
-                tolerance=tolerance,
-                max_steps=max_steps,
-                settle_steps=10 if is_last else 0,
+            self._env.move_to_joints_blocking(
+                joints, tolerance=tolerance, max_steps=max_steps
             )
-            waypoint_statuses.append({"waypoint_index": i, **status})
-            if (
-                not status.get("converged")
-                or status.get("timed_out")
-                or status.get("stalled")
-            ):
-                break
-        return {
-            **status,
-            "waypoint_statuses": waypoint_statuses,
-            "all_converged": bool(waypoint_statuses)
-            and all(item.get("converged") for item in waypoint_statuses),
-            "completed_waypoints": len(waypoint_statuses),
-        }
     
     def update_curobo_world_with_object(
         self,

@@ -1,19 +1,19 @@
 # Code-as-Policy 系列论文梳理：CaP-X、Playful、GaP、ASPIRE
 
 > 整理日期：2026-07-23。本文按当日 arXiv 最新版本整理；这些工作均为 2026 年预印本，后续版本的数字和实验协议可能调整。
->
-> 用户给出的 “ASIPRE” 应为 **ASPIRE**（Agentic Skill Programming through Iterative Robot Exploration）。
 
 ## 0. 先说结论
 
 这四篇不是四个相互替代的算法，而是在回答 Code-as-Policy 系统的四个不同问题：
 
-| 工作 | 它最核心的问题 | 一句话答案 |
-|---|---|---|
-| **CaP-X** | 怎样公平地衡量并增强“写代码控制机器人”的 Agent？ | 用分层 Benchmark 拆开 API 抽象、交互轮次和视觉 grounding，再以 VDM、自动技能合成、并行推理和 RL 提升 coding agent。 |
-| **Playful / RATs** | 没有下游指令时，机器人能否先通过“玩”积累以后有用的技能？ | 用好奇心选择“新颖但可学”的自提任务，经多 Agent 执行、验证和诊断，将成功程序蒸馏成持久代码技能。 |
-| **GaP** | 面向需要长期重复运行的工业任务，free-form Python 是否足够可靠？ | 把 policy 变成可静态检查的有向计算图，调用模块化技能，并在参数化仿真中反复 rehearsal、定位节点失败和改图。 |
-| **ASPIRE** | 如何把每次执行失败变成可复用、可跨任务迁移的修复经验？ | 记录 primitive 级多模态 trace，闭环诊断并验证修复，将修复提炼成 skill，再用 evolutionary search 跳出局部修补。 |
+
+| 工作                 | 它最核心的问题                                  | 一句话答案                                                                             |
+| ------------------ | ---------------------------------------- | --------------------------------------------------------------------------------- |
+| **CaP-X**          | 怎样公平地衡量并增强“写代码控制机器人”的 Agent？             | 用分层 Benchmark 拆开 API 抽象、交互轮次和视觉 grounding，再以 VDM、自动技能合成、并行推理和 RL 提升 coding agent。 |
+| **Playful / RATs** | 没有下游指令时，机器人能否先通过“玩”积累以后有用的技能？            | 用好奇心选择“新颖但可学”的自提任务，经多 Agent 执行、验证和诊断，将成功程序蒸馏成持久代码技能。                              |
+| **GaP**            | 面向需要长期重复运行的工业任务，free-form Python 是否足够可靠？ | 把 policy 变成可静态检查的有向计算图，调用模块化技能，并在参数化仿真中反复 rehearsal、定位节点失败和改图。                    |
+| **ASPIRE**         | 如何把每次执行失败变成可复用、可跨任务迁移的修复经验？              | 记录 primitive 级多模态 trace，闭环诊断并验证修复，将修复提炼成 skill，再用 evolutionary search 跳出局部修补。     |
+
 
 可以把它们放到一条系统生命周期上理解：
 
@@ -31,28 +31,32 @@ GaP：把成熟策略固化为可检查、可重复部署的计算图并优化�
 
 ## 1. Paper 与资源链接
 
-| 简称 | 论文全名 | 版本 | Paper | Project |
-|---|---|---:|---|---|
-| CaP-X | *CaP-X: A Framework for Benchmarking and Improving Coding Agents for Robot Manipulation* | arXiv v2, 2026-07-02 | [arXiv](https://arxiv.org/abs/2603.22435) · [HTML](https://arxiv.org/html/2603.22435) | [CaP-Gym](https://capgym.github.io/) |
-| Playful / RATs | *Playful Agentic Robot Learning* | arXiv v1, 2026-06-17 | [arXiv](https://arxiv.org/abs/2606.19419) · [HTML](https://arxiv.org/html/2606.19419) | [Playful RATs](https://playful-rats.github.io/) |
-| GaP | *GaP: A Graph-as-Policy Multi-Agent Self-Learning Harness for Variational Automation Tasks* | arXiv v1, 2026-07-06 | [arXiv](https://arxiv.org/abs/2607.05369) · [HTML](https://arxiv.org/html/2607.05369) | [Graph-as-Policy](https://graph-robots.github.io/gap/) |
-| ASPIRE | *ASPIRE: Agentic /Skills Discovery for Robotics* | arXiv v1, 2026-06-30 | [arXiv](https://arxiv.org/abs/2607.00272) · [HTML](https://arxiv.org/html/2607.00272) | [NVIDIA GEAR ASPIRE](https://research.nvidia.com/labs/gear/aspire/) |
+
+| 简称             | 论文全名                                                                                        | 版本                   | Paper                                                                                 | Project                                                             |
+| -------------- | ------------------------------------------------------------------------------------------- | -------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| CaP-X          | *CaP-X: A Framework for Benchmarking and Improving Coding Agents for Robot Manipulation*    | arXiv v2, 2026-07-02 | [arXiv](https://arxiv.org/abs/2603.22435) · [HTML](https://arxiv.org/html/2603.22435) | [CaP-Gym](https://capgym.github.io/)                                |
+| Playful / RATs | *Playful Agentic Robot Learning*                                                            | arXiv v1, 2026-06-17 | [arXiv](https://arxiv.org/abs/2606.19419) · [HTML](https://arxiv.org/html/2606.19419) | [Playful RATs](https://playful-rats.github.io/)                     |
+| GaP            | *GaP: A Graph-as-Policy Multi-Agent Self-Learning Harness for Variational Automation Tasks* | arXiv v1, 2026-07-06 | [arXiv](https://arxiv.org/abs/2607.05369) · [HTML](https://arxiv.org/html/2607.05369) | [Graph-as-Policy](https://graph-robots.github.io/gap/)              |
+| ASPIRE         | *ASPIRE: Agentic /Skills Discovery for Robotics*                                            | arXiv v1, 2026-06-30 | [arXiv](https://arxiv.org/abs/2607.00272) · [HTML](https://arxiv.org/html/2607.00272) | [NVIDIA GEAR ASPIRE](https://research.nvidia.com/labs/gear/aspire/) |
+
 
 仓库中已有 CaP-X、Playful 和 ASPIRE 的本地 PDF，位于 `docs/papers/code as policy/`；GaP 的整理以 arXiv v1 和官方项目页为准。
 
 ## 2. 横向总表
 
-| 维度 | CaP-X | Playful / RATs | GaP | ASPIRE |
-|---|---|---|---|---|
-| 核心定位 | Benchmark + agent harness + RL 平台 | 自主 play-time 技能预学习 | 工业/商业 Variational Automation 的结构化 policy | 由执行失败驱动的持续技能发现 |
-| Policy 基本单位 | 可执行 Python 程序，组合 perception/control primitives | Python policy + 可调用代码技能 | 具有 typed I/O 的有向计算图节点与 data/control edge | Python robot program + 可检索的 validated repair skill |
-| 反馈粒度 | stdout/stderr、环境状态、RGB 或 VDM 文本差分 | goal verdict、step verdict、failure diagnosis | node 前后状态、接触和仿真执行结果 | 每个 primitive 的 API I/O、状态、关键帧、overlay、grasp/plan 结果 |
-| 主要学习/搜索机制 | Test-time 多轮自纠；自动 skill synthesis；GRPO/RLVR | 新颖性 + competence frontier 的好奇心选任务；play 后蒸馏 | 参数化仿真并行 rehearsal；修改图拓扑、节点和参数 | trace-guided repair + skill admission + program evolutionary search |
-| 长期记忆 | 9 个自动归纳的 task-agnostic helper skills | skill library + failure memory + reliability tier | MORSL（初始 51 skills）及优化后的部署图 | 经验证的失败签名、适用条件、修复策略/代码草图 |
-| 是否更新模型权重 | Agent0 否；CaP-RL 是 | 否 | 否 | 否 |
-| 主要 Bench | CaP-Bench 7-task core；CaP-Gym 187 tasks；LIBERO-PRO、BEHAVIOR、real robot | LIBERO-PRO、MolmoSpaces、RoboSuite、real robot | 新建 8 个 VA tasks（4 sim + 4 real） | LIBERO-Pro、Robosuite、BEHAVIOR-1K、LIBERO-Pro Long、real robot |
-| 主要外部评价指标 | Zero-shot Pass@1、task success、dense reward、code compilation、navigation success | 下游 task success rate / percentage-point gain | success rate、completion/cycle time、throughput、sequence success | held-out task success、navigation success、tokens-to-first-success |
-| 最能代表论文的结果 | Agent0 在 7 个核心任务中 4 个达到/超过 human；CaP-RL 仿真均值约 20%→72% | LIBERO-PRO 23.2%→43.8%；MolmoSpaces 21.0%→38.0% | 大幅扰动下 SR 0.93–0.99；爆米花 33%→94% sim、90% real | LIBERO-Pro 总体 18%→72%；execution engine + search 消融 14%→62%→72% |
+
+| 维度          | CaP-X                                                                          | Playful / RATs                                    | GaP                                                            | ASPIRE                                                              |
+| ----------- | ------------------------------------------------------------------------------ | ------------------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------- |
+| 核心定位        | Benchmark + agent harness + RL 平台                                              | 自主 play-time 技能预学习                                | 工业/商业 Variational Automation 的结构化 policy                       | 由执行失败驱动的持续技能发现                                                      |
+| Policy 基本单位 | 可执行 Python 程序，组合 perception/control primitives                                 | Python policy + 可调用代码技能                           | 具有 typed I/O 的有向计算图节点与 data/control edge                       | Python robot program + 可检索的 validated repair skill                  |
+| 反馈粒度        | stdout/stderr、环境状态、RGB 或 VDM 文本差分                                              | goal verdict、step verdict、failure diagnosis       | node 前后状态、接触和仿真执行结果                                            | 每个 primitive 的 API I/O、状态、关键帧、overlay、grasp/plan 结果                 |
+| 主要学习/搜索机制   | Test-time 多轮自纠；自动 skill synthesis；GRPO/RLVR                                    | 新颖性 + competence frontier 的好奇心选任务；play 后蒸馏        | 参数化仿真并行 rehearsal；修改图拓扑、节点和参数                                  | trace-guided repair + skill admission + program evolutionary search |
+| 长期记忆        | 9 个自动归纳的 task-agnostic helper skills                                           | skill library + failure memory + reliability tier | MORSL（初始 51 skills）及优化后的部署图                                    | 经验证的失败签名、适用条件、修复策略/代码草图                                             |
+| 是否更新模型权重    | Agent0 否；CaP-RL 是                                                              | 否                                                 | 否                                                              | 否                                                                   |
+| 主要 Bench    | CaP-Bench 7-task core；CaP-Gym 187 tasks；LIBERO-PRO、BEHAVIOR、real robot         | LIBERO-PRO、MolmoSpaces、RoboSuite、real robot       | 新建 8 个 VA tasks（4 sim + 4 real）                                | LIBERO-Pro、Robosuite、BEHAVIOR-1K、LIBERO-Pro Long、real robot         |
+| 主要外部评价指标    | Zero-shot Pass@1、task success、dense reward、code compilation、navigation success | 下游 task success rate / percentage-point gain      | success rate、completion/cycle time、throughput、sequence success | held-out task success、navigation success、tokens-to-first-success    |
+| 最能代表论文的结果   | Agent0 在 7 个核心任务中 4 个达到/超过 human；CaP-RL 仿真均值约 20%→72%                          | LIBERO-PRO 23.2%→43.8%；MolmoSpaces 21.0%→38.0%    | 大幅扰动下 SR 0.93–0.99；爆米花 33%→94% sim、90% real                    | LIBERO-Pro 总体 18%→72%；execution engine + search 消融 14%→62%→72%      |
+
 
 ## 3. CaP-X
 
@@ -62,24 +66,26 @@ CaP-X 把“LLM/VLM 写机器人代码”变成一个可系统实验的研究对
 
 1. **CaP-Gym**：以 Gymnasium/REPL 形式连接代码执行器和底层机器人环境。Agent 接收观察、生成 Python，程序可多次调用 perception、geometry、motion/control primitives。
 2. **CaP-Bench**：沿三个轴做受控评价：
-   - primitive abstraction：人写的 high-level macro vs 原子化 low-level API；
-   - temporal interaction：single-turn vs 带执行反馈的 multi-turn；
-   - perceptual grounding：状态、原始 RGB、或 VLM 生成的结构化视觉差分文本。
+  - primitive abstraction：人写的 high-level macro vs 原子化 low-level API；
+  - temporal interaction：single-turn vs 带执行反馈的 multi-turn；
+  - perceptual grounding：状态、原始 RGB、或 VLM 生成的结构化视觉差分文本。
 3. **CaP-Agent0**：把 Benchmark 中有效的机制组合起来：multi-turn、Visual Differencing Module（VDM）、自动合成的 task-agnostic skill library、并行/多模型候选代码集成。
 4. **CaP-RL**：把生成的程序当作 action，在物理仿真给出的可验证 reward 上用 GRPO 直接 post-train coding LLM。
 
 CaP-Bench 的八个 tier 可概括为：
 
-| Tier | 交互 | Primitive / perception | 主要用途 |
-|---|---|---|---|
-| S1 | single-turn | high-level + privileged noiseless state | 隔离纯规划能力，作为 reasoning upper bound |
-| S2 | single-turn | high-level + noisy perception | 接近以往高层 CaP 设置 |
-| S3 | single-turn | low-level + API usage examples | 测低层组合能力及 in-context 示例作用 |
-| S4 | single-turn | low-level，仅 signature/docstring | 最少人类 scaffolding 的严格设置 |
-| M1 | multi-turn | stdout/stderr 与执行 trace | 测试调试、自省和恢复 |
-| M2 | multi-turn | 直接回传 RGB | 测原始多模态 grounding |
-| M3 | multi-turn | VDM 将视觉变化转成结构化文本 | 测显式文本 grounding |
-| M4 | multi-turn | low-level API + VDM | 在低层表达力下用 test-time compute 补可靠性 |
+
+| Tier | 交互          | Primitive / perception                  | 主要用途                             |
+| ---- | ----------- | --------------------------------------- | -------------------------------- |
+| S1   | single-turn | high-level + privileged noiseless state | 隔离纯规划能力，作为 reasoning upper bound |
+| S2   | single-turn | high-level + noisy perception           | 接近以往高层 CaP 设置                    |
+| S3   | single-turn | low-level + API usage examples          | 测低层组合能力及 in-context 示例作用         |
+| S4   | single-turn | low-level，仅 signature/docstring         | 最少人类 scaffolding 的严格设置           |
+| M1   | multi-turn  | stdout/stderr 与执行 trace                 | 测试调试、自省和恢复                       |
+| M2   | multi-turn  | 直接回传 RGB                                | 测原始多模态 grounding                 |
+| M3   | multi-turn  | VDM 将视觉变化转成结构化文本                        | 测显式文本 grounding                  |
+| M4   | multi-turn  | low-level API + VDM                     | 在低层表达力下用 test-time compute 补可靠性  |
+
 
 ### 3.2 Novelty
 
@@ -90,13 +96,15 @@ CaP-Bench 的八个 tier 可概括为：
 
 ### 3.3 Benchmark 与实验设置
 
-| 层次 | 内容 | 规模/协议 |
-|---|---|---|
-| CaP-Gym 全量发布 | Robosuite、LIBERO-PRO、BEHAVIOR | 共 187 tasks：7 + 130 + 50 |
-| CaP-Bench 核心受控实验 | Cube Lift、Cube Stack、Spill Wipe、Peg Insertion、Cube Re-stack、Two-Arm Lift、Two-Arm Handover | 7 tasks；12 个开源/闭源 LM/VLM；每 task/tier 100 trials |
-| LIBERO-PRO 泛化 | Object、Goal、Spatial；Pos 与 Task perturbation | 与 OpenVLA、π 系列 VLA 比较 |
-| BEHAVIOR 长程移动操作 | Pick up Radio、Pick up Soda Can | 每 task 25 trials；分别报 navigation/task success |
-| CaP-RL | Cube Lift、Cube Stack、Spill Wipe | S1 privileged API 上每 task 训练 50 iterations；S2 和 real Franka 评价 |
+
+| 层次               | 内容                                                                                        | 规模/协议                                                          |
+| ---------------- | ----------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| CaP-Gym 全量发布     | Robosuite、LIBERO-PRO、BEHAVIOR                                                             | 共 187 tasks：7 + 130 + 50                                       |
+| CaP-Bench 核心受控实验 | Cube Lift、Cube Stack、Spill Wipe、Peg Insertion、Cube Re-stack、Two-Arm Lift、Two-Arm Handover | 7 tasks；12 个开源/闭源 LM/VLM；每 task/tier 100 trials                |
+| LIBERO-PRO 泛化    | Object、Goal、Spatial；Pos 与 Task perturbation                                               | 与 OpenVLA、π 系列 VLA 比较                                          |
+| BEHAVIOR 长程移动操作  | Pick up Radio、Pick up Soda Can                                                            | 每 task 25 trials；分别报 navigation/task success                   |
+| CaP-RL           | Cube Lift、Cube Stack、Spill Wipe                                                           | S1 privileged API 上每 task 训练 50 iterations；S2 和 real Franka 评价 |
+
 
 ### 3.4 评价指标
 
@@ -108,15 +116,17 @@ CaP-Bench 的八个 tier 可概括为：
 
 ### 3.5 主要结果
 
-| 结果 | 大致表现 |
-|---|---|
-| 抽象层级 | API 越高层，12 个模型整体越好；低层 S3/S4 暴露明显的代码正确性和机器人几何推理缺口。 |
-| 多轮与视觉 | stdout/stderr 多轮反馈普遍有益；直接塞 RGB（M2）反而比 text-only M1 差；VDM 文本差分（M3/M4）最稳定。 |
-| CaP-Agent0 | 即使只使用 low-level primitives，也在 7 个核心任务中的 4 个达到或超过人类专家程序的成功率。 |
-| LIBERO-PRO | CaP-Agent0 六个 split 为 22/18/26/17/12/14%，总体约 **18%**；最好 VLA 总体约 **13%**，OpenVLA 等多项为 0。 |
-| BEHAVIOR | Radio：Nav 80%、Task 56%；Soda Can：Nav 84%、Task 72%。Radio task success 高于 human 36%，Soda 与 human 72% 持平。 |
-| CaP-RL 仿真 | Qwen2.5-Coder-7B：Lift 25→80%、Stack 4→44%、Wipe 30→93%，三任务均值约 **20→72%**。 |
-| CaP-RL sim-to-real | Franka 上 Lift 24→84%、Stack 12→76%，接近 human 的 92%/84%。 |
+
+| 结果                 | 大致表现                                                                                                  |
+| ------------------ | ----------------------------------------------------------------------------------------------------- |
+| 抽象层级               | API 越高层，12 个模型整体越好；低层 S3/S4 暴露明显的代码正确性和机器人几何推理缺口。                                                     |
+| 多轮与视觉              | stdout/stderr 多轮反馈普遍有益；直接塞 RGB（M2）反而比 text-only M1 差；VDM 文本差分（M3/M4）最稳定。                              |
+| CaP-Agent0         | 即使只使用 low-level primitives，也在 7 个核心任务中的 4 个达到或超过人类专家程序的成功率。                                           |
+| LIBERO-PRO         | CaP-Agent0 六个 split 为 22/18/26/17/12/14%，总体约 **18%**；最好 VLA 总体约 **13%**，OpenVLA 等多项为 0。               |
+| BEHAVIOR           | Radio：Nav 80%、Task 56%；Soda Can：Nav 84%、Task 72%。Radio task success 高于 human 36%，Soda 与 human 72% 持平。 |
+| CaP-RL 仿真          | Qwen2.5-Coder-7B：Lift 25→80%、Stack 4→44%、Wipe 30→93%，三任务均值约 **20→72%**。                               |
+| CaP-RL sim-to-real | Franka 上 Lift 24→84%、Stack 12→76%，接近 human 的 92%/84%。                                                 |
+
 
 ### 3.6 怎么评价
 
@@ -159,12 +169,14 @@ Playful 将学习时点从“接到任务以后”前移到“任务到来以前
 
 ### 4.3 Benchmark 与实验设置
 
-| Benchmark | 用途 | 协议 |
-|---|---|---|
-| LIBERO-PRO | play + in-domain downstream | Object/Goal/Spatial × Pos/Task 共 60 held-out tasks；每 task 10 trials，共 600 |
-| MolmoSpaces | play + in-domain downstream | Open/Close/Pick/Pick-and-Place 各 10 tasks × 10 trials，共 400 |
-| RoboSuite | 不参与 play 的 cross-environment transfer | 7 tasks × 50 trials，共 350 |
-| Real robot | preliminary sim-to-real transfer | Pick up red cube、Place cube in bowl，各 40 trials |
+
+| Benchmark   | 用途                                    | 协议                                                                        |
+| ----------- | ------------------------------------- | ------------------------------------------------------------------------- |
+| LIBERO-PRO  | play + in-domain downstream           | Object/Goal/Spatial × Pos/Task 共 60 held-out tasks；每 task 10 trials，共 600 |
+| MolmoSpaces | play + in-domain downstream           | Open/Close/Pick/Pick-and-Place 各 10 tasks × 10 trials，共 400               |
+| RoboSuite   | 不参与 play 的 cross-environment transfer | 7 tasks × 50 trials，共 350                                                 |
+| Real robot  | preliminary sim-to-real transfer      | Pick up red cube、Place cube in bowl，各 40 trials                           |
+
 
 LIBERO-PRO 和 MolmoSpaces 各运行 **50 次 play iteration**，底座使用 `gemini-3.1pro-preview`。
 
@@ -176,22 +188,26 @@ LIBERO-PRO 和 MolmoSpaces 各运行 **50 次 play iteration**，底座使用 `g
 
 ### 4.5 主要结果
 
-| 实验 | Baseline | RATs / 加技能 | 变化 |
-|---|---:|---:|---:|
-| LIBERO-PRO in-domain | CaP-Agent0 23.2% | RATs 43.8% | **+20.6 pp** |
+
+| 实验                    | Baseline         | RATs / 加技能 | 变化           |
+| --------------------- | ---------------- | ---------- | ------------ |
+| LIBERO-PRO in-domain  | CaP-Agent0 23.2% | RATs 43.8% | **+20.6 pp** |
 | MolmoSpaces in-domain | CaP-Agent0 21.0% | RATs 38.0% | **+17.0 pp** |
-| RoboSuite cross-env | 40.3% | 49.1% | **+8.9 pp** |
-| Real robot | 30.0% | 38.8% | **+8.8 pp** |
+| RoboSuite cross-env   | 40.3%            | 49.1%      | **+8.9 pp**  |
+| Real robot            | 30.0%            | 38.8%      | **+8.8 pp**  |
+
 
 LIBERO-PRO 消融更能说明增益来源：
 
-| Test-time system | Play skills | 平均成功率 |
-|---|---|---:|
-| CaP-Agent0 | No Play | 23.2% |
-| CaP-Agent0 | Random Play | 24.7% |
-| CaP-Agent0 | Curious Play | 32.3% |
-| RATs Exec. | No Play | 36.3% |
-| RATs Exec. | Curious Play | **44.3%** |
+
+| Test-time system | Play skills  | 平均成功率     |
+| ---------------- | ------------ | --------- |
+| CaP-Agent0       | No Play      | 23.2%     |
+| CaP-Agent0       | Random Play  | 24.7%     |
+| CaP-Agent0       | Curious Play | 32.3%     |
+| RATs Exec.       | No Play      | 36.3%     |
+| RATs Exec.       | Curious Play | **44.3%** |
+
 
 因此，主结果不是“只要多采 rollout 就行”：random play 几乎没有帮助；好奇心 curriculum 和更强 test-time execution 各自有效，组合最好。
 
@@ -232,13 +248,15 @@ MORSL 混合了 model-based 与 model-free 模块：SAM/Grounding DINO/Molmo 等
 
 论文所谓 8 tasks 是按 sim/real 实例分别计数：
 
-| VA family | Sim | Real | 变化/任务内容 |
-|---|:---:|:---:|---|
-| I. Fulfill Grocery Orders | ✓ | ✓ | 单目标取放；XY 20×20 cm、basket swap、item permutation、mixed variation |
-| II. Pack Grocery Items | ✓ | ✓ | 6 次尝试将 6 个物品装入篮子 |
-| III. Make Popcorn | ✓ | ✓ | 开炉、抓锅柄、放锅、移锅、关炉的长程流程 |
-| IV. Insert USB-C Cables |  | ✓ | UR5 + wrist camera + force feedback；端口位置/角度和插入顺序变化 |
-| V. Wash Crates | ✓ |  | 双 Franka 协作抓、翻转、清洗和放置；姿态扰动、持续吞吐 |
+
+| VA family                 | Sim | Real | 变化/任务内容                                                        |
+| ------------------------- | --- | ---- | -------------------------------------------------------------- |
+| I. Fulfill Grocery Orders | ✓   | ✓    | 单目标取放；XY 20×20 cm、basket swap、item permutation、mixed variation |
+| II. Pack Grocery Items    | ✓   | ✓    | 6 次尝试将 6 个物品装入篮子                                               |
+| III. Make Popcorn         | ✓   | ✓    | 开炉、抓锅柄、放锅、移锅、关炉的长程流程                                           |
+| IV. Insert USB-C Cables   |     | ✓    | UR5 + wrist camera + force feedback；端口位置/角度和插入顺序变化             |
+| V. Wash Crates            | ✓   |      | 双 Franka 协作抓、翻转、清洗和放置；姿态扰动、持续吞吐                                |
+
 
 前两类仿真主表共 **5,500 trials，每个 cell 100 instances**。Baseline 包括 CaP-X、π0.5、MolmoAct2、TipTop，以及用 GaP 先调整 wrist camera 后再交给 VLA 的组合版本。
 
@@ -253,16 +271,18 @@ MORSL 混合了 model-based 与 model-free 模块：SAM/Grounding DINO/Molmo 等
 
 ### 5.5 主要结果
 
-| 实验 | 主要结果 |
-|---|---|
-| Grocery/Pack simulation | GaP 在各种 positional/geometry variation 下 SR 约 **0.93–0.99**；VLA 在强扰动下常降至约 0.10–0.26。 |
-| GaP + VLA | 先用 GaP 的交互感知/视角调整把 VLA 输入拉回训练分布，部分条件下带来 2× 以上提升。 |
-| Real Grocery Fulfillment | TipTop 8/25，GaP **25/25**。 |
-| Real Grocery Packing | TipTop 10/30，GaP **28/30**。 |
-| Make Popcorn self-learning | 初始约 33%；10 轮 rehearsal 后 **94% sim**，真实 **18/20 = 90%**。 |
-| Cable insertion | 总体 per-insertion **121/130 = 93.1%**；并报告 ascending/descending/odd/even 整序列成功与耗时。 |
-| Crate Washing | GaP **143/150 = 95.3%**，专家手写图 **148/150 = 98.7%**；吞吐 18.33 vs 19.33 success/hour。 |
-| Ablation | graphless raw Python 和把 specialized agents 压成单 Agent 的版本均降到 0，主要死于接口/结构验证失败。 |
+
+| 实验                         | 主要结果                                                                                |
+| -------------------------- | ----------------------------------------------------------------------------------- |
+| Grocery/Pack simulation    | GaP 在各种 positional/geometry variation 下 SR 约 **0.93–0.99**；VLA 在强扰动下常降至约 0.10–0.26。 |
+| GaP + VLA                  | 先用 GaP 的交互感知/视角调整把 VLA 输入拉回训练分布，部分条件下带来 2× 以上提升。                                    |
+| Real Grocery Fulfillment   | TipTop 8/25，GaP **25/25**。                                                          |
+| Real Grocery Packing       | TipTop 10/30，GaP **28/30**。                                                         |
+| Make Popcorn self-learning | 初始约 33%；10 轮 rehearsal 后 **94% sim**，真实 **18/20 = 90%**。                            |
+| Cable insertion            | 总体 per-insertion **121/130 = 93.1%**；并报告 ascending/descending/odd/even 整序列成功与耗时。    |
+| Crate Washing              | GaP **143/150 = 95.3%**，专家手写图 **148/150 = 98.7%**；吞吐 18.33 vs 19.33 success/hour。   |
+| Ablation                   | graphless raw Python 和把 specialized agents 压成单 Agent 的版本均降到 0，主要死于接口/结构验证失败。        |
+
 
 ### 5.6 怎么评价
 
@@ -305,13 +325,15 @@ ASPIRE 的核心循环是：
 
 ### 6.3 Benchmark 与实验设置
 
-| Benchmark | 学习/评价 split | 任务与协议 |
-|---|---|---|
-| LIBERO-Pro | learn seeds 51–65；eval seeds 1–50 | Object/Goal/Spatial × Pos/Task；每 suite/split 10 tasks，每 task 50 held-out seeds |
-| Robosuite | learn seeds 101–125；eval seeds 1–100 | 7 个单臂/双臂 contact-rich tasks；每 task 100 trials |
-| BEHAVIOR-1K | learn seeds 26–35；eval seeds 1–25 | Soda Can 与 Radio 长程移动操作；incremental block execution |
-| LIBERO-Pro Long | skill 来自 LIBERO-90；测试不再 debug | Pos/Task 各 10 个 held-out long-horizon tasks，zero-shot transfer |
-| Real YAM station | sim skill 来自 Franka 环境 | Bowl-on-plate、lift soda can、drawer；比较有/无 skill 的调试 token 与 20 次 held-out success |
+
+| Benchmark        | 学习/评价 split                          | 任务与协议                                                                            |
+| ---------------- | ------------------------------------ | -------------------------------------------------------------------------------- |
+| LIBERO-Pro       | learn seeds 51–65；eval seeds 1–50    | Object/Goal/Spatial × Pos/Task；每 suite/split 10 tasks，每 task 50 held-out seeds   |
+| Robosuite        | learn seeds 101–125；eval seeds 1–100 | 7 个单臂/双臂 contact-rich tasks；每 task 100 trials                                    |
+| BEHAVIOR-1K      | learn seeds 26–35；eval seeds 1–25    | Soda Can 与 Radio 长程移动操作；incremental block execution                              |
+| LIBERO-Pro Long  | skill 来自 LIBERO-90；测试不再 debug        | Pos/Task 各 10 个 held-out long-horizon tasks，zero-shot transfer                   |
+| Real YAM station | sim skill 来自 Franka 环境               | Bowl-on-plate、lift soda can、drawer；比较有/无 skill 的调试 token 与 20 次 held-out success |
+
 
 仿真主实验使用 Claude Code + Claude Opus 4.6、1M context；真实跨 embodiment 实验使用 Codex GPT-5.5 reasoning-xhigh。ASPIRE 每个 LIBERO-Pro/Robosuite task 学出一个程序，再跨 held-out seeds 评价；CaP-Agent0 则可为每个 seed 重新生成并 retry。
 
@@ -325,17 +347,19 @@ ASPIRE 的核心循环是：
 
 ### 6.5 主要结果
 
-| 实验 | Baseline | ASPIRE | 说明 |
-|---|---:|---:|---|
-| LIBERO-Pro overall | CaP-Agent0 18% | **72%** | Object 96.5%、Goal 63%、Spatial 55.5%（各自 Pos/Task 平均） |
-| Robosuite 7-task mean | CaP-Agent0 68% | **81%** | Two-Arm Handover **20→92%**；Two-Arm Lift 略降 74→71% |
-| BEHAVIOR Soda Can | CaP-Agent0 Nav/Task 84/72% | **92/88%** | task success +16 pp |
-| BEHAVIOR Radio | CaP-Agent0 Nav/Task 80/56% | **100/88%** | task success +32 pp |
-| LIBERO-Pro Long zero-shot | CaP-Agent0 3.8% | **30.5%** | Pos 22.6%、Task 38.3%；library 越大总体越好 |
-| Real: bowl on plate | 20/20 | 20/20 | 总 token 8.65M→5.11M |
-| Real: lift soda can | 13/20 | **19/20** | 总 token 61.94M→6.58M |
-| Real: drawer | 无有效程序 / 0/20 | **11/20** | 总 token budget 334.9M→81.7M |
-| 组件消融 | base 14% | engine 62% → engine+search **72%** | Execution engine 是最大增益，search 继续解决剩余 hard tasks |
+
+| 实验                        | Baseline                   | ASPIRE                             | 说明                                                  |
+| ------------------------- | -------------------------- | ---------------------------------- | --------------------------------------------------- |
+| LIBERO-Pro overall        | CaP-Agent0 18%             | **72%**                            | Object 96.5%、Goal 63%、Spatial 55.5%（各自 Pos/Task 平均） |
+| Robosuite 7-task mean     | CaP-Agent0 68%             | **81%**                            | Two-Arm Handover **20→92%**；Two-Arm Lift 略降 74→71%  |
+| BEHAVIOR Soda Can         | CaP-Agent0 Nav/Task 84/72% | **92/88%**                         | task success +16 pp                                 |
+| BEHAVIOR Radio            | CaP-Agent0 Nav/Task 80/56% | **100/88%**                        | task success +32 pp                                 |
+| LIBERO-Pro Long zero-shot | CaP-Agent0 3.8%            | **30.5%**                          | Pos 22.6%、Task 38.3%；library 越大总体越好                 |
+| Real: bowl on plate       | 20/20                      | 20/20                              | 总 token 8.65M→5.11M                                 |
+| Real: lift soda can       | 13/20                      | **19/20**                          | 总 token 61.94M→6.58M                                |
+| Real: drawer              | 无有效程序 / 0/20               | **11/20**                          | 总 token budget 334.9M→81.7M                         |
+| 组件消融                      | base 14%                   | engine 62% → engine+search **72%** | Execution engine 是最大增益，search 继续解决剩余 hard tasks     |
+
 
 ### 6.6 怎么评价
 
@@ -347,22 +371,26 @@ ASPIRE 对系统设计最有启发的地方是：**长期记忆应该保存“�
 
 ### 7.1 “Skill”在四篇里不是同一个概念
 
-| 工作 | Skill 的来源 | Skill 的形态 | 主要作用 |
-|---|---|---|---|
-| CaP-X | 从成功 S3 rollout 中归纳重复 helper | task-agnostic Python function | 补回低层 API 上缺失的中层抽象 |
-| Playful | 自提 play task 的成功执行，或针对瓶颈的 isolated practice | parameterized callable code + reliability metadata | 在下游任务到来前积累可组合能力 |
-| GaP | 初始人工/开源 MORSL + agent 配置与组合 | typed graph node/skill declaration | 可靠连接 perception、planning、control 并部署 |
-| ASPIRE | 失败诊断→patch→跨 debug config 验证 | failure-triggered repair guidance/code sketch | 遇到类似失败时少走弯路、跨任务迁移 |
+
+| 工作      | Skill 的来源                                   | Skill 的形态                                          | 主要作用                                 |
+| ------- | ------------------------------------------- | -------------------------------------------------- | ------------------------------------ |
+| CaP-X   | 从成功 S3 rollout 中归纳重复 helper                 | task-agnostic Python function                      | 补回低层 API 上缺失的中层抽象                    |
+| Playful | 自提 play task 的成功执行，或针对瓶颈的 isolated practice | parameterized callable code + reliability metadata | 在下游任务到来前积累可组合能力                      |
+| GaP     | 初始人工/开源 MORSL + agent 配置与组合                 | typed graph node/skill declaration                 | 可靠连接 perception、planning、control 并部署 |
+| ASPIRE  | 失败诊断→patch→跨 debug config 验证                | failure-triggered repair guidance/code sketch      | 遇到类似失败时少走弯路、跨任务迁移                    |
+
 
 ### 7.2 它们优化的是不同时间尺度
 
-| 时间尺度 | 对应工作 | 典型优化 |
-|---|---|---|
-| 单次请求内 | CaP-Agent0 | 多轮观察、debug、候选集成 |
-| 下游任务到来前 | Playful | 自主 curriculum 与 proactive skill acquisition |
-| 多任务持续运行中 | ASPIRE | 从每次失败积累 validated repair |
-| 稳定任务类长期部署前/中 | GaP | sim rehearsal、graph optimization、吞吐与可靠性 |
-| 模型生命周期 | CaP-RL | 用环境 reward 更新 coding model 权重 |
+
+| 时间尺度         | 对应工作       | 典型优化                                        |
+| ------------ | ---------- | ------------------------------------------- |
+| 单次请求内        | CaP-Agent0 | 多轮观察、debug、候选集成                             |
+| 下游任务到来前      | Playful    | 自主 curriculum 与 proactive skill acquisition |
+| 多任务持续运行中     | ASPIRE     | 从每次失败积累 validated repair                    |
+| 稳定任务类长期部署前/中 | GaP        | sim rehearsal、graph optimization、吞吐与可靠性     |
+| 模型生命周期       | CaP-RL     | 用环境 reward 更新 coding model 权重               |
+
 
 ### 7.3 不能直接拿一个成功率排榜
 
@@ -388,3 +416,4 @@ ASPIRE 对系统设计最有启发的地方是：**长期记忆应该保存“�
 - Zhang et al., [Playful Agentic Robot Learning paper](https://arxiv.org/abs/2606.19419), [project page](https://playful-rats.github.io/).
 - Chen et al., [GaP paper](https://arxiv.org/abs/2607.05369), [project page](https://graph-robots.github.io/gap/).
 - Lu et al., [ASPIRE paper](https://arxiv.org/abs/2607.00272), [project page](https://research.nvidia.com/labs/gear/aspire/).
+

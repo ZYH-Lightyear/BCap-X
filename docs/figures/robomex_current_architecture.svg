@@ -1,0 +1,338 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2200" height="1500" viewBox="0 0 2200 1500" role="img" aria-labelledby="title desc">
+  <title id="title">RoboMEx 当前代码架构：High Level 与实现细节</title>
+  <desc id="desc">左侧展示任务、AgentWorld、Planner、Manager、动态 Agent Swarm、Selector、Executor 与 LIBERO 的高层闭环；右侧按当前代码真实调用链展开数据面、模型调用、单次代码生成、候选想象、选择和物理执行，并标出已装配但当前主路径未使用的组件。</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#0f172a" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#d97706"/>
+    </marker>
+    <style>
+      .bg { fill: #f4f7fb; }
+      .panel { fill: #ffffff; stroke: #d9e2ef; stroke-width: 2; filter: url(#shadow); }
+      .panel-title { font: 700 25px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #13213c; }
+      .panel-subtitle { font: 400 14px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #64748b; }
+      .title { font: 700 38px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #10203d; }
+      .subtitle { font: 400 17px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #64748b; }
+      .section { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; }
+      .section-blue { fill: #f5f8ff; stroke: #b8cdfa; stroke-width: 1.5; }
+      .section-purple { fill: #faf7ff; stroke: #d8c4f5; stroke-width: 1.5; }
+      .section-orange { fill: #fff9f2; stroke: #f3cfaa; stroke-width: 1.5; }
+      .section-green { fill: #f4fbf7; stroke: #b9dfc8; stroke-width: 1.5; }
+      .node { fill: #ffffff; stroke: #b7c4d6; stroke-width: 1.5; }
+      .node-blue { fill: #eef4ff; stroke: #7da4ef; stroke-width: 1.7; }
+      .node-purple { fill: #f4efff; stroke: #a987df; stroke-width: 1.7; }
+      .node-cyan { fill: #edfafd; stroke: #67bdd1; stroke-width: 1.7; }
+      .node-orange { fill: #fff4e8; stroke: #e9a763; stroke-width: 1.7; }
+      .node-green { fill: #eef9f2; stroke: #70b98b; stroke-width: 1.7; }
+      .node-red { fill: #fff1f0; stroke: #dc8e88; stroke-width: 1.7; }
+      .node-muted { fill: #f8fafc; stroke: #94a3b8; stroke-width: 1.5; stroke-dasharray: 7 6; }
+      .node-title { font: 700 18px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #17233b; }
+      .node-title-sm { font: 700 15px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #17233b; }
+      .body { font: 400 14px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #334155; }
+      .body-sm { font: 400 12px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #475569; }
+      .mono { font: 500 12px "SFMono-Regular", Consolas, monospace; fill: #475569; }
+      .label { font: 700 12px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #ffffff; letter-spacing: .4px; }
+      .label-dark { font: 700 12px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #334155; letter-spacing: .3px; }
+      .arrow { fill: none; stroke: #334155; stroke-width: 2.2; marker-end: url(#arrow); }
+      .arrow-blue { fill: none; stroke: #2563eb; stroke-width: 2.5; marker-end: url(#arrowBlue); }
+      .arrow-orange { fill: none; stroke: #d97706; stroke-width: 2.2; stroke-dasharray: 8 7; marker-end: url(#arrowOrange); }
+      .divider { stroke: #d8e1ec; stroke-width: 2; }
+      .chip-blue { fill: #2563eb; }
+      .chip-purple { fill: #7c3aed; }
+      .chip-cyan { fill: #0f8fab; }
+      .chip-orange { fill: #d97706; }
+      .chip-green { fill: #15803d; }
+      .chip-gray { fill: #64748b; }
+      .warning { fill: #fff8e7; stroke: #e2a84b; stroke-width: 1.5; stroke-dasharray: 6 5; }
+      .warning-text { font: 500 12px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #8a5300; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="2200" height="1500"/>
+  <text class="title" x="48" y="58">RoboMEx 当前代码架构</text>
+  <text class="subtitle" x="48" y="88">基于当前工作树真实调用链 · 左：High Level Design ｜ 右：实现展开与边界</text>
+  <rect x="1850" y="38" width="300" height="48" rx="24" fill="#e7eefc"/>
+  <circle cx="1880" cy="62" r="7" fill="#2563eb"/>
+  <text class="label-dark" x="1896" y="67">SOLID = 当前 live 主路径</text>
+
+  <!-- Main panels -->
+  <rect class="panel" x="38" y="112" width="680" height="1338" rx="24"/>
+  <rect class="panel" x="748" y="112" width="1414" height="1338" rx="24"/>
+  <line class="divider" x1="733" y1="132" x2="733" y2="1430"/>
+
+  <!-- LEFT: high level -->
+  <text class="panel-title" x="72" y="154">High Level Design</text>
+  <text class="panel-subtitle" x="72" y="181">三时间尺度：Task → Intent → Action</text>
+
+  <rect class="node-blue" x="118" y="212" width="520" height="78" rx="16"/>
+  <rect class="chip-blue" x="138" y="227" width="96" height="26" rx="13"/>
+  <text class="label" x="155" y="245">TASK INPUT</text>
+  <text class="node-title" x="252" y="247">自然语言任务 + Runtime Profile</text>
+  <text class="body" x="138" y="273">CLI 只指定 profile / task；环境、模型、Skills 与安全参数集中装配</text>
+
+  <path class="arrow-blue" d="M378 290 L378 326"/>
+  <rect class="node-cyan" x="118" y="326" width="520" height="106" rx="16"/>
+  <rect class="chip-cyan" x="138" y="341" width="110" height="26" rx="13"/>
+  <text class="label" x="154" y="359">AGENT WORLD</text>
+  <text class="node-title" x="266" y="361">真实证据世界</text>
+  <text class="body" x="138" y="390">RGB-D · robot state · embodied state · revision · artifacts</text>
+  <text class="body-sm" x="138" y="414">生成 immutable WorldFrame，并按角色投影 AgentWorldView</text>
+
+  <path class="arrow-blue" d="M378 432 L378 468"/>
+  <rect class="node-purple" x="118" y="468" width="520" height="92" rx="16"/>
+  <rect class="chip-purple" x="138" y="483" width="92" height="26" rx="13"/>
+  <text class="label" x="154" y="501">PLANNER</text>
+  <text class="node-title" x="248" y="503">Reactive VLM Planner</text>
+  <text class="body" x="138" y="531">每轮输出一个细粒度 ActionIntent，或结束任务</text>
+  <text class="mono" x="138" y="550">instruction + expected_effect + world pin</text>
+
+  <path class="arrow" d="M378 560 L378 596"/>
+  <rect class="node-purple" x="118" y="596" width="520" height="96" rx="16"/>
+  <rect class="chip-purple" x="138" y="611" width="96" height="26" rx="13"/>
+  <text class="label" x="151" y="629">MANAGER</text>
+  <text class="node-title" x="252" y="631">Meta-Agent 动态组织 Swarm</text>
+  <text class="body" x="138" y="658">读取 Intent + World + Skill catalog + failure history</text>
+  <text class="mono" x="138" y="679">→ declarative SwarmConfig (role DAG)</text>
+
+  <path class="arrow" d="M378 692 L378 724"/>
+  <rect class="section-purple" x="82" y="724" width="592" height="324" rx="18"/>
+  <text class="node-title" x="104" y="754">Action-scoped Agent Swarm / Dynamic Graph</text>
+  <text class="body-sm" x="104" y="776">Graph 只调度依赖、并行和数据流；Agent 负责认知与候选生成</text>
+
+  <rect class="node" x="104" y="802" width="160" height="82" rx="13"/>
+  <text class="node-title-sm" x="126" y="828">Evidence Agents</text>
+  <text class="body-sm" x="126" y="851">grounding · perception</text>
+  <text class="body-sm" x="126" y="870">affordance · geometry</text>
+
+  <rect class="node-orange" x="300" y="794" width="166" height="96" rx="13"/>
+  <text class="node-title-sm" x="321" y="820">Motion Agent A</text>
+  <text class="body-sm" x="321" y="844">写 Python + 调 APIs</text>
+  <text class="body-sm" x="321" y="864">→ exact candidate A</text>
+  <rect class="node-orange" x="300" y="908" width="166" height="96" rx="13"/>
+  <text class="node-title-sm" x="321" y="934">Motion Agent B…</text>
+  <text class="body-sm" x="321" y="958">不同 policy_hint</text>
+  <text class="body-sm" x="321" y="978">→ exact candidate B</text>
+
+  <rect class="node-cyan" x="500" y="794" width="150" height="96" rx="13"/>
+  <text class="node-title-sm" x="519" y="820">Imagination</text>
+  <text class="body-sm" x="519" y="843">RGB-D overlay</text>
+  <text class="body-sm" x="519" y="862">3D point cloud</text>
+  <text class="body-sm" x="519" y="879">trajectory video</text>
+  <rect class="node-purple" x="500" y="908" width="150" height="96" rx="13"/>
+  <text class="node-title-sm" x="519" y="934">Selector Agent</text>
+  <text class="body-sm" x="519" y="957">冻结 Candidate Arena</text>
+  <text class="body-sm" x="519" y="978">select / reject</text>
+
+  <path class="arrow" d="M264 843 L300 843"/>
+  <path class="arrow" d="M466 842 L500 842"/>
+  <path class="arrow" d="M466 956 L500 956"/>
+  <path class="arrow" d="M575 890 L575 908"/>
+
+  <path class="arrow" d="M378 1048 L378 1080"/>
+  <rect class="node-green" x="118" y="1080" width="520" height="102" rx="16"/>
+  <rect class="chip-green" x="138" y="1095" width="118" height="26" rx="13"/>
+  <text class="label" x="152" y="1113">EXECUTION</text>
+  <text class="node-title" x="273" y="1115">Deterministic Executor</text>
+  <text class="body" x="138" y="1144">硬门检查 → 选择唯一 candidate → 调用 physical backend</text>
+  <text class="body-sm" x="138" y="1167">认知层无 physical writer；真实环境只接受一条动作路径</text>
+
+  <path class="arrow" d="M378 1182 L378 1214"/>
+  <rect class="node-orange" x="118" y="1214" width="520" height="90" rx="16"/>
+  <rect class="chip-orange" x="138" y="1229" width="104" height="26" rx="13"/>
+  <text class="label" x="154" y="1247">LIBERO</text>
+  <text class="node-title" x="260" y="1249">Cap-X / Franka / MuJoCo</text>
+  <text class="body" x="138" y="1278">执行 motion / gripper / wait，并强制捕获新 observation</text>
+
+  <path class="arrow-blue" d="M118 1260 L86 1260 L86 378 L118 378"/>
+  <rect x="65" y="732" width="42" height="126" rx="21" fill="#dbeafe"/>
+  <text class="label-dark" transform="rotate(-90 86 795)" x="21" y="799">OBSERVATION FEEDBACK</text>
+
+  <rect class="section" x="82" y="1332" width="592" height="86" rx="14"/>
+  <text class="node-title-sm" x="104" y="1358">Code-as-Policy action language</text>
+  <text class="body" x="104" y="1385">VLM 指引 → Agent 写 Python → exact ActionCandidate → 唯一真实动作</text>
+  <text class="body-sm" x="104" y="1406">每个动作后重新观察；下一轮重新形成 VL context 与 A</text>
+
+  <!-- RIGHT: detailed implementation -->
+  <text class="panel-title" x="782" y="154">Current Implementation Detail</text>
+  <text class="panel-subtitle" x="782" y="181">只画当前 live 路径；虚线框表示“已装配/已有代码，但未接入该路径”</text>
+
+  <!-- bootstrap -->
+  <rect class="section-blue" x="782" y="206" width="1346" height="128" rx="17"/>
+  <rect class="chip-blue" x="802" y="220" width="110" height="26" rx="13"/>
+  <text class="label" x="819" y="238">BOOTSTRAP</text>
+  <rect class="node" x="802" y="255" width="272" height="62" rx="12"/>
+  <text class="node-title-sm" x="820" y="278">robomex.cli._run()</text>
+  <text class="mono" x="820" y="299">timestamped output + TraceEventSink</text>
+  <rect class="node" x="1100" y="255" width="380" height="62" rx="12"/>
+  <text class="node-title-sm" x="1118" y="278">build_swarm_episode()</text>
+  <text class="mono" x="1118" y="299">Planner · Manager · Runtime · Executor wiring</text>
+  <rect class="node" x="1506" y="255" width="596" height="62" rx="12"/>
+  <text class="node-title-sm" x="1524" y="278">build_libero_substrate()</text>
+  <text class="mono" x="1524" y="299">env · data plane · capture · backend · geometry · skills · AgentWorld</text>
+  <path class="arrow" d="M1074 286 L1100 286"/>
+  <path class="arrow" d="M1480 286 L1506 286"/>
+
+  <!-- world data plane -->
+  <rect class="section-green" x="782" y="354" width="1346" height="230" rx="17"/>
+  <rect class="chip-green" x="802" y="368" width="136" height="26" rx="13"/>
+  <text class="label" x="817" y="386">AGENTWORLD</text>
+  <text class="body-sm" x="955" y="386">Grounded evidence plane：不复制 truth store，只组合既有 authority</text>
+
+  <rect class="node-cyan" x="802" y="410" width="274" height="130" rx="13"/>
+  <text class="node-title-sm" x="820" y="436">LiberoObservationCapture</text>
+  <text class="body-sm" x="820" y="458">agentview + wrist RGB-D</text>
+  <text class="body-sm" x="820" y="478">camera intrinsics / pose</text>
+  <text class="body-sm" x="820" y="498">robot joints / Cartesian state</text>
+  <text class="mono" x="820" y="520">observation_sequence + revisions</text>
+
+  <rect class="node" x="1102" y="410" width="320" height="130" rx="13"/>
+  <text class="node-title-sm" x="1120" y="436">Authoritative stores</text>
+  <text class="body-sm" x="1120" y="458">EpisodeDataPlane：artifact ledger</text>
+  <text class="body-sm" x="1120" y="478">ObservationStream：latest samples</text>
+  <text class="body-sm" x="1120" y="498">EmbodiedStateReducer：physical state</text>
+  <text class="mono" x="1120" y="520">content-addressed + replayable</text>
+
+  <rect class="node-green" x="1448" y="410" width="280" height="130" rx="13"/>
+  <text class="node-title-sm" x="1466" y="436">AgentWorld.current()</text>
+  <text class="body-sm" x="1466" y="458">latest sample / track</text>
+  <text class="body-sm" x="1466" y="478">embodied state revision</text>
+  <text class="body-sm" x="1466" y="498">artifact refs</text>
+  <text class="mono" x="1466" y="520">→ sealed WorldFrame + digest</text>
+
+  <rect class="node-green" x="1754" y="410" width="348" height="130" rx="13"/>
+  <text class="node-title-sm" x="1772" y="436">AgentWorldViewBuilder</text>
+  <text class="body-sm" x="1772" y="458">freshness: digest + sequence</text>
+  <text class="body-sm" x="1772" y="478">manager / grounding / motion views</text>
+  <text class="body-sm" x="1772" y="498">signals + evidence + embodied state</text>
+  <text class="mono" x="1772" y="520">→ role-pinned AgentWorldView</text>
+
+  <path class="arrow" d="M1076 474 L1102 474"/>
+  <path class="arrow" d="M1422 474 L1448 474"/>
+  <path class="arrow" d="M1728 474 L1754 474"/>
+
+  <!-- planner manager -->
+  <rect class="section-purple" x="782" y="604" width="650" height="220" rx="17"/>
+  <rect class="chip-purple" x="802" y="618" width="112" height="26" rx="13"/>
+  <text class="label" x="818" y="636">TASK SCALE</text>
+  <text class="node-title" x="802" y="674">CompletionIntentPlanner</text>
+  <text class="body" x="802" y="701">1. LLM prompt：task + completed_intents</text>
+  <text class="body" x="802" y="725">2. JSON：instruction + expected_effect / done</text>
+  <text class="body" x="802" y="749">3. 生成后调用 world.snapshot() 绑定 digest + sequence</text>
+  <rect class="warning" x="802" y="770" width="602" height="34" rx="9"/>
+  <text class="warning-text" x="818" y="792">当前 Planner prompt 未直接包含 RGB / AgentWorldView；World 只用于事后 pin。</text>
+
+  <rect class="section-purple" x="1458" y="604" width="670" height="220" rx="17"/>
+  <rect class="chip-purple" x="1478" y="618" width="120" height="26" rx="13"/>
+  <text class="label" x="1493" y="636">INTENT SCALE</text>
+  <text class="node-title" x="1478" y="674">SwarmManager.next()</text>
+  <text class="body" x="1478" y="701">输入：ActionIntent + Manager WorldView + Skill catalog</text>
+  <text class="body" x="1478" y="725">　　　available model + prior failure signatures</text>
+  <text class="body" x="1478" y="749">输出：SwarmConfig（roles / deps / skills / policy_hint）</text>
+  <text class="body-sm" x="1478" y="776">invalid config 作为一次失败反馈；重复失败或预算耗尽则 abandon</text>
+  <text class="mono" x="1478" y="800">manager.py → acyclic role DAG, exactly one Selector</text>
+
+  <path class="arrow" d="M1432 714 L1458 714"/>
+
+  <!-- dynamic graph and agents -->
+  <rect class="section-orange" x="782" y="844" width="1346" height="372" rx="17"/>
+  <rect class="chip-orange" x="802" y="858" width="130" height="26" rx="13"/>
+  <text class="label" x="818" y="876">ACTION SCALE</text>
+  <text class="body-sm" x="950" y="876">SwarmRuntime 将 SwarmConfig 直接解释为 dependency layers；没有独立 Graph 编译器</text>
+
+  <rect class="node-orange" x="802" y="902" width="282" height="126" rx="13"/>
+  <text class="node-title-sm" x="820" y="928">SwarmRuntime / DAG Scheduler</text>
+  <text class="body-sm" x="820" y="950">_layers(config)</text>
+  <text class="body-sm" x="820" y="970">同层 ThreadPoolExecutor 并行</text>
+  <text class="body-sm" x="820" y="990">失败阻断 downstream</text>
+  <text class="mono" x="820" y="1012">except Selector：仍审视幸存候选</text>
+
+  <rect class="node" x="1110" y="902" width="306" height="126" rx="13"/>
+  <text class="node-title-sm" x="1128" y="928">Support / Motion Role</text>
+  <text class="body-sm" x="1128" y="950">单次 LLM completion → Python block</text>
+  <text class="body-sm" x="1128" y="970">fresh proposal namespace + Cap-X APIs</text>
+  <text class="body-sm" x="1128" y="990">RESULT → findings 或 ActionCandidate</text>
+  <text class="mono" x="1128" y="1012">author-once；不是 core/coder 多轮循环</text>
+
+  <rect class="node-cyan" x="1442" y="902" width="300" height="126" rx="13"/>
+  <text class="node-title-sm" x="1460" y="928">FrozenCandidateArena</text>
+  <text class="body-sm" x="1460" y="950">candidate_id + digest 不可修改</text>
+  <text class="body-sm" x="1460" y="970">绑定 world digest / observation seq</text>
+  <text class="body-sm" x="1460" y="990">附加 hard-gate reports</text>
+  <text class="mono" x="1460" y="1012">候选只能选择，不能就地改写</text>
+
+  <rect class="node-purple" x="1768" y="902" width="334" height="126" rx="13"/>
+  <text class="node-title-sm" x="1786" y="928">Selector Coding Role</text>
+  <text class="body-sm" x="1786" y="950">单次 LLM → restricted Python</text>
+  <text class="body-sm" x="1786" y="970">调用 read-only inspection APIs</text>
+  <text class="body-sm" x="1786" y="990">SELECTION：existing id / reject_all</text>
+  <text class="mono" x="1786" y="1012">最终选择仍由 schema + arena 校验</text>
+
+  <path class="arrow" d="M1084 965 L1110 965"/>
+  <path class="arrow" d="M1416 965 L1442 965"/>
+  <path class="arrow" d="M1742 965 L1768 965"/>
+
+  <rect class="node-cyan" x="1110" y="1052" width="632" height="132" rx="13"/>
+  <text class="node-title-sm" x="1128" y="1078">Action Inspection / Imagination Tools（advisory only）</text>
+  <text class="body-sm" x="1128" y="1101">• RGB-D point cloud + exact Panda URDF pose / TCP trajectory</text>
+  <text class="body-sm" x="1128" y="1122">• main / wrist exact-FK gripper overlay · keyframes · MP4</text>
+  <text class="body-sm" x="1128" y="1143">• advisory clearance profile（不能替代 collision admission）</text>
+  <text class="mono" x="1128" y="1165">inspection.py + LiberoAgentWorldGeometry → content-addressed media</text>
+
+  <path class="arrow" d="M1592 1028 L1592 1052"/>
+  <path class="arrow" d="M1742 1118 L1935 1118 L1935 1028"/>
+
+  <rect class="warning" x="802" y="1052" width="282" height="132" rx="13"/>
+  <text class="node-title-sm" x="820" y="1078" fill="#8a5300">当前 Worker 事实</text>
+  <text class="warning-text" x="820" y="1101">Manager 声明的 role.skills 尚未加载</text>
+  <text class="warning-text" x="820" y="1122">live path 未调用通用 CodingAgent</text>
+  <text class="warning-text" x="820" y="1143">proposal executor globals 暴露 env</text>
+  <text class="warning-text" x="820" y="1164">因此“只读”目前主要是设计约束</text>
+
+  <!-- executor -->
+  <rect class="section-green" x="782" y="1236" width="1346" height="184" rx="17"/>
+  <rect class="chip-green" x="802" y="1250" width="146" height="26" rx="13"/>
+  <text class="label" x="817" y="1268">PHYSICAL EDGE</text>
+
+  <rect class="node-green" x="802" y="1290" width="270" height="108" rx="13"/>
+  <text class="node-title-sm" x="820" y="1316">Executor</text>
+  <text class="body-sm" x="820" y="1338">re-run JointLimitGate</text>
+  <text class="body-sm" x="820" y="1358">TrajectoryContinuityGate</text>
+  <text class="mono" x="820" y="1380">fail → no physical call</text>
+
+  <rect class="node-green" x="1098" y="1290" width="322" height="108" rx="13"/>
+  <text class="node-title-sm" x="1116" y="1316">CapXCandidateBackend</text>
+  <text class="body-sm" x="1116" y="1338">motion / gripper / wait dispatch</text>
+  <text class="body-sm" x="1116" y="1358">CapXSealedActionBackend primitive</text>
+  <text class="mono" x="1116" y="1380">execute → recapture observation</text>
+
+  <rect class="node-orange" x="1446" y="1290" width="260" height="108" rx="13"/>
+  <text class="node-title-sm" x="1464" y="1316">LIBERO physical world</text>
+  <text class="body-sm" x="1464" y="1338">controller executes one candidate</text>
+  <text class="body-sm" x="1464" y="1358">new RGB-D / robot state</text>
+  <text class="mono" x="1464" y="1380">returns to ObservationStream</text>
+
+  <rect class="node-muted" x="1732" y="1290" width="370" height="108" rx="13"/>
+  <text class="node-title-sm" x="1750" y="1316">Assembled but bypassed in live path</text>
+  <text class="body-sm" x="1750" y="1338">CapXFeasibilityChecker + CuRobo exact path</text>
+  <text class="body-sm" x="1750" y="1358">AgentWorld.commit(WorldTransition)</text>
+  <text class="body-sm" x="1750" y="1378">semantic verifier（当前为 PermissiveVerifier）</text>
+
+  <path class="arrow" d="M1072 1344 L1098 1344"/>
+  <path class="arrow" d="M1420 1344 L1446 1344"/>
+  <path class="arrow-blue" d="M1576 1290 L1576 1208 L2068 1208 L2068 584"/>
+  <text class="label-dark" x="1794" y="1200">fresh observation closes the loop</text>
+  <path class="arrow-orange" d="M1732 1344 L1706 1344"/>
+
+  <!-- trace strip -->
+  <rect x="782" y="1432" width="1346" height="1" fill="#d8e1ec"/>
+  <text class="body-sm" x="802" y="1454">Observability：</text>
+  <text class="mono" x="900" y="1454">trace/events.jsonl · trace/llm_io.jsonl · timeline.html · media/inspection/* · substrate/*</text>
+</svg>
