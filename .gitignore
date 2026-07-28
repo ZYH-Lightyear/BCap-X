@@ -36,7 +36,9 @@ output_debug/
 outputs**
 curobo_debug/
 =*
-core.*
+# Core dumps (keep this narrow so agentx/core.py is not ignored)
+core
+core.[0-9]*
 wandb/
 .webui_secret_key
 
