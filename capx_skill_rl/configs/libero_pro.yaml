@@ -1,0 +1,16 @@
+suite_name: libero_object_swap
+task_id: 0
+max_sim_steps: 8000
+max_tool_steps: 32
+
+vlm:
+  model: vapi/gpt-5.5
+  server_url: http://localhost:8110/chat/completions
+  coord_space: pixel
+
+policy:
+  model: vapi/gpt-5.5
+  server_url: http://localhost:8110/chat/completions
+  max_completion_tokens: 1536
+  timeout_seconds: 180
+  jpeg_quality: 90

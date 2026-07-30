@@ -162,8 +162,8 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["capx*", "robomex*"]
-exclude = ["tests*", "configs*"]
+include = ["capx*", "capx_skill_rl*", "robomex*"]
+exclude = ["tests*", "configs*", "capx_skill_rl.tests*"]
 
 [tool.uv.extra-build-dependencies]
 egl-probe = ["cmake<3.27"]
@@ -197,6 +197,7 @@ extend-exclude = [
 
 
 [tool.setuptools.package-data]
+"capx_skill_rl" = ["configs/*.yaml"]
 "capx.envs" = [
   "assets/ur5_pick_place/*.xml",
   "assets/ur5_pick_place/ur5e/*.obj",
