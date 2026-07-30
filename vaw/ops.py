@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import numpy as np
 
 from vaw.camera import resolve_view
-from vaw.executor import execute_commit, execute_gripper
+from vaw.executor import execute_commit, execute_gripper, execute_move
 from vaw.geometry import (
     GRASP_POSE_TO_CONTACT_M,
     mask_to_world_points,
@@ -315,7 +315,8 @@ def select(ws: "Workspace", candidate_id: str) -> str:
 )
 def nudge(ws: "Workspace", candidate_id: str, dx: float = 0.0, dy: float = 0.0, dz: float = 0.0) -> str:
     """Translate a candidate by a metric offset (each axis clamped to ±0.1 m).
-    Voids the candidate's previous preview."""
+    This edits a plan on the canvas and does not move the robot — for that, see
+    move_xyz. Voids the candidate's previous preview."""
     delta = np.clip([dx, dy, dz], -0.1, 0.1)
     cand = ws.state.get_candidate(candidate_id)
     cand.pose.position = cand.pose.position + delta
@@ -352,11 +353,11 @@ def rotate(ws: "Workspace", candidate_id: str, axis: str, degrees: float) -> str
     params={"candidate_id": {"type": "string", "description": "candidate to preview"}},
 )
 def preview_op(ws: "Workspace", candidate_id: str) -> str:
-    """Imagine committing a candidate without moving the robot: checks IK
-    feasibility and path clearance against the scene, and draws the predicted
-    end-effector path on the canvas. Preview before you commit."""
+    """Check endpoint IK without moving the robot and render the resulting
+    terminal gripper through URDF FK. No trajectory or collision claim is made
+    until a motion planner supplies the joint sequence."""
     cand = ws.state.get_candidate(candidate_id)
-    result = run_preview(ws.api, ws.state, cand, ws.obs, camera_name=ws.camera_name)
+    result = run_preview(ws.api, ws.state, cand)
     return f"preview {candidate_id}: {result.notes}"
 
 
@@ -378,7 +379,36 @@ def commit(ws: "Workspace") -> str:
     if receipt.discrepancy:
         parts.append(f"discrepancy={receipt.discrepancy}")
     if receipt.unpredicted_failure:
-        parts.append("UNPREDICTED FAILURE: preview said feasible but execution deviated")
+        parts.append("UNPREDICTED FAILURE: endpoint IK succeeded but execution deviated")
+    return "; ".join(parts)
+
+
+@op(
+    "move_xyz",
+    params={
+        "dx": {"type": "number", "description": "meters, world X", "required": False},
+        "dy": {"type": "number", "description": "meters, world Y", "required": False},
+        "dz": {"type": "number", "description": "meters, world Z", "required": False},
+    },
+    physical=True,
+)
+def move_xyz(ws: "Workspace", dx: float = 0.0, dy: float = 0.0, dz: float = 0.0) -> str:
+    """Move the real gripper by a small world-frame offset, keeping its current
+    orientation (each axis clamped to ±0.05 m). Unlike nudge, which only edits a
+    candidate on the canvas, this moves the robot immediately — no candidate and
+    no preview. Use it to close the last few centimeters onto a target, to back
+    off after a failed grasp, or to correct a commit that stopped short; use
+    candidates and commit for larger repositioning. The receipt reports where the
+    gripper actually ended up and by how much it missed."""
+    receipt = execute_move(ws.api, ws.state, np.array([dx, dy, dz], dtype=np.float64))
+    ws.refresh_observation()
+    parts = [
+        f"{receipt.receipt_id}: gripper at {np.round(receipt.achieved.position, 3).tolist()}"
+    ]
+    if receipt.pos_error_m is not None and receipt.pos_error_m > 0.005:
+        parts.append(f"missed the step by {receipt.pos_error_m:.3f} m")
+    if receipt.discrepancy:
+        parts.append(f"discrepancy={receipt.discrepancy}")
     return "; ".join(parts)
 
 

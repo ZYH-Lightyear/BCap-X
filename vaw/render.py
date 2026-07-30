@@ -17,8 +17,9 @@ Two rules decide what goes where (see ``docs/vaw_implementation_plan.md`` §1.4)
    pixels, so nothing here prints a coordinate.
 2. **Annotation density is graded by zoom.** The main view stays sparse (the
    selected candidate plus a few alternatives) to stay legible; the focus inset
-   is a single object's viewport and can afford every candidate, approach axes
-   and box wireframes.
+   is a single object's viewport and can afford every candidate with its
+   approach axis. Density is spent on what the agent acts on: the focus inset
+   drops the object box precisely because it is already cropped to that object.
 
 Rendering is a pure function of (state, observation, cloud): the same trace
 always produces the same pixels, which is what makes canvases usable as SFT
@@ -42,6 +43,11 @@ from vaw.camera import (
 )
 from vaw.cloud import SceneCloud, build_scene_cloud, splat_cloud
 from vaw.geometry import project_world_to_pixel
+from vaw.gripper_mesh import (
+    load_panda_urdf_fk,
+    mask_outline,
+    rasterize_silhouette,
+)
 from vaw.state import ActionState
 
 CANVAS_W, CANVAS_H = 1024, 576
@@ -204,15 +210,31 @@ def _obb_corners(obb: dict[str, Any]) -> np.ndarray | None:
     return center[None, :] + (rot @ (signs * extent[None, :] / 2).T).T
 
 
-_OBB_EDGES = ((0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3), (2, 6), (3, 7), (4, 5), (4, 6), (5, 7), (6, 7))
+def _draw_bbox(painter: Painter, obb: dict[str, Any], color, width: int = 1) -> None:
+    """Screen rectangle spanning the projected oriented box.
 
-
-def _draw_obb(painter: Painter, obb: dict[str, Any], color, width: int = 1) -> None:
+    The box is only ever an identity cue — "this region is obj1". Its twelve 3D
+    edges also state an orientation, but at the size objects occupy here those
+    edges run across the object and hide the very texture the box points at, and
+    the orientation they encode is the fitter's frame rather than anything the
+    agent acts on. Four edges around the same projected extent keep the claim and
+    give the pixels back.
+    """
     corners = _obb_corners(obb)
     if corners is None:
         return
-    for i, j in _OBB_EDGES:
-        painter.segment(corners[i], corners[j], color, width=width)
+    uvz = painter.project(corners)
+    visible = uvz[uvz[:, 2] > 0.05]
+    if len(visible) < 2:
+        return
+    u0, v0 = visible[:, 0].min(), visible[:, 1].min()
+    u1, v1 = visible[:, 0].max(), visible[:, 1].max()
+    if not (painter.inside(u0, v0) or painter.inside(u1, v1)):
+        return
+    r = painter.region
+    u0, u1 = np.clip([u0, u1], r.x0, r.x0 + r.w - 1)
+    v0, v1 = np.clip([v0, v1], r.y0, r.y0 + r.h - 1)
+    painter.draw.rectangle((u0, v0, u1, v1), outline=color, width=width)
 
 
 def _quat_to_matrix(quat_wxyz: np.ndarray) -> np.ndarray:
@@ -222,11 +244,60 @@ def _quat_to_matrix(quat_wxyz: np.ndarray) -> np.ndarray:
     return Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
 
 
+def _draw_gripper_fk(
+    img: Image.Image,
+    painter: Painter,
+    joint_positions_rad: np.ndarray,
+    opening: float,
+    color,
+    *,
+    fill_alpha: int,
+) -> bool:
+    """Fill the exact joint→URDF-FK hand silhouette. False if unavailable.
+
+    A stick figure places the gripper but says nothing about whether the fingers
+    clear what is next to them, or how wide they are relative to the object —
+    which is most of what the glyph exists to support. The outline is drawn
+    opaque over a translucent fill so the evidence underneath stays readable:
+    this marks an intended pose, not an object that is there.
+    """
+    try:
+        fk = load_panda_urdf_fk()
+        if fk is None:
+            return False
+        tris = fk.triangles(joint_positions_rad, opening)
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    uvz = painter.project(tris.reshape(-1, 3))
+    mask = rasterize_silhouette(
+        uvz[:, :2].reshape(-1, 3, 2), uvz[:, 2].reshape(-1, 3), img.width, img.height
+    )
+    # Confine it to the painter's own region, or a gripper near the edge of the
+    # main view would spill over the side panels.
+    region = np.zeros_like(mask)
+    r = painter.region
+    region[r.y0 : r.y0 + r.h, r.x0 : r.x0 + r.w] = True
+    mask &= region
+    if not mask.any():
+        return False
+
+    ys, xs = np.nonzero(mask)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    sub = mask[y0:y1, x0:x1]
+    layer = np.zeros((*sub.shape, 4), dtype=np.uint8)
+    layer[sub] = (*color, fill_alpha)
+    layer[mask_outline(sub)] = (*color, 255)
+    img.alpha_composite(Image.fromarray(layer, "RGBA"), (x0, y0))
+    return True
+
+
 def _draw_gripper(painter: Painter, pose, open_width: float, color, width: int = 3) -> None:
     """A 3D gripper glyph: stem along the approach axis + two fingers.
 
-    Drawn in 3D rather than as a 2D crosshair because the whole point of the
-    virtual viewpoint is that orientation is legible from more than one angle.
+    The fallback for when the baked hand mesh is missing. Drawn in 3D rather than
+    as a 2D crosshair because the whole point of the virtual viewpoint is that
+    orientation is legible from more than one angle.
     """
     rot = _quat_to_matrix(pose.quat_wxyz)
     approach = rot @ np.array([0.0, 0.0, 1.0])
@@ -390,13 +461,18 @@ def _overlay_mask(
     img.alpha_composite(tinted, (region.x0 + ox, region.y0 + oy))
 
 
-def _annotate_main(painter: Painter, state: ActionState, colors: dict[str, tuple[int, int, int]]) -> None:
+def _annotate_main(
+    img: Image.Image,
+    painter: Painter,
+    state: ActionState,
+    colors: dict[str, tuple[int, int, int]],
+) -> None:
     # Object boxes and labels: identity cues that survive any viewpoint.
     for oid, entry in state.objects.items():
         color = colors[oid]
         stale = entry.obs_revision < state.obs_revision
         if entry.obb is not None:
-            _draw_obb(painter, entry.obb, (*color, 150) if stale else color)
+            _draw_bbox(painter, entry.obb, (*color, 150) if stale else color)
         centroid = entry.centroid_world
         if centroid is None:
             continue
@@ -410,14 +486,7 @@ def _annotate_main(painter: Painter, state: ActionState, colors: dict[str, tuple
         # target, and two overlapping labels are worse than a longer leader.
         painter.label((u + 24, v + 22), text, color, font=F_BODY)
 
-    # Preview path of the selected candidate.
     sel = state.selected
-    if sel is not None:
-        preview = state.previews.get(sel.candidate_id)
-        if preview is not None and preview.path_world is not None and len(preview.path_world) >= 2:
-            painter.polyline(
-                preview.path_world, _SELECTED if preview.feasible else _BAD, width=2
-            )
 
     # Candidates: selected always, plus the best few others.
     others = [c for c in state.candidates.values() if c.candidate_id != state.selected_id]
@@ -435,20 +504,50 @@ def _annotate_main(painter: Painter, state: ActionState, colors: dict[str, tuple
         )
 
     # Virtual gripper (the pending action) and, when they differ, the real arm.
-    width = 0.04 if state.gripper_open else 0.014
-    _draw_gripper(painter, state.virtual_gripper, width, (255, 255, 255))
-    if state.ee_pose is not None:
-        opening = state.gripper_opening if state.gripper_opening is not None else 1.0
-        real_width = 0.04 * opening
-        if np.linalg.norm(state.ee_pose.position - state.virtual_gripper.position) > 0.02:
-            _draw_gripper(painter, state.ee_pose, max(real_width, 0.012), _MUTED, width=2)
+    # Absent until the agent aims somewhere: a placeholder pose would put the
+    # brightest glyph on the canvas at the world origin, standing for a decision
+    # nobody made, and would drag the real-arm glyph in with it (a phantom at the
+    # origin always differs from the arm, so the "when they differ" test passes).
+    virtual = state.virtual_gripper
+    if virtual is None:
+        return
+    opening = state.gripper_opening if state.gripper_opening is not None else 1.0
+    preview = state.previews.get(state.selected_id) if state.selected_id else None
+    target_joints = preview.joint_positions_rad if preview is not None else None
+    if target_joints is None or not _draw_gripper_fk(
+        img,
+        painter,
+        target_joints,
+        1.0 if state.gripper_open else 0.0,
+        (255, 255, 255),
+        fill_alpha=90,
+    ):
+        # Before preview there is no IK configuration to render exactly.  Keep a
+        # deliberately schematic glyph rather than inventing a panda_hand pose
+        # from the candidate with another hand-written TCP transform.
+        _draw_gripper(painter, virtual, 0.04 if state.gripper_open else 0.014, (255, 255, 255))
+    show_current = state.ee_pose is not None and (
+        np.linalg.norm(state.ee_pose.position - virtual.position) > 0.02
+    )
+    if show_current and (
+        state.arm_joint_positions_rad is None
+        or not _draw_gripper_fk(
+            img,
+            painter,
+            state.arm_joint_positions_rad,
+            opening,
+            _MUTED,
+            fill_alpha=48,
+        )
+    ):
+        _draw_gripper(painter, state.ee_pose, max(0.04 * opening, 0.012), _MUTED, width=2)
 
 
 def _preview_flag(state: ActionState, candidate_id: str) -> str:
     preview = state.previews.get(candidate_id)
     if preview is None:
         return ""
-    return " ok" if preview.feasible else " !"
+    return " IK" if preview.ik_ok else " IK!"
 
 
 def _draw_gizmo(painter: Painter, state: ActionState, cloud: SceneCloud) -> None:
@@ -459,18 +558,27 @@ def _draw_gizmo(painter: Painter, state: ActionState, cloud: SceneCloud) -> None
     world axes point in the picture it is looking at.
     """
     cam = painter.cam
-    ox, oy = MAIN.x0 + 52, MAIN.y0 + MAIN.h - 52
-    length = 28
+    # Large enough to remain legible after the full 1024x576 canvas is resized
+    # for a VLM.  The previous 28 px / 2 px compass nearly disappeared in the
+    # physical agentview, especially for a foreshortened axis.
+    ox, oy = MAIN.x0 + 64, MAIN.y0 + MAIN.h - 64
+    length = 42
+    painter.draw.ellipse(
+        (ox - 3, oy - 3, ox + 3, oy + 3),
+        fill=(220, 224, 234),
+        outline=(22, 23, 28),
+        width=1,
+    )
     for axis, color, name in (
-        (np.array([1.0, 0, 0]), (255, 106, 96), "x"),
-        (np.array([0, 1.0, 0]), (72, 199, 130), "y"),
-        (np.array([0, 0, 1.0]), (86, 156, 255), "z"),
+        (np.array([1.0, 0, 0]), (255, 106, 96), "X"),
+        (np.array([0, 1.0, 0]), (72, 199, 130), "Y"),
+        (np.array([0, 0, 1.0]), (86, 156, 255), "Z"),
     ):
         du = float(np.dot(axis, cam.right)) * length
         dv = float(np.dot(axis, cam.down)) * length
-        painter.draw.line([(ox, oy), (ox + du, oy + dv)], fill=color, width=2)
+        painter.draw.line([(ox, oy), (ox + du, oy + dv)], fill=color, width=3)
         painter.draw.text(
-            (ox + du * 1.3 - 3, oy + dv * 1.3 - 6), name, fill=color, font=F_SMALL
+            (ox + du * 1.2 - 4, oy + dv * 1.2 - 7), name, fill=color, font=F_BODY
         )
 
 
@@ -522,7 +630,7 @@ def _render_panel(
             bits.append("SEL")
         preview = state.previews.get(cand.candidate_id)
         if preview is not None:
-            bits.append("ok" if preview.feasible else "infeasible")
+            bits.append("IK" if preview.ik_ok else "IK-fail")
         rows.append(("ring", color, " ".join(bits)))
 
     for glyph, color, text in rows:
@@ -562,8 +670,7 @@ def _render_focus(
     explicit: bool,
 ) -> None:
     """Zoomed viewport on one object, with the dense annotations the main view
-    cannot afford: every candidate of that object, each with its approach axis,
-    plus the oriented box."""
+    cannot afford: every candidate of that object, each with its approach axis."""
     draw.rectangle(FOCUS.box, fill=_PANEL_BG, outline=(64, 68, 78))
     entry = state.objects.get(focus_id) if focus_id else None
     centroid = entry.centroid_world if entry is not None else None
@@ -615,8 +722,9 @@ def _render_focus(
         painter = Painter(draw, cam, inner, margin=0)
 
     color = colors.get(focus_id, _TEXT)
-    if entry.obb is not None:
-        _draw_obb(painter, entry.obb, color)
+    # No box in here. The inset is already cropped to this one object, using that
+    # same box to set the crop, so drawing it outlines roughly the whole viewport
+    # while covering the detail that was the reason to zoom in.
     for cand in state.candidates_of(focus_id):
         selected = cand.candidate_id == state.selected_id
         _draw_candidate(
@@ -726,7 +834,7 @@ def render_canvas(
     painter = _render_main(img, draw, state, obs, cloud, camera_name, colors)
     draw = ImageDraw.Draw(img, "RGBA")  # masks were alpha-composited under it
     painter.draw = draw
-    _annotate_main(painter, state, colors)
+    _annotate_main(img, painter, state, colors)
     _draw_gizmo(painter, state, cloud)
 
     _render_panel(draw, state, colors, focus_id)

@@ -209,11 +209,8 @@ def build_state(obs: dict, can_mask: np.ndarray) -> ActionState:
         PreviewResult(
             candidate_id="g1",
             ik_ok=True,
-            collision=False,
-            min_clearance_m=0.031,
             predicted_ee=state.candidates["g1"].pose.copy(),
-            path_world=np.linspace(state.ee_pose.position, state.candidates["g1"].pose.position, 20),
-            notes="feasible",
+            notes="endpoint IK solved; trajectory not planned",
         )
     )
     state.add_receipt(

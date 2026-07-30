@@ -145,46 +145,55 @@ class Candidate:
 
 @dataclass
 class PreviewResult:
-    """Geometric-rollout prediction for a candidate (the 'imagination')."""
+    """Terminal IK evidence for a candidate before motion planning is connected."""
 
     candidate_id: str
     ik_ok: bool
     orientation_used: str = "requested"     # from solve_ik fallback info
-    collision: bool = False
-    min_clearance_m: float = float("inf")
     predicted_ee: Pose | None = None
-    path_world: np.ndarray | None = None    # (M, 3) polyline for rendering
+    #: Exact seven-joint solution returned by the same IK call that was checked
+    #: during preview.  Rendering feeds this into URDF FK; it never reconstructs
+    #: the hand link by guessing a TCP offset from ``predicted_ee``.
+    joint_positions_rad: np.ndarray | None = None
     notes: str = ""
+
+    def __post_init__(self) -> None:
+        if self.joint_positions_rad is None:
+            return
+        joints = np.asarray(self.joint_positions_rad, dtype=np.float64).reshape(-1)
+        if joints.shape != (7,) or not np.isfinite(joints).all():
+            raise ValueError("preview joint_positions_rad must contain seven finite joints")
+        self.joint_positions_rad = joints
 
     @property
     def feasible(self) -> bool:
-        return self.ik_ok and not self.collision
+        """Endpoint feasibility only; no trajectory/collision claim is implied."""
+
+        return self.ik_ok
 
     def summary(self) -> dict[str, Any]:
         return {
             "candidate_id": self.candidate_id,
-            "feasible": self.feasible,
-            "ik_ok": self.ik_ok,
+            "endpoint_ik_ok": self.ik_ok,
             "orientation_used": self.orientation_used,
-            "collision": self.collision,
-            "min_clearance_m": round(self.min_clearance_m, 4)
-            if np.isfinite(self.min_clearance_m)
-            else None,
+            "trajectory_planned": False,
+            "collision_checked": False,
             "notes": self.notes,
         }
 
 
 @dataclass
 class Receipt:
-    """Execution receipt of a physical operation (commit / commit_gripper).
+    """Execution receipt of a physical operation.
 
-    ``discrepancy`` compares the receipt against the candidate's preview:
-    it powers both failure attribution (written back into the state) and the
-    asymmetric P_viol penalty at training time.
+    ``discrepancy`` compares the receipt against what the operation claimed
+    would happen — the candidate's preview for a commit, the requested offset
+    for a step. It powers both failure attribution (written back into the state)
+    and the asymmetric P_viol penalty at training time.
     """
 
     receipt_id: str
-    op: str                                  # "commit" | "commit_gripper"
+    op: str                                  # "commit" | "move_xyz" | "commit_gripper"
     candidate_id: str | None = None
     requested: Pose | None = None
     achieved: Pose | None = None

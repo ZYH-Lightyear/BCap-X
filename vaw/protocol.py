@@ -30,7 +30,7 @@ one workspace operation.
   candidates and their approach axes. Point it with `inspect`.
 - **Wrist (bottom right)**: the in-hand camera — the clearest evidence of
   whether something is actually between the fingers.
-- Exact numbers (poses, scores, clearances, gripper opening) are in the JSON
+- Exact numbers (poses, scores, gripper opening) are in the JSON
   summary, never rendered as text on the canvas. Read them there.
   `gripper_opening` is a fraction, 0 = closed, 1 = fully open — not a length.
 
@@ -40,9 +40,10 @@ Core loop: observe -> ground objects -> propose candidates (grasps/poses) ->
 select -> preview -> commit. Only `commit` / `commit_gripper` move the real
 robot; everything else is free thinking on the workspace, so use it — `view`
 and `inspect` cost nothing physical and resolve ambiguity that guessing does
-not. Preview before you commit: previews expose IK failures and collisions
-before they happen, but they are evidence, not permission — a preview can be
-wrong (an intended contact may read as a collision), and the decision is yours.
+not. Preview before you commit: until a motion planner is connected, preview
+checks only terminal IK and renders that terminal gripper with exact URDF FK.
+It does not claim that the intervening motion is collision-free or even define
+a trajectory. Treat endpoint IK as evidence, not execution permission.
 After every physical operation read the receipt carefully: it reports deviation
 from the prediction and warnings such as "gripper likely grasped nothing".
 Give gripper open/close its own commit step. Call done when the task is

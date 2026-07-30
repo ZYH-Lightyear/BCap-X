@@ -22,8 +22,8 @@ def r_task(steps: TraceSteps, env_success: bool) -> float:
 def p_viol(steps: TraceSteps) -> float:
     """Asymmetric verification penalty: count of unpredicted failures.
 
-    An unpredicted failure = a commit whose preview said feasible but whose
-    receipt deviated beyond tolerance (executor.py sets the flag). Deliberately
+    An unpredicted failure = a commit whose terminal IK preview succeeded but
+    whose receipt deviated beyond tolerance (executor.py sets the flag). Deliberately
     NOT a symmetric consistency reward: rewarding predictability is hackable
     by conservative free-space motion.
     """

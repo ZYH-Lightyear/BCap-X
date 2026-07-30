@@ -36,7 +36,10 @@ flowchart LR
    一条（每步一个 op）。这条"缺席的边"就是与 tool-ReAct/CaP 的本质区别。
 2. **Workspace 是所有操作的执行中介（dispatcher）**。从 W 出发的三条边表示操作集的
    三类归宿：认知操作 → Tool Space（只改 belief）、preview → Imagination（只改
-   belief）、commit/commit_gripper → Controller（唯一改变世界的路径，物理边界）。
+   belief）、commit/move_xyz/commit_gripper → Controller（唯一改变世界的路径，
+   物理边界）。其中 `move_xyz` 是 VIA 式的伺服通道：直接按世界系增量移动末端、
+   保持姿态、不建候选也不 preview，代价是它不产生"先验证再提交"的训练信号，
+   因此步长上限压到 ±0.05 m，大范围重定位仍必须走候选与 commit。
 3. **一切结果汇入 ActionState**。工具输出实例化为候选、想象输出为 PreviewResult、
    执行输出为 Receipt；Agent 不私藏任何信息，下一步看到的是"已经画上去的画布"。
 4. **Execution monitoring 闭环**：Receipt 与 Preview 比对 → discrepancy →
@@ -182,7 +185,7 @@ tool call 修复 + 图像窗口）、循环骨架与幻觉守卫。
 |---|------|------------|
 | D1 | **每轮恰好一个 op**（不允许并行 tool calls） | 画布是全量状态渲染，动作之间强顺序依赖；单 op 使 trace 成为干净的 (s, a, r) 序列，SFT/RL 无需拆分 |
 | D2 | **think-then-act**：允许并记录 tool call 前的思考文本 | ReAct/Claude Code 惯例；思考文本进 trace，是 SFT 的 rationale 监督 |
-| D3 | **观测是体制不是选择**：物理 op 后强制回灌新画布+回执 | AgentX `RunConfig.observe` 钩子的设计哲学；代码上 `commit`/`commit_gripper` 内部已调用 `refresh_observation` |
+| D3 | **观测是体制不是选择**：物理 op 后强制回灌新画布+回执 | AgentX `RunConfig.observe` 钩子的设计哲学；代码上 `commit`/`move_xyz`/`commit_gripper` 内部已调用 `refresh_observation` |
 | D4 | **错误即回执，不抛异常**：坏 id、空结果、协议违规都变成 agent 可见的错误消息 | Claude Code 的 tool-error-as-result；恢复行为本身是训练目标。`workspace.step` 已实现 |
 | D5 | **确定性上下文窗口**：最近 K 张画布（默认 3）作为图片，更早轮次只保留 op+receipt 文本；state summary 每轮全量重发（不做增量 diff） | 画布是全量状态渲染 → 历史可以浅。相比 Claude Code 的自动压缩，确定性策略保证**训练时上下文 == 推理时上下文**（SFT 数据可复现的前提）；diff 会让上下文依赖历史而非状态，同样破坏这一点 |
 | D6 | **双动作通道**：teacher（frontier API）默认原生 function calling；student（Qwen3-VL）默认文本协议 `<tool_call>` JSON | 原生有 schema 约束、教师产出的坏动作更少；文本协议是 Qwen 原生训练格式，且 RL 中途的 checkpoint 未必稳定守住原生 schema。保留幻觉守卫（模型在正文里编造工具结果的正则检测） |

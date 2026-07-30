@@ -1,0 +1,272 @@
+"""The Franka hand as real geometry, for drawing the gripper on the canvas.
+
+The virtual gripper is the one thing on the canvas no sensor image can show: it
+is where the agent *intends* to put the hand. A stick figure conveys position and
+little else — whether the fingers actually clear the neighbouring object, and how
+wide they are relative to it, are exactly the judgements the glyph has to support,
+and they need the hand's real outline.
+
+Geometry is evaluated by forward kinematics from the seven observed arm joints
+against an isolated Panda URDF, the same joint->FK route the old RoboMEx renderer
+used. Never reconstruct ``panda_hand`` from a reported Cartesian pose and a
+hand-written TCP offset instead: how the reported frame relates to the URDF link
+is a convention one can only guess at, and a mesh drawn from a wrong guess is a
+confident lie about where the hand is. The joints admit no such guess.
+
+It follows that whoever has no joint solution has no exact pose either, and
+should fall back to the schematic glyph rather than invent one.
+"""
+
+from __future__ import annotations
+
+import threading
+from functools import lru_cache
+from typing import Any
+
+import numpy as np
+
+
+class PandaUrdfGripperFK:
+    """Exact Panda gripper visuals evaluated from seven arm joints.
+
+    The URDF instance is private to the renderer and never touches MuJoCo.  A
+    lock protects ``yourdfpy.update_cfg`` because it mutates the scene graph.
+    This is the same joint→URDF-FK route used by the old RoboMEx AgentWorld,
+    with one correction: the finger joint follows the observed normalized
+    opening instead of being hard-coded fully open.
+    """
+
+    _ARM_JOINTS = tuple(f"panda_joint{index}" for index in range(1, 8))
+    _GRIPPER_LINKS = ("panda_hand", "panda_leftfinger", "panda_rightfinger")
+
+    def __init__(self, urdf: Any | None = None) -> None:
+        if urdf is None:
+            from robot_descriptions.loaders.yourdfpy import load_robot_description
+
+            urdf = load_robot_description("panda_description")
+        if not callable(getattr(urdf, "update_cfg", None)):
+            raise TypeError("urdf must expose update_cfg()")
+        self.urdf = urdf
+        finger = urdf.joint_map["panda_finger_joint1"]
+        self.finger_max_q = float(finger.limit.upper)
+        self._lock = threading.RLock()
+
+    @property
+    def model_id(self) -> str:
+        return "robot_descriptions.panda_description:yourdfpy"
+
+    def triangles(
+        self,
+        joint_positions_rad: np.ndarray,
+        gripper_opening: float,
+    ) -> np.ndarray:
+        """Return world/robot-base gripper triangles for one exact joint state."""
+
+        joints = np.asarray(joint_positions_rad, dtype=np.float64).reshape(-1)
+        if joints.shape != (7,) or not np.isfinite(joints).all():
+            raise ValueError("Panda FK requires exactly seven finite arm joints")
+        opening = float(gripper_opening)
+        if not np.isfinite(opening):
+            raise ValueError("gripper opening must be finite")
+
+        with self._lock:
+            config = dict(zip(self._ARM_JOINTS, joints, strict=True))
+            config["panda_finger_joint1"] = (
+                self.finger_max_q * float(np.clip(opening, 0.0, 1.0))
+            )
+            self.urdf.update_cfg(config)
+            parts = self._visual_meshes(self._GRIPPER_LINKS)
+        if not parts:
+            raise RuntimeError("Panda URDF has no gripper visual meshes")
+        return np.concatenate([vertices[faces] for vertices, faces in parts], axis=0)
+
+    def frame(
+        self,
+        joint_positions_rad: np.ndarray,
+        frame_name: str = "panda_hand",
+        *,
+        gripper_opening: float = 1.0,
+    ) -> np.ndarray:
+        """Expose an FK frame for calibration tests and diagnostics."""
+
+        joints = np.asarray(joint_positions_rad, dtype=np.float64).reshape(-1)
+        if joints.shape != (7,) or not np.isfinite(joints).all():
+            raise ValueError("Panda FK requires exactly seven finite arm joints")
+        with self._lock:
+            config = dict(zip(self._ARM_JOINTS, joints, strict=True))
+            config["panda_finger_joint1"] = (
+                self.finger_max_q * float(np.clip(gripper_opening, 0.0, 1.0))
+            )
+            self.urdf.update_cfg(config)
+            return self._frame(frame_name)
+
+    def _visual_meshes(
+        self,
+        links: tuple[str, ...],
+    ) -> tuple[tuple[np.ndarray, np.ndarray], ...]:
+        children = self.urdf.scene.graph.transforms.children
+        names = tuple(
+            dict.fromkeys(
+                name
+                for link in links
+                for name in children.get(link, ())
+                if name in self.urdf.scene.geometry
+            )
+        )
+        meshes: list[tuple[np.ndarray, np.ndarray]] = []
+        for name in names:
+            geometry = self.urdf.scene.geometry[name]
+            vertices = np.asarray(geometry.vertices, dtype=np.float64)
+            faces = np.asarray(geometry.faces, dtype=np.int64)
+            if (
+                vertices.ndim != 2
+                or vertices.shape[1] != 3
+                or faces.ndim != 2
+                or faces.shape[1] != 3
+            ):
+                continue
+            transform = self._frame(name)
+            homogeneous = np.column_stack(
+                (vertices, np.ones(len(vertices), dtype=np.float64))
+            )
+            world_vertices = np.ascontiguousarray(
+                (homogeneous @ transform.T)[:, :3]
+            )
+            meshes.append((world_vertices, np.ascontiguousarray(faces)))
+        return tuple(meshes)
+
+    def _frame(self, frame_name: str) -> np.ndarray:
+        try:
+            value = self.urdf.scene.graph.get(frame_to=frame_name)[0]
+        except Exception as exc:
+            raise RuntimeError(f"Panda URDF has no frame {frame_name!r}") from exc
+        matrix = np.asarray(value, dtype=np.float64)
+        if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
+            raise RuntimeError(f"Panda URDF frame {frame_name!r} is invalid")
+        return np.ascontiguousarray(matrix)
+
+
+@lru_cache(maxsize=1)
+def load_panda_urdf_fk() -> PandaUrdfGripperFK | None:
+    """Load the exact FK provider once; return ``None`` if deps are unavailable."""
+
+    try:
+        return PandaUrdfGripperFK()
+    except (ImportError, FileNotFoundError):
+        return None
+
+
+def rasterize_silhouette(
+    tris_px: np.ndarray,
+    depths: np.ndarray,
+    width: int,
+    height: int,
+    *,
+    max_pixels_per_chunk: int = 8_000_000,
+) -> np.ndarray:
+    """Union of the triangles' pixel coverage: a (height, width) bool mask.
+
+    A silhouette needs no depth buffer — overlapping triangles of one solid body
+    contribute the same pixels — so this is a coverage test per triangle and
+    nothing more.
+
+    Triangles are processed in chunks sized by their bounding boxes, because the
+    vectorised inside-test allocates ``chunk x bbox_h x bbox_w`` booleans and the
+    projected size of a triangle varies with how close the camera is.
+    """
+    mask = np.zeros((height, width), dtype=bool)
+    if len(tris_px) == 0:
+        return mask
+
+    tris = np.asarray(tris_px, dtype=np.float64)
+    keep = np.asarray(depths, dtype=np.float64).min(axis=1) > 1e-6
+    keep &= np.isfinite(tris).all(axis=(1, 2))
+    tris = tris[keep]
+    if len(tris) == 0:
+        return mask
+
+    x0 = np.floor(tris[:, :, 0].min(axis=1)).astype(np.int64)
+    x1 = np.ceil(tris[:, :, 0].max(axis=1)).astype(np.int64)
+    y0 = np.floor(tris[:, :, 1].min(axis=1)).astype(np.int64)
+    y1 = np.ceil(tris[:, :, 1].max(axis=1)).astype(np.int64)
+    # Wholly off-frame triangles cost nothing to drop and would otherwise widen
+    # every chunk's grid to the distance they sit outside the view.
+    on_frame = (x1 >= 0) & (y1 >= 0) & (x0 < width) & (y0 < height)
+    tris, x0, x1, y0, y1 = tris[on_frame], x0[on_frame], x1[on_frame], y0[on_frame], y1[on_frame]
+    if len(tris) == 0:
+        return mask
+    x0 = np.clip(x0, 0, width - 1)
+    y0 = np.clip(y0, 0, height - 1)
+    x1 = np.clip(x1, 0, width - 1)
+    y1 = np.clip(y1, 0, height - 1)
+
+    # Group by bounding-box size so one huge triangle does not set the grid for
+    # thousands of small ones. Order is by span, then chunked to a pixel budget.
+    span = np.maximum(x1 - x0, y1 - y0)
+    order = np.argsort(span, kind="stable")
+    start = 0
+    while start < len(order):
+        # Grow the chunk while the grid it forces stays inside the budget.
+        grid = int(span[order[start]]) + 1
+        end = start + max(1, max_pixels_per_chunk // (grid * grid))
+        end = min(end, len(order))
+        grid = int(span[order[start:end]].max()) + 1
+        while (end - start) * grid * grid > max_pixels_per_chunk and end - start > 1:
+            end -= 1
+            grid = int(span[order[start:end]].max()) + 1
+
+        idx = order[start:end]
+        _fill_chunk(mask, tris[idx], x0[idx], y0[idx], grid, width, height)
+        start = end
+    return mask
+
+
+def _fill_chunk(
+    mask: np.ndarray,
+    tris: np.ndarray,
+    x0: np.ndarray,
+    y0: np.ndarray,
+    grid: int,
+    width: int,
+    height: int,
+) -> None:
+    """Inside-test a grid of candidate pixels per triangle, OR the hits into mask."""
+    off = np.arange(grid, dtype=np.float64)
+    # Pixel centres: a triangle covering a pixel means covering its centre, and
+    # sampling at corners instead drops thin triangles that pass between them.
+    px = x0[:, None, None] + off[None, None, :] + 0.5
+    py = y0[:, None, None] + off[None, :, None] + 0.5
+
+    a, b, c = tris[:, 0], tris[:, 1], tris[:, 2]
+
+    def edge(p: np.ndarray, q: np.ndarray) -> np.ndarray:
+        # Signed area of (p, q, pixel): the standard edge function.
+        return (q[:, 0, None, None] - p[:, 0, None, None]) * (py - p[:, 1, None, None]) - (
+            q[:, 1, None, None] - p[:, 1, None, None]
+        ) * (px - p[:, 0, None, None])
+
+    w0, w1, w2 = edge(a, b), edge(b, c), edge(c, a)
+    # Accept either winding: the meshes are not consistently oriented after
+    # merging several visuals, and a silhouette does not care which way a face
+    # points.
+    inside = ((w0 >= 0) & (w1 >= 0) & (w2 >= 0)) | ((w0 <= 0) & (w1 <= 0) & (w2 <= 0))
+    if not inside.any():
+        return
+
+    tri_i, row, col = np.nonzero(inside)
+    vs = y0[tri_i] + row
+    us = x0[tri_i] + col
+    ok = (vs >= 0) & (vs < height) & (us >= 0) & (us < width)
+    mask[vs[ok], us[ok]] = True
+
+
+def mask_outline(mask: np.ndarray) -> np.ndarray:
+    """Boundary pixels of ``mask``: itself minus its 4-neighbour erosion."""
+    if not mask.any():
+        return mask
+    eroded = mask.copy()
+    eroded[1:, :] &= mask[:-1, :]
+    eroded[:-1, :] &= mask[1:, :]
+    eroded[:, 1:] &= mask[:, :-1]
+    eroded[:, :-1] &= mask[:, 1:]
+    return mask & ~eroded

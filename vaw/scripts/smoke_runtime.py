@@ -29,6 +29,7 @@ import numpy as np
 from vaw.agents.contracts import ModelResponse, TerminateMode, ToolCall
 from vaw.agents.providers.text_protocol import TextProtocolProvider
 from vaw.agents.runtime import RunConfig, VAWRuntime
+from vaw.geometry import shift_along_approach
 from vaw.scripts.smoke_render import synthetic_obs
 from vaw.workspace import Workspace
 
@@ -46,11 +47,16 @@ class FakeApi:
     camera_name = "agentview"
     wrist_camera_name = "robot0_eye_in_hand"
 
+    #: The real ``solve_ik`` targets the panda_hand link this far behind the
+    #: "TCP" it takes as its ``position`` argument (``_TCP_OFFSET`` there).
+    _TCP_OFFSET_M = -0.1
+
     def __init__(self) -> None:
         self._obs, self._mask = synthetic_obs()
         self._ee = np.array([0.30, -0.10, 0.45], dtype=np.float64)
         self._quat = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64)
         self._gripper = 1.0
+        self._pending: tuple[np.ndarray, np.ndarray] | None = None
         self.calls: list[str] = []
 
     def get_observation(self) -> dict[str, Any]:
@@ -78,13 +84,21 @@ class FakeApi:
         self.calls.append("solve_ik")
         reachable = float(np.linalg.norm(np.asarray(position)[:2])) < 1.0
         info = {"orientation_used": "requested" if reachable else "top_down_fallback"}
+        # The controller teleports, so the pose has to ride along with the (dummy)
+        # joints. Applying the real solver's TCP offset here is what makes the
+        # receipt's convention bookkeeping observable offline: commit reports a
+        # deviation of ~0 only if request and readback agree on the frame.
+        self._pending = (
+            shift_along_approach(position, quat_wxyz, self._TCP_OFFSET_M),
+            np.asarray(quat_wxyz, dtype=np.float64).copy(),
+        )
         joints = np.zeros(7)
         return (joints, info) if return_info else joints
 
-    def goto_pose(self, position, quat_wxyz, z_approach: float = 0.0) -> None:
-        self.calls.append("goto_pose")
-        self._ee = np.asarray(position, dtype=np.float64).copy()
-        self._quat = np.asarray(quat_wxyz, dtype=np.float64).copy()
+    def move_to_joints(self, joints) -> None:
+        self.calls.append("move_to_joints")
+        if self._pending is not None:
+            self._ee, self._quat = self._pending
 
     def open_gripper(self) -> None:
         self.calls.append("open_gripper")
@@ -197,8 +211,9 @@ def scripted_episode() -> None:
     ]
     assert len(rebukes) == 1, rebukes
 
-    # Physical ops really reached the robot, in order.
-    assert api.calls.count("goto_pose") == 1, api.calls
+    # Physical ops really reached the robot. One motion, not two: the committed
+    # candidate came from propose_pose, so there is no grasp hover stage.
+    assert api.calls.count("move_to_joints") == 1, api.calls
     assert api.calls.count("close_gripper") == 1, api.calls
 
     # Closing on nothing has to be visible in the receipt the agent reads.

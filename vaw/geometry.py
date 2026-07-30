@@ -35,8 +35,14 @@ import numpy as np
 GRASP_POSE_TO_CONTACT_M = -0.0166
 #: contact point -> the ``position`` solve_ik / goto_pose expect.
 CONTACT_TO_IK_TARGET_M = 0.0886
-#: fingertips -> the panda_hand link the observation reports.
+#: fingertips -> the end-effector point the observation reports.
 CONTACT_TO_HAND_M = -0.0114
+
+# All three are measured against the *reported* end-effector point and agree with
+# each other, which is all anything comparing poses needs. Note what is absent:
+# no offset from that reported point to the URDF ``panda_hand`` link. Drawing the
+# hand's mesh would need one, and it is not derivable here — see
+# :mod:`vaw.gripper_mesh`, which renders from joint FK precisely to avoid it.
 
 
 def approach_axis(quat_wxyz: np.ndarray) -> np.ndarray:
@@ -108,44 +114,6 @@ def mask_to_world_points(
     cam_pts = np.stack([x, y, zs, np.ones_like(zs)], axis=1)
     world = (np.asarray(camera_pose_mat, dtype=np.float64) @ cam_pts.T).T[:, :3]
     return world
-
-
-def depth_to_world_points(
-    depth: np.ndarray,
-    intrinsics: np.ndarray,
-    camera_pose_mat: np.ndarray,
-    stride: int = 4,
-    max_points: int = 20000,
-) -> np.ndarray:
-    """Deproject a full depth image (strided) to world points. Returns (N, 3)."""
-    depth = np.asarray(depth, dtype=np.float64)
-    if depth.ndim == 3:
-        depth = depth[:, :, 0]
-    full = np.zeros_like(depth, dtype=bool)
-    full[::stride, ::stride] = True
-    return mask_to_world_points(depth, full, intrinsics, camera_pose_mat, max_points=max_points)
-
-
-def interpolate_path(start: np.ndarray, end: np.ndarray, num: int = 24) -> np.ndarray:
-    """Linear position path (num, 3) from start to end, endpoints included."""
-    t = np.linspace(0.0, 1.0, num)[:, None]
-    return np.asarray(start).reshape(1, 3) * (1 - t) + np.asarray(end).reshape(1, 3) * t
-
-
-def min_clearance(
-    path: np.ndarray,
-    obstacle_points: np.ndarray,
-    chunk: int = 4096,
-) -> float:
-    """Minimum distance (m) between a polyline's vertices and an obstacle cloud."""
-    if len(obstacle_points) == 0 or len(path) == 0:
-        return float("inf")
-    best = float("inf")
-    obs = np.asarray(obstacle_points, dtype=np.float64)
-    for i in range(0, len(obs), chunk):
-        d = np.linalg.norm(path[:, None, :] - obs[None, i : i + chunk, :], axis=-1)
-        best = min(best, float(d.min()))
-    return best
 
 
 def rotate_quat_wxyz(quat_wxyz: np.ndarray, axis: str, degrees: float) -> np.ndarray:

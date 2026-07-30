@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 
 from vaw.camera import ViewState
-from vaw.types import Candidate, ObjectEntry, Pose, PreviewResult, Receipt, TOP_DOWN_QUAT_WXYZ
+from vaw.types import Candidate, ObjectEntry, Pose, PreviewResult, Receipt
 
 
 @dataclass
@@ -26,9 +26,11 @@ class ActionState:
     previews: dict[str, PreviewResult] = field(default_factory=dict)
     receipts: list[Receipt] = field(default_factory=list)
     selected_id: str | None = None
-    virtual_gripper: Pose = field(
-        default_factory=lambda: Pose(np.zeros(3), TOP_DOWN_QUAT_WXYZ.copy())
-    )
+    #: Where the agent intends to put the gripper: set by select / nudge / rotate
+    #: and by commit's readback. ``None`` until the agent aims somewhere. A
+    #: default pose is not harmless here: it puts the most prominent glyph on the
+    #: canvas at the world origin, standing for a decision nobody made.
+    virtual_gripper: Pose | None = None
     gripper_open: bool = True
     #: Agent-controlled viewpoint of the main canvas view (a ``view`` op away).
     view: ViewState = field(default_factory=ViewState)
@@ -38,6 +40,10 @@ class ActionState:
     #: "robot as entity 0" state (§1.5): the canvas header, the data panel and
     #: preview all read the arm's own state from here rather than re-reading obs.
     ee_pose: Pose | None = None
+    #: Authoritative observed arm joints.  These drive the URDF FK overlay;
+    #: ``ee_pose`` is retained for compact state summaries and distance checks,
+    #: but is never converted back into a mesh with a hand-written TCP offset.
+    arm_joint_positions_rad: np.ndarray | None = None
     #: Normalized finger opening, 0 (closed) .. 1 (fully open); see Receipt.
     gripper_opening: float | None = None
     events: list[str] = field(default_factory=list)

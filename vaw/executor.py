@@ -14,8 +14,11 @@ from typing import Any
 
 import numpy as np
 
-from vaw.geometry import CONTACT_TO_HAND_M, shift_along_approach
-from vaw.ik import solve_arm_ik
+from vaw.geometry import (
+    CONTACT_TO_HAND_M,
+    CONTACT_TO_IK_TARGET_M,
+    shift_along_approach,
+)
 from vaw.state import ActionState
 from vaw.types import Candidate, Pose, Receipt
 
@@ -39,23 +42,42 @@ JOINT_TOLERANCE_RAD = 0.02
 # can at 0.13-0.64 (the fingers stop on the object).
 EMPTY_GRIP_OPENING = 0.05
 
+# Per-axis cap on one incremental move. The whole point of stepping is that each
+# step is small enough for the rudimentary joint interpolation to track it, so a
+# cap well under the commit-time approach height keeps that property; larger
+# repositioning is what candidates and commit are for.
+MOVE_STEP_LIMIT_M = 0.05
+
+
+def _solve_joints(api: Any, pose: Pose) -> np.ndarray:
+    """Arm joints from ``api.solve_ik`` for a pose where the fingers close.
+
+    Candidate positions are fingertip-convention while ``solve_ik`` takes a TCP
+    sitting ``CONTACT_TO_IK_TARGET_M`` in front of it (see :mod:`vaw.geometry`).
+    Whatever the solver then returns is what gets commanded: it clips its target
+    into a fixed box and may substitute a canned orientation, and both surface as
+    deviation in the receipt rather than being compensated for here.
+    """
+    target = shift_along_approach(pose.position, pose.quat_wxyz, CONTACT_TO_IK_TARGET_M)
+    joints = api.solve_ik(target, pose.quat_wxyz)
+    return np.asarray(joints, dtype=np.float64).reshape(-1)[:7]
+
 
 def _drive_to(api: Any, pose: Pose, z_approach: float) -> np.ndarray | None:
     """Move the arm to ``pose``; return the joint configuration commanded last.
 
-    Spelled out as IK + ``move_to_joints`` rather than delegated to
-    ``api.goto_pose`` (which does these same two steps) for two reasons: the IK
-    has to be ours, see :mod:`vaw.ik`; and the receipt needs the configuration
-    that was actually commanded. A 7-DoF arm has a null space of configurations
-    per pose, so joints from any *other* IK call differ from the commanded ones
-    by an arbitrary amount even when tracking was perfect — which makes them
-    useless for telling "the arm never arrived" from "it arrived and the pose is
-    still off".
+    Spelled out as ``solve_ik`` + ``move_to_joints`` rather than delegated to
+    ``api.goto_pose`` (which does these same two steps) because the receipt needs
+    the configuration that was actually commanded. A 7-DoF arm has a null space
+    of configurations per pose, so joints from any *other* IK call differ from
+    the commanded ones by an arbitrary amount even when tracking was perfect —
+    which makes them useless for telling "the arm never arrived" from "it
+    arrived and the pose is still off".
     """
     if z_approach > 0.0:
         hover = Pose(pose.position + np.array([0.0, 0.0, z_approach]), pose.quat_wxyz)
-        api.move_to_joints(solve_arm_ik(api, hover))
-    joints = solve_arm_ik(api, pose)
+        api.move_to_joints(_solve_joints(api, hover))
+    joints = _solve_joints(api, pose)
     api.move_to_joints(joints)
     return joints
 
@@ -128,7 +150,7 @@ def execute_commit(
         )
         discrepancy = {
             "pred_pos_error_m": round(pred_error, 4),
-            "preview_feasible": preview.feasible,
+            "preview_endpoint_ik_ok": preview.ik_ok,
         }
         # Which of the two ways a commit misses its target? Comparing achieved
         # joints against the ones IK returned separates them, and they call for
@@ -147,7 +169,7 @@ def execute_commit(
                 else "arm reached the previewed joints but the pose is still off "
                 "(IK solution does not meet the target)"
             )
-        unpredicted = preview.feasible and (
+        unpredicted = preview.ik_ok and (
             pred_error > POS_TOLERANCE_M or error_note is not None
         )
     elif error_note is not None or pos_error > POS_TOLERANCE_M:
@@ -169,6 +191,72 @@ def execute_commit(
     )
     state.add_receipt(receipt)
     state.virtual_gripper = achieved.copy()
+    return receipt
+
+
+def execute_move(api: Any, state: ActionState, delta_world: np.ndarray) -> Receipt:
+    """Step the gripper by a small world-frame offset, holding its orientation.
+
+    This is the servo-style channel: no candidate, no preview, just move and
+    report. It exists because the alternative for "2 cm closer" is a four-step
+    round trip through propose/select/preview/commit, and because one long
+    motion is exactly what the joint interpolation tracks worst — the first live
+    pick stalled 8 cm short of a candidate whose endpoint IK was solvable.
+
+    Frames: the offset is applied to the *reported* end-effector point, which is
+    the one the agent watches move, while ``_drive_to`` wants the fingertip
+    convention. Holding the orientation makes that conversion cancel out of the
+    comparison, so the error below is simply achieved - (start + delta).
+    """
+    requested_delta = np.asarray(delta_world, dtype=np.float64).reshape(3)
+    delta = np.clip(requested_delta, -MOVE_STEP_LIMIT_M, MOVE_STEP_LIMIT_M)
+
+    start, _ = _read_ee(api.get_observation())
+    contact = shift_along_approach(start.position, start.quat_wxyz, -CONTACT_TO_HAND_M)
+    requested = Pose(contact + delta, start.quat_wxyz.copy())
+
+    error_note = None
+    commanded_joints = None
+    try:
+        commanded_joints = _drive_to(api, requested, z_approach=0.0)
+    except Exception as exc:  # controller/IK failure is a receipt, not a crash
+        error_note = f"{type(exc).__name__}: {exc}"
+
+    obs = api.get_observation()
+    achieved, gripper_opening = _read_ee(obs)
+    target_hand = start.position + delta
+    pos_error = float(np.linalg.norm(achieved.position - target_hand))
+
+    discrepancy: dict[str, Any] = {}
+    if not np.allclose(delta, requested_delta):
+        discrepancy["clamped_to_m"] = [round(float(v), 4) for v in delta]
+    if pos_error > POS_TOLERANCE_M:
+        joint_error = _joint_error(obs, commanded_joints)
+        if joint_error is not None:
+            discrepancy["joint_error_rad"] = round(joint_error, 4)
+            discrepancy["cause"] = (
+                "arm stalled before reaching the commanded joints (something blocked it)"
+                if joint_error > JOINT_TOLERANCE_RAD
+                else "arm reached the commanded joints but the pose is still off "
+                "(IK solution does not meet the target)"
+            )
+    if error_note:
+        discrepancy["execution_error"] = error_note
+
+    receipt = Receipt(
+        receipt_id=state.next_id("r"),
+        op="move_xyz",
+        requested=Pose(target_hand, start.quat_wxyz.copy()),
+        achieved=achieved,
+        gripper_opening=gripper_opening,
+        pos_error_m=pos_error,
+        discrepancy=discrepancy,
+    )
+    state.add_receipt(receipt)
+    # virtual_gripper is deliberately left alone: it stands for where the agent
+    # means to end up, and stepping toward that target does not revise the
+    # intention. Leaving it also makes the canvas show the pair that matters
+    # while servoing — the goal glyph and the hand closing on it.
     return receipt
 
 

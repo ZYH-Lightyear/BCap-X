@@ -2,9 +2,9 @@
 
 论文计划见 `docs/gui_as_policy_v2_cvpr_plan.md`；**架构图、Agent Runtime 设计与
 Milestone 以 `docs/vaw_implementation_plan.md` 为准**。本包实现视觉动作工作区：
-Agent 通过 **约 12 个离散界面操作**（ground / propose / select / nudge / preview /
-commit …）操作机器人，工具输出（mask、grasp、waypoint）实例化为工作区里可引用、
-可视化的候选对象，`commit` 是唯一改变物理世界的操作。
+Agent 通过 **14 个离散界面操作**（ground / propose / select / nudge / preview /
+commit / move_xyz …）操作机器人，工具输出（mask、grasp、waypoint）实例化为工作区里
+可引用、可视化的候选对象，只有 `commit` / `move_xyz` / `commit_gripper` 改变物理世界。
 
 ## 架构
 
@@ -43,7 +43,8 @@ vaw/
 
 - **一切可引用**：对象 `obj1`、候选 `g1/p2`、回执 `r1` 都有短 id，`ActionState.summary()`
   产出进 prompt 的紧凑 JSON；重数组（mask/点云）只留在内存、只画进画布。
-- **物理边界**：只有 `commit` / `commit_gripper` 改变世界，其余操作只改 belief 与画布。
+- **物理边界**：只有 `commit` / `move_xyz` / `commit_gripper` 改变世界，其余操作只改
+  belief 与画布。注意 `nudge` 只编辑画布上的候选，`move_xyz` 才真的移动机器人。
 - **日志即数据**：`TraceLogger` 每步落 `steps.jsonl`（op、args、receipt、state summary）
   + `canvas_XXXX.png`，教师 trace 与学生 rollout 同一格式，SFT/RL 直接消费。
 - **对 Cap-X 只有运行时依赖**：`Workspace` 接收任意实现了所需方法的 api 对象

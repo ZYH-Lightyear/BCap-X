@@ -32,6 +32,7 @@ libero_dataset/
 output/
 old_output/
 outputs/
+vaw/out/
 output_debug/
 outputs**
 curobo_debug/

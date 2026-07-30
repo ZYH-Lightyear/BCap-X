@@ -78,7 +78,7 @@ class Workspace:
 
     ``api`` is duck-typed: any object exposing the FrankaLiberoApiReduced
     surface used by the ops (get_observation, vlm_bbox_detection,
-    segment_sam3_box_prompt, plan_grasp, solve_ik, goto_pose,
+    segment_sam3_box_prompt, plan_grasp, solve_ik, move_to_joints,
     open_gripper/close_gripper, get_oriented_bounding_box_from_3d_points).
     """
 
@@ -126,6 +126,11 @@ class Workspace:
             self.state.ee_pose = Pose(cart[:3], cart[3:7])
             self.state.gripper_opening = float(cart[7])
             self.state.gripper_open = bool(cart[7] > 0.5)
+        joints = np.asarray(self.obs.get("robot_joint_pos", []), dtype=np.float64).reshape(-1)
+        if joints.size >= 7 and np.isfinite(joints[:7]).all():
+            self.state.arm_joint_positions_rad = joints[:7].copy()
+        else:
+            self.state.arm_joint_positions_rad = None
         self._cloud = None
         return self.obs
 
