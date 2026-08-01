@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import base64
-import io
-import os
+import io, os
 import pathlib
 from collections.abc import Sequence
 from typing import Any
@@ -19,15 +18,11 @@ from capx.utils.serve_utils import post_with_retries
 
 Supports:
   1) Local CapX SAM3 server (``/segment`` with ``image_base64`` + ``results``)
-  2) Remote multi-engine SAM3 (``image`` + ``detections`` with PNG masks),
-     e.g. ``http://101.132.143.105:6068``
-
-Override the endpoint with env ``SAM3_SERVICE_URL``.
+  2) Remote multi-engine SAM3 (``image`` + ``detections`` with PNG masks)
 """
 
 # Configuration (overridable via env)
 SERVICE_URL = os.environ.get("SAM3_SERVICE_URL", "http://127.0.0.1:8114").rstrip("/")
-
 
 def _encode_image(image: np.ndarray | Image.Image) -> str:
     if isinstance(image, np.ndarray):

@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
-"""Run GG-CNN (:8119), GraspGen (:8121), GraspGenX (:8123) on every low-level
-task listed in ``debug_tasks.txt``.
+"""Run grasp backends on every low-level task listed in ``debug_tasks.txt``.
+
+Backends: Contact-GraspNet (:8115), GG-CNN (:8119), GraspGen (:8121),
+GraspGenX (:8123). Select with ``--backends`` (default: all).
 
 For each task × backend × object, save one grasp-overlay PNG under::
 
     outputs/debug/<task>/<backend>_<port>/<object>.png
 
 Also writes ``rgb.png`` and ``<object>_mask.png`` per task folder.
+
+Example (GraspNet only on all tasks)::
+
+    python tests/debug_grasp_backends_low_level_tasks.py --backends graspnet
 """
 
 from __future__ import annotations
 
-import importlib.util
+import argparse
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +36,12 @@ from PIL import Image, ImageDraw
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
+
+from capx.integrations.vision.grasp_backends import (  # noqa: E402
+    health_check,
+    init_propose_grasp_pose,
+)
+
 OUT_ROOT = REPO / "outputs" / "debug"
 DEBUG_TASKS = REPO / "debug_tasks.txt"
 
@@ -38,11 +51,14 @@ ENV_ALIASES = {
     "nut_assembly_visual": "franka_robosuite_nut_assembly_low_level_visual",
 }
 
+# (backend_key, port, title)
 BACKENDS = (
-    ("ggcnn", 8119, "capx/integrations/vision/ggcnn.py", "ggcnn_client"),
-    ("graspgen", 8121, "capx/integrations/vision/graspgen.py", "graspgen_client"),
-    ("graspgenx", 8123, "capx/integrations/vision/graspgenx.py", "graspgenx_client"),
+    ("graspnet", 8115, "Contact-GraspNet"),
+    ("ggcnn", 8119, "GG-CNN"),
+    ("graspgen", 8121, "GraspGen"),
+    ("graspgenx", 8123, "GraspGenX"),
 )
+BACKEND_BY_NAME = {b[0]: b for b in BACKENDS}
 
 # Distinct tint / grasp colors cycled per object
 _PALETTE = [
@@ -71,15 +87,6 @@ class ObjCloud:
     mask: np.ndarray
     pc: np.ndarray
     colors: tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]
-
-
-def _load_client(rel: str, name: str):
-    path = REPO / rel
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
 
 
 def _parse_low_level_tasks(path: Path) -> list[str]:
@@ -362,28 +369,6 @@ def _overlay_one(
     return img
 
 
-def _run_ggcnn(plan, obj: ObjCloud, depth, K) -> tuple[list, np.ndarray]:
-    gg = plan(
-        depth=depth,
-        cam_K=K.astype(np.float32),
-        segmap=obj.mask.astype(np.int32),
-        segmap_id=1,
-        n_grasps=5,
-        threshold_abs=0.05,
-    )
-    if not gg["grasps"]:
-        gg = plan(
-            depth=depth,
-            cam_K=K.astype(np.float32),
-            segmap=obj.mask.astype(np.int32),
-            segmap_id=1,
-            n_grasps=5,
-            threshold_abs=0.01,
-        )
-    poses = gg.get("poses", np.zeros((0, 4, 4)))
-    return gg["grasps"], poses
-
-
 def _draw_ggcnn(img, grasps, poses, depth, K, colors):
     draw = ImageDraw.Draw(img)
     best_c, other_c, _ = colors
@@ -414,13 +399,64 @@ def _draw_poses(img, poses, scores, K, colors, topk: int = 6):
             draw.text((uv[0] + 6, uv[1] - 8), f"{rank}:{float(scores[idx]):.2f}", fill=color)
 
 
-def run_task(env_name: str, clients: dict) -> None:
+def _propose(backend: str, propose, obj: ObjCloud, depth, K) -> dict:
+    """Call unified propose_grasp_pose with backend-specific used kwargs only."""
+    if backend == "graspnet":
+        return propose(
+            depth=depth,
+            cam_K=K.astype(np.float32),
+            segmap=obj.mask.astype(np.int32),
+            forward_passes=2,
+            max_tries=10,
+        )
+    if backend == "ggcnn":
+        out = propose(
+            depth=depth,
+            cam_K=K.astype(np.float32),
+            segmap=obj.mask.astype(np.int32),
+            num_grasps=5,
+            quality_threshold=0.05,
+        )
+        if len(out["scores"]) == 0:
+            out = propose(
+                depth=depth,
+                cam_K=K.astype(np.float32),
+                segmap=obj.mask.astype(np.int32),
+                num_grasps=5,
+                quality_threshold=0.01,
+            )
+        return out
+    if backend == "graspgen":
+        return propose(
+            pc_segment=obj.pc,
+            num_grasps=80,
+            topk_num_grasps=8,
+            min_grasps=3,
+            max_tries=4,
+            remove_outliers=False,
+        )
+    if backend == "graspgenx":
+        return propose(
+            pc_segment=obj.pc,
+            gripper_name="franka_panda",
+            num_grasps=80,
+            topk_num_grasps=8,
+            min_grasps=3,
+            max_tries=4,
+            remove_outliers=False,
+        )
+    raise ValueError(f"unknown backend {backend}")
+
+
+def run_task(env_name: str, proposers: dict[str, object]) -> list[dict]:
+    """Run selected backends on one task; return per-object timing rows."""
     from capx.envs.base import get_env
 
     registered = ENV_ALIASES.get(env_name, env_name)
     print(f"\n======== {env_name} (-> {registered}) ========", flush=True)
     task_dir = OUT_ROOT / env_name
     task_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict] = []
 
     env = get_env(registered, enable_render=True)
     try:
@@ -436,115 +472,132 @@ def run_task(env_name: str, clients: dict) -> None:
         objects = _objects_from_obs(obs, cam, depth, K, rng)
         if not objects:
             print("  WARNING: no objects segmented; skip backends", flush=True)
-            return
+            return rows
 
         for obj in objects:
             Image.fromarray((obj.mask * 255).astype(np.uint8)).save(
                 task_dir / f"{obj.name}_mask.png"
             )
 
-        # GG-CNN
-        name, port, _, _ = BACKENDS[0]
-        out_dir = task_dir / f"{name}_{port}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        plan_gg = clients["ggcnn"]
-        print(f"  [{name}:{port}]", flush=True)
-        for obj in objects:
-            grasps, poses = _run_ggcnn(plan_gg, obj, depth, K)
-            title = f"GG-CNN :{port}  {env_name} / {obj.name}  n={len(grasps)}"
-            img = _overlay_one(rgb, obj, title)
-            _draw_ggcnn(img, grasps, poses, depth, K, obj.colors)
-            path = out_dir / f"{obj.name}.png"
-            img.save(path)
-            print(f"    saved {path.relative_to(REPO)}  grasps={len(grasps)}", flush=True)
-
-        # GraspGen
-        name, port, _, _ = BACKENDS[1]
-        out_dir = task_dir / f"{name}_{port}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        infer_g = clients["graspgen"]
-        print(f"  [{name}:{port}]", flush=True)
-        for obj in objects:
-            poses, scores = infer_g(
-                obj.pc,
-                num_grasps=80,
-                topk_num_grasps=8,
-                min_grasps=3,
-                max_tries=4,
-                remove_outliers=False,
-            )
-            title = f"GraspGen :{port}  {env_name} / {obj.name}  n={len(scores)}"
-            img = _overlay_one(rgb, obj, title)
-            _draw_poses(img, poses, scores, K, obj.colors)
-            path = out_dir / f"{obj.name}.png"
-            img.save(path)
-            best = float(np.max(scores)) if len(scores) else float("nan")
-            print(
-                f"    saved {path.relative_to(REPO)}  grasps={len(scores)} best={best:.3f}",
-                flush=True,
-            )
-
-        # GraspGenX
-        name, port, _, _ = BACKENDS[2]
-        out_dir = task_dir / f"{name}_{port}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        infer_x = clients["graspgenx"]
-        print(f"  [{name}:{port}]", flush=True)
-        for obj in objects:
-            poses, scores = infer_x(
-                obj.pc,
-                gripper_name="franka_panda",
-                num_grasps=80,
-                topk_num_grasps=8,
-                min_grasps=3,
-                max_tries=4,
-                remove_outliers=False,
-            )
-            title = f"GraspGenX :{port}  {env_name} / {obj.name}  n={len(scores)}"
-            img = _overlay_one(rgb, obj, title)
-            _draw_poses(img, poses, scores, K, obj.colors)
-            path = out_dir / f"{obj.name}.png"
-            img.save(path)
-            best = float(np.max(scores)) if len(scores) else float("nan")
-            print(
-                f"    saved {path.relative_to(REPO)}  grasps={len(scores)} best={best:.3f}",
-                flush=True,
-            )
+        for backend, port, title in BACKENDS:
+            if backend not in proposers:
+                continue
+            out_dir = task_dir / f"{backend}_{port}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            propose = proposers[backend]
+            print(f"  [{backend}:{port}]", flush=True)
+            for obj in objects:
+                t0 = time.perf_counter()
+                result = _propose(backend, propose, obj, depth, K)
+                dt_ms = (time.perf_counter() - t0) * 1000.0
+                poses = result["poses"]
+                scores = result["scores"]
+                grasps = result.get("grasps")
+                n = int(len(scores))
+                best = float(np.max(scores)) if n else float("nan")
+                caption = f"{title} :{port}  {env_name} / {obj.name}  n={n}"
+                img = _overlay_one(rgb, obj, caption)
+                if backend == "ggcnn" and grasps:
+                    _draw_ggcnn(img, grasps, poses, depth, K, obj.colors)
+                else:
+                    _draw_poses(img, poses, scores, K, obj.colors)
+                path = out_dir / f"{obj.name}.png"
+                img.save(path)
+                print(
+                    f"    saved {path.relative_to(REPO)}  grasps={n} "
+                    f"best={best:.3f}  {dt_ms:.0f}ms",
+                    flush=True,
+                )
+                rows.append(
+                    {
+                        "task": env_name,
+                        "backend": backend,
+                        "object": obj.name,
+                        "n_grasps": n,
+                        "best_score": best,
+                        "client_ms": dt_ms,
+                        "path": str(path.relative_to(REPO)),
+                    }
+                )
     finally:
         try:
             env.close()
         except Exception:
             pass
+    return rows
 
 
-def main() -> int:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--backends",
+        nargs="+",
+        default=[b[0] for b in BACKENDS],
+        choices=[b[0] for b in BACKENDS],
+        help="Which backends to run (default: all).",
+    )
+    p.add_argument(
+        "--tasks",
+        nargs="+",
+        default=None,
+        help="Subset of low-level task names (default: all from debug_tasks.txt).",
+    )
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
     tasks = _parse_low_level_tasks(DEBUG_TASKS)
+    if args.tasks:
+        want = set(args.tasks)
+        tasks = [t for t in tasks if t in want]
+        missing = want - set(tasks)
+        if missing:
+            print(f"WARNING: unknown tasks ignored: {sorted(missing)}", flush=True)
     print("Low-level tasks:", tasks, flush=True)
+    print("Backends:", args.backends, flush=True)
 
-    clients = {}
-    ggcnn = _load_client(BACKENDS[0][2], BACKENDS[0][3])
-    assert ggcnn.health_check(), "GG-CNN :8119 not healthy (set NO_PROXY for localhost)"
-    clients["ggcnn"] = ggcnn.init_ggcnn()
+    proposers: dict[str, object] = {}
+    for name in args.backends:
+        assert health_check(name), f"{name} not healthy (set NO_PROXY for localhost)"
+        proposers[name] = init_propose_grasp_pose(name)
+    print("Selected backends healthy.", flush=True)
 
-    graspgen = _load_client(BACKENDS[1][2], BACKENDS[1][3])
-    assert graspgen.health_check(), "GraspGen :8121 not healthy"
-    clients["graspgen"] = graspgen.init_graspgen()
-
-    graspgenx = _load_client(BACKENDS[2][2], BACKENDS[2][3])
-    assert graspgenx.health_check(), "GraspGenX :8123 not healthy"
-    clients["graspgenx"] = graspgenx.init_graspgenx()
-
-    print("All backends healthy.", flush=True)
-
+    all_rows: list[dict] = []
     for task in tasks:
         try:
-            run_task(task, clients)
+            all_rows.extend(run_task(task, proposers))
         except Exception as e:
             print(f"FAILED {task}: {type(e).__name__}: {e}", flush=True)
             import traceback
 
             traceback.print_exc()
+
+    # Summary table for graspnet / selected backends
+    if all_rows:
+        print("\n======== SUMMARY ========", flush=True)
+        print(
+            f"{'task':40s} {'obj':20s} {'backend':10s} {'n':>4s} {'best':>7s} {'ms':>8s}",
+            flush=True,
+        )
+        for r in all_rows:
+            best_s = f"{r['best_score']:.3f}" if np.isfinite(r["best_score"]) else "nan"
+            print(
+                f"{r['task']:40s} {r['object']:20s} {r['backend']:10s} "
+                f"{r['n_grasps']:4d} {best_s:>7s} {r['client_ms']:8.0f}",
+                flush=True,
+            )
+        summary_path = OUT_ROOT / "grasp_eval_summary.csv"
+        with summary_path.open("w") as f:
+            f.write("task,object,backend,n_grasps,best_score,client_ms,path\n")
+            for r in all_rows:
+                f.write(
+                    f"{r['task']},{r['object']},{r['backend']},"
+                    f"{r['n_grasps']},{r['best_score']},{r['client_ms']:.1f},"
+                    f"{r['path']}\n"
+                )
+        print(f"\nWrote {summary_path}", flush=True)
 
     print("\nDONE. Outputs under", OUT_ROOT, flush=True)
     return 0

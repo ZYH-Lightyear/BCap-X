@@ -16,6 +16,15 @@ import viser.transforms as vtf
 SERVICE_URL = os.environ.get("GRASPNET_SERVICE_URL", "http://127.0.0.1:8115")
 
 
+def health_check(timeout: float = 3.0) -> bool:
+    """Return True if Contact-GraspNet responds (OpenAPI ``/docs``)."""
+    try:
+        resp = requests.get(f"{SERVICE_URL}/docs", timeout=timeout)
+        return resp.ok
+    except requests.RequestException:
+        return False
+
+
 def _depth_to_pointcloud(depth: np.ndarray, K: np.ndarray) -> np.ndarray:
     h, w = depth.shape
     ys, xs = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")

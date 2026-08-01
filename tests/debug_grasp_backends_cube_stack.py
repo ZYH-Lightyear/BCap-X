@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Run GG-CNN (:8119), GraspGen (:8121), GraspGenX (:8123) on real robosuite cube_stack
-observations and save one overlay PNG each under outputs/debug/.
+"""Run Contact-GraspNet (:8115), GG-CNN (:8119), GraspGen (:8121), GraspGenX (:8123)
+on real robosuite cube_stack observations and save one overlay PNG each under
+outputs/debug/.
 
 Grasps are generated for **every** segmented object in the scene (red + green cubes).
 """
@@ -176,7 +177,7 @@ def _subsample(pc: np.ndarray, n: int, rng: np.random.Generator) -> np.ndarray:
 def main() -> int:
     from capx.envs.base import get_env
 
-    print("[1/4] Loading franka_robosuite_cubes_low_level …", flush=True)
+    print("[1/5] Loading franka_robosuite_cubes_low_level …", flush=True)
     env = get_env("franka_robosuite_cubes_low_level", enable_render=True)
     obs, info = env.reset()
     cam = obs["robot0_robotview"]
@@ -203,8 +204,53 @@ def main() -> int:
         inst[mask.astype(bool)] = i
         Image.fromarray((mask * 255).astype(np.uint8)).save(OUT_DIR / f"cube_stack_{name}_mask.png")
 
+    # ----- 8115 Contact-GraspNet: depth + per-object mask -----
+    print("[2/5] Contact-GraspNet :8115 (all objects) …", flush=True)
+    assert health_check("graspnet"), "Contact-GraspNet not healthy"
+    propose_gn = init_propose_grasp_pose("graspnet")
+    img = _overlay_base(rgb, masks, "Contact-GraspNet :8115")
+    draw = ImageDraw.Draw(img)
+    total_gn = 0
+    for obj in objects:
+        grasp_pose_dict = propose_gn(
+            depth=depth,
+            cam_K=K.astype(np.float32),
+            segmap=obj.mask.astype(np.int32),
+            forward_passes=2,
+            max_tries=10,
+        )
+        poses, scores = grasp_pose_dict["poses"], grasp_pose_dict["scores"]
+        total_gn += len(scores)
+        best_c, other_c, _ = OBJ_COLORS[obj.name]
+        order = np.argsort(scores)[::-1][:6] if len(scores) else []
+        print(
+            f"  {obj.name}: {len(scores)} grasps best="
+            f"{scores[order[:3]] if len(order) else []}",
+            flush=True,
+        )
+        for rank, idx in enumerate(order):
+            color = best_c if rank == 0 else other_c
+            uv = _draw_gripper(
+                draw, poses[idx], K, opening=0.08, color=color, width=3 if rank == 0 else 2
+            )
+            if uv:
+                draw.text(
+                    (uv[0] + 6, uv[1] - 8),
+                    f"{obj.name[0]}{rank}:{float(scores[idx]):.2f}",
+                    fill=color,
+                )
+    draw.rectangle((0, 0, img.width, 28), fill=(0, 0, 0))
+    draw.text(
+        (8, 6),
+        f"Contact-GraspNet :8115  n={total_gn} objs={len(objects)}",
+        fill=(255, 255, 255),
+    )
+    out_gn = OUT_DIR / "cube_stack_graspnet_8115.png"
+    img.save(out_gn)
+    print(f"  saved {out_gn}", flush=True)
+
     # ----- 8119 GG-CNN: one plan per object mask -----
-    print("[2/4] GG-CNN :8119 (all objects) …", flush=True)
+    print("[3/5] GG-CNN :8119 (all objects) …", flush=True)
     assert health_check("ggcnn"), "GG-CNN not healthy"
     propose_gg = init_propose_grasp_pose("ggcnn")
     per_obj_gg: dict[str, dict] = {}
@@ -248,10 +294,10 @@ def main() -> int:
     img.save(out_gg)
     print(f"  saved {out_gg}", flush=True)
 
-    # ----- 8121 GraspGen: infer per-object cloud -----
-    print("[3/4] GraspGen :8121 (all objects) …", flush=True)
-    assert health_check("graspgen"), "GraspGen not healthy"
-    propose_g = init_propose_grasp_pose("graspgen")
+    # ----- 8121 GraspGen (default propose_grasp): infer per-object cloud -----
+    print("[4/5] GraspGen :8121 (default propose_grasp, all objects) …", flush=True)
+    assert health_check(), "GraspGen not healthy"
+    propose_g = init_propose_grasp_pose()  # default: graspgen
     img = _overlay_base(rgb, masks, "GraspGen :8121")
     draw = ImageDraw.Draw(img)
     total_g = 0
@@ -290,7 +336,7 @@ def main() -> int:
     print(f"  saved {out_g}", flush=True)
 
     # ----- 8123 GraspGenX: infer per-object cloud -----
-    print("[4/4] GraspGenX :8123 (all objects) …", flush=True)
+    print("[5/5] GraspGenX :8123 (all objects) …", flush=True)
     assert health_check("graspgenx"), "GraspGenX not healthy"
     propose_x = init_propose_grasp_pose("graspgenx")
     img = _overlay_base(rgb, masks, "GraspGenX :8123")
@@ -332,6 +378,7 @@ def main() -> int:
     print(f"  saved {out_x}", flush=True)
 
     print("DONE")
+    print(" ", out_gn)
     print(" ", out_gg)
     print(" ", out_g)
     print(" ", out_x)
