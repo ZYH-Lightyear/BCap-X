@@ -61,6 +61,27 @@ SERVER_REGISTRY: dict[str, dict[str, Any]] = {
         "gpu_memory_mb": 2000,
         "extra_args": {"device": "cuda"},
     },
+    "anygrasp": {
+        "target": "capx.serving.launch_anygrasp_server",
+        "default_port": 8120,
+        "gpu_required": True,
+        "gpu_memory_mb": 2500,
+        "extra_args": {"device": "cuda"},
+    },
+    "graspgen": {
+        "target": "capx.serving.launch_graspgen_server",
+        "default_port": 8121,
+        "gpu_required": True,
+        "gpu_memory_mb": 4000,
+        "extra_args": {"device": "cuda"},
+    },
+    "graspgenx": {
+        "target": "capx.serving.launch_graspgenx_server",
+        "default_port": 8123,
+        "gpu_required": True,
+        "gpu_memory_mb": 4000,
+        "extra_args": {"device": "cuda", "default_gripper": "franka_panda"},
+    },
     "pyroki": {
         "target": "capx.serving.launch_pyroki_server",
         "default_port": 8116,
@@ -89,6 +110,13 @@ SERVER_REGISTRY: dict[str, dict[str, Any]] = {
         "gpu_memory_mb": 2000,
         "extra_args": {},
     },
+    "ggcnn": {
+        "target": "capx.serving.launch_ggcnn_server",
+        "default_port": 8119,
+        "gpu_required": True,
+        "gpu_memory_mb": 500,
+        "extra_args": {"device": "cuda", "network": "ggcnn2"},
+    },
 }
 
 # Reverse lookup: _target_ module string -> short name
@@ -112,9 +140,19 @@ PROFILES: dict[str, list[dict[str, Any]]] = {
         {"server": "pyroki", "port": 8116},
         {"server": "owlvit", "port": 8117},
         {"server": "sam2", "port": 8113},
+        {"server": "ggcnn", "port": 8119},
     ],
     "minimal": [
         {"server": "pyroki", "port": 8116},
+    ],
+    "ggcnn": [
+        {"server": "ggcnn", "port": 8119},
+    ],
+    "anygrasp": [
+        {"server": "anygrasp", "port": 8120},
+    ],
+    "graspgenx": [
+        {"server": "graspgenx", "port": 8123},
     ],
 }
 

@@ -1,0 +1,32 @@
+# Minimal robosuite cube_stack with remote SAM3 + local GraspNet/PyRoKi.
+# Usage:
+#   export SAM3_SERVICE_URL=http://101.132.143.105:6068
+#   python capx/envs/launch.py --config-path env_configs/cube_stack/franka_robosuite_cube_stack_remote_sam.yaml \
+#       --use-oracle-code True --total-trials 1 --num-workers 1
+
+env:
+  _target_: capx.envs.tasks.franka.franka_pick_place.FrankaPickPlaceCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level: franka_robosuite_cubes_low_level
+    privileged: false
+    apis:
+      - FrankaControlApi
+
+# Do NOT auto-launch local SAM3; use remote via SAM3_SERVICE_URL.
+api_servers:
+  - _target_: capx.serving.launch_contact_graspnet_server.main
+    port: 8115
+    host: 127.0.0.1
+
+  - _target_: capx.serving.launch_pyroki_server.main
+    port: 8116
+    host: 127.0.0.1
+    robot: panda_description
+    target_link: panda_hand
+
+record_video: true
+output_dir: ./outputs/franka_robosuite_cube_stack_remote_sam
+trials: 1
+num_workers: 1
+use_oracle_code: true

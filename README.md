@@ -28,6 +28,97 @@ Shankar Sastry<sup>2</sup>, Yuke Zhu<sup>1</sup>, Ken Goldberg<sup>&dagger;,2</s
 | **CaP-Agent0** | Training-free agentic framework with multi-turn visual differencing, auto-synthesized skill libraries, and parallel ensembled reasoning.                                                       |
 | **CaP-RL**     | Reinforcement learning on the coding agent via GRPO, using environment rewards to post-train language models. Transfers from sim to real with minimal gap.                                     |
 
+### Component → code map
+
+| Component | Primary paths |
+| --------- | ------------- |
+| **CaP-Gym** | `capx/envs/` + `env_configs/` |
+| **CaP-Bench** | `env_configs/**` YAML tiers (S1–S4 single-turn, M1–M4 multi-turn) |
+| **CaP-Agent0** | `capx/envs/trial.py`, `capx/agents/`, `capx/skills/` |
+| **CaP-RL** | `capx/third_party/verl`, `verl_agent_reward/`, `scripts/train_franka_grpo.sh` |
+
+### Repository layout
+
+Eval data flow: `YAML → launch.py → runner.py → trial.py → LLM code → Sandbox exec → APIs → Simulator + perception servers`.
+
+```
+BCap-X/
+├── capx/                        # Core framework
+│   ├── envs/                    # CaP-Gym: launch / runner / trial / sandbox tasks
+│   │   ├── launch.py            # CLI entry
+│   │   ├── runner.py            # Parallel eval orchestration
+│   │   ├── trial.py             # Single-trial loop (multi-turn visual diff)
+│   │   ├── configs/             # YAML load + instantiate
+│   │   ├── simulators/          # Robosuite / LIBERO / R1Pro-B1K / real Franka
+│   │   ├── tasks/               # CodeExecutionEnvBase + franka / r1pro tasks
+│   │   ├── assets/              # URDF / MuJoCo assets
+│   │   └── scripts/             # Batch / Codex / coding-agent runners
+│   ├── integrations/            # APIs exposed to LLM (docstring = interface doc)
+│   │   ├── base_api.py          # ApiBase + register_api / get_api
+│   │   ├── franka/              # Privileged / Full / Reduced / Skill-library APIs
+│   │   ├── vision/              # SAM2/3, OWL-ViT, Molmo, Qwen point, GraspNet
+│   │   ├── motion/              # PyRoKi IK, CuRobo planning
+│   │   ├── r1pro/               # BEHAVIOR / R1Pro control glue
+│   │   ├── libero/              # LIBERO helpers
+│   │   └── robosuite/           # Controllers / robot configs
+│   ├── serving/                 # Perception + LLM proxies (SAM3/GraspNet/AnyGrasp/GG-CNN/…)
+│   ├── llm/                     # OpenAI-compatible LLM client
+│   ├── agents/                  # Coding agent / Codex runners
+│   ├── skills/                  # Skill extract + skill library
+│   ├── web/                     # FastAPI / WebSocket backend for web-ui
+│   ├── utils/                   # Parallel eval, camera/depth, logging, viz
+│   ├── cli/                     # VeRL dataset prep, etc.
+│   └── third_party/             # Git submodules (sim / perception / RL)
+│       ├── LIBERO-PRO/
+│       ├── robosuite/
+│       ├── sam3/
+│       ├── curobo/
+│       ├── b1k/                 # BEHAVIOR / OmniGibson
+│       ├── verl/
+│       ├── contact_graspnet_pytorch/
+│       ├── ggcnn/               # dougsm GG-CNN (local :8119)
+│       └── …
+├── env_configs/                 # CaP-Bench YAML (by task family)
+│   ├── cube_stack|lifting|restack/
+│   ├── nut_assembly/ spill_wipe/
+│   ├── two_arm_handover|lift/
+│   ├── libero/ r1pro/ real/
+│   ├── human_oracle_code/
+│   └── */hillclimb/             # Hill-climb experiment variants
+│       # Suffix legend:
+│       #   (none)              single-turn
+│       #   _multiturn(_vdm|_vf) multi-turn / visual differencing / feedback
+│       #   _privileged         privileged-state APIs
+│       #   _reduced_api        low-level primitives
+│       #   _exampleless        no in-prompt examples
+│       #   _skill_lib          primitives + synthesized skills
+├── robomex/                     # Multi-agent extension (planner / verifier / evolve)
+│   ├── agents/ core/ perception/
+│   ├── skills/ verification/
+│   └── examples/
+├── web-ui/                      # React / Vite interactive eval UI
+├── verl_agent_reward/           # GRPO / VeRL Franka reward fns
+├── scripts/                     # Regression, serve up/down, skill-lib compile, RL train
+├── tests/                       # Env smoke + perception integration tests
+├── docs/                        # Guides; see docs/capx-architecture.md for deep dive
+├── .agents/skills/              # Reusable LIBERO agent skills
+├── third_party/                 # Reference skills / tools (≠ capx/third_party)
+├── capskillbench/               # Skill-benchmark placeholder
+├── logs/ outputs/               # Runtime artifacts
+├── pyproject.toml               # uv deps + extras (robosuite / libero / verl / …)
+└── README.md
+```
+
+**Where to edit**
+
+| Goal | Look here |
+| ---- | --------- |
+| Task / eval tier | `env_configs/` + `capx/envs/tasks\|simulators/` |
+| Functions the model can call | `capx/integrations/` |
+| Multi-turn agent loop | `capx/envs/trial.py`, `capx/agents/`, `capx/skills/` |
+| Perception / LLM servers | `capx/serving/` |
+| Stronger planner–verifier loop | `robomex/` |
+| RL post-training | `verl_agent_reward/` + `capx/third_party/verl` + `scripts/train_franka_grpo.sh` |
 
 ---
 
@@ -124,8 +215,18 @@ uv run --no-sync --active capx/serving/launch_servers.py --profile default
 Use `--dry-run` to preview the allocation. Other profiles:
 
 ```bash
---profile full      # All perception servers (SAM3, GraspNet, PyRoKi, OWL-ViT, SAM2)
+--profile full      # All perception servers (SAM3, GraspNet, PyRoKi, OWL-ViT, SAM2, GG-CNN)
 --profile minimal   # PyRoKi only (for oracle/privileged evals)
+--profile anygrasp  # AnyGrasp grasp service only (:8120; mock until license)
+--profile ggcnn     # GG-CNN grasp service only (:8119)
+```
+
+**GG-CNN** optional depth-only antipodal grasps ([dougsm/ggcnn](https://github.com/dougsm/ggcnn)); vendor + Cornell weights under `capx/third_party/ggcnn/`:
+
+```bash
+python -m capx.serving.launch_ggcnn_server --device cuda --port 8119 --host 127.0.0.1
+# curl http://127.0.0.1:8119/health
+# from capx.integrations.vision.ggcnn import init_ggcnn
 ```
 
 ### 2. Set up an LLM proxy
@@ -145,6 +246,16 @@ See [docs/configuration.md](docs/configuration.md) for all provider options (Ope
 ### 3. Run evaluation
 
 ```bash
+export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONPATH=$PWD:$PYTHONPATH
+# Robosuite: minimal
+conda activate sci
+cd /Knowin/foundation/bohanzhou/MyProj/BCap-X
+export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONPATH=$PWD:$PYTHONPATH
+export SAM3_SERVICE_URL=http://101.132.143.105:6068
+python capx/envs/launch.py \
+  --config-path env_configs/cube_stack/franka_robosuite_cube_stack_remote_sam.yaml \
+  --use-oracle-code True --total-trials 1 --num-workers 1
+
 # Robosuite: single-turn benchmark (100 trials, 12 parallel workers)
 uv run --no-sync --active capx/envs/launch.py \
     --config-path env_configs/cube_stack/franka_robosuite_cube_stack.yaml \
