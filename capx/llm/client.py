@@ -42,6 +42,7 @@ VLM_MODELS = [
     "deepseek/deepseek-r1-0528",
     "deepseek/deepseek-r1",
     "qwen/qwen3.5-122b-a10b",
+    "qwen3.5-397b-a17b",
     "moonshotai/kimi-k2",
     "openrouter/qwen/qwen3.6-plus",
 ]

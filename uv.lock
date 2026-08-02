@@ -447,7 +447,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pyrender" },
     { name = "pyrender", marker = "extra == 'contactgraspnet'" },
-    { name = "pyroki", git = "https://github.com/chungmin99/pyroki.git" },
+    { name = "pyroki", editable = "capx/third_party/pyroki" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-timeout", marker = "extra == 'dev'", specifier = ">=2.3" },
     { name = "pyyaml" },
@@ -3812,7 +3812,7 @@ wheels = [
 [[package]]
 name = "pyroki"
 version = "0.0.0"
-source = { git = "https://github.com/chungmin99/pyroki.git#95afccc22658c461ab1042a048ae4e9c24bc2a47" }
+source = { editable = "capx/third_party/pyroki" }
 dependencies = [
     { name = "jax" },
     { name = "jax-dataclasses" },
@@ -3829,6 +3829,29 @@ dependencies = [
     { name = "viser" },
     { name = "yourdfpy" },
 ]
+
+[package.metadata]
+requires-dist = [
+    { name = "jax", specifier = ">=0.4.0" },
+    { name = "jax-dataclasses", specifier = ">=1.0.0" },
+    { name = "jaxlib" },
+    { name = "jaxlie", specifier = ">=1.0.0" },
+    { name = "jaxls", git = "https://github.com/brentyi/jaxls.git" },
+    { name = "jaxtyping" },
+    { name = "loguru" },
+    { name = "m2r2", marker = "extra == 'dev'" },
+    { name = "pyliblzfse" },
+    { name = "pyright", marker = "extra == 'dev'", specifier = ">=1.1.308" },
+    { name = "pytest", marker = "extra == 'dev'" },
+    { name = "robot-descriptions" },
+    { name = "ruff", marker = "extra == 'dev'" },
+    { name = "scikit-sparse", marker = "extra == 'dev'" },
+    { name = "trimesh" },
+    { name = "tyro" },
+    { name = "viser" },
+    { name = "yourdfpy" },
+]
+provides-extras = ["dev"]
 
 [[package]]
 name = "pytest"
