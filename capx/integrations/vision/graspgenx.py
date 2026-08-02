@@ -10,6 +10,8 @@ from typing import Any
 import numpy as np
 import requests
 
+from capx.utils.serve_utils import http_get, http_post
+
 SERVICE_URL = os.environ.get("GRASPGENX_SERVICE_URL", "http://127.0.0.1:8123")
 
 
@@ -49,7 +51,7 @@ def init_graspgenx(default_gripper: str = "franka_panda") -> Any:
             "remove_outliers": remove_outliers,
         }
         try:
-            resp = requests.post(f"{SERVICE_URL}/infer", json=payload, timeout=180)
+            resp = http_post(f"{SERVICE_URL}/infer", json=payload, timeout=180)
             resp.raise_for_status()
             data = resp.json()
         except requests.RequestException as e:
@@ -93,7 +95,7 @@ def init_graspgenx_point_clouds(default_gripper: str = "franka_panda") -> Any:
             "remove_outliers": remove_outliers,
         }
         try:
-            resp = requests.post(
+            resp = http_post(
                 f"{SERVICE_URL}/plan_point_clouds", json=payload, timeout=180
             )
             resp.raise_for_status()
@@ -113,7 +115,7 @@ def init_graspgenx_point_clouds(default_gripper: str = "franka_panda") -> Any:
 
 def health_check(timeout: float = 3.0) -> bool:
     try:
-        r = requests.get(f"{SERVICE_URL}/health", timeout=timeout)
+        r = http_get(f"{SERVICE_URL}/health", timeout=timeout)
         return r.ok and r.json().get("status") == "ok"
     except requests.RequestException:
         return False

@@ -76,6 +76,7 @@ BCap-X/
 │       ├── b1k/                 # BEHAVIOR / OmniGibson
 │       ├── verl/
 │       ├── contact_graspnet_pytorch/
+│       ├── pyroki/              # IK server (:8116)
 │       ├── ggcnn/               # dougsm GG-CNN (local :8119)
 │       └── …
 ├── env_configs/                 # CaP-Bench YAML (by task family)
@@ -246,14 +247,14 @@ See [docs/configuration.md](docs/configuration.md) for all provider options (Ope
 ### 3. Run evaluation
 
 ```bash
-export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONPATH=$PWD:$PYTHONPATH
-# Robosuite: minimal (SAM3 uses remote http://101.132.143.105:6068)
+# Robosuite: minimal 
 conda activate sci
 cd /Knowin/foundation/bohanzhou/MyProj/BCap-X
-export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONPATH=$PWD:$PYTHONPATH
+export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONPATH=$PWD:$PYTHONPATH 
+export PYTHONPATH=$PWD:$PWD/capx/third_party/pyroki/src:$PWD/capx/third_party/sam3:$PYTHONPATH #SAM3_SERVICE_URL=http://101.132.143.105:6068
 python capx/envs/launch.py \
   --config-path env_configs/cube_stack/franka_robosuite_cube_stack.yaml \
-  --use-oracle-code True --total-trials 5 --num-workers 1
+  --use-oracle-code True --total-trials 3 --num-workers 1
 
 # Robosuite: single-turn benchmark (100 trials, 12 parallel workers)
 uv run --no-sync --active capx/envs/launch.py \

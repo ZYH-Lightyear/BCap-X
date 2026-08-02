@@ -10,6 +10,8 @@ from typing import Any
 import numpy as np
 import requests
 
+from capx.utils.serve_utils import http_post
+
 SERVICE_URL = os.environ.get("ANYGRASP_SERVICE_URL", "http://127.0.0.1:8120")
 
 
@@ -68,7 +70,7 @@ def init_anygrasp(device: str = "cuda", checkpoint_path: str | None = None) -> A
             payload["segmap_base64"] = _numpy_to_base64(np.asarray(segmap))
 
         try:
-            resp = requests.post(f"{SERVICE_URL}/plan", json=payload, timeout=120)
+            resp = http_post(f"{SERVICE_URL}/plan", json=payload, timeout=120)
             resp.raise_for_status()
             data = resp.json()
         except requests.RequestException as e:
@@ -115,7 +117,7 @@ def init_anygrasp_points() -> Any:
             )
 
         try:
-            resp = requests.post(f"{SERVICE_URL}/plan_points", json=payload, timeout=120)
+            resp = http_post(f"{SERVICE_URL}/plan_points", json=payload, timeout=120)
             resp.raise_for_status()
             data = resp.json()
         except requests.RequestException as e:

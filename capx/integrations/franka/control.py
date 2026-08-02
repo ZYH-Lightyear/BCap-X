@@ -33,7 +33,6 @@ from capx.integrations.franka.common import (
     select_instance_from_box,
 )
 from capx.utils.visualization_utils import (
-    draw_oriented_bounding_box,
     overlay_segmentation_masks,
 )
 
@@ -70,6 +69,9 @@ class FrankaControlApi(ApiBase):
         self.use_sam3 = use_sam3
         self.debug = debug
         self.real = real
+        self._debug_output_dir: pathlib.Path | None = None
+        self._debug_block_idx: int = 0
+        self._debug_counter: int = 0
         if self.use_sam3:
             self.sam3_seg_fn = init_sam3()
             print("init sam3 seg fn")
@@ -85,6 +87,33 @@ class FrankaControlApi(ApiBase):
         # self._pks = pks
         self.ik_solve_fn = init_pyroki()
         self.cfg = None
+
+    def set_debug_context(self, output_dir: str, block_idx: int) -> None:
+        """Enable per-block RGB overlay dumps under the trial live debug dir."""
+        self._debug_output_dir = pathlib.Path(output_dir)
+        self._debug_block_idx = block_idx
+        self._debug_counter = 0
+        self.debug = True
+
+    def _debug_dir(self) -> pathlib.Path:
+        if self._debug_output_dir is not None:
+            self._debug_output_dir.mkdir(parents=True, exist_ok=True)
+            return self._debug_output_dir
+        return pathlib.Path(".")
+
+    def _save_rgb_debug(self, name: str, image: np.ndarray | Image.Image) -> None:
+        if not self.debug:
+            return
+        out_dir = self._debug_dir()
+        path = out_dir / (
+            f"block_{self._debug_block_idx:02d}_{self._debug_counter:03d}_{name}.png"
+        )
+        self._debug_counter += 1
+        if isinstance(image, Image.Image):
+            image.save(path)
+        else:
+            Image.fromarray(np.asarray(image, dtype=np.uint8)).save(path)
+        print(f"[debug] saved RGB overlay: {path}")
 
     def functions(self) -> dict[str, Any]:
         fns = {
@@ -163,11 +192,11 @@ class FrankaControlApi(ApiBase):
 
         depth = obs["robot0_robotview"]["images"]["depth"]
 
-        # Debug image saves TODO: Remove this eventually, or add a debug mode branch
-        # save depth image with colormap
+        # Debug image saves (RGB overlays go to trial debug_overlays when context is set)
         depth_img = depth_to_rgb(depth[:, :, 0])
-        depth_img_out = Image.fromarray(depth_img)
-        depth_img_out.save("depth_image.jpg")
+        if self.debug:
+            self._save_rgb_debug(f"pose_{object_name.replace(' ', '_')}_rgb", rgb)
+            self._save_rgb_debug(f"pose_{object_name.replace(' ', '_')}_depth", depth_img)
 
         binary_map_nan_is_zero = (~np.isnan(depth[:, :, 0])).astype(int)
 
@@ -186,13 +215,15 @@ class FrankaControlApi(ApiBase):
                     Image.fromarray(rgb),
                     object_name,
                     results,
-                    output_dir=pathlib.Path("."),
+                    output_dir=self._debug_dir(),
                     show=False,
                 )
             vis_masks = [r["mask"] for r in results if r.get("score", 0) > 0.05]
             if vis_masks:
                 vis = overlay_segmentation_masks(rgb, vis_masks)
                 self._log_step_update(text=f"Best detection score: {max(scores):.3f}", images=vis)
+                if self.debug:
+                    self._save_rgb_debug(f"pose_{object_name.replace(' ', '_')}_sam3", vis)
             else:
                 self._log_step_update(text=f"Best detection score: {max(scores):.3f}")
             idxs = np.where(mask.flatten()[binary_map_nan_is_zero.flatten().astype(bool)].astype(bool))
@@ -214,19 +245,21 @@ class FrankaControlApi(ApiBase):
                 img_out = _draw_boxes(
                     rgb, [box], [labels[np.argmax(scores)]], scores=[scores[np.argmax(scores)]]
                 )
-                out_file = pathlib.Path("owlvit_det.jpg")
-                img_out.save(out_file)
-                assert out_file.exists() and out_file.stat().st_size > 0
+                self._save_rgb_debug(f"pose_{object_name.replace(' ', '_')}_owlvit", np.asarray(img_out))
 
             # save segmentation image
             self._log_step("SAM2 Segmentation", "Running SAM2 segmentation on detected region …")
             segmentation = self._get_segmentation_map(obs, rgb, box=box)
             if self.debug:
-                self._save_segmentation_debug(segmentation, pathlib.Path("segmentation_image.jpg"))
+                self._save_segmentation_debug(
+                    segmentation, self._debug_dir() / "segmentation_image.jpg"
+                )
 
             queried_instance_idx, seg_crop = self._select_instance_from_box(segmentation, box)
             if self.debug:
-                self._save_segmentation_debug(seg_crop, pathlib.Path("seg_crop_image.jpg"))
+                self._save_segmentation_debug(
+                    seg_crop, self._debug_dir() / "seg_crop_image.jpg"
+                )
 
             # idxs = np.where(segmentation.flatten() == queried_instance_idx) # Old assumes there are no Nans in the depth map (happens in real ZED returns)
             idxs = np.where(
@@ -299,11 +332,10 @@ class FrankaControlApi(ApiBase):
 
         depth = obs["robot0_robotview"]["images"]["depth"]
 
-        # Debug image saves TODO: Remove this eventually, or add a debug mode branch
-        # save depth image with colormap
         depth_img = depth_to_rgb(depth[:, :, 0])
-        depth_img_out = Image.fromarray(depth_img)
-        depth_img_out.save("depth_image.jpg")
+        if self.debug:
+            self._save_rgb_debug(f"grasp_{object_name.replace(' ', '_')}_rgb", rgb)
+            self._save_rgb_debug(f"grasp_{object_name.replace(' ', '_')}_depth", depth_img)
 
         binary_map_nan_is_zero = (~np.isnan(depth[:, :, 0])).astype(int)
 
@@ -322,13 +354,15 @@ class FrankaControlApi(ApiBase):
                     Image.fromarray(rgb),
                     object_name,
                     results,
-                    output_dir=pathlib.Path("."),
+                    output_dir=self._debug_dir(),
                     show=False,
                 )
             vis_masks = [r["mask"] for r in results if r.get("score", 0) > 0.05]
             if vis_masks:
                 vis = overlay_segmentation_masks(rgb, vis_masks)
                 self._log_step_update(text=f"Best detection score: {max(scores):.3f}", images=vis)
+                if self.debug:
+                    self._save_rgb_debug(f"grasp_{object_name.replace(' ', '_')}_sam3", vis)
             else:
                 self._log_step_update(text=f"Best detection score: {max(scores):.3f}")
             idxs = np.where(segmentation.flatten()[binary_map_nan_is_zero.flatten().astype(bool)].astype(bool))
@@ -351,19 +385,23 @@ class FrankaControlApi(ApiBase):
                 img_out = _draw_boxes(
                     rgb, [box], [labels[np.argmax(scores)]], scores=[scores[np.argmax(scores)]]
                 )
-                out_file = pathlib.Path("owlvit_det.jpg")
-                img_out.save(out_file)
-                assert out_file.exists() and out_file.stat().st_size > 0
+                self._save_rgb_debug(
+                    f"grasp_{object_name.replace(' ', '_')}_owlvit", np.asarray(img_out)
+                )
 
             # save segmentation image
             self._log_step("SAM2 Segmentation", "Running SAM2 segmentation for grasp mask …")
             segmentation = self._get_segmentation_map(obs, rgb, box=box)
             if self.debug:
-                self._save_segmentation_debug(segmentation, pathlib.Path("segmentation_image.jpg"))
+                self._save_segmentation_debug(
+                    segmentation, self._debug_dir() / "segmentation_image.jpg"
+                )
 
             queried_instance_idx, seg_crop = self._select_instance_from_box(segmentation, box)
             if self.debug:
-                self._save_segmentation_debug(seg_crop, pathlib.Path("seg_crop_image.jpg"))
+                self._save_segmentation_debug(
+                    seg_crop, self._debug_dir() / "seg_crop_image.jpg"
+                )
 
             # idxs = np.where(segmentation.flatten() == queried_instance_idx) # Old assumes there are no Nans in the depth map (happens in real ZED returns)
             idxs = np.where(

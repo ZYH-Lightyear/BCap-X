@@ -10,6 +10,8 @@ from typing import Any
 import numpy as np
 import requests
 
+from capx.utils.serve_utils import http_get, http_post
+
 SERVICE_URL = os.environ.get("GRASPGEN_SERVICE_URL", "http://127.0.0.1:8121")
 
 
@@ -47,7 +49,7 @@ def init_graspgen() -> Any:
             "remove_outliers": remove_outliers,
         }
         try:
-            resp = requests.post(f"{SERVICE_URL}/infer", json=payload, timeout=120)
+            resp = http_post(f"{SERVICE_URL}/infer", json=payload, timeout=120)
             resp.raise_for_status()
             data = resp.json()
         except requests.RequestException as e:
@@ -89,7 +91,7 @@ def init_graspgen_point_clouds() -> Any:
             "remove_outliers": remove_outliers,
         }
         try:
-            resp = requests.post(
+            resp = http_post(
                 f"{SERVICE_URL}/plan_point_clouds", json=payload, timeout=120
             )
             resp.raise_for_status()
@@ -109,7 +111,7 @@ def init_graspgen_point_clouds() -> Any:
 
 def health_check(timeout: float = 3.0) -> bool:
     try:
-        r = requests.get(f"{SERVICE_URL}/health", timeout=timeout)
+        r = http_get(f"{SERVICE_URL}/health", timeout=timeout)
         return r.ok and r.json().get("status") == "ok"
     except requests.RequestException:
         return False

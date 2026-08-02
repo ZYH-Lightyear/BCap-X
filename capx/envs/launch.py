@@ -24,7 +24,11 @@ from pathlib import Path
 
 import tyro
 
+from capx.utils.serve_utils import ensure_localhost_noproxy
+
 os.environ.setdefault("MUJOCO_GL", "egl")
+# Local microservices (GraspNet/PyRoki/…) must not go through HTTP_PROXY.
+ensure_localhost_noproxy()
 
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,8 @@ import numpy as np
 import requests
 import viser.transforms as vtf
 
+from capx.utils.serve_utils import http_get, http_post
+
 # Service Configuration
 SERVICE_URL = os.environ.get("GRASPNET_SERVICE_URL", "http://127.0.0.1:8115")
 
@@ -19,7 +21,7 @@ SERVICE_URL = os.environ.get("GRASPNET_SERVICE_URL", "http://127.0.0.1:8115")
 def health_check(timeout: float = 3.0) -> bool:
     """Return True if Contact-GraspNet responds (OpenAPI ``/docs``)."""
     try:
-        resp = requests.get(f"{SERVICE_URL}/docs", timeout=timeout)
+        resp = http_get(f"{SERVICE_URL}/docs", timeout=timeout)
         return resp.ok
     except requests.RequestException:
         return False
@@ -169,7 +171,7 @@ def init_contact_graspnet(device: str = "cuda", checkpoint_path: str | None = No
 
         try:
             # start_time = time.time()
-            resp = requests.post(f"{SERVICE_URL}/plan", json=payload)
+            resp = http_post(f"{SERVICE_URL}/plan", json=payload, timeout=180.0)
             resp.raise_for_status()
             data = resp.json()
             # end_time = time.time()
@@ -210,7 +212,9 @@ def init_contact_graspnet_point_clouds() -> Any:
         }
 
         try:
-            resp = requests.post(f"{SERVICE_URL}/plan_point_clouds", json=payload)
+            resp = http_post(
+                f"{SERVICE_URL}/plan_point_clouds", json=payload, timeout=180.0
+            )
             resp.raise_for_status()
             data = resp.json()
         except requests.RequestException as e:

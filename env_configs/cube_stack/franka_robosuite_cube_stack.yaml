@@ -1,21 +1,23 @@
 # Usage: uv run capx/envs/launch.py --config-path env_configs/cube_stack/franka_robosuite_cube_stack.yaml
 
 env:
-  _target_: capx.envs.tasks.franka.franka_pick_place.FrankaPickPlaceCodeEnv
+  # Improved oracle: CGN XY-error fallback + place with pick_quat
+  _target_: capx.envs.tasks.franka.franka_pick_place_improved.FrankaPickPlaceCodeEnv
   cfg:
     _target_: capx.envs.tasks.base.CodeExecEnvConfig
     low_level: franka_robosuite_cubes_low_level
     privileged: false
     apis:
       - FrankaControlApi
-    # prompt is inherited from FrankaPickPlaceCodeEnv class default
+    # prompt/oracle_code inherited from FrankaPickPlaceCodeEnv (improved)
 
-# SAM3 uses remote service (hardcoded in capx.integrations.vision.sam3).
+# Local SAM3 on :8114 (client default http://127.0.0.1:8114). Do not set SAM3_SERVICE_URL.
 api_servers:
-  # - _target_: capx.serving.launch_sam3_server.main
-  #   device: cuda
-  #   port: 8114
-  #   host: 127.0.0.1
+  - _target_: capx.serving.launch_sam3_server.main
+    device: cuda
+    port: 8114
+    host: 127.0.0.1
+    checkpoint_path: /Knowin/foundation/bohanzhou/__backup/PRETRAINED/models--facebook--sam3/sam3.pt
   - _target_: capx.serving.launch_contact_graspnet_server.main
     port: 8115
     host: 127.0.0.1
@@ -27,7 +29,7 @@ api_servers:
     target_link: panda_hand
 
 record_video: true
-output_dir: ./outputs/franka_robosuite_cube_stack_main_use_server
+output_dir: ./outputs/franka_robosuite_cube_stack_improved
 
 trials: 100
 num_workers: 12

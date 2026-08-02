@@ -15,6 +15,8 @@ from typing import Any
 import numpy as np
 import requests
 
+from capx.utils.serve_utils import http_get, http_post
+
 logger = logging.getLogger(__name__)
 
 SERVICE_URL = os.environ.get("GGCNN_SERVICE_URL", "http://127.0.0.1:8119")
@@ -35,7 +37,7 @@ def _base64_to_numpy(b64_str: str) -> np.ndarray:
 def health_check(timeout: float = 2.0) -> bool:
     """Return True if the GG-CNN service responds to ``/health``."""
     try:
-        resp = requests.get(f"{SERVICE_URL}/health", timeout=timeout)
+        resp = http_get(f"{SERVICE_URL}/health", timeout=timeout)
         return resp.ok
     except requests.RequestException:
         return False
@@ -96,7 +98,7 @@ def init_ggcnn(device: str = "cuda", checkpoint_path: str | None = None) -> Any:
             payload["segmap_base64"] = _numpy_to_base64(np.asarray(segmap))
 
         try:
-            resp = requests.post(f"{SERVICE_URL}/plan", json=payload, timeout=timeout)
+            resp = http_post(f"{SERVICE_URL}/plan", json=payload, timeout=timeout)
             resp.raise_for_status()
             data = resp.json()
         except requests.RequestException as e:

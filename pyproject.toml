@@ -36,7 +36,7 @@ dependencies = [
   "pyyaml",
   "omegaconf",
   "open3d",
-  "pyroki @ git+https://github.com/chungmin99/pyroki.git",
+  "pyroki",
   "robot_descriptions>=1.16.0",
   "yourdfpy>=0.0.56",
   "viser>=0.2.0",
@@ -127,6 +127,7 @@ verl = { path = "capx/third_party/verl" }
 contact_graspnet_pytorch = { path = "capx/third_party/contact_graspnet_pytorch", editable = true }
 sam3 = { path = "capx/third_party/sam3", editable = true}
 nvidia-curobo = { path = "capx/third_party/curobo", editable = true}
+pyroki = { path = "capx/third_party/pyroki", editable = true }
 
 [tool.uv]
 environments = [
