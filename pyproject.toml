@@ -70,6 +70,10 @@ dev = [
   "requests>=2.32",
 ]
 
+vaw-web = [
+  "playwright>=1.50,<2",
+]
+
 libero = [
   "libero",
   "robosuite",
@@ -176,7 +180,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["capx*", "robomex*"]
+include = ["capx*", "robomex*", "vaw*"]
 exclude = ["tests*", "configs*"]
 
 [tool.uv.extra-build-dependencies]

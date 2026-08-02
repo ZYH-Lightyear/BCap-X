@@ -321,6 +321,20 @@ DataPanel 只做 id↔marker 图例不放数值、Focus 为焦点物体放大视
 执行顺序：M1.1 → M1.2（已完成首版）→ M1.4 首跑 → 拿失败归因迭代 M1.2 布局 →
 M1.4 复跑。
 
+**M1.2 第二轮 Web renderer（2026-07）**：
+
+- 新增固定 `1024×576` 的明亮只读 Web workspace；它仍输出 RGB observation，
+  Agent action space 仍是 structured ops，不提供点击或 DOM 控制；
+- 同一 ActionState 同时支持 `pil-v2` 与 `web-v1`，并可在同一个真实 LIBERO state
+  上保存成对截图；policy trace 始终只选择其中一个 renderer；
+- Focus 改为只有 `inspect` 才展开；候选使用“一卡一候选”视觉绑定，主图不再叠加
+  多组 approach axes；Self 与 Now→Next 分开当前本体和 imagined target；
+- M1 只展示 endpoint IK 证据，明确标注 trajectory/collision 未检查；不引入新的
+  affordance 模型或 M2 motion-planning 声明；
+- Web snapshot 只含 RGB raster 与屏幕语义，不含 depth、camera matrix、raw mask、
+  point cloud 或 privileged success。精确 EE/关节/OBB/receipt 数值继续由同一份
+  `state_summary` 提供。
+
 任务套件对齐 `docs/robomex_libero_pro_evaluation.md`（六个 10-task suites：
 object/spatial/goal × {swap, task}），非特权边界同样沿用：agent 只见 RGB-D、
 proprio、workspace 产物；BDDL predicate、真值位姿、reward 均不可见，env 判定只

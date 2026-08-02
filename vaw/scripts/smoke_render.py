@@ -23,7 +23,7 @@ from vaw.geometry import project_world_to_pixel
 from vaw.protocol import parse_action, tool_definitions
 from vaw.render import CANVAS_H, CANVAS_W, render_canvas
 from vaw.state import ActionState
-from vaw.types import Candidate, ObjectEntry, Pose, PreviewResult, Receipt, TOP_DOWN_QUAT_WXYZ
+from vaw.types import TOP_DOWN_QUAT_WXYZ, Candidate, ObjectEntry, Pose, PreviewResult, Receipt
 
 OUT = pathlib.Path(__file__).resolve().parent.parent / "out" / "smoke"
 
@@ -248,7 +248,7 @@ def main() -> None:
         resolve_view(state.view, preset=preset)
         shot(preset)
 
-    # Focus is explicit here; the inset also has an implicit fallback.
+    # Focus is explicit: without inspect the detailed crop stays unavailable.
     resolve_view(state.view, preset="agentview")
     state.focus_id = "obj1"
     shot("focus_explicit")
@@ -269,12 +269,16 @@ def main() -> None:
     op, args = parse_action({"name": "inspect", "arguments": {"object_id": "obj1"}})
     assert op == "inspect"
 
-    # Detail follows focus. obj1 is the implicit focus here (it owns the
-    # selected candidate), so it is expanded and the summary says the agent did
-    # not ask for it; a second object stays compact.
-    assert summary["focus"] == {"object_id": "obj1", "requested": False}, summary["focus"]
+    # Detail follows explicit focus. A selection alone must not reveal the crop
+    # or expanded numeric evidence.
+    assert "focus" not in summary, summary
     obj1 = next(o for o in summary["objects"] if o["id"] == "obj1")
-    assert "obb_yaw_deg" in obj1 and "n_points" in obj1, obj1
+    assert "obb_yaw_deg" not in obj1 and "n_points" not in obj1, obj1
+    state.focus_id = "obj1"
+    focused = state.summary()
+    assert focused["focus"] == {"object_id": "obj1", "requested": True}
+    focused_obj1 = next(o for o in focused["objects"] if o["id"] == "obj1")
+    assert "obb_yaw_deg" in focused_obj1 and "n_points" in focused_obj1, focused_obj1
     state.add_object(
         ObjectEntry(
             object_id=state.next_id("obj"),

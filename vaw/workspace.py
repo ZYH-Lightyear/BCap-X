@@ -19,14 +19,15 @@ from __future__ import annotations
 import json
 import pathlib
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 from PIL import Image
 
 from vaw.cloud import SceneCloud, build_scene_cloud
 from vaw.ops import OPS, OpError
-from vaw.render import render_canvas
+from vaw.renderers import PILRenderer, WorkspaceRenderer
 from vaw.state import ActionState
 from vaw.types import Pose, StepResult
 
@@ -40,6 +41,7 @@ class TraceLogger:
         self.dir.mkdir(parents=True, exist_ok=True)
         self._steps_path = self.dir / "steps.jsonl"
         self._index = 0
+        self._meta: dict[str, Any] = {}
         # One directory holds exactly one episode. Without this, rerunning into
         # the same directory appended a second episode's steps while the canvas
         # indices restarted at 0 — the jsonl and the images silently disagreed,
@@ -49,7 +51,13 @@ class TraceLogger:
         ):
             stale.unlink(missing_ok=True)
 
-    def log(self, result: StepResult) -> None:
+    def log(
+        self,
+        result: StepResult,
+        *,
+        renderer: str,
+        render_ms: float,
+    ) -> None:
         canvas_name = None
         if result.canvas is not None:
             canvas_name = f"canvas_{self._index:04d}.png"
@@ -64,13 +72,16 @@ class TraceLogger:
             "receipt": result.receipt_text,
             "canvas": canvas_name,
             "state": result.state_summary,
+            "renderer": renderer,
+            "render_ms": round(float(render_ms), 2),
         }
         with self._steps_path.open("a") as f:
             f.write(json.dumps(record) + "\n")
         self._index += 1
 
     def log_meta(self, meta: dict[str, Any]) -> None:
-        (self.dir / "meta.json").write_text(json.dumps(meta, indent=2))
+        self._meta.update(meta)
+        (self.dir / "meta.json").write_text(json.dumps(self._meta, indent=2))
 
 
 class Workspace:
@@ -90,6 +101,7 @@ class Workspace:
         trace_dir: str | pathlib.Path | None = None,
         max_physical_ops: int = 30,
         env_check: Callable[[], bool] | None = None,
+        renderer: WorkspaceRenderer | None = None,
     ) -> None:
         """
         :param env_check: Optional privileged success verdict (e.g. LIBERO's
@@ -111,9 +123,16 @@ class Workspace:
         self.max_physical_ops = max_physical_ops
         self._physical_ops = 0
         self._env_check = env_check
+        self.renderer = renderer or PILRenderer()
         self.trace = TraceLogger(trace_dir) if trace_dir else None
         if self.trace:
-            self.trace.log_meta({"instruction": instruction})
+            self.trace.log_meta(
+                {
+                    "instruction": instruction,
+                    "renderer": self.renderer.name,
+                    "viewport": [self.renderer.width, self.renderer.height],
+                }
+            )
 
     # ------------------------------------------------------------------ #
     def refresh_observation(self) -> dict[str, Any]:
@@ -150,7 +169,7 @@ class Workspace:
         return self._cloud
 
     def render(self) -> np.ndarray:
-        return render_canvas(
+        return self.renderer.render(
             self.state,
             self.obs,
             camera_name=self.camera_name,
@@ -209,6 +228,8 @@ class Workspace:
                     "claimed_success": self.claimed_success,
                     "env_success": self.env_success,
                     "physical_ops": self._physical_ops,
+                    "renderer": self.renderer.name,
+                    "viewport": [self.renderer.width, self.renderer.height],
                 }
             )
 
@@ -233,15 +254,31 @@ class Workspace:
         *,
         physical: bool = False,
     ) -> StepResult:
+        render_started = time.monotonic()
+        canvas = self.render()
+        render_ms = (time.monotonic() - render_started) * 1000.0
         result = StepResult(
             ok=ok,
             op=op_name,
-            args={k: v for k, v in args.items()},
+            args=dict(args.items()),
             receipt_text=receipt_text,
-            canvas=self.render(),
+            canvas=canvas,
             state_summary=self.state.summary(),
             physical=physical,
         )
         if self.trace:
-            self.trace.log(result)
+            self.trace.log(
+                result,
+                renderer=self.renderer.name,
+                render_ms=render_ms,
+            )
         return result
+
+    def close(self) -> None:
+        self.renderer.close()
+
+    def __enter__(self) -> Workspace:
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()

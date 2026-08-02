@@ -624,8 +624,6 @@ def _render_panel(
         selected = cand.candidate_id == state.selected_id
         color = _SELECTED if selected else _KIND_COLOR.get(cand.kind, _TEXT)
         bits = [cand.candidate_id, cand.kind[:5]]
-        if cand.score:
-            bits.append(f"{cand.score:.2f}")
         if selected:
             bits.append("SEL")
         preview = state.previews.get(cand.candidate_id)

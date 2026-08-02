@@ -1,8 +1,9 @@
 """Pure geometry helpers shared by ops, preview and render. No capx imports.
 
-Also the single place the gripper's frame conventions are reconciled. Three
-conventions meet at a grasp and none of them coincide; keeping the conversions
-here means every op, preview and receipt speaks the same one.
+Candidate positions use the public CaP-X TCP convention: the same position is
+passed to ``solve_ik`` and reported back by ``robot_cartesian_pos``. Conversion
+from that public TCP to the internal ``panda_hand`` link belongs to the CaP-X
+backend and must not be repeated here.
 """
 
 from __future__ import annotations
@@ -10,39 +11,21 @@ from __future__ import annotations
 import numpy as np
 
 # --------------------------------------------------------------------------- #
-# Gripper frame conventions.
+# Grasp-planner frame convention.
 #
 # A candidate's ``position`` in this workspace means *where the fingers close*.
 # That is the only convention a model can reason about from a picture, and the
-# only one whose number can be checked against the object's own points. The two
-# constants below map it to and from the two foreign conventions:
+# only one whose number can be checked against the object's own points.
 #
-# 1. ``plan_grasp`` returns Contact-GraspNet poses shifted +0.12 m along the
-#    local approach axis, on top of a frame whose contact point already sits
-#    0.1034 m out. Net: the returned position is 0.0166 m *past* the contact.
-# 2. ``solve_ik`` treats its ``position`` as a "TCP" that is not the fingertips:
-#    it applies ``_TCP_OFFSET = (0, 0, -0.1)`` to get the panda_hand link, while
-#    the fingertips are a measured 0.0114 m in *front* of that link. Net: the
-#    fingers close 0.0886 m behind whatever position you pass in.
-#
-# Passing (1) straight into (2) — which is what the first live runs did — closes
-# the fingers 0.072 m short of the object every single time. Measured on five
-# candidates of the alphabet-soup can: 0.0717 / 0.0674 / 0.0751 / 0.0764 /
-# 0.0727 m, which is the derived 0.0886 - 0.0166 to within a millimetre.
+# ``plan_grasp`` returns Contact-GraspNet poses shifted +0.12 m along the local
+# approach axis, on top of a frame whose contact point already sits 0.1034 m
+# out. Net: the returned position is 0.0166 m past the contact. This is the only
+# foreign-frame correction VAW owns. ``solve_ik`` applies its own TCP offset
+# internally, so candidate positions are passed to it unchanged.
 # --------------------------------------------------------------------------- #
 
 #: plan_grasp's returned position -> the contact point it predicted.
 GRASP_POSE_TO_CONTACT_M = -0.0166
-#: contact point -> the ``position`` solve_ik / goto_pose expect.
-CONTACT_TO_IK_TARGET_M = 0.0886
-#: fingertips -> the end-effector point the observation reports.
-CONTACT_TO_HAND_M = -0.0114
-
-# All three are measured against the *reported* end-effector point and agree with
-# each other, which is all anything comparing poses needs. Note what is absent:
-# no offset from that reported point to the URDF ``panda_hand`` link. Drawing the
-# hand's mesh would need one, and it is not derivable here — see
-# :mod:`vaw.gripper_mesh`, which renders from joint FK precisely to avoid it.
 
 
 def approach_axis(quat_wxyz: np.ndarray) -> np.ndarray:

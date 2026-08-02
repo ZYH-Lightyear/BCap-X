@@ -18,7 +18,7 @@ Prerequisites (see ``scripts/start_libero_services.sh``):
 Run inside ``.venv-libero``:
 
     python -m vaw.scripts.scripted_pick \\
-        --suite libero_object --task-id 0 --object "the alphabet soup can"
+        --suite libero_object_swap --task-id 0 --object "the alphabet soup can"
 
 The ``*_task`` / ``*_swap`` LIBERO-PRO suites are registered in the benchmark
 dict but most ship no BDDL files locally; ``libero_object`` / ``libero_spatial``
@@ -66,7 +66,7 @@ def preflight_services() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", default="libero_object")
+    parser.add_argument("--suite", default="libero_object_swap")
     parser.add_argument("--task-id", type=int, default=0)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
@@ -77,6 +77,23 @@ def main() -> None:
     )
     parser.add_argument("--lift", type=float, default=0.15, help="lift height in meters")
     parser.add_argument("--trace-dir", default=None)
+    parser.add_argument(
+        "--renderer",
+        choices=("pil", "web"),
+        default="pil",
+        help="policy-facing visual renderer; PIL remains the default baseline",
+    )
+    parser.add_argument(
+        "--compare-renderers",
+        action="store_true",
+        help="save paired PIL/Web artifacts from every state without changing "
+        "the policy-facing renderer",
+    )
+    parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="show the persistent Chromium page when using the Web renderer",
+    )
     args = parser.parse_args()
 
     preflight_services()
@@ -85,8 +102,8 @@ def main() -> None:
     # the preflight message to work without that stack.
     from capx.envs.simulators.libero import FrankaLiberoTask
     from capx.integrations.franka.libero_reduced import FrankaLiberoApiReduced
-
     from vaw.executor import EMPTY_GRIP_OPENING
+    from vaw.renderers import build_renderer
     from vaw.workspace import Workspace
 
     print(f"[setup] loading {args.suite} task {args.task_id} (seed {args.seed})")
@@ -108,11 +125,17 @@ def main() -> None:
         / "scripted_pick"
         / f"{args.suite}_t{args.task_id}"
     )
+    renderer = build_renderer(
+        args.renderer,
+        headed=args.headed,
+        compare_dir=(trace_dir / "_render_compare") if args.compare_renderers else None,
+    )
     ws = Workspace(
         api,
         instruction,
         trace_dir=trace_dir,
         env_check=env.task_completed,
+        renderer=renderer,
     )
 
     failed = False
@@ -195,6 +218,7 @@ def finish(ws, failed: bool, holding: bool = False) -> None:
     print(f"[verdict] pick={'ok' if holding else 'FAILED'} "
           f"env_success={ws.env_success} claimed={ws.claimed_success}")
     print(f"[trace] {ws.trace.dir}")
+    ws.close()
     if failed or not holding:
         sys.exit("scripted pick did not hold the object; inspect the trace above")
     print("scripted pick completed; review the canvases before calling M1.1 done")

@@ -1,7 +1,9 @@
 # VAW — Visual Action Workspace
 
-论文计划见 `docs/gui_as_policy_v2_cvpr_plan.md`；**架构图、Agent Runtime 设计与
-Milestone 以 `docs/vaw_implementation_plan.md` 为准**。本包实现视觉动作工作区：
+论文计划见 `docs/gui_as_policy_v2_cvpr_plan.md`；M0–M1.2 的已实现架构、Agent Runtime
+与历史 Milestone 见 `docs/vaw_implementation_plan.md`，M1.2 之后的单 VLM Context
+Runtime 工作设计见 [`CONTEXT_RUNTIME_MILESTONES.md`](CONTEXT_RUNTIME_MILESTONES.md)。
+本包实现视觉动作工作区：
 Agent 通过 **14 个离散界面操作**（ground / propose / select / nudge / preview /
 commit / move_xyz …）操作机器人，工具输出（mask、grasp、waypoint）实例化为工作区里
 可引用、可视化的候选对象，只有 `commit` / `move_xyz` / `commit_gripper` 改变物理世界。
@@ -16,6 +18,9 @@ vaw/
   camera.py       # 虚拟相机（az/el/zoom → intrinsics+pose_mat）、预设、视角包络
   cloud.py        # RGB-D → 世界系彩色点云融合 + z-buffer splatting（纯 numpy）
   render.py       # 确定性画布渲染（PIL，无浏览器）：主视图 / DataPanel / Focus / wrist
+  renderers.py    # renderer 协议、PIL baseline 与成对对照 renderer
+  web_presenter.py# ActionState/传感器 → 无隐私泄漏的只读视觉 snapshot
+  web_renderer.py # 持久 Chromium 页面 → 固定 1024×576 RGB policy observation
   preview.py      # 几何 rollout：IK 可行性 + 直线路径点云碰撞（M2 接 cuRobo）
   executor.py     # commit 执行 + 回执 + preview–execution discrepancy
   ops.py          # 操作注册表 = 动作空间 = agent 工具协议（@op 装饰器）
@@ -39,6 +44,10 @@ vaw/
     scripted_pick.py  # M1 验证：LIBERO 上脚本化 ops 序列跑通完整闭环
 ```
 
+仓库根目录的 `vaw-ui/` 是 Web renderer 的 React/Vite 表达层。它没有按钮、输入框或
+DOM action space；Agent 仍然只调用现有 structured ops，Web 页面只负责把同一
+ActionState 排成一张 VLM observation。
+
 关键约定：
 
 - **一切可引用**：对象 `obj1`、候选 `g1/p2`、回执 `r1` 都有短 id，`ActionState.summary()`
@@ -49,8 +58,8 @@ vaw/
   + `canvas_XXXX.png`，教师 trace 与学生 rollout 同一格式，SFT/RL 直接消费。
 - **对 Cap-X 只有运行时依赖**：`Workspace` 接收任意实现了所需方法的 api 对象
   （`FrankaLiberoApiReduced` 即可），vaw 包本身不 import capx。
-- **渲染确定性**：画布是 `(state, obs, cloud)` 的纯函数（`smoke_render` 有逐字节断言）。
-  这是画布能当 SFT 输入与 RL 观测的前提，也是不用浏览器的原因。
+- **渲染确定性**：PIL 与 Web 两条路径都固定为 `(state, obs, cloud) → 1024×576 RGB`。
+  Web 路径使用固定 viewport/DPR、无动画页面和持久 Chromium，逐帧截图可做确定性断言。
 
 ## Canvas（1024×576，设计依据见实现计划 §1.4）
 
@@ -68,9 +77,9 @@ vaw/
   默认 `agentview` 用物理相机 RGB（外观最强）；其他角度渲染融合点云（几何准但稀疏），
   header 与角标标明当前来源。方位角限物理机位 ±75°（单视角深度没有背面证据），
   越界裁剪并在回执里说明。缩放是收窄视场而非拉近相机。
-- **焦点是状态**：`inspect(object_id)` 一次同时做三件事——focus 视口切到该物体、
+- **焦点是显式状态**：`inspect(object_id)` 一次同时做三件事——focus 视口切到该物体、
   summary 里该物体与其候选展开为全字段（其余压缩，context 有界）、返回几何详情。
-  未 `inspect` 时 focus 隐式落在 selected 候选所属物体上并标 `(auto)`。
+  未 `inspect` 时 Focus 保持空白；selection 不会自动泄露详细 crop 或数值。
 - **数值不进画布**：位姿/分数/间隙/宽度全在 state summary 文本里，画布只承担空间关系。
 
 ## Agent Runtime
@@ -104,11 +113,48 @@ result = run_episode(teacher_provider(), api, "put the red mug on the plate",
 见 `docs/vaw_implementation_plan.md` §3（唯一维护处）。当前进度：M0、M0.5（runtime）、
 M1.1（环境接线，`scripted_pick.py` 在 libero_object task 0 上 pick 成功）、
 M1.2（Canvas v2 首版：虚拟视角 + `view` / `inspect` + 四区布局）已完成；
-下一步 M1.4 真模型首跑，再用失败归因数据迭代布局并冻结界面。
+M1.2 第二轮增加了只读 Web renderer，用于与 PIL Canvas 做受控 M1.4 对照。
 
 ## 运行冒烟测试
 
 ```bash
 python -m vaw.scripts.smoke_render    # state/render/protocol → vaw/out/smoke/
 python -m vaw.scripts.smoke_runtime   # agent 循环         → vaw/out/smoke_runtime/
+```
+
+## Web renderer（本地实验）
+
+一次性准备：
+
+```bash
+cd vaw-ui
+npm install
+npm run build
+cd ..
+
+source .venv-libero/bin/activate
+python -m pip install "playwright>=1.50,<2"
+python -m playwright install chromium
+```
+
+真实 LIBERO-PRO 成对渲染：
+
+```bash
+python -m vaw.scripts.scripted_pick \
+  --suite libero_object_swap --task-id 0 \
+  --object "the target object" \
+  --renderer web --compare-renderers
+```
+
+`canvas_XXXX.png` 是实际送给策略的 renderer；另一 renderer 的同状态截图写入
+`_render_compare/`，不会被 trace reader 当作额外 step。Web renderer 出错会显式
+终止该实验，不会静默回退到 PIL。
+
+真实模型 loop 使用同一个 renderer seam：
+
+```bash
+python -m vaw.scripts.run_agent \
+  --suite libero_object_swap --task-id 0 \
+  --model vapi/qwen3.5-plus --protocol text \
+  --renderer web --compare-renderers
 ```

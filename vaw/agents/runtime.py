@@ -40,8 +40,9 @@ import io
 import json
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 from PIL import Image
@@ -56,6 +57,7 @@ from vaw.agents.contracts import (
 )
 from vaw.agents.providers.base import ModelProvider
 from vaw.protocol import SYSTEM_PROMPT, parse_action, tool_definitions
+from vaw.renderers import WorkspaceRenderer
 from vaw.types import StepResult
 from vaw.workspace import Workspace
 
@@ -310,6 +312,7 @@ def run_episode(
     config: RunConfig | None = None,
     max_physical_ops: int = 30,
     env_check: Callable[[], bool] | None = None,
+    renderer: WorkspaceRenderer | None = None,
 ) -> EpisodeResult:
     """Build a workspace over ``api`` and run one episode on it.
 
@@ -319,14 +322,15 @@ def run_episode(
     :param env_check: Privileged episode-end verdict (e.g. ``env.task_completed``);
         recorded in trace meta only, never shown to the agent.
     """
-    workspace = Workspace(
+    with Workspace(
         api,
         instruction,
         trace_dir=trace_dir,
         max_physical_ops=max_physical_ops,
         env_check=env_check,
-    )
-    return VAWRuntime(provider, workspace, config).run()
+        renderer=renderer,
+    ) as workspace:
+        return VAWRuntime(provider, workspace, config).run()
 
 
 # ---------------------------------------------------------------------- #

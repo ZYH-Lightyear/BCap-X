@@ -14,11 +14,6 @@ from typing import Any
 
 import numpy as np
 
-from vaw.geometry import (
-    CONTACT_TO_HAND_M,
-    CONTACT_TO_IK_TARGET_M,
-    shift_along_approach,
-)
 from vaw.state import ActionState
 from vaw.types import Candidate, Pose, Receipt
 
@@ -50,16 +45,15 @@ MOVE_STEP_LIMIT_M = 0.05
 
 
 def _solve_joints(api: Any, pose: Pose) -> np.ndarray:
-    """Arm joints from ``api.solve_ik`` for a pose where the fingers close.
+    """Arm joints from ``api.solve_ik`` for a public-TCP target pose.
 
-    Candidate positions are fingertip-convention while ``solve_ik`` takes a TCP
-    sitting ``CONTACT_TO_IK_TARGET_M`` in front of it (see :mod:`vaw.geometry`).
-    Whatever the solver then returns is what gets commanded: it clips its target
-    into a fixed box and may substitute a canned orientation, and both surface as
-    deviation in the receipt rather than being compensated for here.
+    Candidate positions, ``solve_ik`` inputs and ``robot_cartesian_pos`` share
+    the CaP-X public TCP convention. The backend owns the internal conversion to
+    ``panda_hand``. Whatever the solver returns is what gets commanded: it may
+    clip its target or substitute an orientation, and both surface as deviation
+    in the receipt rather than being compensated for here.
     """
-    target = shift_along_approach(pose.position, pose.quat_wxyz, CONTACT_TO_IK_TARGET_M)
-    joints = api.solve_ik(target, pose.quat_wxyz)
+    joints = api.solve_ik(pose.position, pose.quat_wxyz)
     return np.asarray(joints, dtype=np.float64).reshape(-1)[:7]
 
 
@@ -99,17 +93,6 @@ def _read_ee(obs: dict[str, Any]) -> tuple[Pose, float]:
     return pose, gripper_opening
 
 
-def _expected_hand_position(pose: Pose) -> np.ndarray:
-    """Where the panda_hand link should end up if the fingers close at ``pose``.
-
-    Candidate positions are fingertip-convention while the observation reports
-    the hand link, a measured 1.1 cm behind the fingertips. Comparing the two
-    raw makes every receipt report a phantom deviation — the first live run
-    showed 0.14 m of "error" that was purely this convention gap.
-    """
-    return shift_along_approach(pose.position, pose.quat_wxyz, CONTACT_TO_HAND_M)
-
-
 def execute_commit(
     api: Any,
     state: ActionState,
@@ -134,19 +117,16 @@ def execute_commit(
 
     obs = api.get_observation()
     achieved, gripper_opening = _read_ee(obs)
-    # Both errors are measured between *hand* poses: achieved is a hand pose,
-    # so the requested/predicted targets are mapped through the TCP offset.
-    expected_hand = _expected_hand_position(requested)
-    pos_error = float(np.linalg.norm(achieved.position - expected_hand))
+    # Both values use the public CaP-X TCP convention. The backend's internal
+    # panda_hand offset must not leak into receipt comparisons.
+    pos_error = float(np.linalg.norm(achieved.position - requested.position))
 
     preview = state.previews.get(cand.candidate_id)
     discrepancy: dict[str, Any] = {}
     unpredicted = False
     if preview is not None and preview.predicted_ee is not None:
         pred_error = float(
-            np.linalg.norm(
-                achieved.position - _expected_hand_position(preview.predicted_ee)
-            )
+            np.linalg.norm(achieved.position - preview.predicted_ee.position)
         )
         discrepancy = {
             "pred_pos_error_m": round(pred_error, 4),
@@ -203,17 +183,15 @@ def execute_move(api: Any, state: ActionState, delta_world: np.ndarray) -> Recei
     motion is exactly what the joint interpolation tracks worst — the first live
     pick stalled 8 cm short of a candidate whose endpoint IK was solvable.
 
-    Frames: the offset is applied to the *reported* end-effector point, which is
-    the one the agent watches move, while ``_drive_to`` wants the fingertip
-    convention. Holding the orientation makes that conversion cancel out of the
-    comparison, so the error below is simply achieved - (start + delta).
+    The offset is applied directly to the reported public TCP, which is the same
+    convention ``_drive_to`` passes to ``solve_ik``. The error below is therefore
+    simply achieved - (start + delta).
     """
     requested_delta = np.asarray(delta_world, dtype=np.float64).reshape(3)
     delta = np.clip(requested_delta, -MOVE_STEP_LIMIT_M, MOVE_STEP_LIMIT_M)
 
     start, _ = _read_ee(api.get_observation())
-    contact = shift_along_approach(start.position, start.quat_wxyz, -CONTACT_TO_HAND_M)
-    requested = Pose(contact + delta, start.quat_wxyz.copy())
+    requested = Pose(start.position + delta, start.quat_wxyz.copy())
 
     error_note = None
     commanded_joints = None
@@ -224,8 +202,8 @@ def execute_move(api: Any, state: ActionState, delta_world: np.ndarray) -> Recei
 
     obs = api.get_observation()
     achieved, gripper_opening = _read_ee(obs)
-    target_hand = start.position + delta
-    pos_error = float(np.linalg.norm(achieved.position - target_hand))
+    target_tcp = start.position + delta
+    pos_error = float(np.linalg.norm(achieved.position - target_tcp))
 
     discrepancy: dict[str, Any] = {}
     if not np.allclose(delta, requested_delta):
@@ -246,7 +224,7 @@ def execute_move(api: Any, state: ActionState, delta_world: np.ndarray) -> Recei
     receipt = Receipt(
         receipt_id=state.next_id("r"),
         op="move_xyz",
-        requested=Pose(target_hand, start.quat_wxyz.copy()),
+        requested=Pose(target_tcp, start.quat_wxyz.copy()),
         achieved=achieved,
         gripper_opening=gripper_opening,
         pos_error_m=pos_error,

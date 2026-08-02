@@ -69,17 +69,20 @@ def test_workspace_keeps_authoritative_arm_joints() -> None:
 def test_preview_preserves_the_exact_ik_solution_for_rendering() -> None:
     obs, _ = synthetic_obs()
     expected = np.array([0.1, -0.2, 0.3, -1.7, 0.4, 1.2, 0.8])
+    expected_position = np.array([0.55, 0.0, 0.25])
 
     class Api:
         def solve_ik(self, position, quat_wxyz, *, return_info=False):
             assert return_info
+            np.testing.assert_allclose(position, expected_position)
+            np.testing.assert_allclose(quat_wxyz, TOP_DOWN_QUAT_WXYZ)
             return expected.copy(), {"orientation_used": "requested"}
 
     state = ActionState(instruction="test")
     candidate = Candidate(
         candidate_id="p1",
         kind="waypoint",
-        pose=Pose(np.array([0.55, 0.0, 0.25]), TOP_DOWN_QUAT_WXYZ.copy()),
+        pose=Pose(expected_position.copy(), TOP_DOWN_QUAT_WXYZ.copy()),
     )
 
     preview = run_preview(Api(), state, candidate)

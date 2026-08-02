@@ -1,0 +1,715 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1440, initial-scale=1" />
+    <title>VAW 三层视觉上下文</title>
+    <style>
+      :root {
+        color: #172033;
+        background: #edf3f9;
+        font-family: "WenQuanYi Micro Hei", "DejaVu Sans", Arial, sans-serif;
+        font-synthesis: none;
+      }
+
+      * { box-sizing: border-box; }
+
+      html,
+      body {
+        width: 1440px;
+        min-height: 1900px;
+        margin: 0;
+      }
+
+      body {
+        background:
+          linear-gradient(90deg, rgba(37, 99, 235, 0.035) 1px, transparent 1px),
+          linear-gradient(rgba(37, 99, 235, 0.035) 1px, transparent 1px),
+          #edf3f9;
+        background-size: 28px 28px;
+      }
+
+      .canvas {
+        width: 1440px;
+        min-height: 1900px;
+        padding: 26px 34px 34px;
+      }
+
+      .topbar,
+      .layer,
+      .footer {
+        border: 1px solid #cfd9e7;
+        background: #fff;
+        box-shadow: 0 5px 18px rgba(23, 32, 51, 0.08);
+      }
+
+      .topbar {
+        height: 84px;
+        display: grid;
+        grid-template-columns: 170px minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 22px;
+        padding: 0 20px;
+        border-radius: 13px;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 11px;
+        font-size: 18px;
+        font-weight: 900;
+        letter-spacing: 0.12em;
+      }
+
+      .brand-dot {
+        width: 18px;
+        height: 18px;
+        border: 4px solid #2563eb;
+        border-radius: 50%;
+        box-shadow: 8px 0 0 -3px #16a34a;
+      }
+
+      .topbar__title small,
+      .eyebrow,
+      .panel-label,
+      .tree-meta {
+        color: #64748b;
+        font-family: "WenQuanYi Micro Hei Mono", "DejaVu Sans Mono", monospace;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+      }
+
+      .topbar__title small {
+        display: block;
+        margin-bottom: 5px;
+        font-size: 10px;
+      }
+
+      .topbar__title strong {
+        font-size: 21px;
+      }
+
+      .chips,
+      .layer-head__facts {
+        display: flex;
+        gap: 7px;
+      }
+
+      .chip {
+        display: inline-flex;
+        min-height: 23px;
+        align-items: center;
+        padding: 0 9px;
+        border: 1px solid #cbd5e1;
+        border-radius: 999px;
+        background: #f8fafc;
+        color: #475569;
+        font: 800 9px "WenQuanYi Micro Hei Mono", "DejaVu Sans Mono", monospace;
+        white-space: nowrap;
+      }
+
+      .chip--blue { border-color: #93c5fd; background: #eff6ff; color: #1d4ed8; }
+      .chip--green { border-color: #86efac; background: #f0fdf4; color: #15803d; }
+      .chip--violet { border-color: #c4b5fd; background: #f5f3ff; color: #6d28d9; }
+      .chip--amber { border-color: #fcd34d; background: #fffbeb; color: #a16207; }
+      .chip--red { border-color: #fca5a5; background: #fef2f2; color: #b91c1c; }
+
+      .layer {
+        margin-top: 18px;
+        overflow: hidden;
+        border-radius: 13px;
+      }
+
+      .layer-head {
+        height: 68px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 17px;
+        border-bottom: 1px solid #dbe3ee;
+        background: #fbfdff;
+      }
+
+      .layer-head__title {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .layer-number {
+        width: 38px;
+        height: 38px;
+        display: grid;
+        place-items: center;
+        border-radius: 9px;
+        background: #172033;
+        color: #fff;
+        font: 900 11px "DejaVu Sans Mono", monospace;
+      }
+
+      .eyebrow {
+        display: block;
+        margin-bottom: 4px;
+        font-size: 9px;
+      }
+
+      .layer-head h2 {
+        margin: 0;
+        font-size: 18px;
+      }
+
+      .layer--perception { height: 620px; }
+
+      .perception-grid {
+        height: 552px;
+        padding: 14px;
+        display: grid;
+        grid-template-columns: 3fr 1fr;
+        gap: 14px;
+      }
+
+      .side-column {
+        display: grid;
+        grid-template-rows: 235px 1fr;
+        gap: 10px;
+      }
+
+      .camera,
+      .intent-card,
+      .tree-panel,
+      .self-panel,
+      .imagination-visual,
+      .imagination-panel {
+        overflow: hidden;
+        border: 1px solid #cbd5e1;
+        border-radius: 10px;
+        background: #fff;
+      }
+
+      .panel-title {
+        height: 35px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 10px;
+        border-bottom: 1px solid #e2e8f0;
+        background: #fbfdff;
+      }
+
+      .panel-title strong {
+        font-size: 11px;
+      }
+
+      .panel-label {
+        font-size: 8px;
+      }
+
+      .camera__viewport {
+        position: relative;
+        overflow: hidden;
+        background: #e9eef5;
+      }
+
+      .main-camera .camera__viewport { height: 489px; }
+      .side-column .camera__viewport { height: 200px; }
+
+      .scene-source,
+      .wrist-source,
+      .imagination-source {
+        position: absolute;
+        overflow: hidden;
+        transform-origin: top left;
+      }
+
+      .scene-source {
+        top: 0;
+        left: 58px;
+        width: 686px;
+        height: 382px;
+        transform: scale(1.28);
+      }
+
+      .scene-source img,
+      .wrist-source img,
+      .imagination-source img {
+        position: absolute;
+        width: 1024px;
+        height: 576px;
+        max-width: none;
+      }
+
+      .scene-source img,
+      .imagination-source img {
+        top: -56px;
+        left: -10px;
+      }
+
+      .wrist-source {
+        top: 12px;
+        left: 8px;
+        width: 74px;
+        height: 42px;
+        transform: scale(4.25);
+      }
+
+      .wrist-source img {
+        top: -284px;
+        left: -712px;
+      }
+
+      .camera-note {
+        position: absolute;
+        right: 9px;
+        bottom: 9px;
+        padding: 5px 7px;
+        border: 1px solid #cbd5e1;
+        border-radius: 5px;
+        background: rgba(255, 255, 255, 0.92);
+        color: #475569;
+        font: 800 8px "WenQuanYi Micro Hei Mono", monospace;
+      }
+
+      .intent-card {
+        display: grid;
+        grid-template-rows: 35px auto 1px 1fr;
+      }
+
+      .intent-block {
+        padding: 12px 14px;
+      }
+
+      .intent-block small {
+        display: block;
+        margin-bottom: 6px;
+        color: #64748b;
+        font: 800 9px "WenQuanYi Micro Hei Mono", monospace;
+        letter-spacing: 0.08em;
+      }
+
+      .intent-block p {
+        margin: 0;
+        font-size: 13px;
+        font-weight: 800;
+        line-height: 1.55;
+      }
+
+      .intent-block code {
+        display: block;
+        margin: 5px 0 6px;
+        color: #15803d;
+        font: 900 15px "DejaVu Sans Mono", monospace;
+      }
+
+      .intent-block ul {
+        margin: 5px 0 0;
+        padding-left: 18px;
+        color: #475569;
+        font-size: 10.5px;
+        line-height: 1.55;
+      }
+
+      .divider { background: #e2e8f0; }
+
+      .layer--state { height: 510px; }
+
+      .state-grid {
+        height: 442px;
+        padding: 14px;
+        display: grid;
+        grid-template-columns: 1.55fr 1fr;
+        gap: 14px;
+        background: #f8fafc;
+      }
+
+      .tree-panel,
+      .self-panel {
+        display: grid;
+        grid-template-rows: 35px 1fr;
+      }
+
+      .tree-body {
+        padding: 11px 15px;
+        overflow: hidden;
+      }
+
+      .tree-meta {
+        display: flex;
+        justify-content: space-between;
+        padding-bottom: 8px;
+        border-bottom: 1px solid #e2e8f0;
+        font-size: 10.5px;
+      }
+
+      .tree {
+        margin-top: 8px;
+        color: #334155;
+        font: 700 13px/1.42 "WenQuanYi Micro Hei Mono", "DejaVu Sans Mono", monospace;
+      }
+
+      .tree-row {
+        min-height: 24px;
+        display: flex;
+        align-items: baseline;
+        gap: 7px;
+        white-space: nowrap;
+      }
+
+      .tree-row--root {
+        color: #172033;
+        font-size: 15px;
+        font-weight: 900;
+      }
+
+      .tree-row--object {
+        margin-top: 2px;
+        color: #1d4ed8;
+        font-weight: 900;
+      }
+
+      .branch { color: #94a3b8; }
+      .key { color: #64748b; }
+      .value { color: #172033; }
+      .predicate { color: #6d28d9; }
+      .belief { color: #a16207; }
+
+      .self-body {
+        display: grid;
+        grid-template-rows: auto auto auto auto;
+        gap: 8px;
+        padding: 10px;
+      }
+
+      .state-card {
+        padding: 9px 11px;
+        border: 1px solid #dbe3ee;
+        border-left: 4px solid #2563eb;
+        border-radius: 8px;
+        background: #fff;
+      }
+
+      .state-card--green { border-left-color: #16a34a; }
+      .state-card--violet { border-left-color: #7c3aed; }
+
+      .state-card strong {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 5px;
+        font-size: 12px;
+      }
+
+      .state-card code {
+        display: block;
+        color: #334155;
+        font: 700 12.5px/1.55 "DejaVu Sans Mono", monospace;
+        white-space: pre-wrap;
+      }
+
+      .self-rule {
+        padding: 10px 11px;
+        border: 1px dashed #cbd5e1;
+        border-radius: 8px;
+        background: #f8fafc;
+        color: #475569;
+        font-size: 11.5px;
+        line-height: 1.5;
+      }
+
+      .layer--imagination { height: 622px; }
+
+      .imagination-grid {
+        height: 554px;
+        padding: 14px;
+        display: grid;
+        grid-template-columns: 2.1fr 1fr;
+        gap: 14px;
+      }
+
+      .imagination-visual {
+        display: grid;
+        grid-template-rows: 35px 1fr 43px;
+      }
+
+      .imagination-viewport {
+        position: relative;
+        overflow: hidden;
+        background: #e9eef5;
+      }
+
+      .imagination-source {
+        top: 0;
+        left: 0;
+        width: 686px;
+        height: 382px;
+        transform: scale(1.27);
+      }
+
+      .imagination-caption {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 11px;
+        border-top: 1px solid #e2e8f0;
+        color: #475569;
+        font-size: 10px;
+      }
+
+      .imagination-panel {
+        display: grid;
+        grid-template-rows: 35px auto auto 1fr auto;
+      }
+
+      .dynamic-block {
+        padding: 13px 14px;
+        border-bottom: 1px solid #e2e8f0;
+      }
+
+      .dynamic-block small {
+        display: block;
+        margin-bottom: 7px;
+        color: #64748b;
+        font: 800 9px "WenQuanYi Micro Hei Mono", monospace;
+      }
+
+      .dynamic-block strong {
+        display: block;
+        margin-bottom: 6px;
+        color: #5b21b6;
+        font-size: 13px;
+      }
+
+      .dynamic-block p {
+        margin: 0;
+        color: #475569;
+        font-size: 11px;
+        line-height: 1.55;
+      }
+
+      .dynamic-block code {
+        color: #172033;
+        font: 800 11px/1.7 "DejaVu Sans Mono", monospace;
+      }
+
+      .dynamic-status {
+        padding: 13px 14px;
+        border-bottom: 1px solid #e2e8f0;
+      }
+
+      .dynamic-status .chip {
+        margin: 0 4px 6px 0;
+      }
+
+      .action-grammar {
+        align-self: end;
+        padding: 13px 14px;
+        background: #f8fafc;
+      }
+
+      .action-grammar code {
+        display: block;
+        margin-top: 7px;
+        color: #1d4ed8;
+        font: 800 10px/1.8 "DejaVu Sans Mono", monospace;
+      }
+
+      .footer {
+        min-height: 70px;
+        margin-top: 18px;
+        padding: 12px 18px;
+        display: grid;
+        grid-template-columns: 220px 1fr auto;
+        align-items: center;
+        gap: 18px;
+        border-radius: 11px;
+      }
+
+      .footer strong { font-size: 13px; }
+
+      .footer__flow {
+        color: #334155;
+        font: 800 10px "WenQuanYi Micro Hei Mono", monospace;
+      }
+
+      .footer__rule {
+        padding-left: 18px;
+        border-left: 1px solid #dbe3ee;
+        color: #64748b;
+        font-size: 10px;
+        line-height: 1.5;
+        text-align: right;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="canvas">
+      <header class="topbar">
+        <div class="brand"><span class="brand-dot"></span>VAW</div>
+        <div class="topbar__title">
+          <small>视觉行动工作空间 · 三层上下文</small>
+          <strong>拾取字母汤罐头，并将它放入篮子</strong>
+        </div>
+        <div class="chips">
+          <span class="chip chip--blue">当前版本 R1</span>
+          <span class="chip chip--green">意图 GRASP</span>
+          <span class="chip">真实 LIBERO</span>
+        </div>
+      </header>
+
+      <section class="layer layer--perception">
+        <header class="layer-head">
+          <div class="layer-head__title">
+            <span class="layer-number">01</span>
+            <div><span class="eyebrow">必须层 · 当前世界入口</span><h2>双相机观测 + 当前任务与动作意图</h2></div>
+          </div>
+          <div class="layer-head__facts"><span class="chip chip--blue">视觉区域 3/4</span><span class="chip">意图区域 1/4</span></div>
+        </header>
+        <div class="perception-grid">
+          <article class="camera main-camera">
+            <header class="panel-title"><strong>主视角</strong><span class="panel-label">AGENTVIEW · PHYSICAL RGB · R1</span></header>
+            <div class="camera__viewport">
+              <div class="scene-source"><img src="/vaw/out/scripted_pick/libero_object_swap_t0_web_m12_zh/canvas_0003.png" alt="真实 LIBERO 主视角" /></div>
+              <span class="camera-note">全局空间关系</span>
+            </div>
+          </article>
+          <div class="side-column">
+            <article class="camera">
+              <header class="panel-title"><strong>手摄视角</strong><span class="panel-label">EYE-IN-HAND · R1</span></header>
+              <div class="camera__viewport">
+                <div class="wrist-source"><img src="/vaw/out/scripted_pick/libero_object_swap_t0_web_m12_zh/canvas_0003.png" alt="真实 LIBERO 腕部相机" /></div>
+                <span class="camera-note">局部接触与遮挡</span>
+              </div>
+            </article>
+            <aside class="intent-card">
+              <header class="panel-title"><strong>当前任务与意图</strong><span class="chip chip--green">ACTIVE</span></header>
+              <div class="intent-block">
+                <small>TASK PROMPT</small>
+                <p>Pick the alphabet soup and place it in the basket</p>
+              </div>
+              <div class="divider"></div>
+              <div class="intent-block">
+                <small>CURRENT ACTION INTENT</small>
+                <code>grasp(obj1)</code>
+                <ul>
+                  <li>目标对象：obj1</li>
+                  <li>当前阶段：抓取决策</li>
+                  <li>下一问题：哪个抓取最可执行？</li>
+                </ul>
+              </div>
+            </aside>
+          </div>
+        </div>
+      </section>
+
+      <section class="layer layer--state">
+        <header class="layer-head">
+          <div class="layer-head__title">
+            <span class="layer-number">02</span>
+            <div><span class="eyebrow">事实层 · 以文字为主</span><h2>场景树、PDDL Belief 与机器人本体状态</h2></div>
+          </div>
+          <div class="layer-head__facts"><span class="chip chip--violet">视觉派生状态</span><span class="chip chip--blue">本体观测</span></div>
+        </header>
+        <div class="state-grid">
+          <article class="tree-panel">
+            <header class="panel-title"><strong>场景树</strong><span class="panel-label">SCENE BELIEF TREE · SOURCE AGENTVIEW@R1</span></header>
+            <div class="tree-body">
+              <div class="tree-meta"><span>坐标：当前 agentview 原始像素 bbox</span><span>PDDL：感知 belief，不是仿真真值</span></div>
+              <div class="tree">
+                <div class="tree-row tree-row--root">scene@R1/</div>
+                <div class="tree-row tree-row--object"><span class="branch">├──</span> obj1/ <span class="value">alphabet_soup_can</span></div>
+                <div class="tree-row"><span class="branch">│   ├──</span><span class="key">bbox_xyxy_px</span><span class="value">[342, 201, 376, 251]</span></div>
+                <div class="tree-row"><span class="branch">│   ├──</span><span class="key">geometry</span><span class="value">OBB · MASK · centroid=[0.426,-0.081,0.057]</span></div>
+                <div class="tree-row"><span class="branch">│   ├──</span><span class="key">evidence</span><span class="value">score=0.973 · mask_points=1458</span></div>
+                <div class="tree-row"><span class="branch">│   ├──</span><span class="key">freshness</span><span class="predicate">CURRENT · source_revision=R1</span></div>
+                <div class="tree-row"><span class="branch">│   └──</span><span class="key">pddl</span><span class="predicate">visible(obj1)</span><span class="belief">· on(obj1,table)? · graspable(obj1)?</span></div>
+                <div class="tree-row tree-row--object"><span class="branch">├──</span> task_entity/ <span class="value">basket</span></div>
+                <div class="tree-row"><span class="branch">│   ├──</span><span class="key">source</span><span class="value">task_prompt</span></div>
+                <div class="tree-row"><span class="branch">│   ├──</span><span class="key">visual_binding</span><span class="belief">UNRESOLVED</span></div>
+                <div class="tree-row"><span class="branch">│   └──</span><span class="key">pddl</span><span class="belief">goal_region(basket)? · container(basket)?</span></div>
+                <div class="tree-row tree-row--object"><span class="branch">├──</span> active_context/ <span class="value">grasp(obj1)</span></div>
+                <div class="tree-row"><span class="branch">│   └──</span><span class="key">next_perception_gap</span><span class="belief">ground("basket")</span></div>
+                <div class="tree-row"><span class="branch">└──</span><span class="key">epistemic_note</span><span class="value">“?” = 待 inspect/ground 验证</span></div>
+              </div>
+            </div>
+          </article>
+
+          <article class="self-panel">
+            <header class="panel-title"><strong>机器人本体状态</strong><span class="panel-label">ROBOT0 · OBSERVED@R1</span></header>
+            <div class="self-body">
+              <div class="state-card state-card--green">
+                <strong><span>夹爪</span><span class="chip chip--green">张开</span></strong>
+                <code>opening_norm: 0.968
+estimated_width_m: 0.077</code>
+              </div>
+              <div class="state-card">
+                <strong><span>末端执行器 EE Pose</span><span class="chip chip--blue">BASE FRAME</span></strong>
+                <code>xyz_m: [0.4576, 0.0000, 0.3681]
+quat_wxyz: [-0.0000, 0.9996, 0.0002, -0.0284]</code>
+              </div>
+              <div class="state-card state-card--violet">
+                <strong><span>机械臂关节</span><span class="chip chip--violet">7 DoF</span></strong>
+                <code>q_rad: [0.000, -0.161, 0.000, -2.445,
+        0.000,  2.227, 0.785]</code>
+              </div>
+              <div class="self-rule">这里仅呈现策略可用的本体观测。相机矩阵、深度、原始点云和 LIBERO privileged object pose 不进入上下文。</div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="layer layer--imagination">
+        <header class="layer-head">
+          <div class="layer-head__title">
+            <span class="layer-number">03</span>
+            <div><span class="eyebrow">动态层 · 由下一 Action Intent 决定内容</span><h2>将下一步动作意图渲染为可检查的反事实画面</h2></div>
+          </div>
+          <div class="layer-head__facts"><span class="chip chip--green">INTENT grasp(obj1)</span><span class="chip chip--violet">PREVIEW g1</span></div>
+        </header>
+        <div class="imagination-grid">
+          <article class="imagination-visual">
+            <header class="panel-title"><strong>动作想象画面</strong><span class="panel-label">CURRENT ROBOT → TARGET TCP → FK PREVIEW</span></header>
+            <div class="imagination-viewport">
+              <div class="imagination-source"><img src="/vaw/out/scripted_pick/libero_object_swap_t0_web_m12_zh/canvas_0009.png" alt="抓取动作想象画面" /></div>
+            </div>
+            <div class="imagination-caption"><span>蓝色：当前机器人 · 绿色：目标 TCP · 紫色：想象中的下一状态</span><span>来源：obj1@R2 → g1 → IK preview</span></div>
+          </article>
+
+          <aside class="imagination-panel">
+            <header class="panel-title"><strong>动态 Intent Render</strong><span class="chip chip--violet">GRASP 模板</span></header>
+            <div class="dynamic-block">
+              <small>PROPOSED ACTION</small>
+              <strong>按照候选 g1 位姿接近并抓取 obj1</strong>
+              <code>target_tcp_xyz: [0.4007, -0.0814, 0.0710]
+target_quat_wxyz: [-0.0271, 0.4141, 0.9064, 0.0790]
+expected_effect: holding(obj1)?</code>
+            </div>
+            <div class="dynamic-block">
+              <small>WHY THIS VIEW EXISTS</small>
+              <p>让 Agent 同时检查目标是否对准、夹爪方向是否合理，以及 imagined gripper 与对象和桌面的空间关系。</p>
+            </div>
+            <div class="dynamic-status">
+              <span class="chip chip--green">IK 通过</span>
+              <span class="chip chip--amber">路径未检查</span>
+              <span class="chip chip--amber">碰撞未检查</span>
+              <span class="chip chip--red">证据已过期</span>
+            </div>
+            <div></div>
+            <div class="action-grammar">
+              <span class="panel-label">AGENT 可返回的结构化操作</span>
+              <code>select(candidate_id)
+preview(candidate_id)
+request_more(intent, constraints)
+commit()</code>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <footer class="footer">
+        <strong>VAW · 三层视觉上下文</strong>
+        <div class="footer__flow">01 看见当前世界 → 02 阅读世界与自身状态 → 03 检查下一动作想象</div>
+        <div class="footer__rule">不是 GUI action space<br />是 VLM 的视觉化工作记忆</div>
+      </footer>
+    </main>
+  </body>
+</html>

@@ -4,11 +4,11 @@ This stage answers exactly one question: can IK produce the requested terminal
 pose without silently substituting another orientation?  It stores that exact
 joint solution so the canvas can render the terminal gripper through URDF FK.
 
-It deliberately does *not* invent a trajectory.  A Cartesian line from the
-reported EE frame to a fingertip contact point mixes frame semantics and is not
-the path a joint-controlled Franka follows.  Trajectory and swept-volume
-evidence will only return when a motion planner such as CuRobo supplies the
-joint sequence that execution will actually consume.
+It deliberately does *not* invent a trajectory. A Cartesian line from the
+reported TCP to the target is not the path a joint-controlled Franka follows.
+Trajectory and swept-volume evidence will only return when a motion planner
+such as CuRobo supplies the joint sequence that execution will actually
+consume.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from typing import Any
 
 import numpy as np
 
-from vaw.geometry import CONTACT_TO_IK_TARGET_M, shift_along_approach
 from vaw.state import ActionState
 from vaw.types import Candidate, Pose, PreviewResult
 
@@ -36,10 +35,9 @@ def run_preview(
     ik_ok, orientation_used = False, "failed"
     ik_joints = None
     try:
-        ik_target = shift_along_approach(
-            target.position, target.quat_wxyz, CONTACT_TO_IK_TARGET_M
+        solved, info = api.solve_ik(
+            target.position, target.quat_wxyz, return_info=True
         )
-        solved, info = api.solve_ik(ik_target, target.quat_wxyz, return_info=True)
         solved = np.asarray(solved, dtype=np.float64).reshape(-1)
         if solved.size < 7 or not np.isfinite(solved[:7]).all():
             raise ValueError("IK returned no finite seven-joint solution")

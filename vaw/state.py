@@ -69,18 +69,12 @@ class ActionState:
     def focus_target(self) -> tuple[str | None, bool]:
         """Which object the focus inset shows, and whether it was asked for.
 
-        Falls back to the selected candidate's object, then to the most recent
-        grounding, so the inset earns its pixels even before the agent ever
-        calls ``inspect``. The returned flag drives the "(auto)" marker on the
-        canvas: an implicit focus must not read as a decision the agent made.
+        Focus is an information-gathering action, not a spare panel that should
+        always be filled.  Only an explicit ``inspect`` request may reveal the
+        detailed crop and detailed numeric summary.
         """
         if self.focus_id and self.focus_id in self.objects:
             return self.focus_id, True
-        sel = self.selected
-        if sel is not None and sel.object_id and sel.object_id in self.objects:
-            return sel.object_id, False
-        if self.objects:
-            return next(reversed(self.objects)), False
         return None, False
 
     def candidates_of(self, object_id: str) -> list[Candidate]:
@@ -176,4 +170,11 @@ class ActionState:
             out["gripper_opening"] = round(self.gripper_opening, 3)
         if self.ee_pose is not None:
             out["ee_position"] = [round(float(v), 4) for v in self.ee_pose.position]
+            out["ee_quat_wxyz"] = [
+                round(float(v), 4) for v in self.ee_pose.quat_wxyz
+            ]
+        if self.arm_joint_positions_rad is not None:
+            out["joint_positions_rad"] = [
+                round(float(v), 4) for v in self.arm_joint_positions_rad
+            ]
         return out

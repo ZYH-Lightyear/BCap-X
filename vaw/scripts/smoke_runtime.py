@@ -29,7 +29,6 @@ import numpy as np
 from vaw.agents.contracts import ModelResponse, TerminateMode, ToolCall
 from vaw.agents.providers.text_protocol import TextProtocolProvider
 from vaw.agents.runtime import RunConfig, VAWRuntime
-from vaw.geometry import shift_along_approach
 from vaw.scripts.smoke_render import synthetic_obs
 from vaw.workspace import Workspace
 
@@ -46,10 +45,6 @@ class FakeApi:
 
     camera_name = "agentview"
     wrist_camera_name = "robot0_eye_in_hand"
-
-    #: The real ``solve_ik`` targets the panda_hand link this far behind the
-    #: "TCP" it takes as its ``position`` argument (``_TCP_OFFSET`` there).
-    _TCP_OFFSET_M = -0.1
 
     def __init__(self) -> None:
         self._obs, self._mask = synthetic_obs()
@@ -85,11 +80,10 @@ class FakeApi:
         reachable = float(np.linalg.norm(np.asarray(position)[:2])) < 1.0
         info = {"orientation_used": "requested" if reachable else "top_down_fallback"}
         # The controller teleports, so the pose has to ride along with the (dummy)
-        # joints. Applying the real solver's TCP offset here is what makes the
-        # receipt's convention bookkeeping observable offline: commit reports a
-        # deviation of ~0 only if request and readback agree on the frame.
+        # joints. The fake exposes the same public contract as CaP-X: solve_ik
+        # input and robot_cartesian_pos readback use the same TCP convention.
         self._pending = (
-            shift_along_approach(position, quat_wxyz, self._TCP_OFFSET_M),
+            np.asarray(position, dtype=np.float64).copy(),
             np.asarray(quat_wxyz, dtype=np.float64).copy(),
         )
         joints = np.zeros(7)
@@ -331,7 +325,7 @@ def perception_and_view_ops() -> None:
     ws.step("observe")
     result = ws.step("ground", text="alphabet soup")
     assert result.ok, result.receipt_text
-    assert ws.state.summary()["focus"] == {"object_id": "obj1", "requested": False}
+    assert "focus" not in ws.state.summary()
     physical_canvas = result.canvas
 
     result = ws.step("inspect", object_id="obj1")
