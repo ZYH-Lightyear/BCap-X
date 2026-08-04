@@ -62,7 +62,8 @@ Rules:
 
 - **Exactly one `<tool_call>` block per reply.** One step is one operation; the
   canvas you get back reflects that operation and nothing else.
-- You may write your reasoning as plain text before the block.
+- Follow the task's system instructions about a concise decision basis. When
+  requested, write that basis as plain text before the block.
 - Stop after the block. **Never** write the operation's result yourself — the
   real receipt and a fresh canvas arrive next turn as `<tool_result>`.
   Inventing a result makes everything after it reasoning on fiction.
@@ -97,12 +98,15 @@ class TextProtocolProvider:
         # half in each, breaking both parsing and pairing.
         response = self.inner.generate(rewritten, tools=None)
 
-        text, calls = parse_tool_calls(response.text)
+        raw_text = response.raw_response_text or response.text
+        text, calls = parse_tool_calls(raw_text)
         return ModelResponse(
             text=text,
             tool_calls=tuple(calls),
             finish_reason="tool_calls" if calls else response.finish_reason,
             usage=response.usage,
+            raw_response_text=raw_text,
+            provider_reasoning=response.provider_reasoning,
         )
 
 
@@ -120,7 +124,7 @@ def parse_tool_calls(raw: str) -> tuple[str, list[ToolCall]]:
         return raw.strip(), []
 
     accepted: list[re.Match[str]] = [matches[0]]
-    for previous, current in zip(matches, matches[1:]):
+    for previous, current in zip(matches, matches[1:], strict=False):
         between = raw[previous.end() : current.start()]
         if between.strip():
             break

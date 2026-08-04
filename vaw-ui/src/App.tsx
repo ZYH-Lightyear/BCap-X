@@ -1,9 +1,8 @@
-import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 
 import type { CandidateSnapshot, IkStatus, WorkspaceSnapshot } from './types'
 
-const EMPTY: WorkspaceSnapshot = {
+export const EMPTY: WorkspaceSnapshot = {
   schemaVersion: 1,
   renderId: 'empty',
   viewport: { width: 1024, height: 576 },
@@ -36,7 +35,7 @@ const EMPTY: WorkspaceSnapshot = {
   receipt: null,
 }
 
-function waitForPaint(): Promise<void> {
+export function waitForPaint(): Promise<void> {
   return new Promise((resolve) => {
     requestAnimationFrame(() => {
       requestAnimationFrame(async () => {
@@ -276,24 +275,7 @@ function EvidenceRail({ snapshot }: { snapshot: WorkspaceSnapshot }) {
   )
 }
 
-export function App() {
-  const [snapshot, setSnapshot] = useState<WorkspaceSnapshot>(EMPTY)
-
-  useEffect(() => {
-    window.__VAW_RENDER__ = async (next) => {
-      if (next.schemaVersion !== 1 || next.viewport.width !== 1024 || next.viewport.height !== 576) {
-        throw new Error('Unsupported VAW Web snapshot')
-      }
-      setSnapshot(next)
-      await waitForPaint()
-      document.documentElement.dataset.renderId = next.renderId
-    }
-    document.documentElement.dataset.vawReady = 'true'
-    return () => {
-      delete window.__VAW_RENDER__
-    }
-  }, [])
-
+export function App({ snapshot = EMPTY }: { snapshot?: WorkspaceSnapshot }) {
   return (
     <main className="workspace">
       <AppHeader snapshot={snapshot} />

@@ -38,6 +38,10 @@ class PandaUrdfGripperFK:
 
     _ARM_JOINTS = tuple(f"panda_joint{index}" for index in range(1, 8))
     _GRIPPER_LINKS = ("panda_hand", "panda_leftfinger", "panda_rightfinger")
+    _ROBOT_LINKS = (
+        *(f"panda_link{index}" for index in range(9)),
+        *_GRIPPER_LINKS,
+    )
 
     def __init__(self, urdf: Any | None = None) -> None:
         if urdf is None:
@@ -62,6 +66,33 @@ class PandaUrdfGripperFK:
     ) -> np.ndarray:
         """Return world/robot-base gripper triangles for one exact joint state."""
 
+        return self._triangles_for_links(
+            joint_positions_rad,
+            gripper_opening,
+            self._GRIPPER_LINKS,
+        )
+
+    def robot_triangles(
+        self,
+        joint_positions_rad: np.ndarray,
+        gripper_opening: float,
+    ) -> np.ndarray:
+        """Return the complete Franka visual mesh for one exact joint state."""
+
+        return self._triangles_for_links(
+            joint_positions_rad,
+            gripper_opening,
+            self._ROBOT_LINKS,
+        )
+
+    def _triangles_for_links(
+        self,
+        joint_positions_rad: np.ndarray,
+        gripper_opening: float,
+        links: tuple[str, ...],
+    ) -> np.ndarray:
+        """Evaluate selected URDF visual links under one shared FK update."""
+
         joints = np.asarray(joint_positions_rad, dtype=np.float64).reshape(-1)
         if joints.shape != (7,) or not np.isfinite(joints).all():
             raise ValueError("Panda FK requires exactly seven finite arm joints")
@@ -75,9 +106,9 @@ class PandaUrdfGripperFK:
                 self.finger_max_q * float(np.clip(opening, 0.0, 1.0))
             )
             self.urdf.update_cfg(config)
-            parts = self._visual_meshes(self._GRIPPER_LINKS)
+            parts = self._visual_meshes(links)
         if not parts:
-            raise RuntimeError("Panda URDF has no gripper visual meshes")
+            raise RuntimeError("Panda URDF has no requested visual meshes")
         return np.concatenate([vertices[faces] for vertices, faces in parts], axis=0)
 
     def frame(

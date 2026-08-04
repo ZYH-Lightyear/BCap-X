@@ -120,17 +120,43 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
     choice = choices[0] or {}
     message = choice.get("message") or {}
 
-    text = message.get("content") or ""
-    if isinstance(text, list):
-        # A few upstreams split assistant content into parts as well.
-        text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
+    text = _normalise_text(message.get("content"))
+    reasoning = _normalise_text(
+        message.get("reasoning_content")
+        if message.get("reasoning_content") is not None
+        else message.get("reasoning")
+    )
 
     return ModelResponse(
-        text=str(text),
+        text=text,
         tool_calls=tuple(_parse_tool_calls(message.get("tool_calls"))),
         finish_reason=str(choice.get("finish_reason") or ""),
         usage=data.get("usage") or {},
+        raw_response_text=text,
+        provider_reasoning=reasoning,
     )
+
+
+def _normalise_text(value: Any) -> str:
+    """Turn compatible content/reasoning variants into traceable text."""
+
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for part in value:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text") or part.get("content")
+                if text is not None:
+                    parts.append(str(text))
+        return "".join(parts)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return str(value)
 
 
 def _parse_tool_calls(raw: Any) -> list[ToolCall]:

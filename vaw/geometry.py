@@ -1,9 +1,10 @@
 """Pure geometry helpers shared by ops, preview and render. No capx imports.
 
-Candidate positions use the public CaP-X TCP convention: the same position is
-passed to ``solve_ik`` and reported back by ``robot_cartesian_pos``. Conversion
-from that public TCP to the internal ``panda_hand`` link belongs to the CaP-X
-backend and must not be repeated here.
+Candidate positions use the public CaP-X fingertip/contact TCP convention and
+are passed to ``solve_ik`` unchanged.  The backend converts that target to its
+internal ``panda_hand`` link.  ``robot_cartesian_pos`` reports the hand-link
+pose, so code evaluating an executed target must invert the backend's TCP
+offset before comparing positions.
 """
 
 from __future__ import annotations

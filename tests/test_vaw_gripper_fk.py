@@ -47,6 +47,19 @@ def test_joint_fk_uses_observed_finger_opening(
     assert not np.allclose(closed, opened)
 
 
+def test_joint_fk_can_render_the_complete_robot_visual_mesh(
+    panda_fk: PandaUrdfGripperFK,
+) -> None:
+    joints = np.array([0.0, -0.5, 0.0, -2.0, 0.0, 1.5, 0.8])
+
+    gripper = panda_fk.triangles(joints, gripper_opening=1.0)
+    robot = panda_fk.robot_triangles(joints, gripper_opening=1.0)
+
+    assert robot.shape[1:] == (3, 3)
+    assert len(robot) > len(gripper)
+    assert np.isfinite(robot).all()
+
+
 def test_workspace_keeps_authoritative_arm_joints() -> None:
     obs, _ = synthetic_obs()
     expected = np.linspace(-0.6, 0.6, 7)

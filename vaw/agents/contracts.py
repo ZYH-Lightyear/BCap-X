@@ -73,6 +73,13 @@ class ModelResponse:
     tool_calls: tuple[ToolCall, ...] = ()
     finish_reason: str = ""
     usage: dict[str, Any] = field(default_factory=dict)
+    # The exact assistant content before a text-protocol parser removes the
+    # operation block.  This is trace-only diagnostic evidence; policy history
+    # continues to receive ``text`` plus the structured calls.
+    raw_response_text: str = ""
+    # Some OpenAI-compatible routes return a separate reasoning field.  Keep it
+    # separate from the concise, policy-visible decision basis in ``text``.
+    provider_reasoning: str = ""
 
 
 @dataclass(frozen=True)
