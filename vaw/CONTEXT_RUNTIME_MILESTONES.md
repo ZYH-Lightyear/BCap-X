@@ -275,7 +275,8 @@ ID。Web renderer 只能读取 Packet，不能访问 Workspace、backend 或 Pri
 
 M1.3.1 页面固定为 `1440×1080`。EvidenceCatalog 保存当前 revision 的规范化证据，
 DecisionWorkspaceSpec 只通过 ID 引用本轮相关内容，不复制 evidence。M1.2 的
-`1024×576` schema-v1 页面保持不变，作为 legacy baseline。
+历史上曾保留 `1024×576` schema-v1 页面作为 baseline；2026-08-04 的实现收敛后，
+运行时代码只保留 `1440×1080` schema-v3 页面，旧实现由 Git checkpoint `fd8d89a` 保存。
 
 ## 3. 模型每轮真正看到什么
 
@@ -687,7 +688,7 @@ Teacher、student、SFT replay 和 verl AgentLoop 必须调用同一个 `Context
 
 实现验收（2026-08-02）：
 
-- 新 Context 相关离线与 legacy renderer 回归在可启动 Chromium 的环境中为
+- 新 Context 相关离线回归在可启动 Chromium 的环境中为
   `33 passed`；
 - TypeScript production build 与 Ruff 检查通过；
 - 真实 `libero_object_swap:0` scripted smoke 完成
@@ -711,7 +712,7 @@ Teacher、student、SFT replay 和 verl AgentLoop 必须调用同一个 `Context
 3. renderer 固定为 `1440×1080`，上区显示 persistent world，下区显示动态决策内容；
 4. mode 由最新 Function result 字段推导，不引入 phase 或 Function 名称白名单；
 5. trace 记录 decision mode，并从真实 active action 生成 manifest；
-6. 保留 M1.2 `1024×576` legacy renderer。
+6. 固定 M1.3.1 `1440×1080` renderer；后续实现收敛删除 schema-v1 分流。
 
 验收：九工具无变化；固定截图确定性；非 proposal 调用切换下区但不误删 active action；
 合成 future action 无需 renderer 新分支即可进入 proposal；真实 scripted trace 覆盖完整 mode 序列。

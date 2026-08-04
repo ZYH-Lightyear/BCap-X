@@ -1,160 +1,142 @@
 # VAW — Visual Action Workspace
 
-论文计划见 `docs/gui_as_policy_v2_cvpr_plan.md`；M0–M1.2 的已实现架构、Agent Runtime
-与历史 Milestone 见 `docs/vaw_implementation_plan.md`，M1.2 之后的单 VLM Context
-Runtime 工作设计见 [`CONTEXT_RUNTIME_MILESTONES.md`](CONTEXT_RUNTIME_MILESTONES.md)。
-本包实现视觉动作工作区：
-Agent 通过 **14 个离散界面操作**（ground / propose / select / nudge / preview /
-commit / move_xyz …）操作机器人，工具输出（mask、grasp、waypoint）实例化为工作区里
-可引用、可视化的候选对象，只有 `commit` / `move_xyz` / `commit_gripper` 改变物理世界。
+`vaw` 当前只保留 revision-local Context Runtime。它把 LIBERO-PRO 的当前双相机观测、
+工具产生的局部证据、机器人本体状态和动作想象编译为一张固定 `1440×1080` Context
+图，供单个 VLM 逐轮调用 Function 控制机器人。
 
-## 架构
+VAW 不是 GUI Agent：模型不点击页面，也不操作 DOM。Web 页面只是确定性的只读视觉
+renderer；动作通道始终是 structured Function call。
+
+设计与里程碑见：
+
+- [`CONTEXT_RUNTIME_MILESTONES.md`](CONTEXT_RUNTIME_MILESTONES.md)
+- [`M1_3_2_VISUAL_DENSITY.md`](M1_3_2_VISUAL_DENSITY.md)
+
+## Agent 每轮看到什么
+
+每次 provider 请求都重新构造，仅包含：
+
+1. 中文 System Prompt 与 LIBERO-PRO task prompt；
+2. 当前一张 `1440×1080` Context PNG；
+3. 当前 minimal manifest；
+4. 最近最多三个完整的 Function call/result transaction。
+
+旧图片、旧 decision basis、receipt ID、renderer/schema 元数据、reward 和环境成功真值不会
+进入下一轮策略上下文。Depth、相机参数、raw mask/cloud 和 backend 也只存在于 episode-local
+private context。
+
+## Function space
+
+当前 Agent-visible Function 固定为 11 个：
+
+```text
+inspect(query, within_region_id?)
+locate_point(query, within_region_id?)
+propose_grasps(region_id)
+propose_pose(point_id, offset_xyz, quaternion_xyzw?)
+select(candidate_id)
+delta_move(delta_xyz_m, frame?, action_id?)
+rotate(axis, angle_deg, frame?, action_id?)
+commit(action_id)
+open_gripper()
+close_gripper()
+done(success)
+```
+
+`inspect`、`locate_point`、`propose_grasps` 产生当前 revision 的证据；`select`、
+`propose_pose`、`delta_move`、`rotate` 只创建或编辑 Action Proposal；`commit` 与两个
+gripper Function 才改变物理世界。物理动作刷新 observation，并使旧 revision 的
+region/point/candidate/action 引用失效。
+
+## 当前代码结构
 
 ```text
 vaw/
-  types.py        # Pose / ObjectEntry / Candidate / PreviewResult / Receipt
-  state.py        # ActionState：对象、候选、virtual gripper、视角、focus、回执、事件
-  geometry.py     # 投影 / 反投影 / 位姿插值等纯几何工具
-  camera.py       # 虚拟相机（az/el/zoom → intrinsics+pose_mat）、预设、视角包络
-  cloud.py        # RGB-D → 世界系彩色点云融合 + z-buffer splatting（纯 numpy）
-  render.py       # 确定性画布渲染（PIL，无浏览器）：主视图 / DataPanel / Focus / wrist
-  renderers.py    # renderer 协议、PIL baseline 与成对对照 renderer
-  web_presenter.py# ActionState/传感器 → 无隐私泄漏的只读视觉 snapshot
-  web_renderer.py # 持久 Chromium 页面 → 固定 1024×576 RGB policy observation
-  preview.py      # 几何 rollout：IK 可行性 + 直线路径点云碰撞（M2 接 cuRobo）
-  executor.py     # commit 执行 + 回执 + preview–execution discrepancy
-  ops.py          # 操作注册表 = 动作空间 = agent 工具协议（@op 装饰器）
-  protocol.py     # 操作集导出为 function-calling 工具定义 / 解析 agent 动作
-  workspace.py    # Workspace 门面：绑定 Cap-X ApiBase，step(op) → (canvas, receipt)
-                  #   内置 TraceLogger：每步 JSONL + PNG，日志格式即训练数据格式
-  agents/         # 由仓库内 agentx/ fork 而来（详见下方"Agent Runtime"）
-    contracts.py  #   纯数据：ToolCall / ModelResponse / StepRecord / EpisodeResult
-    providers/    #   OpenAI 兼容端点 + <tool_call> 文本协议
-    chat.py       #   history：孤儿 tool call 修复 + 画布窗口（prune_images）
-    runtime.py    #   VAWRuntime：每轮一个 op、显式 done、预算耗尽强制终止
-    teacher.py    #   teacher_provider()：capx proxy :8110，默认 native 协议
-    student.py    #   student_provider()：本地 vLLM :8120，默认 text 协议
-  train/          # M4/M5：接口已定义，实现留空（SFT 走 LLaMA-Factory，RL 走 verl）
-    collect.py    #   教师 rollout 收集 + 成功过滤 → SFT 样本
-    rewards.py    #   R_task / R_progress(TOPReward) / P_viol / cost
-    rl.py         #   verl 多轮 AgentLoop 接入点
+  context_runtime/
+    model.py              # evidence、candidate、proposal、receipt 与 ContextState
+    workspace.py          # 私有 episode context、revision 生命周期与 Function dispatch
+    functions.py          # 11 个 Function handler
+    protocol.py           # Function schema、解析与中文 System Prompt
+    history.py            # protocol-safe K=3 transaction window
+    packet.py             # trusted state → policy-visible ContextPacket
+    web_renderer.py       # ContextPacket → 固定 Web screenshot
+    browser_renderer.py   # 持久 Playwright/Chromium bridge
+    runtime.py            # 单 VLM loop
+    trace.py / video.py   # trace 与视频产物
+    motion.py             # Pyroki/CuRobo proposal prediction 与执行边界
+    geometry.py           # frame、四元数、投影与 TCP 几何
+    gripper_mesh.py       # URDF/FK robot imagination raster
+  agents/
+    contracts.py          # provider/runtime 公共数据结构
+    providers/            # OpenAI-compatible native/text tool-call transport
+    teacher.py/student.py # provider 配置
   scripts/
-    smoke_render.py   # M0/M1.2 验证：合成 RGB-D 场景跑通 camera/cloud/render/protocol
-    smoke_runtime.py  # M0 验证：假 provider + 假机器人跑通 runtime，无需环境与模型
-    scripted_pick.py  # M1 验证：LIBERO 上脚本化 ops 序列跑通完整闭环
+    run_context_agent.py  # 真实 LIBERO-PRO agent/scripted runner
+    check_gripper_overlay.py
 ```
 
-仓库根目录的 `vaw-ui/` 是 Web renderer 的 React/Vite 表达层。它没有按钮、输入框或
-DOM action space；Agent 仍然只调用现有 structured ops，Web 页面只负责把同一
-ActionState 排成一张 VLM observation。
+`vaw-ui/` 只保留 schemaVersion 3 的 Context 页面。旧 `Workspace`、PIL renderer、
+schema-v1 Web 页面、14-op protocol 和旧 runner 已从当前代码删除；删除前状态保存在 Git
+checkpoint `fd8d89a`，不会与当前运行路径并存。
 
-关键约定：
-
-- **一切可引用**：对象 `obj1`、候选 `g1/p2`、回执 `r1` 都有短 id，`ActionState.summary()`
-  产出进 prompt 的紧凑 JSON；重数组（mask/点云）只留在内存、只画进画布。
-- **物理边界**：只有 `commit` / `move_xyz` / `commit_gripper` 改变世界，其余操作只改
-  belief 与画布。注意 `nudge` 只编辑画布上的候选，`move_xyz` 才真的移动机器人。
-- **日志即数据**：`TraceLogger` 每步落 `steps.jsonl`（op、args、receipt、state summary）
-  + `canvas_XXXX.png`，教师 trace 与学生 rollout 同一格式，SFT/RL 直接消费。
-- **对 Cap-X 只有运行时依赖**：`Workspace` 接收任意实现了所需方法的 api 对象
-  （`FrankaLiberoApiReduced` 即可），vaw 包本身不 import capx。
-- **渲染确定性**：PIL 与 Web 两条路径都固定为 `(state, obs, cloud) → 1024×576 RGB`。
-  Web 路径使用固定 viewport/DPR、无动画页面和持久 Chromium，逐帧截图可做确定性断言。
-
-## Canvas（1024×576，设计依据见实现计划 §1.4）
-
-```text
-+--------------------------------------+------------+
-| header: rev/gripper/sel/view · task  | DataPanel  |  id ↔ marker 图例，不放数值
-|                                      +------------+
-|  主视图 768px：物理相机 RGB，或点云    |  Focus     |  焦点物体放大 + 全候选 + 接近轴
-|  虚拟视角；稀疏标注 + 左下 gizmo      +------------+
-|                                      |  wrist     |  腕相机，爪内有物的直接证据
-+--------------------------------------+------------+
-```
-
-- **视角是状态**：`view(preset|azimuth_deg|elevation_deg|zoom)` 改 `ActionState.view`。
-  默认 `agentview` 用物理相机 RGB（外观最强）；其他角度渲染融合点云（几何准但稀疏），
-  header 与角标标明当前来源。方位角限物理机位 ±75°（单视角深度没有背面证据），
-  越界裁剪并在回执里说明。缩放是收窄视场而非拉近相机。
-- **焦点是显式状态**：`inspect(object_id)` 一次同时做三件事——focus 视口切到该物体、
-  summary 里该物体与其候选展开为全字段（其余压缩，context 有界）、返回几何详情。
-  未 `inspect` 时 Focus 保持空白；selection 不会自动泄露详细 crop 或数值。
-- **数值不进画布**：位姿/分数/间隙/宽度全在 state summary 文本里，画布只承担空间关系。
-
-## Agent Runtime
-
-`vaw/agents/` 是仓库内 `agentx/`（Qwen-Code headless `AgentCore` 的 Python 移植）
-的 fork。保留 provider / chat 两层与循环骨架、幻觉守卫；丢掉 `ToolScheduler`（并行
-批次与"一步一个 op"冲突）、`tools/`、`skills.py`、`cli.py`、`trace.py`（Workspace
-自带 TraceLogger）。选 fork 而非依赖：要改的四处都在循环内部，加开关会让 coding
-agent 与 VAW 互相拖累。
-
-与上游循环的四处差异（理由见 `runtime.py` 模块 docstring 与实现计划 §2）：
-
-1. **一轮一个 op**——多余的调用只回拒绝、不执行（但必须回，否则 call id 成孤儿，
-   端点会拒掉整个下一次请求）。
-2. **观测是结构性的**——`step` 永远返回新渲染画布，不需要 observe 钩子。
-3. **`done` 是显式 op**——纯文本不终止 episode；预算耗尽由 runtime 补
-   `done(success=False)`，保证每条 trace 都有终止步。
-4. **上下文确定性**——不压缩：最近 K 张画布为图片，其余留文本回执，state 每轮全量
-   重发。训练与推理必须看到同一份上下文。
-
-```python
-from vaw.agents.runtime import run_episode
-from vaw.agents.teacher import teacher_provider
-
-result = run_episode(teacher_provider(), api, "put the red mug on the plate",
-                     trace_dir="runs/vaw/ep0")
-```
-
-## Milestones
-
-见 `docs/vaw_implementation_plan.md` §3（唯一维护处）。当前进度：M0、M0.5（runtime）、
-M1.1（环境接线，`scripted_pick.py` 在 libero_object task 0 上 pick 成功）、
-M1.2（Canvas v2 首版：虚拟视角 + `view` / `inspect` + 四区布局）已完成；
-M1.2 第二轮增加了只读 Web renderer，用于与 PIL Canvas 做受控 M1.4 对照。
-
-## 运行冒烟测试
+## 构建 Web renderer
 
 ```bash
-python -m vaw.scripts.smoke_render    # state/render/protocol → vaw/out/smoke/
-python -m vaw.scripts.smoke_runtime   # agent 循环         → vaw/out/smoke_runtime/
-```
-
-## Web renderer（本地实验）
-
-一次性准备：
-
-```bash
-cd vaw-ui
-npm install
+cd /mnt/data/zyh/BCap-X/vaw-ui
+npm ci
 npm run build
-cd ..
+```
 
-source .venv-libero/bin/activate
+一次性安装浏览器（若环境尚未安装）：
+
+```bash
+source /mnt/data/zyh/BCap-X/.venv-libero/bin/activate
 python -m pip install "playwright>=1.50,<2"
 python -m playwright install chromium
 ```
 
-真实 LIBERO-PRO 成对渲染：
+## 真实 LIBERO-PRO 运行
+
+服务启动后：
 
 ```bash
-python -m vaw.scripts.scripted_pick \
-  --suite libero_object_swap --task-id 0 \
-  --object "the target object" \
-  --renderer web --compare-renderers
+cd /mnt/data/zyh/BCap-X
+source .venv-libero/bin/activate
+
+python -m vaw.scripts.run_context_agent \
+  --mode agent \
+  --suite libero_object_swap \
+  --task-id 0 \
+  --model vapi/qwen3.5-plus \
+  --protocol text \
+  --motion-backend curobo \
+  --record-video
 ```
 
-`canvas_XXXX.png` 是实际送给策略的 renderer；另一 renderer 的同状态截图写入
-`_render_compare/`，不会被 trace reader 当作额外 step。Web renderer 出错会显式
-终止该实验，不会静默回退到 PIL。
-
-真实模型 loop 使用同一个 renderer seam：
+真实接线 smoke（脚本不属于 Agent policy）：
 
 ```bash
-python -m vaw.scripts.run_agent \
-  --suite libero_object_swap --task-id 0 \
-  --model vapi/qwen3.5-plus --protocol text \
-  --renderer web --compare-renderers
+python -m vaw.scripts.run_context_agent \
+  --mode scripted \
+  --suite libero_object_swap \
+  --task-id 0 \
+  --motion-backend pyroki
 ```
+
+默认 trace 写入 `vaw/out/context_runs/`，包含当前 Context PNG、结构化 trace、meta 和
+可用时导出的 agentview/wrist/context 视频。
+
+## 回归测试
+
+```bash
+cd /mnt/data/zyh/BCap-X
+source .venv-libero/bin/activate
+
+python -m pytest -q \
+  tests/test_vaw_context_agent.py \
+  tests/test_vaw_context_packet.py \
+  tests/test_vaw_context_runtime.py \
+  tests/test_vaw_gripper_fk.py
+```
+
+当前代码不会修改 CaP-X、RoboMEx、`capx_skill_rl` 或其他项目路径。

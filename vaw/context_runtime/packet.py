@@ -12,10 +12,14 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from scipy.spatial.transform import Rotation
 
+from vaw.context_runtime.geometry import project_world_to_pixel
+from vaw.context_runtime.gripper_mesh import (
+    load_panda_urdf_fk,
+    mask_outline,
+    rasterize_silhouette,
+)
 from vaw.context_runtime.model import ContextState, PointEvidence, Pose, RobotState
 from vaw.context_runtime.workspace import ContextWorkspace
-from vaw.geometry import project_world_to_pixel
-from vaw.gripper_mesh import load_panda_urdf_fk, mask_outline, rasterize_silhouette
 
 CONTEXT_SCHEMA = "vaw-context-v2"
 CONTEXT_WEB_SCHEMA_VERSION = 3

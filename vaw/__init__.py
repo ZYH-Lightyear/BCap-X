@@ -1,25 +1,23 @@
-"""VAW — Visual Action Workspace.
+"""VAW — the revision-local Visual Action Workspace Context Runtime."""
 
-See vaw/README.md for architecture and milestones, and
-docs/gui_as_policy_v2_cvpr_plan.md for the paper plan.
-"""
-
-from vaw.camera import ViewState, VirtualCamera
-from vaw.cloud import SceneCloud
-from vaw.state import ActionState
-from vaw.types import Candidate, ObjectEntry, Pose, PreviewResult, Receipt, StepResult
-from vaw.workspace import Workspace
+from vaw.context_runtime import (
+    FUNCTION_NAMES,
+    SYSTEM_PROMPT,
+    ContextCompiler,
+    ContextRunConfig,
+    ContextRuntime,
+    ContextWorkspace,
+    function_definitions,
+    run_context_episode,
+)
 
 __all__ = [
-    "ActionState",
-    "Candidate",
-    "ObjectEntry",
-    "Pose",
-    "PreviewResult",
-    "Receipt",
-    "SceneCloud",
-    "StepResult",
-    "ViewState",
-    "VirtualCamera",
-    "Workspace",
+    "ContextCompiler",
+    "ContextRunConfig",
+    "ContextRuntime",
+    "ContextWorkspace",
+    "FUNCTION_NAMES",
+    "SYSTEM_PROMPT",
+    "function_definitions",
+    "run_context_episode",
 ]

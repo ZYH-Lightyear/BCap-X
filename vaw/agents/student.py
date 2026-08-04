@@ -10,10 +10,13 @@ Defaults to the text protocol rather than native function calling. Two reasons:
 checkpoint mid-RL cannot be relied on to hold a native tool schema — while the
 text path degrades into something still parseable.
 
-    from vaw.agents.runtime import run_episode
     from vaw.agents.student import student_provider
+    from vaw.context_runtime.runtime import run_context_episode
+    from vaw.context_runtime.web_renderer import ContextWebRenderer
 
-    result = run_episode(student_provider(), api, instruction, trace_dir=...)
+    result = run_context_episode(
+        student_provider(), api, instruction, ContextWebRenderer(), trace_dir=...
+    )
 """
 
 from __future__ import annotations

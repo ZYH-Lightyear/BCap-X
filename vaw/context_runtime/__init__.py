@@ -1,9 +1,4 @@
-"""Revision-local VAW Context Runtime.
-
-This package is intentionally separate from the legacy ``vaw.Workspace``
-path.  The hybrid runtime can therefore evolve its public contract without changing the
-M0--M1.2 traces or renderers used as paper baselines.
-"""
+"""The revision-local VAW Context Runtime and its public contract."""
 
 from vaw.context_runtime.model import (
     ActionAdjustment,

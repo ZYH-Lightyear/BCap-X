@@ -1,7 +1,10 @@
 # VAW 实现计划（Visual Action Workspace）
 
-> 本文档是 VAW 系统实现的唯一主线文档：架构、Agent Runtime 设计、Milestone 都以此为准。
-> 论文故事与训练目标见 `docs/gui_as_policy_v2_cvpr_plan.md`；代码在仓库根 `vaw/`。
+> **历史设计归档（M0–M1.2）**：本文描述的 ActionState、旧 Canvas、legacy ops 与
+> `smoke_*` runner 已于 2026-08-04 从当前代码删除，文中的命令不再是可执行入口。
+> 当前唯一实现、入口和 Milestone 以 `vaw/README.md` 与
+> `vaw/CONTEXT_RUNTIME_MILESTONES.md` 为准；删除前代码保存在 Git checkpoint
+> `fd8d89a`。论文故事与训练目标仍见 `docs/gui_as_policy_v2_cvpr_plan.md`。
 
 ## 1. 系统架构
 

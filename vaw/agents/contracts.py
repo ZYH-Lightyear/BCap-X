@@ -1,13 +1,7 @@
-"""Types for the agent runtime layer.
+"""Provider/runtime data contracts for the VAW Context Runtime.
 
-Forked from ``agentx/contracts.py`` and trimmed to what a VAW episode needs.
-Dropped from the original: ``ToolKind`` / ``CONCURRENCY_SAFE_KINDS`` (they exist
-only to batch parallel tool calls, and VAW runs exactly one op per step),
-``ToolResult`` / ``ToolRecord`` / ``ToolValidationError`` (the workspace already
-returns a :class:`~vaw.types.StepResult` and turns op failures into receipts).
-
-This layer holds data only. ``providers``, ``chat`` and ``runtime`` all depend
-on it, so any behaviour added here becomes a three-way coupling.
+This layer holds data only. Providers, context history, and the runtime depend
+on it, so behavior belongs in those layers rather than in these records.
 
 History is kept in OpenAI wire format (``{"role": ..., "content": ...}``)
 rather than a custom content model: we only ever talk to OpenAI-compatible
@@ -74,8 +68,8 @@ class ModelResponse:
     finish_reason: str = ""
     usage: dict[str, Any] = field(default_factory=dict)
     # The exact assistant content before a text-protocol parser removes the
-    # operation block.  This is trace-only diagnostic evidence; policy history
-    # continues to receive ``text`` plus the structured calls.
+    # operation block. This is trace-only diagnostic evidence; policy history
+    # replays only structured calls and results.
     raw_response_text: str = ""
     # Some OpenAI-compatible routes return a separate reasoning field.  Keep it
     # separate from the concise, policy-visible decision basis in ``text``.
@@ -86,9 +80,8 @@ class ModelResponse:
 class StepRecord:
     """One executed op, flattened for the episode result.
 
-    Deliberately not the full :class:`~vaw.types.StepResult`: that carries the
-    rendered canvas, and holding every canvas of an episode in memory costs
-    tens of MB for data the ``TraceLogger`` has already written to disk.
+    Deliberately not the full ContextStepResult or rendered Context image:
+    retaining every raster in the episode result would duplicate trace data.
     """
 
     turn: int

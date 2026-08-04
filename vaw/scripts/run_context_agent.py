@@ -21,7 +21,7 @@ from typing import Any
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
-from vaw.scripts.scripted_pick import preflight_services
+from vaw.context_runtime.services import preflight_services
 
 
 def _parse_args() -> argparse.Namespace:
@@ -77,7 +77,10 @@ def _safe_name(value: str) -> str:
 
 def main() -> int:
     args = _parse_args()
-    preflight_services()
+    try:
+        preflight_services()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
 
     from capx.envs.simulators.libero import FrankaLiberoTask
     from capx.integrations.franka.libero_reduced import FrankaLiberoApiReduced

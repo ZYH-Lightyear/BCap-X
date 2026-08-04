@@ -1,4 +1,4 @@
-"""Shared persistent-browser bridge for read-only VAW snapshots."""
+"""Persistent-browser bridge for read-only Context Runtime snapshots."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ class SnapshotBrowser:
         self.height = int(height)
         self.asset_dir = pathlib.Path(
             asset_dir
-            or pathlib.Path(__file__).resolve().parent.parent / "vaw-ui" / "dist"
+            or pathlib.Path(__file__).resolve().parent.parent.parent / "vaw-ui" / "dist"
         ).resolve()
         index = self.asset_dir / "index.html"
         if not index.exists():

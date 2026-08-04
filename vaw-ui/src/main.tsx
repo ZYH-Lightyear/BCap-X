@@ -1,22 +1,36 @@
 import React, { useEffect, useState } from 'react'
 import ReactDOM from 'react-dom/client'
 
-import { App, EMPTY, waitForPaint } from './App'
 import { ContextApp } from './context/ContextApp'
-import type { VawSnapshot } from './types'
-import './styles.css'
+import type { ContextSnapshot } from './types'
 import './context/context.css'
 
+function waitForPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(async () => {
+        await document.fonts.ready
+        const pending = Array.from(document.images)
+          .filter((image) => !image.complete)
+          .map(
+            (image) => new Promise<void>((done) => {
+              image.addEventListener('load', () => done(), { once: true })
+              image.addEventListener('error', () => done(), { once: true })
+            }),
+          )
+        await Promise.all(pending)
+        resolve()
+      })
+    })
+  })
+}
+
 function Root() {
-  const [snapshot, setSnapshot] = useState<VawSnapshot>(EMPTY)
+  const [snapshot, setSnapshot] = useState<ContextSnapshot | null>(null)
 
   useEffect(() => {
     window.__VAW_RENDER__ = async (next) => {
-      if (next.schemaVersion === 1) {
-        if (next.viewport.width !== 1024 || next.viewport.height !== 576) {
-          throw new Error('Unsupported legacy VAW viewport')
-        }
-      } else if (
+      if (
         next.schemaVersion !== 3
         || next.schema !== 'vaw-context-v2'
         || next.viewport.width !== 1440
@@ -24,7 +38,6 @@ function Root() {
       ) {
         throw new Error('Unsupported VAW Context snapshot')
       }
-      document.documentElement.dataset.vawSchema = String(next.schemaVersion)
       setSnapshot(next)
       await waitForPaint()
       document.documentElement.dataset.renderId = next.renderId
@@ -35,9 +48,7 @@ function Root() {
     }
   }, [])
 
-  return snapshot.schemaVersion === 3
-    ? <ContextApp snapshot={snapshot} />
-    : <App snapshot={snapshot} />
+  return snapshot ? <ContextApp snapshot={snapshot} /> : null
 }
 
 ReactDOM.createRoot(document.getElementById('root')!).render(

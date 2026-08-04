@@ -6,7 +6,7 @@ import pathlib
 
 import numpy as np
 
-from vaw.browser_renderer import SnapshotBrowser
+from vaw.context_runtime.browser_renderer import SnapshotBrowser
 from vaw.context_runtime.packet import (
     CONTEXT_HEIGHT,
     CONTEXT_WIDTH,

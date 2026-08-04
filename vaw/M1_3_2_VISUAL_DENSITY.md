@@ -165,7 +165,8 @@ Receipt mode 的主要内容是最新 observation，而不是执行报告。
 - Runtime/Compiler 只增加最近 spatial target 的 episode-local 摘要，用于当前 RGB 投影。
 - Renderer 名称更新为 `context-web-v2-focus`，确保 trace 可以区分旧版密度布局与新的
   clean-world / focused-action 图像。
-- legacy M1.2 renderer 和既有 trace 不修改、不删除。
+- 既有 trace 作为实验产物保留；未冻结的 legacy M1.2 renderer 已在后续代码收敛中删除，
+  历史实现由 Git checkpoint `fd8d89a` 保存。
 
 本轮不再加入：
 
@@ -201,7 +202,7 @@ Receipt mode 的主要内容是最新 observation，而不是执行报告。
   不含 renderer/schema 元数据。
 - `decision_basis` 只进入 trace，K=3 History 只回放 structured call/result。
 - K=3 History、revision 失效、active action 生命周期和 trace 记录保持兼容。
-- legacy M1.2 `1024×576` renderer 回归通过。
+- 当前 schema-v3 `1440×1080` renderer 回归通过，且代码中不存在 schema-v1 分流。
 
 ### 6.4 真实案例验收
 

@@ -38,8 +38,8 @@ def main() -> None:
     from PIL import Image
 
     from capx.envs.simulators.libero import FrankaLiberoTask
-    from vaw.geometry import project_world_to_pixel
-    from vaw.gripper_mesh import (
+    from vaw.context_runtime.geometry import project_world_to_pixel
+    from vaw.context_runtime.gripper_mesh import (
         load_panda_urdf_fk,
         mask_outline,
         rasterize_silhouette,

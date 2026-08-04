@@ -3,12 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from vaw.gripper_mesh import PandaUrdfGripperFK
-from vaw.preview import run_preview
-from vaw.scripts.smoke_render import synthetic_obs
-from vaw.state import ActionState
-from vaw.types import Candidate, Pose, TOP_DOWN_QUAT_WXYZ
-from vaw.workspace import Workspace
+from vaw.context_runtime.gripper_mesh import PandaUrdfGripperFK
 
 
 @pytest.fixture(scope="module")
@@ -58,51 +53,3 @@ def test_joint_fk_can_render_the_complete_robot_visual_mesh(
     assert robot.shape[1:] == (3, 3)
     assert len(robot) > len(gripper)
     assert np.isfinite(robot).all()
-
-
-def test_workspace_keeps_authoritative_arm_joints() -> None:
-    obs, _ = synthetic_obs()
-    expected = np.linspace(-0.6, 0.6, 7)
-    obs["robot_joint_pos"] = np.concatenate([expected, [0.75]])
-
-    class Api:
-        camera_name = "agentview"
-        wrist_camera_name = "robot0_eye_in_hand"
-
-        def get_observation(self):
-            return obs
-
-    workspace = Workspace(Api(), instruction="test")
-    workspace.refresh_observation()
-
-    np.testing.assert_allclose(workspace.state.arm_joint_positions_rad, expected)
-    assert workspace.state.arm_joint_positions_rad.shape == (7,)
-
-
-def test_preview_preserves_the_exact_ik_solution_for_rendering() -> None:
-    obs, _ = synthetic_obs()
-    expected = np.array([0.1, -0.2, 0.3, -1.7, 0.4, 1.2, 0.8])
-    expected_position = np.array([0.55, 0.0, 0.25])
-
-    class Api:
-        def solve_ik(self, position, quat_wxyz, *, return_info=False):
-            assert return_info
-            np.testing.assert_allclose(position, expected_position)
-            np.testing.assert_allclose(quat_wxyz, TOP_DOWN_QUAT_WXYZ)
-            return expected.copy(), {"orientation_used": "requested"}
-
-    state = ActionState(instruction="test")
-    candidate = Candidate(
-        candidate_id="p1",
-        kind="waypoint",
-        pose=Pose(expected_position.copy(), TOP_DOWN_QUAT_WXYZ.copy()),
-    )
-
-    preview = run_preview(Api(), state, candidate)
-
-    np.testing.assert_allclose(preview.joint_positions_rad, expected)
-    assert preview.ik_ok
-    assert preview.notes == "endpoint IK solved; trajectory not planned"
-    assert preview.summary()["trajectory_planned"] is False
-    assert "path_world" not in vars(preview)
-    assert "collision" not in preview.summary()

@@ -1,17 +1,17 @@
 """Teacher role: a frontier model operating the workspace to produce traces.
 
 There is no teacher-specific loop. The teacher is a provider configuration and
-nothing else — it runs the same :class:`~vaw.agents.runtime.VAWRuntime` over the
-same protocol as the student, which is what makes a teacher trace usable as a
-student training sample without a conversion step.
+nothing else: it runs the same ContextRuntime and protocol as the student.
 
-    from vaw.agents.runtime import run_episode
     from vaw.agents.teacher import teacher_provider
+    from vaw.context_runtime.runtime import run_context_episode
+    from vaw.context_runtime.web_renderer import ContextWebRenderer
 
-    result = run_episode(
+    result = run_context_episode(
         teacher_provider(),
         api,
         "put the red mug on the plate",
+        ContextWebRenderer(),
         trace_dir="runs/vaw/teacher/ep0",
     )
 """

@@ -5,6 +5,10 @@ from __future__ import annotations
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+# Contact-GraspNet's returned pose is 0.0166 m past the predicted fingertip
+# contact along its local approach axis.
+GRASP_POSE_TO_CONTACT_M = -0.0166
+
 # Franka/LIBERO ``solve_ik`` accepts a fingertip/contact TCP target, then
 # targets ``panda_hand`` at this local translation.  The backend's own value is
 # preferred when available; this is the matching default for
@@ -16,6 +20,42 @@ DEFAULT_TCP_TO_HAND_LOCAL_XYZ = (0.0, 0.0, -0.1)
 # LIBERO API applies the same +90 degree local-Z correction before sending a
 # sampled grasp to the robot.  Local Z (the grasp approach axis) is unchanged.
 _GRASPNET_TO_PANDA_HAND = Rotation.from_euler("z", np.pi / 2.0).as_matrix()
+
+
+def approach_axis(quaternion_wxyz: np.ndarray) -> np.ndarray:
+    """Return local +Z of a public wxyz grasp quaternion in robot-base."""
+
+    quaternion = np.asarray(quaternion_wxyz, dtype=np.float64).reshape(4)
+    return Rotation.from_quat(np.roll(quaternion, -1)).as_matrix()[:, 2]
+
+
+def shift_along_approach(
+    position_xyz: np.ndarray,
+    quaternion_wxyz: np.ndarray,
+    distance_m: float,
+) -> np.ndarray:
+    """Shift a position along the grasp frame's local +Z approach axis."""
+
+    position = np.asarray(position_xyz, dtype=np.float64).reshape(3)
+    return position + float(distance_m) * approach_axis(quaternion_wxyz)
+
+
+def project_world_to_pixel(
+    points_world: np.ndarray,
+    intrinsics: np.ndarray,
+    camera_pose_mat: np.ndarray,
+) -> np.ndarray:
+    """Project robot-base points into calibrated camera pixels and depth."""
+
+    points = np.asarray(points_world, dtype=np.float64).reshape(-1, 3)
+    world_to_camera = np.linalg.inv(np.asarray(camera_pose_mat, dtype=np.float64))
+    homogeneous = np.column_stack((points, np.ones(len(points), dtype=np.float64)))
+    camera_points = (world_to_camera @ homogeneous.T).T[:, :3]
+    depth = camera_points[:, 2:3]
+    uvw = (np.asarray(intrinsics, dtype=np.float64) @ camera_points.T).T
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pixels = uvw[:, :2] / np.where(np.abs(depth) < 1e-9, 1e-9, depth)
+    return np.concatenate((pixels, depth), axis=1)
 
 
 def graspnet_pose_to_panda_hand(grasp_pose: np.ndarray) -> np.ndarray:
@@ -135,8 +175,12 @@ def pixel_to_base(
 
 __all__ = [
     "DEFAULT_TCP_TO_HAND_LOCAL_XYZ",
+    "GRASP_POSE_TO_CONTACT_M",
+    "approach_axis",
     "graspnet_pose_to_panda_hand",
     "local_surface_depth",
     "pixel_to_base",
+    "project_world_to_pixel",
+    "shift_along_approach",
     "tcp_position_from_hand_pose",
 ]

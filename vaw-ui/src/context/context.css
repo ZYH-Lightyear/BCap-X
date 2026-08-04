@@ -1,12 +1,27 @@
-html[data-vaw-schema="3"],
-html[data-vaw-schema="3"] body,
-html[data-vaw-schema="3"] #root {
+:root {
+  font-family: "WenQuanYi Micro Hei", "Noto Sans CJK SC", "DejaVu Sans", sans-serif;
+  color: #172033;
+  background: #edf3f9;
+  font-synthesis: none;
+  text-rendering: geometricPrecision;
+}
+
+*,
+*::before,
+*::after { box-sizing: border-box; }
+
+html,
+body,
+#root {
   width: 1440px;
   height: 1080px;
+  margin: 0;
   overflow: hidden;
 }
 
-html[data-vaw-schema="3"] body { background: #edf3f9; }
+body { background: #edf3f9; }
+
+img { display: block; }
 
 .context-workspace,
 .context-workspace * { box-sizing: border-box; }

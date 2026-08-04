@@ -9,9 +9,11 @@ from scipy.spatial.transform import Rotation
 
 from vaw.context_runtime.errors import ContextFunctionError
 from vaw.context_runtime.geometry import (
+    GRASP_POSE_TO_CONTACT_M,
     graspnet_pose_to_panda_hand,
     local_surface_depth,
     pixel_to_base,
+    shift_along_approach,
     tcp_position_from_hand_pose,
 )
 from vaw.context_runtime.model import (
@@ -26,7 +28,6 @@ from vaw.context_runtime.model import (
     SpatialTargetSummary,
 )
 from vaw.context_runtime.motion import MotionBackendError, MotionPlan
-from vaw.geometry import GRASP_POSE_TO_CONTACT_M, shift_along_approach
 
 if TYPE_CHECKING:
     from collections.abc import Callable

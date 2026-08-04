@@ -1,4 +1,4 @@
-"""The Franka hand as real geometry, for drawing the gripper on the canvas.
+"""Franka geometry used by the current VAW Context renderer.
 
 The virtual gripper is the one thing on the canvas no sensor image can show: it
 is where the agent *intends* to put the hand. A stick figure conveys position and

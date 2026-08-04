@@ -3,8 +3,7 @@
 Forked from ``agentx/providers/text_protocol.py``. Wraps any
 :class:`~vaw.agents.providers.base.ModelProvider` and still returns a
 :class:`~vaw.agents.contracts.ModelResponse` with ``tool_calls`` filled in, so
-``ChatSession`` and ``VAWRuntime`` do not change — which is the whole point of
-keeping the provider a separate layer.
+the Context Runtime remains independent of the provider's tool-call transport.
 
 ## Why it exists
 
