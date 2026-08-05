@@ -31,8 +31,8 @@ function Root() {
   useEffect(() => {
     window.__VAW_RENDER__ = async (next) => {
       if (
-        next.schemaVersion !== 3
-        || next.schema !== 'vaw-context-v2'
+        next.schemaVersion !== 4
+        || next.schema !== 'vaw-context-v3'
         || next.viewport.width !== 1440
         || next.viewport.height !== 1080
       ) {

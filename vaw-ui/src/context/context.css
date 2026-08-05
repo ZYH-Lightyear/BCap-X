@@ -51,7 +51,7 @@ img { display: block; }
 
 .ctx-section,
 .ctx-main-view,
-.ctx-wrist-view,
+.ctx-near-field-view,
 .ctx-robot-compact,
 .ctx-fact-card,
 .ctx-candidate,
@@ -99,7 +99,7 @@ img { display: block; }
 }
 
 .ctx-main-view,
-.ctx-wrist-view {
+.ctx-near-field-view {
   position: relative;
   min-width: 0;
   min-height: 0;
@@ -131,7 +131,7 @@ img { display: block; }
 }
 
 .ctx-main-view img,
-.ctx-wrist-view img,
+.ctx-near-field-view img,
 .ctx-decision-image img,
 .ctx-proposal-image > img,
 .ctx-candidate-raster img,

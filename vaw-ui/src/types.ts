@@ -1,6 +1,6 @@
 export interface ContextSnapshot {
-  schemaVersion: 3
-  schema: 'vaw-context-v2'
+  schemaVersion: 4
+  schema: 'vaw-context-v3'
   renderId: string
   revision: number
   viewport: { width: 1440; height: 1080 }
@@ -9,7 +9,7 @@ export interface ContextSnapshot {
   world: {
     taskPrompt: string
     agentviewRasterId: string
-    wristRasterId: string | null
+    nearFieldRasterId: string | null
     robot: {
       source_revision: number
       ee_pose?: { position_xyz: number[]; quaternion_xyzw: number[] }

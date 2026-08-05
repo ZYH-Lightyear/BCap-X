@@ -291,12 +291,26 @@ def create_motion_backend(name: str, api: Any) -> MotionBackend:
 
 def _solve_ik_prediction(api: Any, target: Pose) -> ActionPrediction:
     try:
-        joints = _call(
+        solved = _call(
             api,
             "solve_ik",
             np.asarray(target.position_xyz, dtype=np.float64),
             _xyzw_to_wxyz(target.quaternion_xyzw),
+            return_info=True,
         )
+        if not isinstance(solved, tuple) or len(solved) != 2:
+            raise MotionBackendError(
+                "solve_ik did not report whether the requested orientation was used"
+            )
+        joints, info = solved
+        if not isinstance(info, dict):
+            raise MotionBackendError("solve_ik returned invalid orientation metadata")
+        orientation_used = str(info.get("orientation_used", ""))
+        if orientation_used != "requested":
+            raise MotionBackendError(
+                "solve_ik substituted orientation "
+                f"'{orientation_used or 'unknown'}' for the requested candidate pose"
+            )
         values = _joint_tuple(joints)
     except MotionBackendError as exc:
         return ActionPrediction(solve_ik="error", detail=str(exc))

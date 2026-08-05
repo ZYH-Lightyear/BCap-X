@@ -102,17 +102,20 @@ def test_agent_prompt_is_chinese_and_keeps_wire_identifiers() -> None:
     assert "每轮必须且只能调用一个 Function" in SYSTEM_PROMPT
     assert "唯一的视觉观测" in SYSTEM_PROMPT
     assert "不得只读文字" in SYSTEM_PROMPT
-    assert "agentview 是 PRIMARY" in SYSTEM_PROMPT
-    assert "wrist RGB 只是 AUXILIARY" in SYSTEM_PROMPT
-    assert "只说明二维视线方向近似对齐" in SYSTEM_PROMPT
-    assert "蓝色半透明 self-mask 只标明当前夹爪自身" in SYSTEM_PROMPT
-    assert "close_gripper 成功只说明闭合指令已执行" in SYSTEM_PROMPT
-    assert "done(success=True) 前" in SYSTEM_PROMPT
-    assert "commit 只执行" in SYSTEM_PROMPT
+    assert "AGENTVIEW · PRIMARY" in SYSTEM_PROMPT
+    assert "GRIPPER-LOCAL" in SYSTEM_PROMPT
+    assert "空白表示未观测区域" in SYSTEM_PROMPT
+    assert "世界知识只能生成受当前视觉证据约束的假设" in SYSTEM_PROMPT
+    assert "不得假定任何 Function 存在默认的下一个 Function" in SYSTEM_PROMPT
+    assert "预测所选 Function 的直接物理后果" in SYSTEM_PROMPT
+    assert "可逆、小幅、能够获取信息或改善几何关系" in SYSTEM_PROMPT
+    assert "candidate 和 Action Proposal 是待验证的几何/动作假设" in SYSTEM_PROMPT
+    assert "commit 只执行指定 active Action Proposal" in SYSTEM_PROMPT
+    assert "不移动 TCP，也不保证接触或夹持" in SYSTEM_PROMPT
     assert "0=closed、1=open" in SYSTEM_PROMPT
     assert "每次 Function call 前必须输出一条简短的“决策依据”" in SYSTEM_PROMPT
-    assert "至少一个未选候选" in SYSTEM_PROMPT
-    assert "不得仅按 ID、卡片顺序" in SYSTEM_PROMPT
+    assert "小幅向上 delta_move" not in SYSTEM_PROMPT
+    assert "至少一个未选候选" not in SYSTEM_PROMPT
     definitions = function_definitions()
     assert [item["function"]["name"] for item in definitions] == [
         "inspect",
@@ -253,6 +256,7 @@ def test_context_runtime_sends_only_current_image_and_bounded_history(tmp_path: 
         assert record["result_manifest"]["revision"] == record["revision_after"]
         assert record["decision_basis"] == record["thought"]
         assert "execution_receipt" in record
+        assert "runtime_diagnostics" in record
         assert "raw_response_text" in record
         assert "provider_reasoning" in record
 

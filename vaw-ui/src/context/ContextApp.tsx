@@ -52,9 +52,9 @@ function PersistentWorld({ snapshot }: { snapshot: ContextSnapshot }) {
           <div className="ctx-view-label"><strong>AGENTVIEW · PRIMARY</strong><span>CURRENT RGB</span></div>
           <Raster snapshot={snapshot} id={snapshot.world.agentviewRasterId} alt="当前主视角" />
         </article>
-        <article className="ctx-wrist-view">
-          <div className="ctx-view-label"><strong>WRIST · AUXILIARY</strong><span>CURRENT RGB</span></div>
-          <Raster snapshot={snapshot} id={snapshot.world.wristRasterId} alt="当前手摄视角" />
+        <article className="ctx-near-field-view">
+          <div className="ctx-view-label"><strong>GRIPPER-LOCAL · GEOMETRY</strong><span>CURRENT FUSED RGB-D</span></div>
+          <Raster snapshot={snapshot} id={snapshot.world.nearFieldRasterId} alt="当前夹爪近场几何" />
         </article>
       </div>
     </section>

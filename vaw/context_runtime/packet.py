@@ -19,16 +19,20 @@ from vaw.context_runtime.gripper_mesh import (
     rasterize_silhouette,
 )
 from vaw.context_runtime.model import ContextState, PointEvidence, Pose, RobotState
+from vaw.context_runtime.near_field import render_near_field
 from vaw.context_runtime.workspace import ContextWorkspace
 
-CONTEXT_SCHEMA = "vaw-context-v2"
-CONTEXT_WEB_SCHEMA_VERSION = 3
+CONTEXT_SCHEMA = "vaw-context-v3"
+CONTEXT_WEB_SCHEMA_VERSION = 4
 CONTEXT_WIDTH = 1440
 CONTEXT_HEIGHT = 1080
 
 BLUE = (37, 99, 235)
 GREEN = (22, 163, 74)
 VIOLET = (124, 58, 237)
+
+_CANDIDATE_FK_POSITION_TOLERANCE_M = 0.02
+_CANDIDATE_FK_ROTATION_TOLERANCE_RAD = 0.10
 
 DecisionMode = Literal[
     "idle",
@@ -127,7 +131,7 @@ class CandidateSpec:
 class WorldContextSpec:
     task_prompt: str
     agentview_raster_id: str
-    wrist_raster_id: str | None
+    near_field_raster_id: str | None
     robot: RobotState | None
     active_action: dict[str, Any] | None
     latest_event: dict[str, Any] | None
@@ -137,7 +141,7 @@ class WorldContextSpec:
         return {
             "taskPrompt": self.task_prompt,
             "agentviewRasterId": self.agentview_raster_id,
-            "wristRasterId": self.wrist_raster_id,
+            "nearFieldRasterId": self.near_field_raster_id,
             "robot": self.robot.summary() if self.robot is not None else None,
             "activeAction": self.active_action,
             "latestEvent": self.latest_event,
@@ -231,22 +235,27 @@ class ContextCompiler:
         private = workspace._private
         camera = private.camera(workspace.camera_name)
         rgb = _rgb(camera)
-        wrist = None
         wrist_camera = None
         with suppress(RuntimeError, ValueError):
             wrist_camera = private.camera(workspace.wrist_camera_name)
-            wrist = _rgb(wrist_camera)
+        near_field = render_near_field(camera, wrist_camera, state.robot)
 
         # The persistent world view is deliberately sensor-clean.  All
         # grounding, self and imagination overlays belong to the dynamic
         # decision workspace below it.
         rasters: dict[str, np.ndarray] = {"agentview": rgb.copy()}
-        if wrist is not None:
-            rasters["wrist"] = wrist.copy()
+        if near_field is not None:
+            rasters["near_field"] = near_field
 
         region_specs = self._compile_regions(state, rgb, private.region_masks, rasters)
         point_specs = self._compile_points(state, rgb, rasters)
-        candidate_specs = self._compile_candidates(state, rgb, camera, rasters)
+        candidate_specs = self._compile_candidates(
+            state,
+            rgb,
+            camera,
+            rasters,
+            tcp_to_hand_local_xyz=workspace._tcp_to_hand_local_xyz,
+        )
         decision = _decision_spec(state)
         if decision.mode == "proposal" and state.active_action is not None:
             raster_id = "decision:proposal"
@@ -278,7 +287,9 @@ class ContextCompiler:
             world=WorldContextSpec(
                 task_prompt=state.task_prompt,
                 agentview_raster_id="agentview",
-                wrist_raster_id="wrist" if wrist is not None else None,
+                near_field_raster_id=(
+                    "near_field" if near_field is not None else None
+                ),
                 robot=state.robot,
                 active_action=(
                     state.active_action.summary() if state.active_action is not None else None
@@ -363,6 +374,8 @@ class ContextCompiler:
         rgb: np.ndarray,
         camera: dict[str, Any],
         rasters: dict[str, np.ndarray],
+        *,
+        tcp_to_hand_local_xyz: np.ndarray,
     ) -> list[CandidateSpec]:
         specs: list[CandidateSpec] = []
         for candidate in state.candidates.values():
@@ -395,26 +408,36 @@ class ContextCompiler:
                 )
             robot_mask = None
             gripper_mask = None
+            displayed_solve_ik = candidate.prediction.solve_ik
             if candidate.prediction.joint_positions_rad is not None:
-                opening = (
-                    state.robot.gripper_opening
-                    if state.robot is not None and state.robot.gripper_opening is not None
-                    else 1.0
-                )
-                robot_mask = _robot_mask(
+                preview_matches = _candidate_fk_matches_target(
                     candidate.prediction.joint_positions_rad,
-                    opening,
-                    camera,
-                    rgb.shape[1],
-                    rgb.shape[0],
+                    candidate.target_pose,
+                    tcp_to_hand_local_xyz,
                 )
-                gripper_mask = _gripper_mask(
-                    candidate.prediction.joint_positions_rad,
-                    opening,
-                    camera,
-                    rgb.shape[1],
-                    rgb.shape[0],
-                )
+                if preview_matches:
+                    opening = (
+                        state.robot.gripper_opening
+                        if state.robot is not None
+                        and state.robot.gripper_opening is not None
+                        else 1.0
+                    )
+                    robot_mask = _robot_mask(
+                        candidate.prediction.joint_positions_rad,
+                        opening,
+                        camera,
+                        rgb.shape[1],
+                        rgb.shape[0],
+                    )
+                    gripper_mask = _gripper_mask(
+                        candidate.prediction.joint_positions_rad,
+                        opening,
+                        camera,
+                        rgb.shape[1],
+                        rgb.shape[0],
+                    )
+                else:
+                    displayed_solve_ik = "mismatch"
             rasters[raster_id] = _candidate_crop(
                 rgb,
                 source.bbox_xyxy_px if source is not None else None,
@@ -431,7 +454,7 @@ class ContextCompiler:
                     target_pose=candidate.target_pose,
                     delta_from_anchor_xyz_m=delta,
                     approach_vector_base=approach,
-                    solve_ik=candidate.prediction.solve_ik,
+                    solve_ik=displayed_solve_ik,
                     source_revision=candidate.source_revision,
                     raster_id=raster_id,
                 )
@@ -1089,6 +1112,49 @@ def _source_bbox(
     return _pixel_box(projected, radius=18.0)
 
 
+def _candidate_fk_matches_target(
+    joints: tuple[float, ...],
+    target: Pose,
+    tcp_to_hand_local_xyz: np.ndarray,
+) -> bool:
+    """Whether preview joints actually realise the candidate TCP pose.
+
+    Reduced ``solve_ik`` may clamp the requested position or substitute a
+    fallback orientation. Its returned joints remain valid robot joints, but
+    rendering them as the original candidate would be misleading. Validate
+    the exact URDF FK before allowing a whole-arm mask onto a candidate card.
+    """
+
+    fk = load_panda_urdf_fk()
+    if fk is None:
+        return False
+    try:
+        actual_hand = fk.frame(np.asarray(joints), "panda_hand")
+        target_rotation = Rotation.from_quat(
+            np.asarray(target.quaternion_xyzw, dtype=np.float64)
+        ).as_matrix()
+        expected_hand_position = np.asarray(
+            target.position_xyz, dtype=np.float64
+        ) + target_rotation @ np.asarray(
+            tcp_to_hand_local_xyz, dtype=np.float64
+        ).reshape(3)
+        position_error = float(
+            np.linalg.norm(actual_hand[:3, 3] - expected_hand_position)
+        )
+        rotation_error = float(
+            (
+                Rotation.from_matrix(actual_hand[:3, :3]).inv()
+                * Rotation.from_matrix(target_rotation)
+            ).magnitude()
+        )
+    except (RuntimeError, ValueError, np.linalg.LinAlgError):
+        return False
+    return (
+        position_error <= _CANDIDATE_FK_POSITION_TOLERANCE_M
+        and rotation_error <= _CANDIDATE_FK_ROTATION_TOLERANCE_RAD
+    )
+
+
 def _robot_mask(
     joints: tuple[float, ...],
     opening: float,
@@ -1137,10 +1203,15 @@ def _panda_mask(
 def _project_pose(pose: Pose, camera: dict[str, Any]) -> tuple[float, float, float, float] | None:
     rotation = Rotation.from_quat(np.asarray(pose.quaternion_xyzw)).as_matrix()
     origin = np.asarray(pose.position_xyz, dtype=np.float64)
-    axis = origin + rotation[:, 2] * 0.06
+    # The public approach vector is local +Z from panda_hand toward the TCP.
+    # Draw the arrow from the hand side into the contact point so the raster
+    # direction matches CandidateSpec.approachVector exactly.
+    hand_side = origin - rotation[:, 2] * 0.06
     try:
         projected = project_world_to_pixel(
-            np.stack([origin, axis]), camera["intrinsics"], camera["pose_mat"]
+            np.stack([origin, hand_side]),
+            camera["intrinsics"],
+            camera["pose_mat"],
         )
     except (KeyError, ValueError, np.linalg.LinAlgError):
         return None

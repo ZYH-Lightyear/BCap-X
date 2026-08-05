@@ -33,7 +33,10 @@ class FakeContextApi:
         self.point_outputs: list[list[float]] = []
         self.solve_calls: list[tuple[np.ndarray, np.ndarray]] = []
         self.move_calls: list[np.ndarray] = []
+        self.pointcloud_grasp_calls: list[tuple[np.ndarray, np.ndarray]] = []
+        self.use_pointcloud_grasp = True
         self.solve_errors_remaining = 0
+        self.orientation_used = "requested"
         self.move_error = False
         self._last_solve_position = self.cartesian[:3].copy()
         self._last_solve_quaternion = self.cartesian[3:7].copy()
@@ -68,12 +71,36 @@ class FakeContextApi:
 
     def plan_grasp(self, depth, intrinsics, mask):
         first = np.eye(4, dtype=np.float64)
+        first[:3, :3] = Rotation.from_euler("x", np.pi).as_matrix()
         first[:3, 3] = [0.1, 0.2, 0.3]
         second = np.eye(4, dtype=np.float64)
+        second[:3, :3] = Rotation.from_euler("x", np.pi).as_matrix()
         second[:3, 3] = [0.4, 0.5, 0.6]
         return [first, second], [0.2, 0.8]
 
-    def solve_ik(self, position, quaternion_wxyz):
+    def plan_grasp_from_point_clouds(self, pc_full, pc_segment):
+        if not self.use_pointcloud_grasp:
+            raise RuntimeError("point-cloud grasp disabled")
+        self.pointcloud_grasp_calls.append(
+            (
+                np.asarray(pc_full, dtype=np.float64).copy(),
+                np.asarray(pc_segment, dtype=np.float64).copy(),
+            )
+        )
+        first = np.eye(4, dtype=np.float64)
+        first[:3, :3] = Rotation.from_euler("x", np.pi).as_matrix()
+        first[:3, 3] = [0.1, 0.2, 0.3]
+        second = np.eye(4, dtype=np.float64)
+        second[:3, :3] = Rotation.from_euler("x", np.pi).as_matrix()
+        second[:3, 3] = [0.4, 0.5, 0.6]
+        first = self.pose_mat @ first
+        second = self.pose_mat @ second
+        return [first, second], [0.2, 0.8]
+
+    def filter_noise(self, points, colors=None):
+        return np.asarray(points, dtype=np.float64), colors
+
+    def solve_ik(self, position, quaternion_wxyz, *, return_info=False):
         position = np.asarray(position, dtype=np.float64).copy()
         quaternion = np.asarray(quaternion_wxyz, dtype=np.float64).copy()
         self.solve_calls.append((position, quaternion))
@@ -82,7 +109,10 @@ class FakeContextApi:
         if self.solve_errors_remaining:
             self.solve_errors_remaining -= 1
             raise RuntimeError("solver unavailable")
-        return np.arange(7, dtype=np.float64)
+        joints = np.arange(7, dtype=np.float64)
+        if return_info:
+            return joints, {"orientation_used": self.orientation_used}
+        return joints
 
     def move_to_joints(self, joints):
         if self.move_error:
@@ -544,6 +574,50 @@ def test_grasp_candidates_cache_ik_and_selection_reuses_it() -> None:
     assert len(api.solve_calls) == 2
 
 
+def test_candidate_preview_rejects_solve_ik_orientation_fallback() -> None:
+    api = FakeContextApi()
+    api.orientation_used = "top-down"
+    workspace = ContextWorkspace(api, "pick the mug", motion_backend="pyroki")
+    region_id = workspace.execute("inspect", query="mug").result["region_id"]
+
+    workspace.execute("propose_grasps", region_id=region_id)
+
+    prediction = workspace.state.candidates["g1"].prediction
+    assert prediction.solve_ik == "error"
+    assert prediction.joint_positions_rad is None
+    assert "substituted orientation 'top-down'" in prediction.detail
+
+
+def test_propose_grasps_uses_single_view_planner() -> None:
+    api = FakeContextApi()
+    workspace = ContextWorkspace(api, "pick the mug", motion_backend="pyroki")
+
+    region_id = workspace.execute("inspect", query="mug").result["region_id"]
+    candidates = workspace.execute("propose_grasps", region_id=region_id)
+
+    assert candidates.result == {"candidate_ids": ["g1", "g2"]}
+    assert api.pointcloud_grasp_calls == []
+    diagnostic = candidates.trace_diagnostics["grasp_candidates"]
+    assert diagnostic["selected_source"] == "single_view"
+    assert [attempt["source"] for attempt in diagnostic["attempts"]] == [
+        "single_view"
+    ]
+    public = json.dumps(candidates.result).lower()
+    for forbidden in ("mask", "depth", "intrinsics", "pose_mat", "cloud"):
+        assert forbidden not in public
+
+
+def test_propose_grasps_does_not_call_multiview_planner_when_available() -> None:
+    api = FakeContextApi()
+    workspace = ContextWorkspace(api, "pick the mug", motion_backend="pyroki")
+    region_id = workspace.execute("inspect", query="mug").result["region_id"]
+
+    candidates = workspace.execute("propose_grasps", region_id=region_id)
+
+    assert candidates.result == {"candidate_ids": ["g1", "g2"]}
+    assert api.pointcloud_grasp_calls == []
+
+
 def test_graspnet_pose_is_adapted_to_panda_hand_axes() -> None:
     graspnet_pose = np.eye(4, dtype=np.float64)
     graspnet_pose[:3, 3] = [0.1, 0.2, 0.3]
@@ -559,7 +633,11 @@ def test_graspnet_pose_is_adapted_to_panda_hand_axes() -> None:
     region_id = workspace.execute("inspect", query="mug").result["region_id"]
     workspace.execute("propose_grasps", region_id=region_id)
 
-    expected_wxyz = np.array([np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)])
+    expected_rotation = Rotation.from_matrix(
+        Rotation.from_euler("x", 180.0, degrees=True).as_matrix()
+        @ Rotation.from_euler("z", 90.0, degrees=True).as_matrix()
+    )
+    expected_wxyz = np.roll(expected_rotation.as_quat(), 1)
     assert np.allclose(api.solve_calls[0][1], expected_wxyz)
 
 

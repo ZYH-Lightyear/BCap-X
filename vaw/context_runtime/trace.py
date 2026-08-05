@@ -62,6 +62,9 @@ class ContextTraceLogger:
             "function_call": function_call,
             "function_result": step.result if step is not None else None,
             "execution_receipt": step.trace_receipt if step is not None else None,
+            "runtime_diagnostics": (
+                step.trace_diagnostics if step is not None else None
+            ),
             "revision_before": step.revision_before if step is not None else packet.revision,
             "revision_after": step.revision_after if step is not None else packet.revision,
             "decision_basis": thought,

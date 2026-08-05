@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from capx.utils.depth_utils import depth_to_pointcloud
 from vaw.context_runtime.errors import ContextFunctionError
 from vaw.context_runtime.geometry import (
     GRASP_POSE_TO_CONTACT_M,
@@ -28,11 +30,20 @@ from vaw.context_runtime.model import (
     SpatialTargetSummary,
 )
 from vaw.context_runtime.motion import MotionBackendError, MotionPlan
+from vaw.context_runtime.private import RegionGeometryArtifact
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from vaw.context_runtime.workspace import ContextWorkspace
+
+
+@dataclass(frozen=True)
+class _PreparedGrasp:
+    target: Pose
+    score: float
+    raw_index: int
+    approach_z: float
 
 
 class ContextFunctions:
@@ -100,6 +111,13 @@ class ContextFunctions:
             source_revision=self.ws.state.observation_revision,
         )
         self.ws._private.region_masks[region_id] = global_mask
+        geometry = self._build_region_geometry(
+            str(query),
+            global_mask,
+            float(best.get("score", 0.0)),
+        )
+        if geometry is not None:
+            self.ws._private.region_geometry[region_id] = geometry
         return {
             "region_id": region_id,
             "bbox_xyxy_px": [round(float(value), 3) for value in global_box],
@@ -157,54 +175,135 @@ class ContextFunctions:
         mask = self.ws._private.region_masks.get(region.region_id)
         if mask is None:
             raise ContextFunctionError(f"region '{region_id}' has no private mask")
+        geometry = self.ws._private.region_geometry.get(region.region_id)
         planned = self.ws._call_backend(
             "plan_grasp",
             _camera_image(camera, "depth"),
             camera["intrinsics"],
             mask.astype(np.int64),
         )
-        if not isinstance(planned, tuple) or len(planned) != 2:
-            raise ContextFunctionError("grasp planner did not return poses and scores")
-        poses_camera, scores = planned
-        scores_array = np.asarray(scores, dtype=np.float64).reshape(-1)
-        poses_array = np.asarray(poses_camera, dtype=np.float64)
-        if scores_array.size == 0:
-            raise ContextFunctionError(f"grasp planner returned no candidates for '{region_id}'")
-        if poses_array.shape != (scores_array.size, 4, 4):
-            raise ContextFunctionError(
-                f"grasp poses {poses_array.shape} do not match {scores_array.size} scores"
-            )
-        order = np.argsort(scores_array, kind="stable")[::-1][: self.ws.MAX_GRASP_CANDIDATES]
         try:
-            base_from_camera = np.asarray(camera["pose_mat"], dtype=np.float64).reshape(4, 4)
+            base_from_camera = np.asarray(
+                camera["pose_mat"], dtype=np.float64
+            ).reshape(4, 4)
         except (KeyError, ValueError) as exc:
             raise ContextFunctionError(f"invalid camera pose: {exc}") from exc
+        prepared, diagnostic = _prepare_grasps(
+            planned,
+            poses_are_base_frame=False,
+            base_from_camera=base_from_camera,
+            object_points_base=(
+                geometry.filtered_object_points_base
+                if geometry is not None
+                else None
+            ),
+        )
+        self.ws._private.trace_diagnostics["grasp_candidates"] = {
+            "selected_source": "single_view" if prepared else None,
+            "object_points": _point_summary(
+                geometry.filtered_object_points_base if geometry is not None else None
+            ),
+            "attempts": [{"source": "single_view", **diagnostic}],
+        }
+        if not prepared:
+            raise ContextFunctionError(
+                f"grasp planner returned no geometrically valid candidates for '{region_id}'"
+            )
 
         ids: list[str] = []
-        for index in order:
-            base_from_graspnet = base_from_camera @ poses_array[index]
-            base_from_hand = graspnet_pose_to_panda_hand(base_from_graspnet)
-            quaternion_xyzw = Rotation.from_matrix(base_from_hand[:3, :3]).as_quat()
-            contact = shift_along_approach(
-                base_from_hand[:3, 3],
-                np.roll(quaternion_xyzw, 1),
-                GRASP_POSE_TO_CONTACT_M,
-            )
-            target = Pose(
-                tuple(float(value) for value in contact),
-                tuple(float(value) for value in quaternion_xyzw),
-            )
+        ordered = sorted(prepared, key=lambda item: item.score, reverse=True)
+        for item in ordered[: self.ws.MAX_GRASP_CANDIDATES]:
             candidate_id = self.ws.state.next_id("g")
             self.ws.state.candidates[candidate_id] = ActionCandidate(
                 candidate_id=candidate_id,
                 kind="grasp",
                 source_ref=region_id,
-                target_pose=target,
+                target_pose=item.target,
                 source_revision=self.ws.state.observation_revision,
-                prediction=self._predict(target),
+                prediction=self._predict(item.target),
             )
             ids.append(candidate_id)
         return {"candidate_ids": ids}
+
+    def _build_region_geometry(
+        self,
+        query: str,
+        agentview_mask: np.ndarray,
+        agentview_score: float,
+    ) -> RegionGeometryArtifact | None:
+        try:
+            agent_camera = self.ws._camera()
+            agent_points = _masked_points_base(agent_camera, agentview_mask)
+            object_points = agent_points
+            scene_parts = [_scene_points_base(agent_camera)]
+        except (ContextFunctionError, KeyError, ValueError, np.linalg.LinAlgError):
+            return None
+
+        wrist_mask: np.ndarray | None = None
+        try:
+            wrist_camera = self.ws._private.camera(self.ws.wrist_camera_name)
+            scene_parts.append(_scene_points_base(wrist_camera))
+            wrist = self._segment_wrist_mask(wrist_camera, query)
+            wrist_mask = wrist[0] if wrist is not None else None
+            if wrist_mask is not None:
+                wrist_points = _masked_points_base(wrist_camera, wrist_mask)
+                object_points = _merge_multiview_object_points(
+                    agent_points,
+                    float(agentview_score),
+                    wrist_points,
+                    float(wrist[1]),
+                )
+        except (RuntimeError, ContextFunctionError, KeyError, ValueError, np.linalg.LinAlgError):
+            wrist_mask = None
+
+        scene_points = _stack_points(scene_parts)
+        filtered = self._filter_object_points(object_points)
+        if not _has_points(filtered):
+            filtered = object_points
+        return RegionGeometryArtifact(
+            agentview_mask=np.asarray(agentview_mask, dtype=bool).copy(),
+            wrist_mask=None if wrist_mask is None else np.asarray(wrist_mask, dtype=bool).copy(),
+            object_points_base=object_points,
+            scene_points_base=scene_points,
+            filtered_object_points_base=filtered,
+        )
+
+    def _segment_wrist_mask(
+        self, wrist_camera: dict[str, Any], query: str
+    ) -> tuple[np.ndarray, float] | None:
+        segment = getattr(self.ws.api, "segment_sam3_text_prompt", None)
+        if not callable(segment):
+            return None
+        rgb = _camera_image(wrist_camera, "rgb")
+        try:
+            results = segment(rgb, query)
+        except Exception:
+            return None
+        if not isinstance(results, (list, tuple)):
+            return None
+        valid = [
+            item for item in results if isinstance(item, dict) and item.get("mask") is not None
+        ]
+        if not valid:
+            return None
+        best = max(valid, key=lambda item: float(item.get("score", 0.0)))
+        mask = np.asarray(best["mask"], dtype=bool)
+        if mask.shape != rgb.shape[:2]:
+            return None
+        return mask, float(best.get("score", 0.0))
+
+    def _filter_object_points(self, points: np.ndarray) -> np.ndarray:
+        if not _has_points(points):
+            return points
+        filter_noise = getattr(self.ws.api, "filter_noise", None)
+        if not callable(filter_noise):
+            return points
+        try:
+            filtered, _ = filter_noise(points)
+        except Exception:
+            return points
+        filtered_array = _points_array(filtered)
+        return filtered_array if _has_points(filtered_array) else points
 
     def propose_pose(
         self,
@@ -544,6 +643,277 @@ def _camera_image(camera: dict[str, Any], name: str) -> np.ndarray:
     except (KeyError, TypeError) as exc:
         raise ContextFunctionError(f"camera has no {name} image") from exc
     return image
+
+
+def _camera_depth(camera: dict[str, Any]) -> np.ndarray:
+    depth = _camera_image(camera, "depth")
+    if depth.ndim == 3 and depth.shape[-1] == 1:
+        depth = depth[:, :, 0]
+    if depth.ndim != 2:
+        raise ContextFunctionError(f"camera depth must be 2D, got {depth.shape}")
+    return np.asarray(depth, dtype=np.float64)
+
+
+def _camera_pose(camera: dict[str, Any]) -> np.ndarray:
+    try:
+        return np.asarray(camera["pose_mat"], dtype=np.float64).reshape(4, 4)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ContextFunctionError(f"invalid camera pose: {exc}") from exc
+
+
+def _camera_intrinsics(camera: dict[str, Any]) -> np.ndarray:
+    try:
+        return np.asarray(camera["intrinsics"], dtype=np.float64).reshape(3, 3)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ContextFunctionError(f"invalid camera intrinsics: {exc}") from exc
+
+
+def _scene_points_base(camera: dict[str, Any]) -> np.ndarray:
+    points_camera = depth_to_pointcloud(
+        _camera_depth(camera),
+        _camera_intrinsics(camera),
+        subsample_factor=1,
+        filter_invalid=True,
+    )
+    return _transform_points(_points_array(points_camera), _camera_pose(camera))
+
+
+def _masked_points_base(camera: dict[str, Any], mask: np.ndarray) -> np.ndarray:
+    depth = _camera_depth(camera)
+    mask_array = np.asarray(mask, dtype=bool)
+    if mask_array.shape != depth.shape:
+        raise ContextFunctionError(
+            f"mask shape {mask_array.shape} does not match depth {depth.shape}"
+        )
+    points_camera = depth_to_pointcloud(
+        depth,
+        _camera_intrinsics(camera),
+        subsample_factor=1,
+        filter_invalid=False,
+    )
+    points = _points_array(points_camera)
+    flat_mask = mask_array.reshape(-1)
+    if flat_mask.shape[0] != points.shape[0]:
+        raise ContextFunctionError(
+            f"mask has {flat_mask.shape[0]} pixels but point cloud has {points.shape[0]} points"
+        )
+    valid = (
+        flat_mask
+        & np.isfinite(points).all(axis=1)
+        & (points[:, 2] >= 0.015)
+        & (points[:, 2] <= 20.0)
+    )
+    return _transform_points(points[valid], _camera_pose(camera))
+
+
+def _transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    points = _points_array(points)
+    if points.shape[0] == 0:
+        return points
+    ones = np.ones((points.shape[0], 1), dtype=np.float64)
+    homogeneous = np.concatenate([points, ones], axis=1)
+    return (transform @ homogeneous.T).T[:, :3]
+
+
+def _stack_points(parts: list[np.ndarray]) -> np.ndarray:
+    arrays = [_points_array(part) for part in parts if _has_points(part)]
+    if not arrays:
+        return np.empty((0, 3), dtype=np.float64)
+    return np.concatenate(arrays, axis=0)
+
+
+def _merge_multiview_object_points(
+    agent_points: np.ndarray,
+    agent_score: float,
+    wrist_points: np.ndarray,
+    wrist_score: float,
+) -> np.ndarray:
+    agent = _points_array(agent_points)
+    wrist = _points_array(wrist_points)
+    if agent.shape[0] == 0:
+        return wrist
+    if wrist.shape[0] == 0:
+        return agent
+    # Match CaP-X Full API's conservative merge: combine views only when the
+    # two segmented clouds agree spatially, otherwise trust the higher-score
+    # segmentation instead of mixing likely-wrong object points.
+    agent_probe = _deterministic_point_sample(agent, 3000)
+    wrist_probe = _deterministic_point_sample(wrist, 3000)
+    distances = np.linalg.norm(
+        agent_probe[:, np.newaxis, :] - wrist_probe[np.newaxis, :, :], axis=2
+    )
+    if float(np.min(distances)) < 0.01:
+        return np.concatenate([agent, wrist], axis=0)
+    return wrist if wrist_score > agent_score else agent
+
+
+def _deterministic_point_sample(points: np.ndarray, limit: int) -> np.ndarray:
+    if points.shape[0] <= limit:
+        return points
+    indices = np.linspace(0, points.shape[0] - 1, num=limit, dtype=np.int64)
+    return points[indices]
+
+
+def _points_array(points: Any) -> np.ndarray:
+    array = np.asarray(points, dtype=np.float64)
+    if array.size == 0:
+        return np.empty((0, 3), dtype=np.float64)
+    return array.reshape(-1, 3)
+
+
+def _has_points(points: Any) -> bool:
+    try:
+        return _points_array(points).shape[0] > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _prepare_grasps(
+    planned: Any,
+    *,
+    poses_are_base_frame: bool,
+    base_from_camera: np.ndarray | None,
+    object_points_base: np.ndarray | None,
+) -> tuple[list[_PreparedGrasp], dict[str, Any]]:
+    """Convert planner output without inventing a different approach pose.
+
+    Contact-GraspNet's local +Z is the hand-to-contact direction used by the
+    Franka TCP offset.  A positive base-Z component would therefore place the
+    hand below a tabletop contact.  Such candidates are rejected so the caller
+    can fall back to the independent single-view planner; they are never
+    repaired by rotating the gripper 180 degrees around the contact point.
+    """
+
+    if not isinstance(planned, tuple) or len(planned) != 2:
+        raise ContextFunctionError("grasp planner did not return poses and scores")
+    poses, scores = planned
+    try:
+        scores_array = np.asarray(scores, dtype=np.float64).reshape(-1)
+        poses_array = np.asarray(poses, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ContextFunctionError(f"invalid grasp planner output: {exc}") from exc
+    if scores_array.size == 0:
+        return [], {"raw_count": 0, "accepted_count": 0, "rejected": []}
+    if poses_array.shape != (scores_array.size, 4, 4):
+        raise ContextFunctionError(
+            f"grasp poses {poses_array.shape} do not match {scores_array.size} scores"
+        )
+    if not poses_are_base_frame and base_from_camera is None:
+        raise ContextFunctionError("camera-frame grasps require a camera pose")
+
+    object_points = (
+        _points_array(object_points_base)
+        if object_points_base is not None and _has_points(object_points_base)
+        else np.empty((0, 3), dtype=np.float64)
+    )
+    prepared: list[_PreparedGrasp] = []
+    rejected: list[dict[str, Any]] = []
+    for index, (pose, score) in enumerate(
+        zip(poses_array, scores_array, strict=True)
+    ):
+        reasons: list[str] = []
+        if not np.isfinite(score):
+            reasons.append("non_finite_score")
+        if not np.isfinite(pose).all():
+            reasons.append("non_finite_pose")
+        elif not np.allclose(pose[3], [0.0, 0.0, 0.0, 1.0], atol=1e-5):
+            reasons.append("invalid_homogeneous_row")
+        else:
+            rotation = pose[:3, :3]
+            if not np.allclose(rotation.T @ rotation, np.eye(3), atol=5e-3) or not np.isclose(
+                np.linalg.det(rotation), 1.0, atol=5e-3
+            ):
+                reasons.append("invalid_rotation")
+        if reasons:
+            rejected.append({"index": index, "reasons": reasons})
+            continue
+
+        base_from_graspnet = (
+            pose if poses_are_base_frame else np.asarray(base_from_camera) @ pose
+        )
+        base_from_hand = graspnet_pose_to_panda_hand(base_from_graspnet)
+        quaternion_xyzw = Rotation.from_matrix(base_from_hand[:3, :3]).as_quat()
+        approach_z = float(base_from_hand[2, 2])
+        contact = shift_along_approach(
+            base_from_hand[:3, 3],
+            np.roll(quaternion_xyzw, 1),
+            GRASP_POSE_TO_CONTACT_M,
+        )
+        nearest_object_m = None
+        if object_points.shape[0]:
+            nearest_object_m = float(
+                np.min(np.linalg.norm(object_points - contact[None, :], axis=1))
+            )
+        if approach_z > 0.0:
+            rejected.append(
+                {
+                    "index": index,
+                    "reasons": ["approach_points_upward"],
+                    "approach_z": round(approach_z, 6),
+                    "target_xyz": _rounded_vector(contact),
+                    "nearest_object_m": _rounded_scalar(nearest_object_m),
+                }
+            )
+            continue
+        prepared.append(
+            _PreparedGrasp(
+                target=Pose(
+                    tuple(float(value) for value in contact),
+                    tuple(float(value) for value in quaternion_xyzw),
+                ),
+                score=float(score),
+                raw_index=index,
+                approach_z=approach_z,
+            )
+        )
+
+    accepted = [
+        {
+            "index": item.raw_index,
+            "approach_z": round(item.approach_z, 6),
+            "target_xyz": _rounded_vector(item.target.position_xyz),
+            "nearest_object_m": _rounded_scalar(
+                float(
+                    np.min(
+                        np.linalg.norm(
+                            object_points
+                            - np.asarray(item.target.position_xyz)[None, :],
+                            axis=1,
+                        )
+                    )
+                )
+                if object_points.shape[0]
+                else None
+            ),
+        }
+        for item in prepared
+    ]
+    return prepared, {
+        "raw_count": int(scores_array.size),
+        "accepted_count": len(prepared),
+        "accepted": accepted,
+        "rejected": rejected,
+    }
+
+
+def _point_summary(points: Any) -> dict[str, Any]:
+    if not _has_points(points):
+        return {"count": 0}
+    array = _points_array(points)
+    return {
+        "count": int(array.shape[0]),
+        "min_xyz": _rounded_vector(np.min(array, axis=0)),
+        "max_xyz": _rounded_vector(np.max(array, axis=0)),
+        "centroid_xyz": _rounded_vector(np.mean(array, axis=0)),
+    }
+
+
+def _rounded_vector(values: Any) -> list[float]:
+    return [round(float(value), 6) for value in np.asarray(values).reshape(-1)]
+
+
+def _rounded_scalar(value: float | None) -> float | None:
+    return None if value is None else round(float(value), 6)
 
 
 def _bounded_box(box: Any, width: int, height: int) -> tuple[float, float, float, float]:

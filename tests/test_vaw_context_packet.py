@@ -4,6 +4,7 @@ import json
 
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
 import vaw.context_runtime.packet as packet_module
 from tests.test_vaw_context_runtime import FakeContextApi
@@ -67,20 +68,24 @@ def test_context_packet_is_deterministic_and_normalized() -> None:
     first_candidate = first.catalog.candidates[0]
     assert first_candidate.kind == "grasp"
     assert first_candidate.source_ref == "region1"
-    assert first_candidate.solve_ik == "returned"
+    # The fake solver returns arbitrary joints unrelated to its requested TCP.
+    # The packet must not present that FK as an exact candidate preview.
+    assert first_candidate.solve_ik == "mismatch"
     assert first_candidate.delta_from_anchor_xyz_m is not None
     assert np.isclose(np.linalg.norm(first_candidate.approach_vector_base), 1.0)
     candidate_raster = first.rasters[first_candidate.raster_id]
     assert np.any(np.all(candidate_raster == np.array([124, 58, 237]), axis=-1))
 
 
-def test_persistent_world_rasters_are_clean_sensor_rgb() -> None:
+def test_persistent_world_replaces_raw_wrist_with_near_field_geometry() -> None:
     workspace = _workspace_with_evidence()
 
     packet = ContextCompiler().compile(workspace)
 
     assert np.array_equal(packet.rasters["agentview"], workspace.api.rgb)
-    assert np.array_equal(packet.rasters["wrist"], workspace.api.rgb)
+    assert "wrist" not in packet.rasters
+    assert packet.world.near_field_raster_id == "near_field"
+    assert packet.rasters["near_field"].shape == (540, 480, 3)
 
 
 def test_imagined_gripper_is_more_prominent_than_the_arm() -> None:
@@ -127,6 +132,64 @@ def test_candidate_focus_ignores_full_arm_extent() -> None:
     assert raster.shape[1] < rgb.shape[1] // 2
 
 
+def test_candidate_fk_mismatch_is_checked_against_exact_target(monkeypatch) -> None:
+    target = Pose(
+        (0.4, -0.1, 0.2),
+        tuple(
+            Rotation.from_euler("y", 25.0, degrees=True).as_quat().tolist()
+        ),
+    )
+    offset = np.array([0.0, 0.0, -0.1168], dtype=np.float64)
+    rotation = Rotation.from_quat(target.quaternion_xyzw).as_matrix()
+    expected = np.eye(4, dtype=np.float64)
+    expected[:3, :3] = rotation
+    expected[:3, 3] = np.asarray(target.position_xyz) + rotation @ offset
+
+    class FakeFK:
+        def __init__(self, frame):
+            self.value = frame
+
+        def frame(self, joints, frame_name):
+            del joints, frame_name
+            return self.value
+
+    monkeypatch.setattr(
+        packet_module, "load_panda_urdf_fk", lambda: FakeFK(expected)
+    )
+    assert packet_module._candidate_fk_matches_target(
+        tuple(np.zeros(7)), target, offset
+    )
+
+    shifted = expected.copy()
+    shifted[0, 3] += 0.05
+    monkeypatch.setattr(
+        packet_module, "load_panda_urdf_fk", lambda: FakeFK(shifted)
+    )
+    assert not packet_module._candidate_fk_matches_target(
+        tuple(np.zeros(7)), target, offset
+    )
+
+
+def test_candidate_arrow_points_along_public_approach_vector() -> None:
+    camera = {
+        "intrinsics": np.array(
+            [[100.0, 0.0, 50.0], [0.0, 100.0, 50.0], [0.0, 0.0, 1.0]]
+        ),
+        "pose_mat": np.eye(4),
+    }
+    pose = Pose(
+        (0.0, 0.0, 2.0),
+        tuple(Rotation.from_euler("y", 90.0, degrees=True).as_quat().tolist()),
+    )
+
+    contact_x, contact_y, hand_x, hand_y = packet_module._project_pose(
+        pose, camera
+    )
+
+    assert hand_x < contact_x
+    assert np.isclose(hand_y, contact_y)
+
+
 def test_context_packet_snapshot_does_not_leak_private_sensor_state() -> None:
     packet = ContextCompiler().compile(_workspace_with_evidence())
     snapshot = packet.web_snapshot(render_id="privacy")
@@ -144,8 +207,8 @@ def test_context_packet_snapshot_does_not_leak_private_sensor_state() -> None:
     }
 
     assert forbidden.isdisjoint(set(_walk_keys(snapshot)))
-    assert snapshot["schemaVersion"] == 3
-    assert snapshot["schema"] == "vaw-context-v2"
+    assert snapshot["schemaVersion"] == 4
+    assert snapshot["schema"] == "vaw-context-v3"
     assert snapshot["viewport"] == {"width": 1440, "height": 1080}
     assert all(
         value.startswith("data:image/png;base64,")
@@ -345,7 +408,9 @@ def test_context_browser_renderer_is_fixed_and_deterministic() -> None:
         delta_text = renderer._page.locator(".ctx-proposal-facts").inner_text()
         renderer.render(candidates_packet)
         main_box = renderer._page.locator(".ctx-main-view").bounding_box()
-        wrist_box = renderer._page.locator(".ctx-wrist-view").bounding_box()
+        near_field_box = renderer._page.locator(
+            ".ctx-near-field-view"
+        ).bounding_box()
         candidate_facts = renderer._page.locator(".ctx-candidate-facts").all_inner_texts()
         removed_world_cards = renderer._page.locator(
             ".ctx-task-block, .ctx-event-block"
@@ -373,8 +438,8 @@ def test_context_browser_renderer_is_fixed_and_deterministic() -> None:
     assert "LOCAL REFINEMENT · BASE FRAME" in delta_text
     assert "delta_xyz_m" in delta_text
     assert main_box is not None and main_box["height"] >= 500
-    assert wrist_box is not None and wrist_box["width"] >= 450
-    assert wrist_box["height"] >= 500
+    assert near_field_box is not None and near_field_box["width"] >= 450
+    assert near_field_box["height"] >= 500
     assert candidate_facts and all("source" not in text.lower() for text in candidate_facts)
     assert removed_world_cards == 0
     assert removed_chrome == 0
@@ -388,4 +453,4 @@ def test_context_browser_renderer_is_fixed_and_deterministic() -> None:
     assert receipt_world_box is not None and receipt_world_box["height"] >= 785
     assert receipt_raster == 1
     assert "TARGET TCP" not in delta_text
-    assert renderer.name == "context-web-v2-focus"
+    assert renderer.name == "context-web-v3-near-field"

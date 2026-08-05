@@ -37,6 +37,7 @@ class ContextStepResult:
     revision_after: int
     manifest: dict[str, Any]
     trace_receipt: dict[str, Any] | None = None
+    trace_diagnostics: dict[str, Any] | None = None
 
     @property
     def ok(self) -> bool:
@@ -102,6 +103,7 @@ class ContextWorkspace:
 
     def execute(self, function_name: str, **arguments: Any) -> ContextStepResult:
         before = self.state.observation_revision
+        self._private.begin_function_call()
         handler = self._functions.handlers.get(function_name)
         if handler is None:
             result: dict[str, Any] = {"error": f"unknown function '{function_name}'"}
@@ -135,6 +137,7 @@ class ContextWorkspace:
     ) -> ContextStepResult:
         """Record a protocol-level failure without dispatching a function."""
 
+        self._private.begin_function_call()
         return self._record(
             function_name,
             arguments,
@@ -178,6 +181,11 @@ class ContextWorkspace:
             revision_after=revision_after,
             manifest=self.state.manifest(),
             trace_receipt=trace_receipt,
+            trace_diagnostics=(
+                dict(self._private.trace_diagnostics)
+                if self._private.trace_diagnostics
+                else None
+            ),
         )
 
     def _call_backend(self, name: str, *args: Any, **kwargs: Any) -> Any:
