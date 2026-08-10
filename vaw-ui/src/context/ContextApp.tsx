@@ -124,6 +124,7 @@ function WaypointPanel({ snapshot }: { snapshot: ContextSnapshot }) {
   const prediction = action?.prediction
   const planned = prediction?.solve_ik === 'returned'
   const grip = action?.target.gripper ?? 'INHERIT'
+  const goal = snapshot.world.refinementGoal ?? action?.intent
   return (
     <aside className="via-waypoint-panel">
       <h2>WAYPOINT</h2>
@@ -132,7 +133,7 @@ function WaypointPanel({ snapshot }: { snapshot: ContextSnapshot }) {
       <FactRow label="GRIPPER">{grip.toUpperCase()}</FactRow>
       <FactRow label="CONTACT"><em>UNKNOWN</em></FactRow>
       <FactRow label="DYNAMICS"><em>UNKNOWN</em></FactRow>
-      {snapshot.world.refinementGoal && <p className="via-goal">{snapshot.world.refinementGoal}</p>}
+      {goal && <p className="via-goal">{goal}</p>}
     </aside>
   )
 }
@@ -154,11 +155,48 @@ function ImaginationLayer({ snapshot }: { snapshot: ContextSnapshot }) {
   )
 }
 
+function PostCommitLayer({ snapshot }: { snapshot: ContextSnapshot }) {
+  const action = snapshot.world.lastPhysicalAction
+  return (
+    <section className="via-post-commit">
+      <header><h1>POST-COMMIT VERIFY · REAL OBSERVATIONS</h1></header>
+      <div className="via-post-commit-grid">
+        <article className="via-compare-card via-compare-before">
+          <Raster
+            snapshot={snapshot}
+            id={snapshot.world.postCommitBeforeRasterId}
+            alt="执行前目标附近真实画面"
+          />
+          <strong>BEFORE COMMIT</strong>
+        </article>
+        <div className="via-causal-arrow" aria-hidden="true">→</div>
+        <article className="via-compare-card via-compare-current">
+          <Raster
+            snapshot={snapshot}
+            id={snapshot.world.postCommitCurrentRasterId}
+            alt="执行后目标附近当前真实画面"
+          />
+          <strong>CURRENT OBSERVED</strong>
+        </article>
+        <aside className="via-post-commit-facts">
+          <h2>LAST PHYSICAL ACTION</h2>
+          <FactRow label="INTENT">{action?.intent ?? 'N/A'}</FactRow>
+          <FactRow label="EXECUTED">{action?.executed_stages.toUpperCase() ?? 'N/A'}</FactRow>
+          <FactRow label="CONTROL">{action?.outcome.toUpperCase() ?? 'N/A'}</FactRow>
+          <p>TASK EFFECT · VERIFY FROM CURRENT IMAGE</p>
+        </aside>
+      </div>
+    </section>
+  )
+}
+
 export function ContextApp({ snapshot }: { snapshot: ContextSnapshot }) {
   return (
     <main className="via-canvas">
       <ObservedLayer snapshot={snapshot} />
-      <ImaginationLayer snapshot={snapshot} />
+      {snapshot.decision.mode === 'post_commit'
+        ? <PostCommitLayer snapshot={snapshot} />
+        : <ImaginationLayer snapshot={snapshot} />}
     </main>
   )
 }

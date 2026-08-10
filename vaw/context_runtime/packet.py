@@ -21,6 +21,7 @@ from vaw.context_runtime.gripper_mesh import (
 from vaw.context_runtime.model import (
     ActionTarget,
     ContextState,
+    LastPhysicalAction,
     PointEvidence,
     Pose,
     RobotState,
@@ -34,8 +35,8 @@ from vaw.context_runtime.private import (
 from vaw.context_runtime.scene_view import render_scene_view
 from vaw.context_runtime.workspace import ContextWorkspace
 
-CONTEXT_SCHEMA = "vaw-context-v11-control-focus"
-CONTEXT_WEB_SCHEMA_VERSION = 12
+CONTEXT_SCHEMA = "vaw-context-v13-post-commit"
+CONTEXT_WEB_SCHEMA_VERSION = 14
 CONTEXT_WIDTH = 1920
 CONTEXT_HEIGHT = 1080
 
@@ -52,6 +53,7 @@ DecisionMode = Literal[
     "seeds",
     "editing",
     "reviewed",
+    "post_commit",
     "error",
     "terminal",
 ]
@@ -144,6 +146,9 @@ class WorldContextSpec:
     action: dict[str, Any] | None
     refinement_goal: str | None
     latest_error: str | None
+    last_physical_action: LastPhysicalAction | None = None
+    post_commit_before_raster_id: str | None = None
+    post_commit_current_raster_id: str | None = None
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -155,6 +160,13 @@ class WorldContextSpec:
             "action": self.action,
             "refinementGoal": self.refinement_goal,
             "latestError": self.latest_error,
+            "lastPhysicalAction": (
+                self.last_physical_action.summary()
+                if self.last_physical_action is not None
+                else None
+            ),
+            "postCommitBeforeRasterId": self.post_commit_before_raster_id,
+            "postCommitCurrentRasterId": self.post_commit_current_raster_id,
         }
 
 
@@ -285,6 +297,11 @@ class ContextCompiler:
             "observed_scene": observed_scene,
             "imagination_scene": imagination_scene,
         }
+        post_before_id, post_current_id = _compile_post_commit_rasters(
+            workspace,
+            camera,
+            rasters,
+        )
 
         region_specs = self._compile_regions(state, rgb, private.region_masks, rasters)
         point_specs = self._compile_points(state, rgb, rasters)
@@ -313,6 +330,9 @@ class ContextCompiler:
                     else None
                 ),
                 latest_error=event.error if event is not None else None,
+                last_physical_action=state.last_physical_action,
+                post_commit_before_raster_id=post_before_id,
+                post_commit_current_raster_id=post_current_id,
             ),
             catalog=EvidenceCatalogSpec(
                 regions=tuple(region_specs),
@@ -493,6 +513,9 @@ def _decision_spec(workspace: ContextWorkspace) -> DecisionWorkspaceSpec:
             seed_ids=tuple(state.seeds)[:5],
         )
 
+    if state.last_physical_action is not None:
+        return DecisionWorkspaceSpec(mode="post_commit")
+
     # A Main-review target may remain available while Main gathers newer evidence.
     # The lower canvas must show that latest evidence instead of pinning an old
     # reviewed preview over every subsequent detection/proposal result.
@@ -543,6 +566,93 @@ def _decision_spec(workspace: ContextWorkspace) -> DecisionWorkspaceSpec:
     return DecisionWorkspaceSpec(mode="idle")
 
 
+def _compile_post_commit_rasters(
+    workspace: ContextWorkspace,
+    current_camera: dict[str, Any],
+    rasters: dict[str, np.ndarray],
+) -> tuple[str | None, str | None]:
+    """Compile one policy-visible before/current comparison around the target.
+
+    Sensor calibration remains private: it is used only to project the last
+    physical target into each observation.  The packet receives two RGB crops
+    at the same metric scale, never the old raw frame as a second model image.
+    """
+
+    if workspace.state.last_physical_action is None:
+        return None, None
+    artifacts = workspace._private.last_physical_artifacts
+    try:
+        previous_camera = workspace._private.camera(
+            workspace.camera_name,
+            previous=True,
+        )
+    except RuntimeError:
+        previous_camera = current_camera
+    focus_pose = artifacts.focus_pose if artifacts is not None else None
+    before_id = "post_commit:before"
+    current_id = "post_commit:current"
+    rasters[before_id] = _metric_focus_crop(previous_camera, focus_pose)
+    rasters[current_id] = _metric_focus_crop(current_camera, focus_pose)
+    return before_id, current_id
+
+
+def _metric_focus_crop(
+    camera: dict[str, Any],
+    focus_pose: Pose | None,
+    *,
+    span_m: float = 0.32,
+    output_size: tuple[int, int] = (760, 390),
+) -> np.ndarray:
+    """Return a deterministic target-centred RGB crop or a full-view fallback."""
+
+    rgb = _rgb(camera)
+    bounds: tuple[int, int, int, int] | None = None
+    if focus_pose is not None:
+        try:
+            projected = project_world_to_pixel(
+                np.asarray([focus_pose.position_xyz], dtype=np.float64),
+                camera["intrinsics"],
+                camera["pose_mat"],
+            )[0]
+            depth = float(projected[2])
+            intrinsics = np.asarray(camera["intrinsics"], dtype=np.float64)
+            if (
+                np.isfinite(projected).all()
+                and depth > 1e-4
+                and 0.0 <= float(projected[0]) < rgb.shape[1]
+                and 0.0 <= float(projected[1]) < rgb.shape[0]
+            ):
+                half_w = float(intrinsics[0, 0]) * span_m / (2.0 * depth)
+                half_h = float(intrinsics[1, 1]) * span_m / (2.0 * depth)
+                crop_box = _fit_box_aspect(
+                    (
+                        float(projected[0] - half_w),
+                        float(projected[1] - half_h),
+                        float(projected[0] + half_w),
+                        float(projected[1] + half_h),
+                    ),
+                    target_aspect=output_size[0] / output_size[1],
+                )
+                bounds = _expanded_bounds(
+                    crop_box,
+                    rgb.shape[1],
+                    rgb.shape[0],
+                    ratio=0.0,
+                )
+        except (KeyError, TypeError, ValueError, np.linalg.LinAlgError):
+            bounds = None
+    if bounds is None:
+        crop = rgb
+    else:
+        left, top, right, bottom = bounds
+        crop = rgb[top:bottom, left:right]
+        if crop.size == 0:
+            crop = rgb
+    image = Image.fromarray(crop).convert("RGB")
+    image = image.resize(output_size, Image.Resampling.LANCZOS)
+    return np.asarray(image, dtype=np.uint8)
+
+
 def _active_presentation(
     workspace: ContextWorkspace,
 ) -> tuple[
@@ -575,7 +685,7 @@ def _active_presentation(
                 artifacts,
                 status="review",
                 action_id=state.action_review.action_id,
-                handoff_reason=state.action_review.handoff_reason,
+                intent=state.action_review.intent,
             ),
         )
     return None, None, None
@@ -587,13 +697,13 @@ def _target_presentation(
     *,
     status: str,
     action_id: str | None,
-    handoff_reason: str | None = None,
+    intent: str | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {"status": status, "target": target.summary()}
     if action_id is not None:
         result["action_id"] = action_id
-    if handoff_reason is not None:
-        result["handoff_reason"] = handoff_reason
+    if intent is not None:
+        result["intent"] = intent
     plan = _artifact_plan(artifacts)
     if plan is not None:
         result["prediction"] = plan.prediction.summary()

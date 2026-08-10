@@ -30,7 +30,8 @@ img { display: block; }
 }
 
 .via-observed,
-.via-imagination {
+.via-imagination,
+.via-post-commit {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -47,13 +48,15 @@ img { display: block; }
 }
 
 .via-observed > header,
-.via-imagination > header {
+.via-imagination > header,
+.via-post-commit > header {
   display: flex;
   align-items: center;
 }
 
 .via-observed h1,
-.via-imagination h1 {
+.via-imagination h1,
+.via-post-commit h1 {
   margin: 0;
   font: 900 31px "DejaVu Sans Mono", monospace;
   letter-spacing: .02em;
@@ -270,4 +273,93 @@ img { display: block; }
   color: #64748b;
   background: #e8eef6;
   font: 800 13px "DejaVu Sans Mono", monospace;
+}
+
+.via-post-commit {
+  display: grid;
+  grid-template-rows: 58px minmax(0, 1fr);
+  padding: 0 16px 16px;
+  border-color: #64748b;
+  background: #fff;
+}
+
+.via-post-commit h1 { color: #334155; }
+
+.via-post-commit-grid {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 48px minmax(0, 1fr) 420px;
+  gap: 12px;
+}
+
+.via-compare-card {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 2px solid #94a3b8;
+  border-radius: 9px;
+  background: #0b1220;
+}
+
+.via-compare-card img,
+.via-compare-card .via-no-raster {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.via-compare-card strong {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  padding: 7px 11px;
+  border-radius: 5px;
+  color: #fff;
+  background: rgba(15, 23, 42, .86);
+  font: 900 17px "DejaVu Sans Mono", monospace;
+}
+
+.via-compare-current { border-color: #2563eb; }
+.via-compare-current strong { background: rgba(37, 99, 235, .92); }
+
+.via-causal-arrow {
+  display: grid;
+  place-items: center;
+  color: #475569;
+  font: 900 44px "DejaVu Sans Mono", monospace;
+}
+
+.via-post-commit-facts {
+  min-width: 0;
+  overflow: hidden;
+  padding: 17px 20px;
+  border: 2px solid #94a3b8;
+  border-radius: 9px;
+  background: #f8fafc;
+}
+
+.via-post-commit-facts h2 {
+  margin: 0 0 9px;
+  padding-bottom: 11px;
+  border-bottom: 1px solid #cbd5e1;
+  color: #334155;
+  font: 900 21px "DejaVu Sans Mono", monospace;
+}
+
+.via-post-commit-facts .via-fact-row {
+  grid-template-columns: 104px minmax(0, 1fr);
+  min-height: 68px;
+}
+
+.via-post-commit-facts .via-fact-row strong { color: #475569; font-size: 15px; }
+.via-post-commit-facts .via-fact-row code { font-size: 15px; }
+.via-post-commit-facts p {
+  margin: 15px 0 0;
+  padding: 12px 14px;
+  border: 2px solid #f59e0b;
+  border-radius: 7px;
+  color: #92400e;
+  background: #fffbeb;
+  font: 900 15px/1.35 "DejaVu Sans Mono", monospace;
 }

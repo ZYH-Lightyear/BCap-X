@@ -64,9 +64,10 @@ def test_packet_modes_follow_owner_and_evidence_not_history() -> None:
     packet = compiler.compile(workspace)
     assert packet.decision.mode == "reviewed"
     assert packet.world.action["action_id"] == action_id
+    assert packet.world.action["intent"] == "check grasp geometry"
     assert packet.manifest()["review_action_id"] == action_id
     assert packet.world.action["status"] == "review"
-    assert packet.world.action["handoff_reason"] == "completed"
+    assert "handoff_reason" not in packet.world.action
 
 
 def test_failed_imagination_returns_to_visible_seed_catalog() -> None:
@@ -88,17 +89,18 @@ def test_failed_imagination_returns_to_visible_seed_catalog() -> None:
     assert packet.decision.seed_ids == (seed_id,)
 
 
-def test_budget_exhaustion_is_presented_as_main_review_not_ready() -> None:
+def test_turn_limit_is_presented_as_neutral_main_review() -> None:
     workspace = _workspace()
     workspace.execute("open_gripper")
     result = workspace.limit_imagination()
 
     packet = ContextCompiler().compile(workspace)
 
-    assert result.result["status"] == "budget_exhausted"
+    assert result.result["status"] == "review_required"
     assert packet.world.owner == "main"
     assert packet.world.action["status"] == "review"
-    assert packet.world.action["handoff_reason"] == "budget_exhausted"
+    assert "handoff_reason" not in packet.world.action
+    assert "turn_limit" not in json.dumps(packet.summary())
     assert packet.decision.mode == "reviewed"
 
 
@@ -178,12 +180,12 @@ def test_packet_is_deterministic_and_does_not_leak_private_state() -> None:
     assert forbidden.isdisjoint(set(_walk_keys(snapshot)))
     encoded = json.dumps(snapshot).lower()
     assert "functionrecord" not in encoded and "waypointdraft" not in encoded
-    assert snapshot["schemaVersion"] == 12
-    assert snapshot["schema"] == "vaw-context-v11-control-focus"
+    assert snapshot["schemaVersion"] == 14
+    assert snapshot["schema"] == "vaw-context-v13-post-commit"
     assert snapshot["viewport"] == {"width": CONTEXT_WIDTH, "height": CONTEXT_HEIGHT}
 
 
-def test_commit_returns_to_clean_current_canvas() -> None:
+def test_commit_compiles_one_shot_post_action_visual_comparison() -> None:
     workspace = _workspace()
     workspace.execute("open_gripper")
     action_id = workspace.execute("finish_imagination", status="ready").result[
@@ -191,6 +193,19 @@ def test_commit_returns_to_clean_current_canvas() -> None:
     ]
     workspace.execute("commit", action_id=action_id)
     packet = ContextCompiler().compile(workspace)
-    assert packet.decision.mode == "idle"
+    assert packet.decision.mode == "post_commit"
     assert packet.world.action is None
     assert packet.world.owner == "main"
+    assert packet.world.last_physical_action is not None
+    assert packet.world.last_physical_action.executed_stages == "gripper"
+    assert packet.world.last_physical_action.outcome == "completed"
+    assert packet.world.post_commit_before_raster_id == "post_commit:before"
+    assert packet.world.post_commit_current_raster_id == "post_commit:current"
+    assert packet.rasters["post_commit:before"].shape == (390, 760, 3)
+    assert packet.rasters["post_commit:current"].shape == (390, 760, 3)
+
+    workspace.consume_main_context()
+    consumed = ContextCompiler().compile(workspace)
+    assert consumed.decision.mode == "idle"
+    assert consumed.world.last_physical_action is None
+    assert "post_commit:before" not in consumed.rasters

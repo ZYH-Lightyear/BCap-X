@@ -95,6 +95,21 @@ class ContextWorkspace:
         normalized = " ".join(str(text).split())
         self.refinement_goal = normalized or f"为任务“{self.state.task_prompt}”检查并调整动作"
 
+    def consume_main_context(self) -> None:
+        """Consume one-shot causal context after a valid Main decision.
+
+        The immediately following Main request may see the latest imagination
+        handoff and physical action comparison.  Once Main has produced a
+        valid Function call, those records must not turn into implicit
+        long-term history.  A later physical commit installs a new record
+        after this method has run.
+        """
+
+        self.state.last_handoff = None
+        self.state.last_physical_action = None
+        self._private.last_physical_artifacts = None
+        self._private.previous_observation = None
+
     def refresh_observation(self) -> dict[str, Any]:
         observation = self._call_backend("get_observation")
         if not isinstance(observation, dict):

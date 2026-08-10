@@ -25,6 +25,7 @@ from vaw.context_runtime.packet import (
     ContextPacket,
     encode_png_data_url,
 )
+from vaw.context_runtime.private import build_edit_summary
 from vaw.context_runtime.protocol import (
     FUNCTION_NAMES,
     IMAGINATION_FUNCTION_NAMES,
@@ -92,7 +93,6 @@ class ContextRuntime:
         self.main_turns = 0
         self.imagination_turns = 0
         self._feedback: dict[str, str | None] = {"main": None, "imagination": None}
-        self._previous_observed: np.ndarray | None = None
         if self.trace is not None:
             self.trace.log_meta(
                 {
@@ -170,17 +170,11 @@ class ContextRuntime:
                         f"physical operation limit {self.config.max_physical_ops} reached",
                     )
                 self.physical_ops += 1
-            if owner == "main" and call.name in IMAGINATION_STARTERS:
-                self.workspace.set_refinement_goal(response.text)
-
             step = self._dispatch(owner, call)
             if not step.ok:
                 self._feedback[owner] = str(step.result.get("error", "Function failed"))
             physical = owner == "main" and call.name == "commit"
-            if physical:
-                self._capture_previous_observed()
-                self._update_env_success()
-            elif owner == "main" and call.name == "done":
+            if physical or (owner == "main" and call.name == "done"):
                 self._update_env_success()
 
             record = _step_record(turn, owner, step, response.text, physical=physical)
@@ -205,6 +199,16 @@ class ContextRuntime:
                     turn, "runtime", limit_step, "imagination turn limit", physical=False
                 )
                 steps.append(limit_record)
+                if self.trace is not None:
+                    self.trace.log_event(
+                        "imagination_handoff",
+                        {
+                            "turn": turn,
+                            "termination_reason": "turn_limit",
+                            "result": limit_step.result,
+                            "runtime_diagnostics": limit_step.trace_diagnostics,
+                        },
+                    )
                 self.imagination_turns = 0
 
     def _messages(
@@ -215,11 +219,18 @@ class ContextRuntime:
         if owner == "imagination":
             imagination = self.workspace.state.imagination
             assert imagination is not None
+            edit_summary = build_edit_summary(
+                imagination.target,
+                self.workspace._private.imagination_artifacts,
+            )
             text = (
-                f"User Task：{self.workspace.state.task_prompt}\n"
                 f"Refinement Goal：{imagination.refinement_goal}\n"
-                "Current ActionTarget："
-                + json.dumps(imagination.target.summary(), ensure_ascii=False, separators=(",", ":"))
+                "Edit Summary："
+                + json.dumps(
+                    edit_summary.summary(),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
             )
             if feedback:
                 text += f"\n上轮协议错误：{feedback}"
@@ -235,14 +246,14 @@ class ContextRuntime:
             text += "\nLatest Imagination Handoff：" + json.dumps(
                 handoff.summary(), ensure_ascii=False, separators=(",", ":")
             )
+        last_physical = self.workspace.state.last_physical_action
+        if last_physical is not None:
+            text += "\nLast Physical Action：" + json.dumps(
+                last_physical.summary(), ensure_ascii=False, separators=(",", ":")
+            )
         if feedback:
             text += f"\n上轮协议错误：{feedback}"
-        return _image_messages(
-            SYSTEM_PROMPT,
-            text,
-            context_image,
-            previous_observed=self._previous_observed,
-        )
+        return _image_messages(SYSTEM_PROMPT, text, context_image)
 
     def _single_call(
         self, response: ModelResponse
@@ -257,28 +268,29 @@ class ContextRuntime:
         if call.parse_error:
             return self.workspace.reject(call.name, call.args, call.parse_error)
         allowed = IMAGINATION_FUNCTION_NAMES if owner == "imagination" else FUNCTION_NAMES
+        arguments = dict(call.args)
+        if owner == "main" and call.name in IMAGINATION_STARTERS:
+            raw_goal = arguments.pop("refinement_goal", None)
+            if not isinstance(raw_goal, str) or not raw_goal.strip():
+                return self.workspace.reject(
+                    call.name,
+                    call.args,
+                    "refinement_goal is required when Main starts Imagination",
+                )
+            self.workspace.set_refinement_goal(raw_goal)
         try:
             name, arguments = parse_action(
-                {"name": call.name, "arguments": call.args}, allowed=allowed
+                {"name": call.name, "arguments": arguments}, allowed=allowed
             )
         except ValueError as exc:
             return self.workspace.reject(call.name, call.args, str(exc))
-        step = self.workspace.execute(name, **arguments)
         if owner == "main":
-            self.workspace.state.last_handoff = None
-        if owner == "main" and self._previous_observed is not None:
-            self._previous_observed = None
-            self.workspace._private.previous_observation = None
+            # Consume the context only after Main has returned a protocol-valid
+            # decision.  A commit may immediately install the next one-shot
+            # LastPhysicalAction during execution.
+            self.workspace.consume_main_context()
+        step = self.workspace.execute(name, **arguments)
         return step
-
-    def _capture_previous_observed(self) -> None:
-        try:
-            camera = self.workspace._private.camera(
-                self.workspace.camera_name, previous=True
-            )
-            self._previous_observed = np.asarray(camera["images"]["rgb"], dtype=np.uint8).copy()
-        except (KeyError, RuntimeError, TypeError, ValueError):
-            self._previous_observed = None
 
     def _set_private_imagination_turn(self, count: int) -> None:
         artifacts = self.workspace._private.imagination_artifacts
@@ -378,24 +390,12 @@ def _image_messages(
     system_prompt: str,
     text: str,
     image: np.ndarray,
-    *,
-    previous_observed: np.ndarray | None = None,
 ) -> list[Message]:
     content: list[dict[str, Any]] = [
         {"type": "text", "text": text},
         {"type": "text", "text": "CURRENT CONTEXT CANVAS"},
         {"type": "image_url", "image_url": {"url": encode_png_data_url(image)}},
     ]
-    if previous_observed is not None:
-        content.extend(
-            [
-                {"type": "text", "text": "PREVIOUS OBSERVED BEFORE LAST COMMIT"},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": encode_png_data_url(previous_observed)},
-                },
-            ]
-        )
     return [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": content},

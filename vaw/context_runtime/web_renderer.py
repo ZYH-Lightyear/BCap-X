@@ -15,7 +15,7 @@ from vaw.context_runtime.packet import (
 
 
 class ContextWebRenderer:
-    name = "context-web-v11-control-focus"
+    name = "context-web-v13-post-commit"
     width = CONTEXT_WIDTH
     height = CONTEXT_HEIGHT
 

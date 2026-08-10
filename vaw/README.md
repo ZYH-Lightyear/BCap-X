@@ -42,12 +42,12 @@ Main Agent：
 detection_and_sam(query, within_region_id?)
 locate_point(query, within_region_id?)
 propose_grasps(region_id) -> seed_ids
-propose_pose(point_id, offset_xyz, quaternion_xyzw?)
-select(seed_id)
-delta_move(delta_xyz_m, frame)
-rotate(axis, angle_deg, frame)
-open_gripper()
-close_gripper()
+propose_pose(point_id, offset_xyz, refinement_goal, quaternion_xyzw?)
+select(seed_id, refinement_goal)
+delta_move(delta_xyz_m, frame, refinement_goal)
+rotate(axis, angle_deg, frame, refinement_goal)
+open_gripper(refinement_goal)
+close_gripper(refinement_goal)
 commit(action_id)
 done(success)
 ```
@@ -64,19 +64,24 @@ finish_imagination(status="ready" | "failed")
 
 除 `commit` 外，所有 Function 都不会改变真实世界。`select/propose_pose` 以及 Main 直接调用
 空间或夹爪 editor 时进入 Imagination；结束后产生等待 Main 判断的 `ActionReview`。
-默认最多连续想象 6 轮，达到上限时以 `budget_exhausted` 原因交回 Main。无论显式完成还是
-预算耗尽都不代表动作获批；只有 Main 查看最终 Preview 后调用 `commit` 才构成批准。
+Main 启动 Imagination 时必须显式提供一句短的 `refinement_goal`，不能把整段 rationale 当成
+局部控制目标。Imagination 每次请求只收到当前 Canvas、目标几何和累计 `EditSummary`，不收到
+Function transcript。默认最多连续想象 6 轮；主动完成或达到上限都以中性的
+`review_required` 交回 Main，`turn_limit` 只写 trace。只有 Main 查看最终 Preview 后调用
+`commit` 才构成批准。
 
 ## Canvas
 
-Web schema 12 / `vaw-context-v11-control-focus` / renderer
-`context-web-v11-control-focus`：
+Web schema 14 / `vaw-context-v13-post-commit` / renderer
+`context-web-v13-post-commit`：
 
 - 上层 `OBSERVED NOW · REAL WORLD`：干净 agentview、与 agentview 标定透视一致的稠密
   RGB-D surface 和四行本体状态；
 - `ACTION SEEDS`：最多五个候选以固定五列占满下层，统一尺度并完整显示；
 - 下层 `IMAGINATION · NOT EXECUTED`：同一当前 RGB-D surface 的 metric target-centered
   Contact Focus、蓝色当前夹爪、高显著度紫色 target gripper 和上一 target 的浅色轮廓；
+- commit 后下层短暂切换为同一 Canvas 内的 `BEFORE COMMIT → CURRENT OBSERVED` 目标区
+  对照；只显示一次 `LastPhysicalAction` 因果摘要，不额外发送旧图或声明任务效果；
 - BASE/WORLD 坐标提示由 robot-base 几何投影产生，并固定在角落以避免遮挡 target；
 - grounding、ActionSeed 与 refinement 信息只占用下层固定 overlay，不改变双层版式；
 - 紫色几何只存在于下层，并始终表示未执行的预测；

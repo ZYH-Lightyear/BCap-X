@@ -36,15 +36,19 @@ TARGET GRIPPER 是未执行目标。规划与紫色几何都不是物理事实�
 
 你负责理解任务、调用感知、选择动作起点，并审查 Imagination 最终交回的 ActionReview。
 select、propose_pose、delta_move、rotate、open_gripper、close_gripper 会把控制权交给独立的
-Imagination Agent；它会连续微调并交回完成、失败或预算耗尽的结果。完成和预算耗尽都不是批准：
-你必须查看最终 Preview，只有自己判断几何合理时才 commit；否则换 seed 或重新进入 Imagination。
+Imagination Agent；它会连续微调并交回 review_required 或 failed。review_required 只表示轮到你审查，
+不是批准：你必须查看最终 Preview，只有自己判断几何合理时才 commit；否则换 seed 或重新进入
+Imagination。
 不要替它执行局部微调。
-当你的 Function 会启动 Imagination 时，调用前的简短依据将成为它的 refinement goal；只描述
-希望它检查或达到的动作几何，不要把旧动作状态、历史失败或未经验证的效果写成目标事实。
+当 Function 会启动 Imagination 时，必须在 refinement_goal 参数中写一句短的目标几何；不要把
+整段理由、旧失败、预算或未经验证的物理效果写进去。
 
 detection_and_sam 的 region 是当前观测中目标身份与二维位置的权威检测/分割结果，
 但不证明接触、抓持、支撑或包含，也不刷新 observation。
 commit 是唯一改变真实世界的 Function。命令成功不等于任务效果成功。
+若 Canvas 下层显示 POST-COMMIT VERIFY，BEFORE 与 CURRENT 都是真实 observation；
+Last Physical Action 只说明刚执行的意图、阶段和控制结果，不声称物体已被抓住、移动或释放。
+用 CURRENT 中的可见变化判断该动作是否产生了任务相关效果，并据此选择下一步。
 每轮必须且只能调用一个 Function。调用前只写一句简短依据。坐标为 robot-base frame、单位米，
 四元数为 xyzw；所有 evidence/seed ID 只在当前真实观测有效。
 """
@@ -54,14 +58,17 @@ IMAGINATION_SYSTEM_PROMPT = """\
 
 Canvas 上层 OBSERVED NOW 是真实世界；下层 IMAGINATION 是在同一当前点云上的虚拟 target。
 紫色 TARGET GRIPPER 和规划状态不证明接触、抓持、释放或包含。结合主视角、融合 RGB-D、
-固定角落的 BASE/WORLD 坐标提示和 refinement goal，连续使用 delta_move、rotate、
-open_gripper、close_gripper。
-每次编辑后都会得到更新的 Canvas。认为几何与夹爪目标足够合理时调用
-finish_imagination(status="ready")；无法形成可靠目标时调用 status="failed"。
+固定角落的 BASE/WORLD 坐标提示、refinement goal 和 Edit Summary 审查当前 target。
+
+每轮只做三种选择之一：若当前 target 已满足目标，调用 finish_imagination(status="ready")；若能
+指出一个当前可见的几何缺陷，只做一次 delta_move、rotate、open_gripper 或 close_gripper；若该
+target 无法可靠修复，调用 status="failed"。不要为了用满轮数而编辑。
 
 先判断空间姿态，再设置最终 gripper target；open/close 只改变虚拟目标，不能模拟接触结果。
 若一次空间编辑使 motion prediction 变为 error，不要沿同一趋势盲目累计；应撤回、换方向，或
-在无法恢复时结束为 failed。refinement goal 是审查意图，不是已经成立的视觉事实。
+在无法恢复时结束为 failed。Edit Summary 中的累计位移、累计旋转和最近两次编辑是当前控制
+状态，不是对话历史；若两次编辑相互抵消且没有新的可见改进，应接受当前 target 或失败，而不是
+继续振荡。refinement goal 是审查意图，不是已经成立的视觉事实。
 
 不要调用感知、commit 或 done。每轮必须且只能调用一个 Function，调用前只写一句简短依据。
 delta_move 的 frame 必须显式填写；每轴单次不超过 0.03m。rotate 的 frame 必须显式填写。
@@ -88,12 +95,21 @@ def _function(
     }
 
 
-def _edit_definitions() -> dict[str, dict[str, Any]]:
+def _refinement_goal() -> dict[str, Any]:
+    return {
+        "type": "string",
+        "description": "一句短的目标几何；只描述希望 Imagination 检查或达到什么",
+    }
+
+
+def _edit_definitions(*, main: bool) -> dict[str, dict[str, Any]]:
     frame = {
         "type": "string",
         "enum": ["base", "tool"],
         "description": "必须显式选择 robot-base 或 TCP 局部坐标系",
     }
+    extra = {"refinement_goal": _refinement_goal()} if main else {}
+    extra_required = ("refinement_goal",) if main else ()
     return {
         "delta_move": _function(
             "delta_move",
@@ -111,8 +127,9 @@ def _edit_definitions() -> dict[str, dict[str, Any]]:
                     "description": "所选 frame 中的 [dx,dy,dz]，每轴单次不超过 0.03m",
                 },
                 "frame": frame,
+                **extra,
             },
-            ("delta_xyz_m", "frame"),
+            ("delta_xyz_m", "frame", *extra_required),
         ),
         "rotate": _function(
             "rotate",
@@ -126,22 +143,27 @@ def _edit_definitions() -> dict[str, dict[str, Any]]:
                     "description": "非零角度，绝对值不超过 90°",
                 },
                 "frame": frame,
+                **extra,
             },
-            ("axis", "angle_deg", "frame"),
+            ("axis", "angle_deg", "frame", *extra_required),
         ),
         "open_gripper": _function(
             "open_gripper",
             "把想象目标的夹爪状态设为 open；不会打开真实夹爪。",
+            extra,
+            extra_required,
         ),
         "close_gripper": _function(
             "close_gripper",
             "把想象目标的夹爪状态设为 closed；不会闭合真实夹爪，也不保证抓住物体。",
+            extra,
+            extra_required,
         ),
     }
 
 
 def function_definitions() -> list[dict[str, Any]]:
-    edits = _edit_definitions()
+    edits = _edit_definitions(main=True)
     within = {"type": "string", "description": "可选的当前 region 搜索范围"}
     common = [
         _function(
@@ -169,14 +191,18 @@ def function_definitions() -> list[dict[str, Any]]:
                 "point_id": {"type": "string"},
                 "offset_xyz": {"type": "array", "items": {"type": "number"}},
                 "quaternion_xyzw": {"type": "array", "items": {"type": "number"}},
+                "refinement_goal": _refinement_goal(),
             },
-            ("point_id", "offset_xyz"),
+            ("point_id", "offset_xyz", "refinement_goal"),
         ),
         _function(
             "select",
             "选择一个 ActionSeed 并进入 Imagination；不执行。",
-            {"seed_id": {"type": "string"}},
-            ("seed_id",),
+            {
+                "seed_id": {"type": "string"},
+                "refinement_goal": _refinement_goal(),
+            },
+            ("seed_id", "refinement_goal"),
         ),
         edits["delta_move"],
         edits["rotate"],
@@ -199,7 +225,7 @@ def function_definitions() -> list[dict[str, Any]]:
 
 
 def imagination_function_definitions() -> list[dict[str, Any]]:
-    edits = _edit_definitions()
+    edits = _edit_definitions(main=False)
     return [
         edits["delta_move"],
         edits["rotate"],
@@ -207,7 +233,7 @@ def imagination_function_definitions() -> list[dict[str, Any]]:
         edits["close_gripper"],
         _function(
             "finish_imagination",
-            "结束本次想象审查。ready 生成可供 Main commit 的动作；failed 放弃目标。",
+            "结束本次想象审查。ready 请求 Main 审查最终 Preview；failed 放弃该 target。",
             {"status": {"type": "string", "enum": ["ready", "failed"]}},
             ("status",),
         ),

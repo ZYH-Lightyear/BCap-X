@@ -332,9 +332,9 @@ OR fail this target
 | 版本 | 假设 | Commit | 离线证据 | 真实 Trace | 结果/下一失败 |
 |---|---|---|---|---|---|
 | M1.5.0 | dense world view 可作为清晰视觉基线 | `91f9d17` | 12 tests + Web build | `via_canvas_qwen35plus_t0_s1` | world 清晰；local control、handoff、continuity 失败 |
-| M1.5.1 | metric Contact Focus 能让 2–3 cm/小角度修正可读 | pending | 12 packet/agent tests + Ruff + Web build | `m151_v11_control_focus_scripted_t0_s1` | 五 seed 完整；3 cm 蓝紫分离和 5° 新旧轮廓可读；开放式静态 VLM probe 待完成 |
-| M1.5.2 | 最小 edit memory + neutral review 能结束振荡并促成 Main review | pending | pending | pending | pending |
-| M1.5.3 | one-shot physical continuity 能避免 commit 后任务重启 | pending | pending | pending | pending |
+| M1.5.1 | metric Contact Focus 能让 2–3 cm/小角度修正可读 | `5d056f0` | 12 packet/agent tests + Ruff + Web build | `m151_v11_control_focus_scripted_t0_s1` | 五 seed 完整；3 cm 蓝紫分离和 5° 新旧轮廓可读；开放式静态 VLM probe 待完成 |
+| M1.5.2 | 最小 edit memory + neutral review 能结束振荡并促成 Main review | pending | 相关 runtime/packet/agent 回归 + Ruff + Web build | `m152_qwen35plus_review_t0_s1` | 首次 Imagination 一次修正后主动 ready，Main 审查并 commit；随后暴露 post-commit 因果丢失，进入 M1.5.3 |
+| M1.5.3 | one-shot physical continuity 能避免 commit 后任务重启 | pending | 24 core tests / 40 full VAW tests + Ruff + Web build；post-commit fixture 为 `1920×1080` | pending | LastPhysicalAction、单图 BEFORE→CURRENT 对照与一次性消费已实现；待真实模型验证 |
 | M1.5.4 | 完整闭环可达到基本 pick-place 成功 | pending | pending | pending | pending |
 
 ## 11. 非目标

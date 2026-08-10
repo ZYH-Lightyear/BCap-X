@@ -253,13 +253,16 @@ def _run_scripted(
 
     def step(name: str, **arguments: Any) -> dict[str, Any]:
         nonlocal turn
+        owner = workspace.state.owner
         packet = compiler.compile(workspace)
         image = renderer.render(packet)
+        if owner == "main":
+            workspace.consume_main_context()
         result = workspace.execute(name, **arguments)
         env_success = bool(env.task_completed()) if name in workspace.PHYSICAL_FUNCTIONS else None
         trace.log_turn(
             turn=turn,
-            agent_owner=("imagination" if name == "finish_imagination" else workspace.state.owner),
+            agent_owner=owner,
             image=image,
             packet=packet,
             function_call={"name": name, "arguments": arguments},
@@ -275,6 +278,7 @@ def _run_scripted(
             raise RuntimeError(result.result["error"])
         return result.result
 
+    workspace.set_refinement_goal("只把虚拟夹爪目标设为 open")
     step("open_gripper")
     action_id = step("finish_imagination", status="ready")["action_id"]
     step("commit", action_id=action_id)
@@ -283,13 +287,18 @@ def _run_scripted(
     seed_ids = step("propose_grasps", region_id=region_id)["seed_ids"]
     if not seed_ids:
         raise RuntimeError("scripted smoke received no grasp candidates")
+    workspace.set_refinement_goal(
+        f"使两指围绕 {object_query} 形成可审查的对称接触几何"
+    )
     step("select", seed_id=seed_ids[0])
     action_id = step("finish_imagination", status="ready")["action_id"]
     step("commit", action_id=action_id)
+    workspace.set_refinement_goal("只把虚拟夹爪目标设为 closed")
     step("close_gripper")
     action_id = step("finish_imagination", status="ready")["action_id"]
     step("commit", action_id=action_id)
     if scripted_refinement:
+        workspace.set_refinement_goal("验证累计小幅平移与旋转在 Contact Focus 中清晰可见")
         step(
             "delta_move",
             delta_xyz_m=[0.0, 0.0, 0.03],

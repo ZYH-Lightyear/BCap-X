@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from vaw.context_runtime.model import ActionTarget, Pose
 
@@ -37,6 +38,7 @@ class VisualEdit:
     delta_xyz_m: tuple[float, float, float] | None = None
     axis: str | None = None
     angle_deg: float | None = None
+    gripper_target: str | None = None
 
     def summary(self) -> dict[str, Any]:
         result: dict[str, Any] = {"kind": self.kind}
@@ -50,6 +52,15 @@ class VisualEdit:
             result["axis"] = self.axis
         if self.angle_deg is not None:
             result["angle_deg"] = round(float(self.angle_deg), 6)
+        if self.gripper_target is not None:
+            result["gripper_target"] = self.gripper_target
+        return result
+
+    def command_summary(self) -> dict[str, Any]:
+        """Return only the command delta needed to reason about edit history."""
+
+        result = self.summary()
+        result.pop("reference_pose", None)
         return result
 
 
@@ -63,6 +74,8 @@ class SeedArtifacts:
 class ImaginationArtifacts:
     planning_context: PlanningContext | None = None
     preview_plan: MotionPlan | None = None
+    initial_target: ActionTarget | None = None
+    previous_visual_edit: VisualEdit | None = None
     latest_visual_edit: VisualEdit | None = None
     turn_count: int = 0
 
@@ -71,7 +84,85 @@ class ImaginationArtifacts:
 class ActionReviewArtifacts:
     motion_plan: MotionPlan | None = None
     planning_context: PlanningContext | None = None
-    handoff_reason: str = "completed"
+    termination_reason: str = "agent_ready"
+
+
+@dataclass(frozen=True)
+class LastPhysicalArtifacts:
+    focus_pose: Pose | None = None
+
+
+@dataclass(frozen=True)
+class EditSummary:
+    """Minimal command memory for one revision-local imagination session."""
+
+    initial_target: ActionTarget
+    current_target: ActionTarget
+    total_translation_base_m: tuple[float, float, float] | None
+    total_rotation_axis_base: tuple[float, float, float] | None
+    total_rotation_deg: float | None
+    previous_edit: VisualEdit | None
+    last_edit: VisualEdit | None
+
+    def summary(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "initial_target": self.initial_target.summary(),
+            "current_target": self.current_target.summary(),
+        }
+        if self.total_translation_base_m is not None:
+            result["total_translation_base_m"] = [
+                round(float(value), 6) for value in self.total_translation_base_m
+            ]
+        if self.total_rotation_deg is not None:
+            result["total_rotation_deg"] = round(float(self.total_rotation_deg), 3)
+            result["total_rotation_axis_base"] = [
+                round(float(value), 6)
+                for value in self.total_rotation_axis_base or (0.0, 0.0, 0.0)
+            ]
+        if self.previous_edit is not None:
+            result["previous_edit"] = self.previous_edit.command_summary()
+        if self.last_edit is not None:
+            result["last_edit"] = self.last_edit.command_summary()
+        return result
+
+
+def build_edit_summary(
+    current_target: ActionTarget,
+    artifacts: ImaginationArtifacts | None,
+) -> EditSummary:
+    """Compile exact cumulative pose change without replaying tool history."""
+
+    initial = (
+        artifacts.initial_target
+        if artifacts is not None and artifacts.initial_target is not None
+        else current_target
+    )
+    translation: tuple[float, float, float] | None = None
+    rotation_axis: tuple[float, float, float] | None = None
+    rotation_deg: float | None = None
+    if initial.pose is not None and current_target.pose is not None:
+        initial_position = np.asarray(initial.pose.position_xyz, dtype=np.float64)
+        current_position = np.asarray(current_target.pose.position_xyz, dtype=np.float64)
+        translation = tuple(float(value) for value in current_position - initial_position)
+        initial_rotation = Rotation.from_quat(initial.pose.quaternion_xyzw)
+        current_rotation = Rotation.from_quat(current_target.pose.quaternion_xyzw)
+        rotvec = (current_rotation * initial_rotation.inv()).as_rotvec()
+        angle = float(np.linalg.norm(rotvec))
+        rotation_deg = float(np.rad2deg(angle))
+        rotation_axis = (
+            tuple(float(value) for value in rotvec / angle)
+            if angle > 1e-9
+            else (0.0, 0.0, 0.0)
+        )
+    return EditSummary(
+        initial_target=initial,
+        current_target=current_target,
+        total_translation_base_m=translation,
+        total_rotation_axis_base=rotation_axis,
+        total_rotation_deg=rotation_deg,
+        previous_edit=(artifacts.previous_visual_edit if artifacts is not None else None),
+        last_edit=(artifacts.latest_visual_edit if artifacts is not None else None),
+    )
 
 
 @dataclass(frozen=True)
@@ -90,6 +181,7 @@ class PrivateEnvContext:
     seed_artifacts: dict[str, SeedArtifacts] = field(default_factory=dict)
     imagination_artifacts: ImaginationArtifacts | None = None
     review_artifacts: dict[str, ActionReviewArtifacts] = field(default_factory=dict)
+    last_physical_artifacts: LastPhysicalArtifacts | None = None
     presentation_event: PresentationEvent | None = None
     trace_diagnostics: dict[str, Any] = field(default_factory=dict)
 
@@ -101,6 +193,7 @@ class PrivateEnvContext:
         self.seed_artifacts.clear()
         self.imagination_artifacts = None
         self.review_artifacts.clear()
+        self.last_physical_artifacts = None
         self.presentation_event = None
         self.trace_diagnostics.clear()
 
@@ -118,12 +211,15 @@ class PrivateEnvContext:
 
 
 __all__ = [
+    "EditSummary",
     "ImaginationArtifacts",
     "PlanningContext",
     "PresentationEvent",
     "PrivateEnvContext",
     "ActionReviewArtifacts",
+    "LastPhysicalArtifacts",
     "RegionGeometryArtifact",
     "SeedArtifacts",
     "VisualEdit",
+    "build_edit_summary",
 ]

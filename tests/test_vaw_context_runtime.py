@@ -5,8 +5,13 @@ import json
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from vaw.context_runtime import FUNCTION_NAMES, ContextWorkspace, function_definitions
-from vaw.context_runtime.motion import CUROBO_TCP_TO_HAND_LOCAL_XYZ
+from vaw.context_runtime import (
+    FUNCTION_NAMES,
+    ActionPrediction,
+    ContextWorkspace,
+    function_definitions,
+)
+from vaw.context_runtime.motion import CUROBO_TCP_TO_HAND_LOCAL_XYZ, MotionPlan
 from vaw.context_runtime.protocol import (
     IMAGINATION_FUNCTION_NAMES,
     SYSTEM_PROMPT,
@@ -131,6 +136,33 @@ class FakeCuroboContextApi(FakeContextApi):
         self.cartesian[3:7] = self._target_quaternion
 
 
+class FailedMotionBackend:
+    name = "failed-test"
+    tcp_to_hand_local_xyz = (0.0, 0.0, -0.1)
+
+    @staticmethod
+    def _plan() -> MotionPlan:
+        return MotionPlan(
+            "failed-test",
+            ActionPrediction(solve_ik="error", detail="no executable plan"),
+        )
+
+    def preview(self, target):
+        del target
+        return self._plan().prediction
+
+    def plan_pose(self, target, *, preview=None):
+        del target, preview
+        return self._plan()
+
+    def plan_grasp(self, target, *, object_name, object_mask, preview=None):
+        del target, object_name, object_mask, preview
+        return self._plan()
+
+    def execute(self, plan, target):
+        raise AssertionError(f"failed plan must not execute: {plan}, {target}")
+
+
 def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
     assert len(FUNCTION_NAMES) == 11
     assert FUNCTION_NAMES[0] == "detection_and_sam"
@@ -158,6 +190,12 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
     for name in ("delta_move", "rotate"):
         definition = next(x["function"] for x in main if x["function"]["name"] == name)
         assert "frame" in definition["parameters"]["required"]
+        assert "refinement_goal" in definition["parameters"]["required"]
+    for name in ("select", "propose_pose", "open_gripper", "close_gripper"):
+        definition = next(x["function"] for x in main if x["function"]["name"] == name)
+        assert "refinement_goal" in definition["parameters"]["required"]
+    for definition in imagination:
+        assert "refinement_goal" not in definition["function"]["parameters"]["properties"]
 
 
 def test_gripper_preview_enters_imagination_without_physical_effect() -> None:
@@ -193,8 +231,8 @@ def test_continuous_imagination_edits_one_target_then_hands_off() -> None:
     action_id = handoff.result["action_id"]
     assert workspace.state.owner == "main"
     assert workspace.state.action_review.action_id == action_id
-    assert workspace.state.action_review.handoff_reason == "completed"
-    assert workspace.state.last_handoff.status == "ready"
+    assert workspace.state.last_handoff.status == "review_required"
+    assert handoff.result == {"status": "review_required", "action_id": action_id}
 
 
 def test_commit_is_only_physical_boundary_and_invalidates_revision_state() -> None:
@@ -213,6 +251,51 @@ def test_commit_is_only_physical_boundary_and_invalidates_revision_state() -> No
     assert workspace.state.observation_revision == before + 1
     assert workspace.state.action_review is None
     assert region_id not in workspace.state.regions
+    assert workspace.state.last_physical_action.intent == "task"
+    assert workspace.state.last_physical_action.executed_stages == "arm+gripper"
+    assert workspace.state.last_physical_action.outcome == "completed"
+    assert workspace._private.previous_observation is not None
+    assert workspace._private.last_physical_artifacts.focus_pose is not None
+
+
+def test_commit_records_failed_stage_without_claiming_task_effect() -> None:
+    arm_api = FakeContextApi()
+    arm_api.move_error = True
+    arm_workspace = ContextWorkspace(arm_api, "arm failure", motion_backend="pyroki")
+    arm_workspace.set_refinement_goal("move and close")
+    arm_workspace.execute("delta_move", delta_xyz_m=[0.0, 0.0, 0.01], frame="base")
+    arm_workspace.execute("close_gripper")
+    arm_action = arm_workspace.execute("finish_imagination", status="ready").result[
+        "action_id"
+    ]
+
+    arm_result = arm_workspace.execute("commit", action_id=arm_action)
+
+    assert not arm_result.ok
+    assert arm_api.operation_log == ["arm"]
+    assert arm_workspace.state.last_physical_action.executed_stages == "arm"
+    assert arm_workspace.state.last_physical_action.outcome == "arm_failed"
+
+    gripper_api = FakeContextApi()
+    gripper_api.gripper_error = True
+    gripper_workspace = ContextWorkspace(
+        gripper_api,
+        "gripper failure",
+        motion_backend="pyroki",
+    )
+    gripper_workspace.set_refinement_goal("only close")
+    gripper_workspace.execute("close_gripper")
+    gripper_action = gripper_workspace.execute(
+        "finish_imagination",
+        status="ready",
+    ).result["action_id"]
+
+    gripper_result = gripper_workspace.execute("commit", action_id=gripper_action)
+
+    assert not gripper_result.ok
+    assert gripper_api.operation_log == ["gripper:closed"]
+    assert gripper_workspace.state.last_physical_action.executed_stages == "gripper"
+    assert gripper_workspace.state.last_physical_action.outcome == "gripper_failed"
 
 
 def test_grasp_proposal_returns_general_action_seeds() -> None:
@@ -232,6 +315,49 @@ def test_imagination_limit_produces_main_review_not_approval() -> None:
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
     workspace.execute("open_gripper")
     result = workspace.limit_imagination()
-    assert result.result["status"] == "budget_exhausted"
-    assert workspace.state.action_review.handoff_reason == "budget_exhausted"
+    assert result.result["status"] == "review_required"
+    assert workspace.state.last_handoff.status == "review_required"
+    artifact = workspace._private.review_artifacts[result.result["action_id"]]
+    assert artifact.termination_reason == "turn_limit"
     assert workspace.state.owner == "main"
+
+
+def test_imagination_limit_does_not_publish_unexecutable_review() -> None:
+    workspace = ContextWorkspace(
+        FakeContextApi(),
+        "task",
+        motion_backend=FailedMotionBackend(),
+    )
+    workspace.execute("delta_move", delta_xyz_m=[0.01, 0.0, 0.0], frame="base")
+
+    result = workspace.limit_imagination()
+
+    assert result.result == {"status": "failed"}
+    assert workspace.state.owner == "main"
+    assert workspace.state.action_review is None
+    assert workspace.state.last_handoff.status == "failed"
+
+
+def test_main_revision_continues_from_reviewed_target() -> None:
+    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
+    workspace.execute("delta_move", delta_xyz_m=[0.01, 0.0, 0.0], frame="base")
+    workspace.execute("close_gripper")
+    first_action = workspace.execute("finish_imagination", status="ready").result[
+        "action_id"
+    ]
+    reviewed = workspace.state.action_review.target
+
+    workspace.set_refinement_goal("继续把已审查目标向 base +Y 微调")
+    workspace.execute("delta_move", delta_xyz_m=[0.0, 0.01, 0.0], frame="base")
+
+    revised = workspace.state.imagination.target
+    assert workspace.state.action_review is None
+    assert revised.gripper == "closed"
+    assert np.allclose(
+        revised.pose.position_xyz,
+        np.asarray(reviewed.pose.position_xyz) + np.array([0.0, 0.01, 0.0]),
+    )
+    second_action = workspace.execute("finish_imagination", status="ready").result[
+        "action_id"
+    ]
+    assert second_action != first_action

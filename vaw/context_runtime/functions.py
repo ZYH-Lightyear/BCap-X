@@ -25,6 +25,7 @@ from vaw.context_runtime.model import (
     ActionTarget,
     ImaginationHandoff,
     ImaginationState,
+    LastPhysicalAction,
     PointEvidence,
     Pose,
     RegionEvidence,
@@ -33,6 +34,7 @@ from vaw.context_runtime.motion import MotionBackendError, MotionPlan
 from vaw.context_runtime.private import (
     ActionReviewArtifacts,
     ImaginationArtifacts,
+    LastPhysicalArtifacts,
     PlanningContext,
     RegionGeometryArtifact,
     SeedArtifacts,
@@ -398,14 +400,25 @@ class ContextFunctions:
         planning_context = artifacts.planning_context
         plan = self._plan_adjusted_pose(target, planning_context)
         current = self.ws.state.imagination
+        gripper = (
+            current.target.gripper
+            if current is not None
+            else (
+                artifacts.initial_target.gripper
+                if artifacts.initial_target is not None
+                else None
+            )
+        )
         return self._store_imagination(
             ActionTarget(
                 pose=target,
-                gripper=current.target.gripper if current is not None else None,
+                gripper=gripper,
             ),
             ImaginationArtifacts(
                 planning_context=planning_context,
                 preview_plan=plan,
+                initial_target=artifacts.initial_target,
+                previous_visual_edit=artifacts.previous_visual_edit,
                 latest_visual_edit=visual_edit,
                 turn_count=artifacts.turn_count,
             ),
@@ -454,14 +467,25 @@ class ContextFunctions:
         planning_context = artifacts.planning_context
         plan = self._plan_adjusted_pose(target, planning_context)
         current = self.ws.state.imagination
+        gripper = (
+            current.target.gripper
+            if current is not None
+            else (
+                artifacts.initial_target.gripper
+                if artifacts.initial_target is not None
+                else None
+            )
+        )
         return self._store_imagination(
             ActionTarget(
                 pose=target,
-                gripper=current.target.gripper if current is not None else None,
+                gripper=gripper,
             ),
             ImaginationArtifacts(
                 planning_context=planning_context,
                 preview_plan=plan,
+                initial_target=artifacts.initial_target,
+                previous_visual_edit=artifacts.previous_visual_edit,
                 latest_visual_edit=visual_edit,
                 turn_count=artifacts.turn_count,
             ),
@@ -477,6 +501,31 @@ class ContextFunctions:
             )
             return reference, self.ws._private.imagination_artifacts or ImaginationArtifacts()
 
+        review = self.ws.state.action_review
+        if review is not None and review.target.pose is not None:
+            reference_rotation = _pose_rotation(review.target.pose)
+            reference = Pose(
+                review.target.pose.position_xyz,
+                tuple(float(value) for value in reference_rotation.as_quat()),
+            )
+            review_artifacts = self.ws._private.review_artifacts.get(review.action_id)
+            return (
+                reference,
+                ImaginationArtifacts(
+                    planning_context=(
+                        review_artifacts.planning_context
+                        if review_artifacts is not None
+                        else None
+                    ),
+                    preview_plan=(
+                        review_artifacts.motion_plan
+                        if review_artifacts is not None
+                        else None
+                    ),
+                    initial_target=review.target,
+                ),
+            )
+
         robot = self.ws.state.robot
         if robot is None or robot.tcp_pose is None:
             raise ContextFunctionError("current TCP pose is unavailable")
@@ -484,12 +533,13 @@ class ContextFunctions:
             rotation = _pose_rotation(robot.tcp_pose)
         except ValueError as exc:
             raise ContextFunctionError(f"current TCP pose is invalid: {exc}") from exc
+        reference = Pose(
+            robot.tcp_pose.position_xyz,
+            tuple(float(value) for value in rotation.as_quat()),
+        )
         return (
-            Pose(
-                robot.tcp_pose.position_xyz,
-                tuple(float(value) for value in rotation.as_quat()),
-            ),
-            ImaginationArtifacts(),
+            reference,
+            ImaginationArtifacts(initial_target=ActionTarget(pose=reference)),
         )
 
     def _plan_adjusted_pose(
@@ -516,6 +566,15 @@ class ContextFunctions:
     ) -> dict[str, Any]:
         self.ws.state.action_review = None
         self.ws._private.review_artifacts.clear()
+        self.ws._private.imagination_artifacts = None
+        artifacts = ImaginationArtifacts(
+            planning_context=artifacts.planning_context,
+            preview_plan=artifacts.preview_plan,
+            initial_target=target,
+            previous_visual_edit=None,
+            latest_visual_edit=artifacts.latest_visual_edit,
+            turn_count=0,
+        )
         return self._store_imagination(target, artifacts)
 
     def _store_imagination(
@@ -528,6 +587,21 @@ class ContextFunctions:
         )
         previous = self.ws._private.imagination_artifacts
         turn_count = previous.turn_count if previous is not None else 0
+        initial_target = (
+            previous.initial_target
+            if previous is not None and previous.initial_target is not None
+            else artifacts.initial_target or target
+        )
+        latest_edit = artifacts.latest_visual_edit
+        previous_edit = artifacts.previous_visual_edit
+        if previous is not None:
+            if latest_edit is not None:
+                previous_edit = previous.latest_visual_edit
+            else:
+                latest_edit = previous.latest_visual_edit
+                previous_edit = previous.previous_visual_edit
+        self.ws.state.action_review = None
+        self.ws._private.review_artifacts.clear()
         self.ws.state.imagination = ImaginationState(
             target=target,
             refinement_goal=self.ws.refinement_goal,
@@ -535,7 +609,9 @@ class ContextFunctions:
         self.ws._private.imagination_artifacts = ImaginationArtifacts(
             planning_context=artifacts.planning_context,
             preview_plan=artifacts.preview_plan,
-            latest_visual_edit=artifacts.latest_visual_edit,
+            initial_target=initial_target,
+            previous_visual_edit=previous_edit,
+            latest_visual_edit=latest_edit,
             turn_count=turn_count,
         )
         self.ws._private.trace_diagnostics["imagination_edit"] = {
@@ -575,8 +651,14 @@ class ContextFunctions:
         if action is None or action.action_id != action_id:
             raise ContextFunctionError(f"unknown or expired action_id '{action_id}'")
         execution_error: ContextFunctionError | None = None
-        failed_stage: str | None = None
+        failed_stage: str | None = (
+            "arm" if action.target.pose is not None else "gripper"
+        )
         executed_stages: list[str] = []
+        focus_pose = (
+            action.target.pose
+            or (self.ws.state.robot.tcp_pose if self.ws.state.robot is not None else None)
+        )
         try:
             artifacts = self.ws._private.review_artifacts.get(action_id)
             if artifacts is None:
@@ -585,21 +667,21 @@ class ContextFunctions:
                 )
             if action.target.pose is not None:
                 failed_stage = "arm"
+                executed_stages.append("arm")
                 if artifacts.motion_plan is None:
                     raise ContextFunctionError(
                         f"active action '{action_id}' has no cached motion plan"
                     )
                 self.ws.motion.execute(artifacts.motion_plan, action.target.pose)
-                executed_stages.append("arm")
             if action.target.gripper is not None:
                 failed_stage = "gripper"
+                executed_stages.append("gripper")
                 backend_function = (
                     "open_gripper"
                     if action.target.gripper == "open"
                     else "close_gripper"
                 )
                 self.ws._call_backend(backend_function)
-                executed_stages.append("gripper")
             failed_stage = None
         except MotionBackendError as exc:
             execution_error = ContextFunctionError(str(exc))
@@ -607,6 +689,29 @@ class ContextFunctions:
             execution_error = exc
         finally:
             self.ws.refresh_observation()
+
+        if not executed_stages and failed_stage is not None:
+            executed_stages.append(failed_stage)
+        if executed_stages == ["arm", "gripper"]:
+            stage_summary = "arm+gripper"
+        elif executed_stages == ["arm"]:
+            stage_summary = "arm"
+        else:
+            stage_summary = "gripper"
+        if execution_error is None:
+            outcome = "completed"
+        elif failed_stage == "arm":
+            outcome = "arm_failed"
+        else:
+            outcome = "gripper_failed"
+        self.ws.state.last_physical_action = LastPhysicalAction(
+            intent=action.intent,
+            executed_stages=stage_summary,
+            outcome=outcome,
+        )
+        self.ws._private.last_physical_artifacts = LastPhysicalArtifacts(
+            focus_pose=focus_pose
+        )
 
         self.ws._private.trace_diagnostics["waypoint_commit"] = {
             "action_id": action_id,
@@ -644,10 +749,40 @@ class ContextFunctions:
 
     def _preview_gripper(self, target: str) -> dict[str, Any]:
         imagination = self.ws.state.imagination
-        artifacts = self.ws._private.imagination_artifacts or ImaginationArtifacts()
-        pose = imagination.target.pose if imagination is not None else None
+        if imagination is not None:
+            artifacts = self.ws._private.imagination_artifacts or ImaginationArtifacts()
+            pose = imagination.target.pose
+        elif self.ws.state.action_review is not None:
+            review = self.ws.state.action_review
+            review_artifacts = self.ws._private.review_artifacts.get(review.action_id)
+            artifacts = ImaginationArtifacts(
+                planning_context=(
+                    review_artifacts.planning_context
+                    if review_artifacts is not None
+                    else None
+                ),
+                preview_plan=(
+                    review_artifacts.motion_plan
+                    if review_artifacts is not None
+                    else None
+                ),
+                initial_target=review.target,
+            )
+            pose = review.target.pose
+        else:
+            artifacts = ImaginationArtifacts()
+            pose = None
+        edit = VisualEdit(kind="gripper", gripper_target=target)
         return self._store_imagination(
-            ActionTarget(pose=pose, gripper=_gripper_target(target)), artifacts
+            ActionTarget(pose=pose, gripper=_gripper_target(target)),
+            ImaginationArtifacts(
+                planning_context=artifacts.planning_context,
+                preview_plan=artifacts.preview_plan,
+                initial_target=artifacts.initial_target,
+                previous_visual_edit=artifacts.previous_visual_edit,
+                latest_visual_edit=edit,
+                turn_count=artifacts.turn_count,
+            ),
         )
 
     def finish_imagination(self, status: str) -> dict[str, Any]:
@@ -656,40 +791,17 @@ class ContextFunctions:
         imagination = self.ws.state.imagination
         if imagination is None:
             raise ContextFunctionError("there is no active imagination session")
-        artifacts = self.ws._private.imagination_artifacts or ImaginationArtifacts()
         if status == "failed":
             self.ws.state.imagination = None
             self.ws._private.imagination_artifacts = None
             self.ws.state.last_handoff = ImaginationHandoff(status="failed")
             self.ws._private.trace_diagnostics["imagination_handoff"] = {
                 "status": "failed",
+                "termination_reason": "agent_failed",
                 "target": imagination.target.summary(),
             }
             return {"status": "failed"}
-        plan = artifacts.preview_plan
-        if imagination.target.pose is not None and (
-            plan is None or plan.prediction.solve_ik != "returned"
-        ):
-            raise ContextFunctionError("target has no executable cached motion plan")
-        action_id = self.ws.state.next_id("a")
-        review = ActionReview(action_id, imagination.target, "completed")
-        self.ws.state.action_review = review
-        self.ws._private.review_artifacts = {
-            action_id: ActionReviewArtifacts(
-                motion_plan=plan,
-                planning_context=artifacts.planning_context,
-                handoff_reason="completed",
-            )
-        }
-        self.ws.state.imagination = None
-        self.ws._private.imagination_artifacts = None
-        self.ws.state.last_handoff = ImaginationHandoff("ready", action_id)
-        self.ws._private.trace_diagnostics["imagination_handoff"] = {
-            "status": "ready",
-            "action_id": action_id,
-            "target": review.target.summary(),
-        }
-        return self.ws.state.last_handoff.summary()
+        return self._handoff_review("agent_ready")
 
     def limit_imagination(self) -> dict[str, Any]:
         """Return the final preview to Main without marking it as approved."""
@@ -697,25 +809,52 @@ class ContextFunctions:
         imagination = self.ws.state.imagination
         if imagination is None:
             raise ContextFunctionError("there is no active imagination session")
+        return self._handoff_review("turn_limit")
+
+    def _handoff_review(self, termination_reason: str) -> dict[str, Any]:
+        imagination = self.ws.state.imagination
+        if imagination is None:
+            raise ContextFunctionError("there is no active imagination session")
         artifacts = self.ws._private.imagination_artifacts or ImaginationArtifacts()
+        plan = artifacts.preview_plan
+        if imagination.target.pose is not None and (
+            plan is None or plan.prediction.solve_ik != "returned"
+        ):
+            self.ws.state.imagination = None
+            self.ws._private.imagination_artifacts = None
+            self.ws.state.last_handoff = ImaginationHandoff("failed")
+            self.ws._private.trace_diagnostics["imagination_handoff"] = {
+                "status": "failed",
+                "termination_reason": f"{termination_reason}_without_executable_plan",
+                "target": imagination.target.summary(),
+            }
+            return {"status": "failed"}
+
         action_id = self.ws.state.next_id("a")
-        self.ws.state.action_review = ActionReview(
-            action_id, imagination.target, "budget_exhausted"
+        review = ActionReview(
+            action_id,
+            imagination.target,
+            imagination.refinement_goal,
         )
+        self.ws.state.action_review = review
         self.ws._private.review_artifacts = {
             action_id: ActionReviewArtifacts(
-                motion_plan=artifacts.preview_plan,
+                motion_plan=plan,
                 planning_context=artifacts.planning_context,
-                handoff_reason="budget_exhausted",
+                termination_reason=termination_reason,
             )
         }
         self.ws.state.imagination = None
         self.ws._private.imagination_artifacts = None
-        self.ws.state.last_handoff = ImaginationHandoff("budget_exhausted", action_id)
+        self.ws.state.last_handoff = ImaginationHandoff(
+            "review_required", action_id
+        )
         self.ws._private.trace_diagnostics["imagination_handoff"] = {
-            "status": "budget_exhausted",
+            "status": "review_required",
+            "termination_reason": termination_reason,
             "action_id": action_id,
-            "target": imagination.target.summary(),
+            "target": review.target.summary(),
+            "intent": review.intent,
         }
         return self.ws.state.last_handoff.summary()
 

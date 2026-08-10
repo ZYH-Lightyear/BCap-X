@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 GripperTarget = Literal["open", "closed"]
-ImaginationOutcome = Literal["ready", "failed", "budget_exhausted"]
+ImaginationOutcome = Literal["review_required", "failed"]
 
 
 def _floats(values: tuple[float, ...]) -> list[float]:
@@ -71,21 +71,17 @@ class ImaginationState:
 
 @dataclass(frozen=True)
 class ActionReview:
-    """A final imagination target awaiting an explicit Main-Agent decision.
-
-    ``handoff_reason`` describes why control returned to Main; it is not an
-    approval signal.  Calling ``commit`` is the Main Agent's approval.
-    """
+    """A final imagination target awaiting an explicit Main-Agent decision."""
 
     action_id: str
     target: ActionTarget
-    handoff_reason: Literal["completed", "budget_exhausted"]
+    intent: str
 
     def summary(self) -> dict[str, Any]:
         return {
             "action_id": self.action_id,
             "target": self.target.summary(),
-            "handoff_reason": self.handoff_reason,
+            "intent": self.intent,
         }
 
 
@@ -99,6 +95,22 @@ class ImaginationHandoff:
         if self.action_id is not None:
             result["action_id"] = self.action_id
         return result
+
+
+@dataclass(frozen=True)
+class LastPhysicalAction:
+    """One-shot causal continuity after a commit, never a task-effect claim."""
+
+    intent: str
+    executed_stages: Literal["arm", "gripper", "arm+gripper"]
+    outcome: Literal["completed", "arm_failed", "gripper_failed"]
+
+    def summary(self) -> dict[str, str]:
+        return {
+            "intent": self.intent,
+            "executed_stages": self.executed_stages,
+            "outcome": self.outcome,
+        }
 
 
 @dataclass(frozen=True)
@@ -195,6 +207,7 @@ class ContextState:
     imagination: ImaginationState | None = None
     action_review: ActionReview | None = None
     last_handoff: ImaginationHandoff | None = None
+    last_physical_action: LastPhysicalAction | None = None
     _counters: dict[str, int] = field(default_factory=dict, repr=False)
 
     @property
@@ -213,6 +226,7 @@ class ContextState:
         self.imagination = None
         self.action_review = None
         self.last_handoff = None
+        self.last_physical_action = None
         return self.observation_revision
 
     def manifest(self) -> dict[str, Any]:
@@ -249,6 +263,11 @@ class ContextState:
             "last_handoff": (
                 self.last_handoff.summary() if self.last_handoff is not None else None
             ),
+            "last_physical_action": (
+                self.last_physical_action.summary()
+                if self.last_physical_action is not None
+                else None
+            ),
         }
 
 
@@ -260,6 +279,7 @@ __all__ = [
     "GripperTarget",
     "ImaginationHandoff",
     "ImaginationState",
+    "LastPhysicalAction",
     "PointEvidence",
     "Pose",
     "ActionReview",

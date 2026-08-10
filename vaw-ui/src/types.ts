@@ -1,6 +1,6 @@
 export interface ContextSnapshot {
-  schemaVersion: 12
-  schema: 'vaw-context-v11-control-focus'
+  schemaVersion: 14
+  schema: 'vaw-context-v13-post-commit'
   renderId: string
   revision: number
   viewport: { width: 1920; height: 1080 }
@@ -13,6 +13,13 @@ export interface ContextSnapshot {
     owner: 'main' | 'imagination'
     refinementGoal: string | null
     latestError: string | null
+    lastPhysicalAction: {
+      intent: string
+      executed_stages: 'arm' | 'gripper' | 'arm+gripper'
+      outcome: 'completed' | 'arm_failed' | 'gripper_failed'
+    } | null
+    postCommitBeforeRasterId: string | null
+    postCommitCurrentRasterId: string | null
     robot: {
       ee_pose?: { position_xyz: number[]; quaternion_xyzw: number[] }
       tcp_pose?: { position_xyz: number[]; quaternion_xyzw: number[] }
@@ -22,7 +29,7 @@ export interface ContextSnapshot {
     action: {
       status: 'editing' | 'review'
       action_id?: string
-      handoff_reason?: 'completed' | 'budget_exhausted'
+      intent?: string
       target: {
         pose?: { position_xyz: number[]; quaternion_xyzw: number[] }
         gripper?: 'open' | 'closed'
@@ -34,11 +41,12 @@ export interface ContextSnapshot {
         detail?: string
       }
       latest_edit?: {
-        kind: 'delta_move' | 'rotate'
+        kind: 'delta_move' | 'rotate' | 'gripper'
         frame: 'base' | 'tool'
         delta_xyz_m?: number[]
         axis?: 'x' | 'y' | 'z'
         angle_deg?: number
+        gripper_target?: 'open' | 'closed'
       }
     } | null
   }
@@ -71,7 +79,7 @@ export interface ContextSnapshot {
     }>
   }
   decision: {
-    mode: 'idle' | 'grounding' | 'seeds' | 'editing' | 'reviewed' | 'error' | 'terminal'
+    mode: 'idle' | 'grounding' | 'seeds' | 'editing' | 'reviewed' | 'post_commit' | 'error' | 'terminal'
     regionIds: string[]
     pointIds: string[]
     seedIds: string[]

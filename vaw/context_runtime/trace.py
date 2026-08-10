@@ -22,8 +22,10 @@ class ContextTraceLogger:
         for artifact in self.dir.glob("video_*.mp4"):
             artifact.unlink()
         self.steps_path = self.dir / "steps.jsonl"
+        self.events_path = self.dir / "runtime_events.jsonl"
         self.meta_path = self.dir / "meta.json"
         self.steps_path.unlink(missing_ok=True)
+        self.events_path.unlink(missing_ok=True)
         self.meta_path.unlink(missing_ok=True)
         self.index = 0
 
@@ -90,6 +92,13 @@ class ContextTraceLogger:
         self.meta_path.write_text(
             json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+
+    def log_event(self, event_type: str, values: dict[str, Any]) -> None:
+        """Write runtime-only control provenance that is never policy-visible."""
+
+        record = {"event_type": str(event_type), **values}
+        with self.events_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def _packet_manifest(packet: ContextPacket) -> dict[str, Any]:

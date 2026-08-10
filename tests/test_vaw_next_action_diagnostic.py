@@ -19,12 +19,26 @@ def test_lift_probe_scores_valid_delta_and_rejects_oversized_delta() -> None:
     )[0]
     preferred, _ = score_call(
         case,
-        {"name": "delta_move", "arguments": {"delta_xyz_m": [0, 0, 0.03], "frame": "base"}},
+        {
+            "name": "delta_move",
+            "arguments": {
+                "delta_xyz_m": [0, 0, 0.03],
+                "frame": "base",
+                "refinement_goal": "小幅抬升并检查物体是否随动",
+            },
+        },
         None,
     )
     invalid, reason = score_call(
         case,
-        {"name": "delta_move", "arguments": {"delta_xyz_m": [0, 0, 0.15], "frame": "base"}},
+        {
+            "name": "delta_move",
+            "arguments": {
+                "delta_xyz_m": [0, 0, 0.15],
+                "frame": "base",
+                "refinement_goal": "小幅抬升并检查物体是否随动",
+            },
+        },
         None,
     )
     assert preferred == "preferred"
