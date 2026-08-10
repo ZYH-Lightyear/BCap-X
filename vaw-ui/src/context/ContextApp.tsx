@@ -63,6 +63,17 @@ function SeedCard({ snapshot, seed }: { snapshot: ContextSnapshot; seed: Seed })
   )
 }
 
+function SeedGallery({ snapshot }: { snapshot: ContextSnapshot }) {
+  const seeds = snapshot.decision.seedIds
+    .map((id) => snapshot.catalog.seeds.find((item) => item.id === id))
+    .filter((item): item is Seed => Boolean(item))
+  return (
+    <div className="via-seed-gallery">
+      {seeds.map((seed) => <SeedCard key={seed.id} snapshot={snapshot} seed={seed} />)}
+    </div>
+  )
+}
+
 function GroundingOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
   const region = snapshot.decision.regionIds
     .map((id) => snapshot.catalog.regions.find((item) => item.id === id))
@@ -102,12 +113,7 @@ function EditOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
 
 function ModeOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
   const mode = snapshot.decision.mode
-  if (mode === 'seeds') {
-    const seeds = snapshot.decision.seedIds
-      .map((id) => snapshot.catalog.seeds.find((item) => item.id === id))
-      .filter((item): item is Seed => Boolean(item))
-    return <div className="via-seed-strip">{seeds.map((seed) => <SeedCard key={seed.id} snapshot={snapshot} seed={seed} />)}</div>
-  }
+  if (mode === 'seeds') return null
   if (mode === 'grounding') return <GroundingOverlay snapshot={snapshot} />
   if (mode === 'error') return <div className="via-error-overlay"><strong>FUNCTION ERROR</strong><p>{snapshot.world.latestError}</p></div>
   return <EditOverlay snapshot={snapshot} />
@@ -133,13 +139,16 @@ function WaypointPanel({ snapshot }: { snapshot: ContextSnapshot }) {
 
 function ImaginationLayer({ snapshot }: { snapshot: ContextSnapshot }) {
   const active = snapshot.world.action !== null
+  const selecting = snapshot.decision.mode === 'seeds'
   return (
-    <section className={`via-imagination${active ? ' via-imagination--active' : ''}`}>
-      <header><h1>IMAGINATION · NOT EXECUTED</h1></header>
+    <section className={`via-imagination${active ? ' via-imagination--active' : ''}${selecting ? ' via-imagination--seeds' : ''}`}>
+      <header><h1>{selecting ? 'ACTION SEEDS · SELECT ONE TO IMAGINE' : 'IMAGINATION · NOT EXECUTED'}</h1></header>
       <div className="via-imagination-stage">
-        <Raster snapshot={snapshot} id={snapshot.world.imaginationSceneRasterId} alt="当前点云上的虚拟 Waypoint" />
-        <ModeOverlay snapshot={snapshot} />
-        <WaypointPanel snapshot={snapshot} />
+        {selecting
+          ? <SeedGallery snapshot={snapshot} />
+          : <Raster snapshot={snapshot} id={snapshot.world.imaginationSceneRasterId} alt="当前点云上的虚拟 Waypoint" />}
+        {!selecting && <ModeOverlay snapshot={snapshot} />}
+        {!selecting && active && <WaypointPanel snapshot={snapshot} />}
       </div>
     </section>
   )

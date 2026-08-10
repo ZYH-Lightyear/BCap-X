@@ -8,9 +8,11 @@ call。
 和物理提交；Imagination Agent 在独立、无物理副作用的会话中连续检查和微调一个
 `ActionTarget`。
 
-双 Agent 基线见 [`M1_4_2_DUAL_AGENT_RUNTIME.md`](M1_4_2_DUAL_AGENT_RUNTIME.md)。当前的
-20-turn 真实抓取优化、Context Builder 审计和逐版本验收记录见
-[`M1_4_3_GRASP_CONTEXT_OPTIMIZATION.md`](M1_4_3_GRASP_CONTEXT_OPTIMIZATION.md)。
+当前权威目标、完成定义、Agentic Context 设计和逐版本验收路线见
+[`M1_5_AGENTIC_SYSTEM_COMPLETION.md`](M1_5_AGENTIC_SYSTEM_COMPLETION.md)。双 Agent 基线见
+[`M1_4_2_DUAL_AGENT_RUNTIME.md`](M1_4_2_DUAL_AGENT_RUNTIME.md)；早期 20-turn 抓取审计见
+[`M1_4_3_GRASP_CONTEXT_OPTIMIZATION.md`](M1_4_3_GRASP_CONTEXT_OPTIMIZATION.md)，二者只作为
+历史失败证据，不再定义当前完成标准。
 
 ## Runtime
 
@@ -67,13 +69,14 @@ finish_imagination(status="ready" | "failed")
 
 ## Canvas
 
-Web schema 11 / `vaw-context-v10-via-dense` / renderer
-`context-web-v10-via-dense`：
+Web schema 12 / `vaw-context-v11-control-focus` / renderer
+`context-web-v11-control-focus`：
 
 - 上层 `OBSERVED NOW · REAL WORLD`：干净 agentview、与 agentview 标定透视一致的稠密
   RGB-D surface 和四行本体状态；
-- 下层 `IMAGINATION · NOT EXECUTED`：同一当前 RGB-D surface 的 target-centered 放大图、
-  蓝色当前夹爪和高显著度紫色 target gripper；
+- `ACTION SEEDS`：最多五个候选以固定五列占满下层，统一尺度并完整显示；
+- 下层 `IMAGINATION · NOT EXECUTED`：同一当前 RGB-D surface 的 metric target-centered
+  Contact Focus、蓝色当前夹爪、高显著度紫色 target gripper 和上一 target 的浅色轮廓；
 - BASE/WORLD 坐标提示由 robot-base 几何投影产生，并固定在角落以避免遮挡 target；
 - grounding、ActionSeed 与 refinement 信息只占用下层固定 overlay，不改变双层版式；
 - 紫色几何只存在于下层，并始终表示未执行的预测；

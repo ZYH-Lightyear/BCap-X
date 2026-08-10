@@ -30,6 +30,7 @@ OBSERVED_SCENE_WIDTH = 960
 OBSERVED_SCENE_HEIGHT = 570
 IMAGINATION_SCENE_WIDTH = 1000
 IMAGINATION_SCENE_HEIGHT = 560
+CONTACT_FOCUS_WIDTH_M = 0.32
 
 _BLUE = np.array([37, 99, 235], dtype=np.uint8)
 _BLUE_EDGE = np.array([23, 55, 130], dtype=np.uint8)
@@ -69,6 +70,12 @@ class _RasterMap:
         return out
 
 
+@dataclass(frozen=True)
+class _FocusSpec:
+    center_uv: np.ndarray
+    crop_width_px: float
+
+
 def render_scene_view(
     agentview: dict,
     wrist: dict | None,
@@ -76,6 +83,7 @@ def render_scene_view(
     preview: NearFieldPreview | None = None,
     *,
     dark: bool,
+    source_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Render current dense RGB-D with an optional unexecuted target gripper."""
 
@@ -89,13 +97,14 @@ def render_scene_view(
         color = (3, 7, 14) if dark else (247, 250, 253)
         return np.full((height, width, 3), color, dtype=np.uint8)
 
-    focus = _focus_pixel(camera, robot, preview) if dark else None
+    focus = _focus_spec(camera, robot, preview, source_mask) if dark else None
     mapping = _crop_mapping(
         camera.rgb.shape[1],
         camera.rgb.shape[0],
         width,
         height,
-        focus=focus,
+        focus=focus.center_uv if focus is not None else None,
+        crop_width_hint=focus.crop_width_px if focus is not None else None,
         target_focused=dark and focus is not None,
     )
     native = _dense_surface(camera, dark=dark)
@@ -112,12 +121,15 @@ def render_scene_view(
         crop.resize((width, height), Image.Resampling.BILINEAR),
         dtype=np.uint8,
     ).copy()
+    if dark and source_mask is not None:
+        _overlay_source_surface(output_array, source_mask, mapping)
     # Rasterize geometry at final resolution.  Compositing at the source depth
     # resolution and then enlarging it made diagonal fingers look soft and
     # mask-like; final-resolution silhouettes stay crisp and hole-free.
     if robot is not None:
         _overlay_current(output_array, camera, mapping, robot, dark=dark)
         if preview is not None:
+            _overlay_reference_target(output_array, camera, mapping, robot, preview)
             _overlay_preview(output_array, camera, mapping, robot, preview)
     output = Image.fromarray(output_array)
     draw = ImageDraw.Draw(output, "RGBA")
@@ -240,29 +252,31 @@ def _crop_mapping(
     output_height: int,
     *,
     focus: np.ndarray | None,
+    crop_width_hint: float | None,
     target_focused: bool,
 ) -> _RasterMap:
     aspect = output_width / output_height
-    crop_width = float(source_width * (0.84 if target_focused else 1.0))
+    if target_focused and crop_width_hint is not None:
+        crop_width = float(np.clip(crop_width_hint, 1.0, source_width))
+    else:
+        crop_width = float(source_width)
     crop_height = crop_width / aspect
     if crop_height > source_height:
         crop_height = float(source_height)
         crop_width = crop_height * aspect
     center_x = float(focus[0]) if focus is not None else source_width * 0.5
     center_y = float(focus[1]) if focus is not None else source_height * 0.52
-    # Leave more pixels above the contact TCP for the wrist/palm geometry.
-    if target_focused:
-        center_y -= crop_height * 0.08
     left = float(np.clip(center_x - crop_width * 0.5, 0.0, source_width - crop_width))
     top = float(np.clip(center_y - crop_height * 0.5, 0.0, source_height - crop_height))
     return _RasterMap(left, top, crop_width, crop_height, output_width, output_height)
 
 
-def _focus_pixel(
+def _focus_spec(
     camera: _CameraData,
     robot: RobotState | None,
     preview: NearFieldPreview | None,
-) -> np.ndarray | None:
+    source_mask: np.ndarray | None,
+) -> _FocusSpec | None:
     pose = None
     if preview is not None:
         pose = preview.target_pose
@@ -276,7 +290,59 @@ def _focus_pixel(
     )
     if depth[0] <= 0 or not np.isfinite(uv[0]).all():
         return None
-    return uv[0]
+    # TCP alone is not the visible target: reserve calibrated room for the
+    # palm and fingers before unioning it with the source object evidence.
+    target_half_width = float(camera.intrinsics[0, 0]) * 0.08 / float(depth[0])
+    target_half_height = float(camera.intrinsics[1, 1]) * 0.10 / float(depth[0])
+    lower = uv[0] - np.array([target_half_width, target_half_height])
+    upper = uv[0] + np.array([target_half_width, target_half_height])
+    if source_mask is not None and source_mask.shape == camera.depth.shape:
+        ys, xs = np.nonzero(source_mask)
+        if len(xs):
+            lower = np.minimum(lower, np.array([xs.min(), ys.min()], dtype=np.float64))
+            upper = np.maximum(upper, np.array([xs.max(), ys.max()], dtype=np.float64))
+    center = (lower + upper) * 0.5
+    aspect = IMAGINATION_SCENE_WIDTH / IMAGINATION_SCENE_HEIGHT
+    metric_width = float(camera.intrinsics[0, 0]) * CONTACT_FOCUS_WIDTH_M / float(depth[0])
+    union = np.maximum(upper - lower, 1.0)
+    required_width = max(
+        metric_width,
+        float(union[0]) * 1.45,
+        float(union[1]) * aspect * 1.45,
+    )
+    return _FocusSpec(center_uv=center, crop_width_px=required_width)
+
+
+def _overlay_source_surface(
+    image: np.ndarray,
+    source_mask: np.ndarray,
+    mapping: _RasterMap,
+) -> None:
+    mask = np.asarray(source_mask, dtype=bool)
+    if mask.ndim != 2 or not np.any(mask):
+        return
+    left = int(round(mapping.left))
+    top = int(round(mapping.top))
+    right = int(round(mapping.left + mapping.crop_width))
+    bottom = int(round(mapping.top + mapping.crop_height))
+    cropped = Image.fromarray(mask.astype(np.uint8) * 255).crop(
+        (left, top, right, bottom)
+    )
+    visible = np.asarray(
+        cropped.resize(
+            (mapping.output_width, mapping.output_height),
+            Image.Resampling.NEAREST,
+        ),
+        dtype=np.uint8,
+    ) > 0
+    if not np.any(visible):
+        return
+    emphasis = np.array([14, 165, 233], dtype=np.uint8)
+    image[visible] = np.asarray(
+        np.round(image[visible] * 0.84 + emphasis * 0.16),
+        dtype=np.uint8,
+    )
+    image[mask_outline(visible)] = np.array([125, 211, 252], dtype=np.uint8)
 
 
 def _project_base(
@@ -346,6 +412,40 @@ def _overlay_preview(
     )
 
 
+def _overlay_reference_target(
+    image: np.ndarray,
+    camera: _CameraData,
+    mapping: _RasterMap,
+    robot: RobotState,
+    preview: NearFieldPreview,
+) -> None:
+    edit = preview.visual_edit
+    if edit is None or edit.reference_pose is None or preview.gripper_opening is None:
+        return
+    reference = NearFieldPreview(
+        target_pose=edit.reference_pose,
+        joint_positions_rad=None,
+        gripper_opening=preview.gripper_opening,
+    )
+    triangles = _target_gripper_triangles(robot, reference)
+    if triangles is None:
+        return
+    mask = _triangle_mask(image, camera, mapping, triangles)
+    if not np.any(mask):
+        return
+    outline = mask_outline(mask)
+    for _ in range(2):
+        padded = np.pad(outline, 1, mode="constant")
+        outline = (
+            padded[1:-1, 1:-1]
+            | padded[:-2, 1:-1]
+            | padded[2:, 1:-1]
+            | padded[1:-1, :-2]
+            | padded[1:-1, 2:]
+        )
+    image[outline] = np.array([226, 232, 240], dtype=np.uint8)
+
+
 def _robot_triangles(
     joints: tuple[float, ...],
     opening: float,
@@ -391,15 +491,7 @@ def _overlay_triangles(
     *,
     alpha: float,
 ) -> None:
-    values = np.asarray(triangles, dtype=np.float64).reshape(-1, 3, 3)
-    uv, depth = _project_base(values.reshape(-1, 3), camera)
-    uv = mapping.pixels(uv)
-    mask = rasterize_silhouette(
-        uv.reshape(-1, 3, 2),
-        depth.reshape(-1, 3),
-        image.shape[1],
-        image.shape[0],
-    )
+    mask = _triangle_mask(image, camera, mapping, triangles)
     if not np.any(mask):
         return
     image[mask] = np.asarray(
@@ -407,6 +499,23 @@ def _overlay_triangles(
         dtype=np.uint8,
     )
     image[mask_outline(mask)] = edge
+
+
+def _triangle_mask(
+    image: np.ndarray,
+    camera: _CameraData,
+    mapping: _RasterMap,
+    triangles: np.ndarray,
+) -> np.ndarray:
+    values = np.asarray(triangles, dtype=np.float64).reshape(-1, 3, 3)
+    uv, depth = _project_base(values.reshape(-1, 3), camera)
+    uv = mapping.pixels(uv)
+    return rasterize_silhouette(
+        uv.reshape(-1, 3, 2),
+        depth.reshape(-1, 3),
+        image.shape[1],
+        image.shape[0],
+    )
 
 
 def _draw_world_axes(
@@ -526,6 +635,7 @@ def _font(size: int) -> ImageFont.ImageFont:
 __all__ = [
     "IMAGINATION_SCENE_HEIGHT",
     "IMAGINATION_SCENE_WIDTH",
+    "CONTACT_FOCUS_WIDTH_M",
     "OBSERVED_SCENE_HEIGHT",
     "OBSERVED_SCENE_WIDTH",
     "render_scene_view",

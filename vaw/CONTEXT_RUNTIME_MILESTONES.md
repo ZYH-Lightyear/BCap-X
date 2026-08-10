@@ -1,9 +1,9 @@
 # VAW Context Runtime：单 VLM 设计与 Post-M1.2 Milestones
 
-> **当前执行版本是 M1.4.2。** 下文的单 VLM、K=8 和 Persistent Waypoint 内容仅作为
-> 历史设计记录；运行路径已被 [`M1_4_2_DUAL_AGENT_RUNTIME.md`](M1_4_2_DUAL_AGENT_RUNTIME.md)
-> 中的 Main / Imagination 双 Agent 架构完整替换，不保留旧 packet、history 或 receipt
-> 兼容分支。
+> **当前执行路线是 M1.5 Agentic System Completion。** 本文的单 VLM、K=8、Persistent
+> Waypoint 和 M0–M1.4 内容仅作为历史设计记录。当前完成定义、Context Builder、Canvas、
+> Main/Imagination handoff 与真实 LIBERO-PRO 验收路线以
+> [`M1_5_AGENTIC_SYSTEM_COMPLETION.md`](M1_5_AGENTIC_SYSTEM_COMPLETION.md) 为准。
 
 > 状态：M1.3 核心 Runtime 已完成；M1.3.1 Dynamic Context Canvas 已实现，2026-08-03。
 >

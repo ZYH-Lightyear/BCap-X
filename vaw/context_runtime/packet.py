@@ -34,8 +34,8 @@ from vaw.context_runtime.private import (
 from vaw.context_runtime.scene_view import render_scene_view
 from vaw.context_runtime.workspace import ContextWorkspace
 
-CONTEXT_SCHEMA = "vaw-context-v10-via-dense"
-CONTEXT_WEB_SCHEMA_VERSION = 11
+CONTEXT_SCHEMA = "vaw-context-v11-control-focus"
+CONTEXT_WEB_SCHEMA_VERSION = 12
 CONTEXT_WIDTH = 1920
 CONTEXT_HEIGHT = 1080
 
@@ -256,6 +256,12 @@ class ContextCompiler:
             if target is not None
             else None
         )
+        source_ref = _observed_source_ref(active_artifacts)
+        source_mask = (
+            private.region_masks.get(source_ref)
+            if source_ref is not None
+            else None
+        )
         observed_scene = render_scene_view(
             camera,
             wrist_camera,
@@ -268,6 +274,7 @@ class ContextCompiler:
             state.robot,
             scene_preview,
             dark=True,
+            source_mask=source_mask,
         )
 
         # The persistent world view is deliberately sensor-clean.  All
@@ -765,7 +772,7 @@ def _candidate_crop(
     )
     # The hand/object relationship is the decision evidence.  Preserve the
     # true whole-arm silhouette, but keep it subordinate to the target hand.
-    raster = _overlay_mask(raster, local_robot, VIOLET, alpha=0.18)
+    raster = _overlay_mask(raster, local_robot, VIOLET, alpha=0.10)
     raster = _overlay_mask(raster, local_gripper, VIOLET, alpha=0.80)
     image = Image.fromarray(raster).convert("RGB")
     draw = ImageDraw.Draw(image, "RGBA")

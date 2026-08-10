@@ -178,8 +178,8 @@ def test_packet_is_deterministic_and_does_not_leak_private_state() -> None:
     assert forbidden.isdisjoint(set(_walk_keys(snapshot)))
     encoded = json.dumps(snapshot).lower()
     assert "functionrecord" not in encoded and "waypointdraft" not in encoded
-    assert snapshot["schemaVersion"] == 11
-    assert snapshot["schema"] == "vaw-context-v10-via-dense"
+    assert snapshot["schemaVersion"] == 12
+    assert snapshot["schema"] == "vaw-context-v11-control-focus"
     assert snapshot["viewport"] == {"width": CONTEXT_WIDTH, "height": CONTEXT_HEIGHT}
 
 

@@ -153,8 +153,7 @@ img { display: block; }
 .via-waypoint-panel,
 .via-edit-overlay,
 .via-grounding-overlay,
-.via-error-overlay,
-.via-seed-strip {
+.via-error-overlay {
   position: absolute;
   z-index: 3;
   border: 2px solid #7c3aed;
@@ -202,28 +201,39 @@ img { display: block; }
 .via-edit-overlay .via-fact-row strong { color: #a78bfa; font-size: 16px; }
 .via-edit-overlay .via-fact-row code { color: #fff; font-size: 16px; }
 
-.via-seed-strip {
-  left: 20px;
-  right: 382px;
-  bottom: 18px;
-  height: 176px;
+.via-seed-gallery {
+  position: absolute;
+  z-index: 3;
+  inset: 66px 20px 18px;
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 8px;
-  padding: 10px;
+  gap: 14px;
 }
 
 .via-seed-card {
   min-width: 0;
   display: grid;
-  grid-template-rows: 26px minmax(0, 1fr);
+  grid-template-rows: 42px minmax(0, 1fr);
   overflow: hidden;
-  border: 1px solid #7c3aed;
-  border-radius: 5px;
-  background: #111827;
+  border: 2px solid #7c3aed;
+  border-radius: 9px;
+  background: #0f172a;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, .42);
 }
-.via-seed-card strong { padding: 4px 8px; color: #c4b5fd; font: 900 13px "DejaVu Sans Mono", monospace; }
-.via-seed-card img { width: 100%; height: 100%; object-fit: cover; }
+.via-seed-card strong {
+  display: flex;
+  align-items: center;
+  padding: 0 14px;
+  color: #ede9fe;
+  border-bottom: 1px solid #6d4bc1;
+  font: 900 20px "DejaVu Sans Mono", monospace;
+}
+.via-seed-card img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #eaf1f8;
+}
 
 .via-grounding-overlay {
   left: 20px;

@@ -1,6 +1,6 @@
 export interface ContextSnapshot {
-  schemaVersion: 11
-  schema: 'vaw-context-v10-via-dense'
+  schemaVersion: 12
+  schema: 'vaw-context-v11-control-focus'
   renderId: string
   revision: number
   viewport: { width: 1920; height: 1080 }
