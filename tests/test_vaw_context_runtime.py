@@ -120,6 +120,7 @@ class FakeCuroboContextApi(FakeContextApi):
     def __init__(self) -> None:
         super().__init__()
         self.curobo_execute_calls: list[np.ndarray] = []
+        self.curobo_execute_kwargs: list[dict] = []
         self._target_position = np.zeros(3)
         self._target_quaternion = np.array([1.0, 0.0, 0.0, 0.0])
 
@@ -133,9 +134,9 @@ class FakeCuroboContextApi(FakeContextApi):
         return True, np.stack([self.joints, np.full(7, 0.5)]), 0
 
     def execute_joint_trajectory(self, trajectory, **kwargs):
-        del kwargs
         values = np.asarray(trajectory).copy()
         self.curobo_execute_calls.append(values)
+        self.curobo_execute_kwargs.append(dict(kwargs))
         self.joints = values[-1]
         quat_xyzw = np.roll(self._target_quaternion, -1)
         self.cartesian[:3] = self._target_position + Rotation.from_quat(
@@ -150,9 +151,9 @@ class SettlingCuroboApi(FakeCuroboContextApi):
         self.settle = settle
 
     def execute_joint_trajectory(self, trajectory, **kwargs):
-        del kwargs
         values = np.asarray(trajectory).copy()
         self.curobo_execute_calls.append(values)
+        self.curobo_execute_kwargs.append(dict(kwargs))
         if len(self.curobo_execute_calls) == 1:
             self.joints = values[-1] + 0.02
         elif self.settle:
@@ -284,6 +285,16 @@ def test_curobo_retries_exact_final_waypoint_when_reduced_api_is_still_settling(
 
     assert len(api.curobo_execute_calls) == 2
     np.testing.assert_allclose(api.curobo_execute_calls[1], trajectory[-1:])
+    assert api.curobo_execute_kwargs[0] == {
+        "subsample": 2,
+        "tolerance": 0.025,
+        "max_steps": 15,
+    }
+    assert api.curobo_execute_kwargs[1] == {
+        "subsample": 1,
+        "tolerance": 0.025,
+        "max_steps": 120,
+    }
 
 
 def test_curobo_final_settle_does_not_relax_residual_threshold() -> None:

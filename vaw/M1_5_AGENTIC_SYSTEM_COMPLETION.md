@@ -400,6 +400,35 @@ gripper-only visual edit 没有 reference pose 时的 Canvas 崩溃，修复后�
 execution、contact close 与 lift-follow verification 可连续工作。当前首要失败已收敛为
 **destination grounding 与 transport/place action selection**，而不是 Canvas 分辨率或 pick 执行。
 
+真实 Agent trace `m154e_qwen35plus_destination_t0_s1` 验证了上述 destination 语义修订：当
+`propose_grasps` 返回空候选后，Main 不再循环检测，而是正确执行
+`locate_point(within_region_id) → propose_pose`。但旧的 `LastPhysicalAction=arm_failed` 同时出现在
+新的 ActionReview 旁，Main 连续把已经重新规划的动作误当成旧失败。因果事实本身没有错，错误在
+Context Builder 把“上一动作结果”和“当前待审动作”并列成了两个竞争焦点。修订后底层
+LastPhysicalAction 仍保留在 trace/state，但只要存在 Imagination 或 ActionReview，Agent-visible
+packet 与文本就隐藏旧物理事实；当前 Preview 成为唯一待审对象。
+
+真实 Agent trace `m154f_qwen35plus_review_scope_t0_s1` 证明该作用域修正有效：旧 arm failure 没有
+阻止 Main 审查新的 point-based Waypoint，链路能够完成
+`locate_point → propose_pose → delta_move → review → commit`。该 run 随后暴露出独立的执行层缺陷：
+LIBERO 视频恰好记录 999 帧，而采样率为每 4 个 simulation step 一帧，对应默认 4000-step
+horizon；第二次 commit 在已经 terminated 的 episode 上继续运行并返回
+`executing action in terminated episode`。根因是 VAW 把 Reduced API 的逐 waypoint settle 配成
+`0.01 rad / 120 steps`，一条轨迹即可消耗数千 simulation steps，同时 Runtime 没有传播底层
+episode termination。
+
+同一 `libero_object_swap:0` reset 上用安全的 `base +3 cm Z` 做了隔离 A/B 诊断：
+
+- 原 VAW 默认值执行 31-waypoint CuRobo 轨迹消耗 81 sim steps，TCP error `8.43 mm`；
+- 对齐 CaP-X low-level trajectory helper 的 `0.025 rad / 15 steps`，并保留 VAW 的严格
+  `0.02 rad` 最终 joint residual gate，只消耗 43 sim steps，TCP error `6.13 mm`、最终 residual
+  `0.0172 rad`，环境未终止。
+
+因此执行修订不放宽最终验收、不重规划、不修改 CaP-X：只缩短 intermediate waypoint 的阻塞预算，
+仍允许对同一缓存终点做一次最多 120-step settle。Runtime 另接入 trace-only environment terminal
+check；任何 commit 导致底层 episode 结束后都立即以 `env_terminated` 停止，不能继续向死环境发出
+感知或动作。
+
 验收：主任务 seeds `0,1,2` 至少 `2/3` env success。
 
 ### M1.5.5 — Basic Generalization and Freeze
@@ -437,6 +466,8 @@ execution、contact close 与 lift-follow verification 可连续工作。当前�
 | M1.5.4-b | 去除 quaternion 控制歧义后 Imagination 不再无依据旋转 | in progress | 49 full VAW tests + Ruff + Web build | `m154_qwen35plus_control_semantics_t0_s1` | 旋转错误消失并产生真实接触；单投影仍造成 Z 振荡，加入正交 JAW PLANE 与 rejected source handoff 后待真实复测 |
 | M1.5.4-c | 正交 Contact Focus 能收敛局部接触；revision-local cause + one-decision review 防止任务重启与 stale commit | in progress | 52 full VAW tests + Ruff + Web build | `m154_qwen35plus_contact_focus_t0_s1`, `m154c_source_guard_scripted_t0_s1`, `m154c_qwen35plus_causal_t0_s1` | 局部调整明显收敛且首次真实抓起；因果、stale review、source outlier 与 gripper-only Canvas crash 均已修复并回归 |
 | M1.5.4-d | 精确终点 settle + 幂等 grounding + local/semantic motion 分工能把闭环推进到可靠 place | in progress | 56 full VAW tests + Ruff + Web build | `m154d_qwen35plus_settle_t0_s1` | pick 与 3cm lift 真实成功；首次 place 因未 grounding basket、把 delta 当长距离导航而落在篮外；策略语义已修订，待复测 |
+| M1.5.4-e | 当前 Review 应覆盖旧物理失败，避免两个因果焦点竞争 | in progress | packet/message scope tests + Ruff | `m154e_qwen35plus_destination_t0_s1`, `m154f_qwen35plus_review_scope_t0_s1` | destination recovery 已使用 region-scoped point；隐藏旧 failure 后 Main 能审查新 point-based action。下一失败来自 executor 耗尽 LIBERO horizon |
+| M1.5.4-f | 有界 waypoint tracking + environment termination 传播能保留真实闭环预算 | in progress | safe `+3 cm Z` A/B：81 steps/8.43 mm → 43 steps/6.13 mm；terminal callback regression | pending agent rerun | 保留 0.02 rad 最终 gate，不改 CaP-X；待真实完整 episode 验证 |
 | M1.5.4 | 完整闭环可达到基本 pick-place 成功 | in progress | 56 full VAW tests + Ruff + Web build | pending frozen seeds 0/1/2 | 尚未达到 `2/3 env_success`，不得宣称完成 |
 
 ## 11. 非目标

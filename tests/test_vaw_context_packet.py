@@ -238,3 +238,15 @@ def test_commit_compiles_one_shot_post_action_visual_comparison() -> None:
     assert consumed.world.last_physical_action.executed_stages == "gripper"
     assert "post_commit:before" not in consumed.rasters
     assert "post_commit:current" not in consumed.rasters
+
+    workspace.execute("delta_move", delta_xyz_m=[0.0, 0.0, 0.01], frame="base")
+    editing = ContextCompiler().compile(workspace)
+    assert workspace.state.last_physical_action is not None
+    assert editing.world.last_physical_action is None
+    action_id = workspace.execute("finish_imagination", status="ready").result[
+        "action_id"
+    ]
+    assert action_id
+    reviewed = ContextCompiler().compile(workspace)
+    assert workspace.state.last_physical_action is not None
+    assert reviewed.world.last_physical_action is None

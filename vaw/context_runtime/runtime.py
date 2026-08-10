@@ -76,6 +76,7 @@ class ContextRuntime:
         config: ContextRunConfig | None = None,
         trace: ContextTraceLogger | None = None,
         env_check: Callable[[], bool] | None = None,
+        env_terminal_check: Callable[[], bool] | None = None,
     ) -> None:
         self.main_provider = main_provider
         self.imagination_provider = imagination_provider or main_provider
@@ -85,6 +86,7 @@ class ContextRuntime:
         self.config = config or ContextRunConfig()
         self.trace = trace
         self.env_check = env_check
+        self.env_terminal_check = env_terminal_check
         self.main_tools = function_definitions()
         self.imagination_tools = imagination_function_definitions()
         self.usage: dict[str, int] = {}
@@ -182,6 +184,14 @@ class ContextRuntime:
             self._log(turn, owner, image, packet, _call_summary(call), step, response)
             self._notify(turn, record)
 
+            if physical and self._environment_terminated():
+                return self._result(
+                    TerminateMode.ENV_TERMINATED,
+                    turn,
+                    steps,
+                    "environment terminated during physical execution",
+                )
+
             if (
                 owner == "main"
                 and self.workspace.state.owner == "imagination"
@@ -257,7 +267,11 @@ class ContextRuntime:
                 handoff.summary(), ensure_ascii=False, separators=(",", ":")
             )
         last_physical = self.workspace.state.last_physical_action
-        if last_physical is not None:
+        if (
+            last_physical is not None
+            and self.workspace.state.imagination is None
+            and self.workspace.state.action_review is None
+        ):
             text += "\nLast Physical Action：" + json.dumps(
                 last_physical.summary(), ensure_ascii=False, separators=(",", ":")
             )
@@ -365,6 +379,14 @@ class ContextRuntime:
         except Exception:
             self.env_success = None
 
+    def _environment_terminated(self) -> bool:
+        if self.env_terminal_check is None:
+            return False
+        try:
+            return bool(self.env_terminal_check())
+        except Exception:
+            return False
+
     def _log(
         self,
         turn: int,
@@ -431,6 +453,7 @@ def run_context_episode(
     trace_dir: str | None = None,
     config: ContextRunConfig | None = None,
     env_check: Callable[[], bool] | None = None,
+    env_terminal_check: Callable[[], bool] | None = None,
     motion_backend: str = "curobo",
 ) -> EpisodeResult:
     workspace = ContextWorkspace(api, task_prompt, motion_backend=motion_backend)
@@ -444,6 +467,7 @@ def run_context_episode(
             config=config,
             trace=trace,
             env_check=env_check,
+            env_terminal_check=env_terminal_check,
         ).run()
     finally:
         renderer.close()

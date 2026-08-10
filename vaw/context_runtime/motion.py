@@ -138,10 +138,10 @@ class CuroboMotionBackend:
         *,
         use_world_collision: bool = True,
         trajectory_subsample: int = 2,
-        waypoint_tolerance_rad: float = 0.01,
-        max_steps_per_waypoint: int = 120,
+        waypoint_tolerance_rad: float = 0.025,
+        max_steps_per_waypoint: int = 15,
         final_joint_tolerance_rad: float = 0.02,
-        final_settle_max_steps: int = 360,
+        final_settle_max_steps: int = 120,
     ) -> None:
         if trajectory_subsample < 1:
             raise ValueError("trajectory_subsample must be at least one")
@@ -266,10 +266,12 @@ class CuroboMotionBackend:
         residual = self._final_joint_residual(trajectory[-1])
         if residual > self.final_joint_tolerance_rad and status is None:
             # FrankaLiberoApiReduced does not expose the per-waypoint controller
-            # status.  Its last waypoint can still be settling when the call
-            # returns, even though the cached CuRobo path itself is valid.  Make
-            # one bounded attempt at the *same* endpoint: this neither relaxes
-            # the acceptance threshold nor silently replans a different path.
+            # status.  Track dense trajectory waypoints with the same bounded
+            # budget used by CaP-X's low-level trajectory helper, then make one
+            # bounded attempt at the *same* endpoint if needed.  This avoids
+            # spending LIBERO's entire episode horizon settling every
+            # intermediate waypoint; it neither relaxes the final acceptance
+            # threshold nor silently replans a different path.
             _call(
                 self.api,
                 "execute_joint_trajectory",

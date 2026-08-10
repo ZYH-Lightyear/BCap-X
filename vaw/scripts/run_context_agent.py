@@ -249,6 +249,7 @@ def _run_agent(
         ),
         trace=trace,
         env_check=env.task_completed,
+        env_terminal_check=lambda: bool(getattr(env, "_current_done", False)),
     )
     result = runtime.run()
     print(

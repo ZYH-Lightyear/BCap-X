@@ -29,14 +29,16 @@ class TerminateMode(enum.Enum):
 
     ``GOAL`` means the agent called the ``done`` op — note that this says
     nothing about task success, which is ``EpisodeResult.claimed_success``
-    (the agent's own claim) or an environment-side check. The other four are
-    budget or failure exits.
+    (the agent's own claim) or an environment-side check.
+    ``ENV_TERMINATED`` is an environment/controller boundary exit and is never
+    inferred from model-visible state.
     """
 
     GOAL = "goal"
     MAX_TURNS = "max_turns"
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
+    ENV_TERMINATED = "env_terminated"
     ERROR = "error"
 
 

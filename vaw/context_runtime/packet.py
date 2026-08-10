@@ -344,7 +344,11 @@ class ContextCompiler:
                     else None
                 ),
                 latest_error=event.error if event is not None else None,
-                last_physical_action=state.last_physical_action,
+                last_physical_action=(
+                    state.last_physical_action
+                    if state.imagination is None and state.action_review is None
+                    else None
+                ),
                 post_commit_before_raster_id=post_before_id,
                 post_commit_current_raster_id=post_current_id,
             ),

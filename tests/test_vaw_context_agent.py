@@ -109,6 +109,53 @@ def test_dual_agent_runtime_rebuilds_every_request_without_history(tmp_path: Pat
     assert all("execution_receipt" not in row for row in rows)
 
 
+def test_runtime_stops_after_environment_terminates_during_commit() -> None:
+    main = RecordingProvider(
+        [
+            _response(
+                1,
+                "open_gripper",
+                refinement_goal="只设置张开目标",
+            ),
+            _response(3, "commit", action_id="a1"),
+            _response(4, "done", success=False),
+        ]
+    )
+    imagination = RecordingProvider(
+        [_response(2, "finish_imagination", status="ready")]
+    )
+    terminated = False
+
+    def terminal_check() -> bool:
+        return terminated
+
+    api = FakeContextApi()
+    original_open = api.open_gripper
+
+    def terminating_open() -> None:
+        nonlocal terminated
+        original_open()
+        terminated = True
+
+    api.open_gripper = terminating_open  # type: ignore[method-assign]
+    result = ContextRuntime(
+        main,
+        ContextWorkspace(api, "task", motion_backend="pyroki"),
+        SolidRenderer(),
+        imagination_provider=imagination,
+        env_terminal_check=terminal_check,
+    ).run()
+
+    assert result.terminate_mode.value == "env_terminated"
+    assert result.turns == 3
+    assert len(main.messages) == 2
+    assert [step.op for step in result.steps] == [
+        "main:open_gripper",
+        "imagination:finish_imagination",
+        "main:commit",
+    ]
+
+
 def test_last_physical_action_persists_across_main_perception_calls() -> None:
     main = RecordingProvider(
         [

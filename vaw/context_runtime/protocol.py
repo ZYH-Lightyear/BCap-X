@@ -68,7 +68,9 @@ GRIP 接近 0，就先完成 gripper-only open；闭合夹爪不能形成新的�
 Last Physical Action 只说明刚执行的意图、阶段和控制结果，不声称物体已被抓住、移动或释放。
 用 CURRENT 中的可见变化判断该动作是否产生了任务相关效果，并据此选择下一步。
 紧凑的 Last Physical Action 会在同一真实 observation revision 内持续存在，直到下一次 commit
-覆盖；感知调用不会把它清空。它用于维持因果连续性，不是要求重复上一动作。
+覆盖；感知调用不会把它清空。它用于维持因果连续性，不是要求重复上一动作。一旦新的
+Imagination/ActionReview 已形成，当前 Preview 取代旧物理动作成为待审对象，旧事实只保留在
+trace，不再与当前 review 并列输入。
 需要从当前真实 TCP 做相对抬升、下降或平移时，直接调用 delta_move；没有 active target 时它会
 以当前真实 TCP 为起点。propose_pose 只能引用 locate_point 实际返回且仍在 valid_point_ids 中的
 point_id，绝不能虚构 `current_tcp` 等 ID。
