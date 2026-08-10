@@ -19,18 +19,25 @@ from vaw.context_runtime.geometry import (
     tcp_position_from_hand_pose,
 )
 from vaw.context_runtime.model import (
-    ActionAdjustment,
-    ActionCandidate,
     ActionPrediction,
-    ActionProposal,
-    ExecutionReceipt,
+    ActionReview,
+    ActionSeed,
+    ActionTarget,
+    ImaginationHandoff,
+    ImaginationState,
     PointEvidence,
     Pose,
     RegionEvidence,
-    SpatialTargetSummary,
 )
 from vaw.context_runtime.motion import MotionBackendError, MotionPlan
-from vaw.context_runtime.private import RegionGeometryArtifact
+from vaw.context_runtime.private import (
+    ActionReviewArtifacts,
+    ImaginationArtifacts,
+    PlanningContext,
+    RegionGeometryArtifact,
+    SeedArtifacts,
+    VisualEdit,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -55,7 +62,7 @@ class ContextFunctions:
     def __init__(self, workspace: ContextWorkspace) -> None:
         self.ws = workspace
         self.handlers: dict[str, Callable[..., dict[str, Any]]] = {
-            "inspect": self.inspect,
+            "detection_and_sam": self.detection_and_sam,
             "locate_point": self.locate_point,
             "propose_grasps": self.propose_grasps,
             "propose_pose": self.propose_pose,
@@ -65,11 +72,12 @@ class ContextFunctions:
             "commit": self.commit,
             "open_gripper": self.open_gripper,
             "close_gripper": self.close_gripper,
+            "finish_imagination": self.finish_imagination,
             "done": self.done,
         }
 
     # ---------------------------------------------------------- perception --
-    def inspect(
+    def detection_and_sam(
         self,
         query: str,
         within_region_id: str | None = None,
@@ -192,6 +200,12 @@ class ContextFunctions:
             planned,
             poses_are_base_frame=False,
             base_from_camera=base_from_camera,
+            reference_quaternion_xyzw=(
+                self.ws.state.robot.ee_pose.quaternion_xyzw
+                if self.ws.state.robot is not None
+                and self.ws.state.robot.ee_pose is not None
+                else None
+            ),
             object_points_base=(
                 geometry.filtered_object_points_base
                 if geometry is not None
@@ -213,17 +227,22 @@ class ContextFunctions:
         ids: list[str] = []
         ordered = sorted(prepared, key=lambda item: item.score, reverse=True)
         for item in ordered[: self.ws.MAX_GRASP_CANDIDATES]:
-            candidate_id = self.ws.state.next_id("g")
-            self.ws.state.candidates[candidate_id] = ActionCandidate(
-                candidate_id=candidate_id,
-                kind="grasp",
-                source_ref=region_id,
-                target_pose=item.target,
+            seed_id = self.ws.state.next_id("s")
+            target = ActionTarget(pose=item.target)
+            prediction = self._predict(item.target)
+            self.ws.state.seeds[seed_id] = ActionSeed(
+                seed_id=seed_id,
+                target=target,
                 source_revision=self.ws.state.observation_revision,
-                prediction=self._predict(item.target),
             )
-            ids.append(candidate_id)
-        return {"candidate_ids": ids}
+            self.ws._private.seed_artifacts[seed_id] = SeedArtifacts(
+                planning_context=PlanningContext(
+                    source_kind="grasp", source_ref=seed_id, region_id=region_id
+                ),
+                preview_plan=MotionPlan(self.ws.motion_backend_name, prediction),
+            )
+            ids.append(seed_id)
+        return {"seed_ids": ids}
 
     def _build_region_geometry(
         self,
@@ -326,43 +345,34 @@ class ContextFunctions:
             tuple(float(value) for value in np.asarray(point.position_xyz) + offset),
             quaternion,
         )
-        plan = self.ws.motion.plan_pose(target)
-        return self._create_action("pose", point_id, target, motion_plan=plan)
+        return self._start_imagination(
+            ActionTarget(pose=target),
+            ImaginationArtifacts(
+                planning_context=PlanningContext(
+                    source_kind="point", source_ref=point_id
+                ),
+                preview_plan=self.ws.motion.plan_pose(target),
+            ),
+        )
 
-    def select(self, candidate_id: str) -> dict[str, Any]:
-        candidate = self.ws._current_candidate(candidate_id)
-        region = (
-            self.ws._current_region(candidate.source_ref)
-            if candidate.source_ref is not None
-            else None
-        )
-        mask = (
-            self.ws._private.region_masks.get(region.region_id)
-            if region is not None
-            else None
-        )
-        if region is None or mask is None:
-            raise ContextFunctionError(
-                f"candidate '{candidate_id}' has no current source region mask"
-            )
-        plan = self.ws.motion.plan_grasp(
-            candidate.target_pose,
-            object_name=region.query,
-            object_mask=mask,
-            preview=candidate.prediction,
-        )
-        return self._create_action(
-            "grasp",
-            candidate_id,
-            candidate.target_pose,
-            motion_plan=plan,
+    def select(self, seed_id: str) -> dict[str, Any]:
+        seed = self.ws._current_seed(seed_id)
+        artifacts = self.ws._private.seed_artifacts.get(seed_id)
+        if artifacts is None:
+            raise ContextFunctionError(f"seed '{seed_id}' has no private artifacts")
+        plan = self._plan_target(seed.target, artifacts.planning_context)
+        return self._start_imagination(
+            seed.target,
+            ImaginationArtifacts(
+                planning_context=artifacts.planning_context,
+                preview_plan=plan,
+            ),
         )
 
     def delta_move(
         self,
         delta_xyz_m: list[float],
-        frame: str = "base",
-        action_id: str | None = None,
+        frame: str,
     ) -> dict[str, Any]:
         delta = _vector(delta_xyz_m, 3, "delta_xyz_m")
         if not np.any(delta != 0.0):
@@ -372,35 +382,40 @@ class ContextFunctions:
                 "each delta_xyz_m component must be within [-0.03, 0.03] meters"
             )
         normalized_frame = _frame(frame)
-        reference, source_ref, parent = self._adjustment_reference(action_id)
+        reference, artifacts = self._adjustment_reference()
         rotation = _pose_rotation(reference)
         displacement = delta if normalized_frame == "base" else rotation.apply(delta)
         target = Pose(
             tuple(float(value) for value in np.asarray(reference.position_xyz) + displacement),
             tuple(float(value) for value in rotation.as_quat()),
         )
-        adjustment = ActionAdjustment(
+        visual_edit = VisualEdit(
             kind="delta_move",
             frame=normalized_frame,
             reference_pose=reference,
-            parent_action_id=parent.action_id if parent is not None else None,
             delta_xyz_m=tuple(float(value) for value in delta),
         )
-        plan = self._plan_adjusted_pose(target, source_ref)
-        return self._create_action(
-            "delta_move",
-            source_ref,
-            target,
-            motion_plan=plan,
-            adjustment=adjustment,
+        planning_context = artifacts.planning_context
+        plan = self._plan_adjusted_pose(target, planning_context)
+        current = self.ws.state.imagination
+        return self._store_imagination(
+            ActionTarget(
+                pose=target,
+                gripper=current.target.gripper if current is not None else None,
+            ),
+            ImaginationArtifacts(
+                planning_context=planning_context,
+                preview_plan=plan,
+                latest_visual_edit=visual_edit,
+                turn_count=artifacts.turn_count,
+            ),
         )
 
     def rotate(
         self,
         axis: str,
         angle_deg: float,
-        frame: str = "tool",
-        action_id: str | None = None,
+        frame: str,
     ) -> dict[str, Any]:
         normalized_axis = str(axis)
         if normalized_axis not in {"x", "y", "z"}:
@@ -416,7 +431,7 @@ class ContextFunctions:
         if abs(angle) > self.MAX_ROTATION_DEG:
             raise ContextFunctionError("angle_deg must be within [-90, 90] degrees")
         normalized_frame = _frame(frame)
-        reference, source_ref, parent = self._adjustment_reference(action_id)
+        reference, artifacts = self._adjustment_reference()
         reference_rotation = _pose_rotation(reference)
         axis_vector = np.eye(3, dtype=np.float64)["xyz".index(normalized_axis)]
         delta_rotation = Rotation.from_rotvec(axis_vector * np.deg2rad(angle))
@@ -429,40 +444,38 @@ class ContextFunctions:
             reference.position_xyz,
             tuple(float(value) for value in target_rotation.as_quat()),
         )
-        adjustment = ActionAdjustment(
+        visual_edit = VisualEdit(
             kind="rotate",
             frame=normalized_frame,
             reference_pose=reference,
-            parent_action_id=parent.action_id if parent is not None else None,
             axis=normalized_axis,
             angle_deg=angle,
         )
-        plan = self._plan_adjusted_pose(target, source_ref)
-        return self._create_action(
-            "rotate",
-            source_ref,
-            target,
-            motion_plan=plan,
-            adjustment=adjustment,
+        planning_context = artifacts.planning_context
+        plan = self._plan_adjusted_pose(target, planning_context)
+        current = self.ws.state.imagination
+        return self._store_imagination(
+            ActionTarget(
+                pose=target,
+                gripper=current.target.gripper if current is not None else None,
+            ),
+            ImaginationArtifacts(
+                planning_context=planning_context,
+                preview_plan=plan,
+                latest_visual_edit=visual_edit,
+                turn_count=artifacts.turn_count,
+            ),
         )
 
-    def _adjustment_reference(
-        self, action_id: str | None
-    ) -> tuple[Pose, str | None, ActionProposal | None]:
-        if action_id is not None:
-            action = self.ws.state.active_action
-            if (
-                action is None
-                or action.action_id != action_id
-                or action.source_revision != self.ws.state.observation_revision
-            ):
-                raise ContextFunctionError(f"unknown or expired action_id '{action_id}'")
-            reference_rotation = _pose_rotation(action.target_pose)
+    def _adjustment_reference(self) -> tuple[Pose, ImaginationArtifacts]:
+        imagination = self.ws.state.imagination
+        if imagination is not None and imagination.target.pose is not None:
+            reference_rotation = _pose_rotation(imagination.target.pose)
             reference = Pose(
-                action.target_pose.position_xyz,
+                imagination.target.pose.position_xyz,
                 tuple(float(value) for value in reference_rotation.as_quat()),
             )
-            return reference, action.source_ref, action
+            return reference, self.ws._private.imagination_artifacts or ImaginationArtifacts()
 
         robot = self.ws.state.robot
         if robot is None or robot.tcp_pose is None:
@@ -476,26 +489,20 @@ class ContextFunctions:
                 robot.tcp_pose.position_xyz,
                 tuple(float(value) for value in rotation.as_quat()),
             ),
-            None,
-            None,
+            ImaginationArtifacts(),
         )
 
-    def _plan_adjusted_pose(self, target: Pose, source_ref: str | None) -> MotionPlan:
-        candidate = self.ws.state.candidates.get(source_ref) if source_ref is not None else None
-        if candidate is not None and candidate.kind == "grasp":
-            region = (
-                self.ws.state.regions.get(candidate.source_ref)
-                if candidate.source_ref is not None
-                else None
-            )
-            mask = (
-                self.ws._private.region_masks.get(region.region_id)
-                if region is not None
-                else None
-            )
+    def _plan_adjusted_pose(
+        self,
+        target: Pose,
+        planning_context: PlanningContext | None,
+    ) -> MotionPlan:
+        if planning_context is not None and planning_context.region_id is not None:
+            region = self.ws.state.regions.get(planning_context.region_id)
+            mask = self.ws._private.region_masks.get(planning_context.region_id)
             if region is None or mask is None:
                 raise ContextFunctionError(
-                    f"grasp source for action candidate '{candidate.candidate_id}' is unavailable"
+                    f"grasp source '{planning_context.source_ref}' is unavailable"
                 )
             return self.ws.motion.plan_grasp(
                 target,
@@ -504,55 +511,96 @@ class ContextFunctions:
             )
         return self.ws.motion.plan_pose(target)
 
-    def _create_action(
-        self,
-        kind: str,
-        source_ref: str | None,
-        target: Pose,
-        *,
-        motion_plan: MotionPlan | None = None,
-        adjustment: ActionAdjustment | None = None,
+    def _start_imagination(
+        self, target: ActionTarget, artifacts: ImaginationArtifacts
     ) -> dict[str, Any]:
-        motion_plan = motion_plan or self.ws.motion.plan_pose(target)
-        prediction = motion_plan.prediction
-        previous = self.ws.state.active_action
-        if previous is not None:
-            self.ws._private.motion_plans.pop(previous.action_id, None)
-        action = ActionProposal(
-            action_id=self.ws.state.next_id("a"),
-            kind=kind,
-            source_ref=source_ref,
-            source_revision=self.ws.state.observation_revision,
-            target_pose=target,
-            prediction=prediction,
-            adjustment=adjustment,
+        self.ws.state.action_review = None
+        self.ws._private.review_artifacts.clear()
+        return self._store_imagination(target, artifacts)
+
+    def _store_imagination(
+        self, target: ActionTarget, artifacts: ImaginationArtifacts
+    ) -> dict[str, Any]:
+        before_target = (
+            self.ws.state.imagination.target.summary()
+            if self.ws.state.imagination is not None
+            else None
         )
-        self.ws.state.active_action = action
-        self.ws._private.motion_plans[action.action_id] = motion_plan
-        return {
-            "action_id": action.action_id,
-            "solve_ik": prediction.solve_ik,
-            "trajectory_checked": prediction.trajectory_checked,
-            "collision_checked": prediction.collision_checked,
+        previous = self.ws._private.imagination_artifacts
+        turn_count = previous.turn_count if previous is not None else 0
+        self.ws.state.imagination = ImaginationState(
+            target=target,
+            refinement_goal=self.ws.refinement_goal,
+        )
+        self.ws._private.imagination_artifacts = ImaginationArtifacts(
+            planning_context=artifacts.planning_context,
+            preview_plan=artifacts.preview_plan,
+            latest_visual_edit=artifacts.latest_visual_edit,
+            turn_count=turn_count,
+        )
+        self.ws._private.trace_diagnostics["imagination_edit"] = {
+            "target_before": before_target,
+            "target_after": target.summary(),
+            "refinement_goal": self.ws.refinement_goal,
+            "turn_count": turn_count,
+            "latest_visual_edit": (
+                artifacts.latest_visual_edit.summary()
+                if artifacts.latest_visual_edit is not None
+                else None
+            ),
+            "planning_source": (
+                {
+                    "kind": artifacts.planning_context.source_kind,
+                    "ref": artifacts.planning_context.source_ref,
+                }
+                if artifacts.planning_context is not None
+                else None
+            ),
         }
+        return _preview_result(target, self.ws._private.imagination_artifacts)
+
+    def _plan_target(
+        self, target: ActionTarget, context: PlanningContext | None
+    ) -> MotionPlan | None:
+        if target.pose is None:
+            return None
+        return self._plan_adjusted_pose(target.pose, context)
 
     def _predict(self, target: Pose) -> ActionPrediction:
         return self.ws.motion.preview(target)
 
     # ------------------------------------------------------------- physical --
     def commit(self, action_id: str) -> dict[str, Any]:
-        action = self.ws.state.active_action
+        action = self.ws.state.action_review
         if action is None or action.action_id != action_id:
             raise ContextFunctionError(f"unknown or expired action_id '{action_id}'")
-        before = self.ws.state.observation_revision
         execution_error: ContextFunctionError | None = None
+        failed_stage: str | None = None
+        executed_stages: list[str] = []
         try:
-            plan = self.ws._private.motion_plans.get(action_id)
-            if plan is None:
+            artifacts = self.ws._private.review_artifacts.get(action_id)
+            if artifacts is None:
                 raise ContextFunctionError(
-                    f"active action '{action_id}' has no cached motion plan"
+                    f"active action '{action_id}' has no private artifacts"
                 )
-            self.ws.motion.execute(plan, action.target_pose)
+            if action.target.pose is not None:
+                failed_stage = "arm"
+                if artifacts.motion_plan is None:
+                    raise ContextFunctionError(
+                        f"active action '{action_id}' has no cached motion plan"
+                    )
+                self.ws.motion.execute(artifacts.motion_plan, action.target.pose)
+                executed_stages.append("arm")
+            if action.target.gripper is not None:
+                failed_stage = "gripper"
+                backend_function = (
+                    "open_gripper"
+                    if action.target.gripper == "open"
+                    else "close_gripper"
+                )
+                self.ws._call_backend(backend_function)
+                executed_stages.append("gripper")
+            failed_stage = None
         except MotionBackendError as exc:
             execution_error = ContextFunctionError(str(exc))
         except ContextFunctionError as exc:
@@ -560,81 +608,147 @@ class ContextFunctions:
         finally:
             self.ws.refresh_observation()
 
+        self.ws._private.trace_diagnostics["waypoint_commit"] = {
+            "action_id": action_id,
+            "executed_stages": list(executed_stages),
+            "failed_stage": failed_stage,
+            "target_gripper_state": action.target.gripper,
+        }
+
         achieved = self.ws.state.robot.ee_pose if self.ws.state.robot is not None else None
         position_error = None
-        if achieved is not None:
+        if achieved is not None and action.target.pose is not None:
             achieved_tcp_position = tcp_position_from_hand_pose(
                 achieved.position_xyz,
                 achieved.quaternion_xyzw,
                 self.ws._tcp_to_hand_local_xyz,
             )
             position_error = float(
-                np.linalg.norm(achieved_tcp_position - np.asarray(action.target_pose.position_xyz))
+                np.linalg.norm(achieved_tcp_position - np.asarray(action.target.pose.position_xyz))
             )
-        discrepancy = (
-            {"execution_error": str(execution_error)} if execution_error is not None else None
-        )
-        receipt = ExecutionReceipt(
-            receipt_id=self.ws.state.next_id("receipt"),
-            function_name="commit",
-            action_id=action_id,
-            revision_before=before,
-            revision_after=self.ws.state.observation_revision,
-            position_error_m=position_error,
-            discrepancy=discrepancy,
-        )
-        self.ws.state.last_spatial_target = SpatialTargetSummary(
-            action_id=action_id,
-            target_pose=action.target_pose,
-            revision_after=self.ws.state.observation_revision,
-        )
-        self.ws.state.last_receipt = receipt
+        opening = self.ws.state.robot.gripper_opening if self.ws.state.robot is not None else None
         if execution_error is not None:
             raise execution_error
         result: dict[str, Any] = {}
         if position_error is not None:
             result["position_error_m"] = round(position_error, 6)
+        if action.target.gripper is not None and opening is not None:
+            result["gripper_opening"] = round(float(opening), 6)
         return result
 
     def open_gripper(self) -> dict[str, Any]:
-        return self._execute_gripper("open")
+        return self._preview_gripper("open")
 
     def close_gripper(self) -> dict[str, Any]:
-        return self._execute_gripper("close")
+        return self._preview_gripper("closed")
 
-    def _execute_gripper(self, action: str) -> dict[str, Any]:
-        before = self.ws.state.observation_revision
-        execution_error: ContextFunctionError | None = None
-        try:
-            self.ws._call_backend(f"{action}_gripper")
-        except ContextFunctionError as exc:
-            execution_error = exc
-        finally:
-            self.ws.refresh_observation()
-        opening = self.ws.state.robot.gripper_opening if self.ws.state.robot is not None else None
-        discrepancy = (
-            {"execution_error": str(execution_error)} if execution_error is not None else None
+    def _preview_gripper(self, target: str) -> dict[str, Any]:
+        imagination = self.ws.state.imagination
+        artifacts = self.ws._private.imagination_artifacts or ImaginationArtifacts()
+        pose = imagination.target.pose if imagination is not None else None
+        return self._store_imagination(
+            ActionTarget(pose=pose, gripper=_gripper_target(target)), artifacts
         )
-        receipt = ExecutionReceipt(
-            receipt_id=self.ws.state.next_id("receipt"),
-            function_name=f"{action}_gripper",
-            revision_before=before,
-            revision_after=self.ws.state.observation_revision,
-            gripper_opening=opening,
-            discrepancy=discrepancy,
+
+    def finish_imagination(self, status: str) -> dict[str, Any]:
+        if status not in {"ready", "failed"}:
+            raise ContextFunctionError("status must be 'ready' or 'failed'")
+        imagination = self.ws.state.imagination
+        if imagination is None:
+            raise ContextFunctionError("there is no active imagination session")
+        artifacts = self.ws._private.imagination_artifacts or ImaginationArtifacts()
+        if status == "failed":
+            self.ws.state.imagination = None
+            self.ws._private.imagination_artifacts = None
+            self.ws.state.last_handoff = ImaginationHandoff(status="failed")
+            self.ws._private.trace_diagnostics["imagination_handoff"] = {
+                "status": "failed",
+                "target": imagination.target.summary(),
+            }
+            return {"status": "failed"}
+        plan = artifacts.preview_plan
+        if imagination.target.pose is not None and (
+            plan is None or plan.prediction.solve_ik != "returned"
+        ):
+            raise ContextFunctionError("target has no executable cached motion plan")
+        action_id = self.ws.state.next_id("a")
+        review = ActionReview(action_id, imagination.target, "completed")
+        self.ws.state.action_review = review
+        self.ws._private.review_artifacts = {
+            action_id: ActionReviewArtifacts(
+                motion_plan=plan,
+                planning_context=artifacts.planning_context,
+                handoff_reason="completed",
+            )
+        }
+        self.ws.state.imagination = None
+        self.ws._private.imagination_artifacts = None
+        self.ws.state.last_handoff = ImaginationHandoff("ready", action_id)
+        self.ws._private.trace_diagnostics["imagination_handoff"] = {
+            "status": "ready",
+            "action_id": action_id,
+            "target": review.target.summary(),
+        }
+        return self.ws.state.last_handoff.summary()
+
+    def limit_imagination(self) -> dict[str, Any]:
+        """Return the final preview to Main without marking it as approved."""
+
+        imagination = self.ws.state.imagination
+        if imagination is None:
+            raise ContextFunctionError("there is no active imagination session")
+        artifacts = self.ws._private.imagination_artifacts or ImaginationArtifacts()
+        action_id = self.ws.state.next_id("a")
+        self.ws.state.action_review = ActionReview(
+            action_id, imagination.target, "budget_exhausted"
         )
-        self.ws.state.last_receipt = receipt
-        if execution_error is not None:
-            raise execution_error
-        result: dict[str, Any] = {}
-        if opening is not None:
-            result["gripper_opening"] = round(float(opening), 6)
-        return result
+        self.ws._private.review_artifacts = {
+            action_id: ActionReviewArtifacts(
+                motion_plan=artifacts.preview_plan,
+                planning_context=artifacts.planning_context,
+                handoff_reason="budget_exhausted",
+            )
+        }
+        self.ws.state.imagination = None
+        self.ws._private.imagination_artifacts = None
+        self.ws.state.last_handoff = ImaginationHandoff("budget_exhausted", action_id)
+        self.ws._private.trace_diagnostics["imagination_handoff"] = {
+            "status": "budget_exhausted",
+            "action_id": action_id,
+            "target": imagination.target.summary(),
+        }
+        return self.ws.state.last_handoff.summary()
 
     def done(self, success: bool) -> dict[str, Any]:
         self.ws.finished = True
         self.ws.claimed_success = bool(success)
         return {}
+
+
+def _gripper_target(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value not in {"open", "closed"}:
+        raise ValueError(f"invalid private gripper target {value!r}")
+    return value
+
+
+def _preview_result(
+    target: ActionTarget,
+    artifacts: ImaginationArtifacts,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {"preview": "updated"}
+    plan = artifacts.preview_plan
+    if plan is not None:
+        prediction = plan.prediction
+        result.update(
+            {
+                "solve_ik": prediction.solve_ik,
+                "trajectory_checked": prediction.trajectory_checked,
+                "collision_checked": prediction.collision_checked,
+            }
+        )
+    return result
 
 
 def _camera_image(camera: dict[str, Any], name: str) -> np.ndarray:
@@ -773,6 +887,7 @@ def _prepare_grasps(
     *,
     poses_are_base_frame: bool,
     base_from_camera: np.ndarray | None,
+    reference_quaternion_xyzw: tuple[float, float, float, float] | None = None,
     object_points_base: np.ndarray | None,
 ) -> tuple[list[_PreparedGrasp], dict[str, Any]]:
     """Convert planner output without inventing a different approach pose.
@@ -831,7 +946,10 @@ def _prepare_grasps(
         base_from_graspnet = (
             pose if poses_are_base_frame else np.asarray(base_from_camera) @ pose
         )
-        base_from_hand = graspnet_pose_to_panda_hand(base_from_graspnet)
+        base_from_hand = graspnet_pose_to_panda_hand(
+            base_from_graspnet,
+            reference_quaternion_xyzw=reference_quaternion_xyzw,
+        )
         quaternion_xyzw = Rotation.from_matrix(base_from_hand[:3, :3]).as_quat()
         approach_z = float(base_from_hand[2, 2])
         contact = shift_along_approach(

@@ -1,4 +1,4 @@
-"""Schema-v4 fixed-viewport renderer that consumes only a ContextPacket."""
+"""Dual-agent fixed-viewport renderer that consumes only a ContextPacket."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from vaw.context_runtime.packet import (
 
 
 class ContextWebRenderer:
-    name = "context-web-v3-near-field"
+    name = "context-web-v7-dual-agent-review"
     width = CONTEXT_WIDTH
     height = CONTEXT_HEIGHT
 

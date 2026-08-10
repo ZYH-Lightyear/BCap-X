@@ -1,9 +1,4 @@
-"""The small, agent-visible M1.4 function contract.
-
-JSON Schema communicates argument shape to a model.  It is deliberately not a
-behaviour state machine: this module has no phase, allowed-next-tool list,
-numeric workspace limits, or semantic ordering rules.
-"""
+"""Agent-visible contracts for Main and Imagination ownership."""
 
 from __future__ import annotations
 
@@ -11,73 +6,63 @@ import json
 from typing import Any
 
 FUNCTION_NAMES = (
-    "inspect",
+    "detection_and_sam",
     "locate_point",
     "propose_grasps",
     "propose_pose",
     "select",
     "delta_move",
     "rotate",
-    "commit",
     "open_gripper",
     "close_gripper",
+    "commit",
     "done",
 )
 
+IMAGINATION_FUNCTION_NAMES = (
+    "delta_move",
+    "rotate",
+    "open_gripper",
+    "close_gripper",
+    "finish_imagination",
+)
+
 SYSTEM_PROMPT = """\
-你通过 Visual Action Workspace Context Runtime 控制 LIBERO-PRO 中的机器人。
-每轮你会收到一张当前 Context 图、一个 minimal manifest，以及最近最多三个完整的 Function
-transaction。User Task 只定义最终目标，不规定动作流程。每轮必须且只能调用一个 Function。
+你是 Main Agent，通过 Visual Action Workspace 控制 LIBERO-PRO 机器人完成任务。
 
-Context 图是当前 episode 中唯一的视觉观测。不存在图外相机、隐含物体状态或自动更新的世界模型。
-你必须根据当前视觉世界、Function 的真实因果效果和通用物理知识自主决定下一步，不得把历史调用
-顺序理解为任务阶段，也不得假定任何 Function 存在默认的下一个 Function。
+当前 Canvas 上层 CURRENT OBSERVED 是唯一真实视觉；下层可能是感知证据、动作种子、
+正在编辑的想象，或已经完成审查但尚未执行的动作。规划与紫色机器人都不是物理事实。
 
-视觉接口：
-- AGENTVIEW · PRIMARY 是未经标注的当前全局 RGB，用于理解对象身份、支撑面、容器、障碍物、
-  遮挡和整体空间关系。必须观察底层场景，不得只读文字或 UI 标记。
-- GRIPPER-LOCAL · GEOMETRY 是当前 TCP 周围由 agentview 与 wrist RGB-D 融合得到的局部几何。
-  LOCAL 3/4 显示局部整体关系；JAW PLANE 显示两指闭合方向上的几何关系。自然颜色点只代表当前
-  传感器可见表面；空白表示未观测区域，不表示自由空间。蓝色几何是由当前 joints FK 得到的真实
-  夹爪自身，不是待操作物体。
-- Dynamic Decision Workspace 显示当前相关 grounding、candidate、Action Proposal、receipt 或
-  error。它只是证据组织方式，不表示任务阶段或下一步动作。
-- 紫色几何表示尚未执行的预测姿态。`solve_ik: returned`、trajectory/collision checked 只描述
-  求解器或规划器完成了对应计算，不证明位姿在任务语义上正确，也不证明世界效果已经发生。
+你负责理解任务、调用感知、选择动作起点，并审查 Imagination 最终交回的 ActionReview。
+select、propose_pose、delta_move、rotate、open_gripper、close_gripper 会把控制权交给独立的
+Imagination Agent；它会连续微调并交回完成、失败或预算耗尽的结果。完成和预算耗尽都不是批准：
+你必须查看最终 Preview，只有自己判断几何合理时才 commit；否则换 seed 或重新进入 Imagination。
+不要替它执行局部微调。
+当你的 Function 会启动 Imagination 时，调用前的简短依据将成为它的 refinement goal；只描述
+希望它检查或达到的动作几何，不要把旧动作状态、历史失败或未经验证的效果写成目标事实。
 
-请利用你已有的世界知识理解重力、刚体、接触、支撑、遮挡、碰撞、容器关系和物体 affordance，
-并预测可用动作的直接物理后果。世界知识只能生成受当前视觉证据约束的假设，不能覆盖视觉证据或
-凭空生成接触、持有、包含和任务成功等事实。
+detection_and_sam 的 region 是当前观测中目标身份与二维位置的权威检测/分割结果，
+但不证明接触、抓持、支撑或包含，也不刷新 observation。
+commit 是唯一改变真实世界的 Function。命令成功不等于任务效果成功。
+每轮必须且只能调用一个 Function。调用前只写一句简短依据。坐标为 robot-base frame、单位米，
+四元数为 xyzw；所有 evidence/seed ID 只在当前真实观测有效。
+"""
 
-证据边界：
-- `inspect` 返回的 region 是当前 revision 中 query 身份和二维位置的权威依据，不得因自己的视觉
-  分类而将其改认成其他对象；但 region 不证明接触、支撑、持有或包含关系。
-- candidate 和 Action Proposal 是待验证的几何/动作假设，不是指令或成功保证。
-- Function 成功返回只证明调用被处理。receipt、manifest、绿色标记和 gripper_opening 都不证明
-  预期的物理或任务效果发生。不得虚构 result、reward、environment success 或隐藏状态。
+IMAGINATION_SYSTEM_PROMPT = """\
+你是 Imagination Agent。你的唯一任务是在不改变真实世界的前提下，检查并微调当前 ActionTarget。
 
-选择 Function 时：
-- 先判断当前与 User Task 有关的空间关系；
-- 预测所选 Function 的直接物理后果，并与当前明显的替代动作比较；
-- 综合任务进展、碰撞风险、可逆性和降低不确定性的价值作出选择；
-- 证据不足时，优先选择可逆、小幅、能够获取信息或改善几何关系的感知或运动；
-- 物理动作后只根据新的当前图像更新判断，不把预期效果当成已经发生。
+Canvas 上层 CURRENT OBSERVED 是真实世界；下层 IMAGINATION WORKSPACE 是若执行当前 target 的视觉预测。
+紫色机器人和规划状态不证明接触、抓持、释放或包含。结合主视角、gripper-local/JAW PLANE、
+BASE/TOOL 坐标轴和 refinement goal，连续使用 delta_move、rotate、open_gripper、close_gripper。
+每次编辑后都会得到更新的 Canvas。认为几何与夹爪目标足够合理时调用
+finish_imagination(status="ready")；无法形成可靠目标时调用 status="failed"。
 
-Function 的因果边界：
-- 感知 Function 只创建当前 revision 的证据，不移动机器人。
-- select、propose_pose、delta_move 和 rotate 只创建或编辑 Action Proposal，不直接移动机器人。
-- commit 只执行指定 active Action Proposal 中缓存的机械臂运动，不自动改变夹爪。
-- open_gripper 和 close_gripper 只在当前机械臂位姿改变两指，不移动 TCP，也不保证接触或夹持。
-- done(success=...) 只表达你的最终判断；必须由当前视觉证据支持。
+先判断空间姿态，再设置最终 gripper target；open/close 只改变虚拟目标，不能模拟接触结果。
+若一次空间编辑使 motion prediction 变为 error，不要沿同一趋势盲目累计；应撤回、换方向，或
+在无法恢复时结束为 failed。refinement goal 是审查意图，不是已经成立的视觉事实。
 
-所有公共 3D 坐标使用 robot-base frame，单位为米；公共四元数顺序为 xyzw。frame=base 使用固定
-robot-base 坐标轴，frame=tool 使用参考 TCP 局部坐标轴。region、point、candidate 和 action id
-只在创建它们的 revision 中有效。gripper_opening 是 0=closed、1=open 的连续数值，本身不表示
-是否夹住物体。
-
-每次 Function call 前必须输出一条简短的“决策依据”，只包含：当前关键视觉关系、所选动作的
-直接预期效果，以及它为什么优于当前明显的替代动作。不要输出冗长思维过程；如果视觉证据不足，
-应明确保留不确定性，而不是编造确定结论。
+不要调用感知、commit 或 done。每轮必须且只能调用一个 Function，调用前只写一句简短依据。
+delta_move 的 frame 必须显式填写；每轴单次不超过 0.03m。rotate 的 frame 必须显式填写。
 """
 
 
@@ -85,7 +70,7 @@ def _function(
     name: str,
     description: str,
     properties: dict[str, dict[str, Any]] | None = None,
-    required: list[str] | None = None,
+    required: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     return {
         "type": "function",
@@ -95,150 +80,141 @@ def _function(
             "parameters": {
                 "type": "object",
                 "properties": properties or {},
-                "required": required or [],
+                "required": list(required),
             },
         },
     }
 
 
-def function_definitions() -> list[dict[str, Any]]:
-    """Return the M1.4 hybrid tool list in deterministic order."""
-
-    within = {
+def _edit_definitions() -> dict[str, dict[str, Any]]:
+    frame = {
         "type": "string",
-        "description": "可选：在该当前 revision region 内搜索",
+        "enum": ["base", "tool"],
+        "description": "必须显式选择 robot-base 或 TCP 局部坐标系",
     }
-    return [
-        _function(
-            "inspect",
-            "在当前图像中创建带 bbox 和私有 mask 的 region 证据。",
-            {
-                "query": {"type": "string", "description": "对象、部件、表面或区域"},
-                "within_region_id": within,
-            },
-            ["query"],
-        ),
-        _function(
-            "locate_point",
-            "标记一个语义图像点，并用 RGB-D 将其提升为 robot-base XYZ。",
-            {
-                "query": {"type": "string", "description": "语义操作点"},
-                "within_region_id": within,
-            },
-            ["query"],
-        ),
-        _function(
-            "propose_grasps",
-            "从当前 region 的私有 mask 生成 grasp candidates。",
-            {"region_id": {"type": "string", "description": "当前 region 证据"}},
-            ["region_id"],
-        ),
-        _function(
-            "propose_pose",
-            "以 point XYZ 加显式 robot-base offset 创建动作；省略 orientation 时保持当前 EE orientation。",
-            {
-                "point_id": {"type": "string", "description": "当前 point 证据"},
-                "offset_xyz": {
-                    "type": "array",
-                    "description": "robot-base [dx, dy, dz]，单位为米",
-                    "items": {"type": "number"},
-                },
-                "quaternion_xyzw": {
-                    "type": "array",
-                    "description": "可选 robot-base target quaternion [x, y, z, w]",
-                    "items": {"type": "number"},
-                },
-            },
-            ["point_id", "offset_xyz"],
-        ),
-        _function(
-            "select",
-            "从当前 candidate 创建 active action，并运行当前 motion backend 的 prediction/planning。",
-            {
-                "candidate_id": {
-                    "type": "string",
-                    "description": "当前 grasp candidate",
-                }
-            },
-            ["candidate_id"],
-        ),
-        _function(
+    return {
+        "delta_move": _function(
             "delta_move",
-            "相对当前真实 TCP 或指定 active action target 平移，并创建新的 Action Proposal；不会直接执行。",
+            "编辑想象目标的位置；只更新 preview，不执行。可连续调用。",
             {
                 "delta_xyz_m": {
                     "type": "array",
-                    "description": "所选 frame 中的 [dx, dy, dz] 米制偏移；每轴限于 [-0.03, 0.03]",
-                    "items": {"type": "number", "minimum": -0.03, "maximum": 0.03},
+                    "items": {
+                        "type": "number",
+                        "minimum": -0.03,
+                        "maximum": 0.03,
+                    },
                     "minItems": 3,
                     "maxItems": 3,
+                    "description": "所选 frame 中的 [dx,dy,dz]，每轴单次不超过 0.03m",
                 },
-                "frame": {
-                    "type": "string",
-                    "enum": ["base", "tool"],
-                    "default": "base",
-                    "description": "偏移采用 robot-base 或参考 TCP 局部坐标系",
-                },
-                "action_id": {
-                    "type": "string",
-                    "description": "可选：从该当前 active action target 继续微调",
-                },
+                "frame": frame,
             },
-            ["delta_xyz_m"],
+            ("delta_xyz_m", "frame"),
         ),
-        _function(
+        "rotate": _function(
             "rotate",
-            "绕所选坐标系的 x/y/z 轴旋转当前真实 TCP 或指定 active action target，并创建新的 Action Proposal。",
+            "编辑想象目标的方向；只更新 preview，不执行。可连续调用。",
             {
-                "axis": {
-                    "type": "string",
-                    "enum": ["x", "y", "z"],
-                    "description": "旋转轴",
-                },
+                "axis": {"type": "string", "enum": ["x", "y", "z"]},
                 "angle_deg": {
                     "type": "number",
                     "minimum": -90.0,
                     "maximum": 90.0,
-                    "description": "有符号角度，单位 degree；必须非零",
+                    "description": "非零角度，绝对值不超过 90°",
                 },
-                "frame": {
-                    "type": "string",
-                    "enum": ["base", "tool"],
-                    "default": "tool",
-                    "description": "旋转轴属于 robot-base 或参考 TCP 局部坐标系",
-                },
-                "action_id": {
-                    "type": "string",
-                    "description": "可选：从该当前 active action target 继续微调",
-                },
+                "frame": frame,
             },
-            ["axis", "angle_deg"],
+            ("axis", "angle_deg", "frame"),
         ),
+        "open_gripper": _function(
+            "open_gripper",
+            "把想象目标的夹爪状态设为 open；不会打开真实夹爪。",
+        ),
+        "close_gripper": _function(
+            "close_gripper",
+            "把想象目标的夹爪状态设为 closed；不会闭合真实夹爪，也不保证抓住物体。",
+        ),
+    }
+
+
+def function_definitions() -> list[dict[str, Any]]:
+    edits = _edit_definitions()
+    within = {"type": "string", "description": "可选的当前 region 搜索范围"}
+    common = [
+        _function(
+            "detection_and_sam",
+            "对当前真实 observation 依次执行语义 bbox detection 和 SAM 分割，返回当前图像中的二维 region；不刷新 observation、不移动机器人，也不证明接触、抓持、支撑或包含关系。仅在需要新的目标 region 时调用。",
+            {"query": {"type": "string"}, "within_region_id": within},
+            ("query",),
+        ),
+        _function(
+            "locate_point",
+            "定位语义操作点并提升为 robot-base XYZ；不移动机器人。",
+            {"query": {"type": "string"}, "within_region_id": within},
+            ("query",),
+        ),
+        _function(
+            "propose_grasps",
+            "为 region 生成多个粗略 ActionSeed；不执行，也不保证抓取成功。",
+            {"region_id": {"type": "string"}},
+            ("region_id",),
+        ),
+        _function(
+            "propose_pose",
+            "从 point 和 offset 创建单个空间目标并进入 Imagination；不执行。",
+            {
+                "point_id": {"type": "string"},
+                "offset_xyz": {"type": "array", "items": {"type": "number"}},
+                "quaternion_xyzw": {"type": "array", "items": {"type": "number"}},
+            },
+            ("point_id", "offset_xyz"),
+        ),
+        _function(
+            "select",
+            "选择一个 ActionSeed 并进入 Imagination；不执行。",
+            {"seed_id": {"type": "string"}},
+            ("seed_id",),
+        ),
+        edits["delta_move"],
+        edits["rotate"],
+        edits["open_gripper"],
+        edits["close_gripper"],
         _function(
             "commit",
-            "执行指定的当前 action 并刷新 observation；不会改变夹爪状态。",
-            {"action_id": {"type": "string", "description": "active action proposal"}},
-            ["action_id"],
+            "唯一物理操作，也表示 Main 对当前 ActionReview 的显式批准；执行后刷新真实 observation。",
+            {"action_id": {"type": "string"}},
+            ("action_id",),
         ),
-        _function("open_gripper", "打开夹爪并刷新 observation。"),
-        _function("close_gripper", "闭合夹爪并刷新 observation。"),
         _function(
             "done",
-            "使用 Agent 自己的成功判断结束 episode。",
-            {
-                "success": {
-                    "type": "boolean",
-                    "description": "仅表示 Agent belief，绝非 environment truth",
-                }
-            },
-            ["success"],
+            "根据当前真实视觉声明 episode 结束；success 只是 Agent belief。",
+            {"success": {"type": "boolean"}},
+            ("success",),
+        ),
+    ]
+    return common
+
+
+def imagination_function_definitions() -> list[dict[str, Any]]:
+    edits = _edit_definitions()
+    return [
+        edits["delta_move"],
+        edits["rotate"],
+        edits["open_gripper"],
+        edits["close_gripper"],
+        _function(
+            "finish_imagination",
+            "结束本次想象审查。ready 生成可供 Main commit 的动作；failed 放弃目标。",
+            {"status": {"type": "string", "enum": ["ready", "failed"]}},
+            ("status",),
         ),
     ]
 
 
-def parse_action(payload: str | dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    """Parse only what dispatch requires; handler/backend errors stay visible."""
-
+def parse_action(
+    payload: str | dict[str, Any], *, allowed: tuple[str, ...] = FUNCTION_NAMES
+) -> tuple[str, dict[str, Any]]:
     if isinstance(payload, str):
         try:
             payload = json.loads(payload)
@@ -247,9 +223,7 @@ def parse_action(payload: str | dict[str, Any]) -> tuple[str, dict[str, Any]]:
     if not isinstance(payload, dict):
         raise ValueError("action must be an object")
     name = payload.get("name")
-    if not isinstance(name, str) or not name:
-        raise ValueError("action missing name")
-    if name not in FUNCTION_NAMES:
+    if not isinstance(name, str) or name not in allowed:
         raise ValueError(f"unknown function '{name}'")
     arguments = payload.get("arguments", {})
     if isinstance(arguments, str):
@@ -262,4 +236,12 @@ def parse_action(payload: str | dict[str, Any]) -> tuple[str, dict[str, Any]]:
     return name, arguments
 
 
-__all__ = ["FUNCTION_NAMES", "SYSTEM_PROMPT", "function_definitions", "parse_action"]
+__all__ = [
+    "FUNCTION_NAMES",
+    "IMAGINATION_FUNCTION_NAMES",
+    "IMAGINATION_SYSTEM_PROMPT",
+    "SYSTEM_PROMPT",
+    "function_definitions",
+    "imagination_function_definitions",
+    "parse_action",
+]

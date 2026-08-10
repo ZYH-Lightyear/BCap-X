@@ -64,11 +64,10 @@ Rules:
 - Follow the task's system instructions about a concise decision basis. When
   requested, write that basis as plain text before the block.
 - Stop after the block. **Never** write the operation's result yourself — the
-  real receipt and a fresh canvas arrive next turn as `<tool_result>`.
+  runtime will apply the call and provide the next freshly compiled canvas.
   Inventing a result makes everything after it reasoning on fiction.
 - `arguments` must be a valid JSON object; escape newlines in strings as \\n.
-- The episode ends only when you call `done`. Plain text without a
-  `<tool_call>` block does not end anything and wastes a turn.
+- Plain text without a `<tool_call>` block does not execute anything.
 
 # Available operations
 

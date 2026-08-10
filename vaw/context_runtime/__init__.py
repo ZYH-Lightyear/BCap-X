@@ -1,13 +1,13 @@
 """The revision-local VAW Context Runtime and its public contract."""
 
 from vaw.context_runtime.model import (
-    ActionAdjustment,
-    ActionCandidate,
     ActionPrediction,
-    ActionProposal,
+    ActionReview,
+    ActionSeed,
+    ActionTarget,
     ContextState,
-    ExecutionReceipt,
-    FunctionRecord,
+    ImaginationHandoff,
+    ImaginationState,
     PointEvidence,
     Pose,
     RegionEvidence,
@@ -29,10 +29,9 @@ from vaw.context_runtime.runtime import (
 from vaw.context_runtime.workspace import ContextStepResult, ContextWorkspace
 
 __all__ = [
-    "ActionAdjustment",
-    "ActionCandidate",
     "ActionPrediction",
-    "ActionProposal",
+    "ActionSeed",
+    "ActionTarget",
     "ContextState",
     "ContextCompiler",
     "ContextPacket",
@@ -41,9 +40,9 @@ __all__ = [
     "ContextStepResult",
     "ContextWorkspace",
     "CuroboMotionBackend",
-    "ExecutionReceipt",
     "FUNCTION_NAMES",
-    "FunctionRecord",
+    "ImaginationHandoff",
+    "ImaginationState",
     "MotionBackend",
     "MotionPlan",
     "PointEvidence",
@@ -51,6 +50,7 @@ __all__ = [
     "PyrokiMotionBackend",
     "RegionEvidence",
     "RobotState",
+    "ActionReview",
     "SYSTEM_PROMPT",
     "function_definitions",
     "run_context_episode",

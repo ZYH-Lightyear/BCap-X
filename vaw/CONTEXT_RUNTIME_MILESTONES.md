@@ -1,5 +1,10 @@
 # VAW Context Runtime：单 VLM 设计与 Post-M1.2 Milestones
 
+> **当前执行版本是 M1.4.2。** 下文的单 VLM、K=8 和 Persistent Waypoint 内容仅作为
+> 历史设计记录；运行路径已被 [`M1_4_2_DUAL_AGENT_RUNTIME.md`](M1_4_2_DUAL_AGENT_RUNTIME.md)
+> 中的 Main / Imagination 双 Agent 架构完整替换，不保留旧 packet、history 或 receipt
+> 兼容分支。
+
 > 状态：M1.3 核心 Runtime 已完成；M1.3.1 Dynamic Context Canvas 已实现，2026-08-03。
 >
 > 范围：定义 M1.2 之后的 Agent 输入、Context 生命周期、Function Space、单 VLM
@@ -21,7 +26,7 @@ Post-M1.2 的核心工作不再是继续硬编码新的面板，而是建立：
   + 静态 System Prompt
   + LIBERO User Task
   + 当前一张双区 Dynamic Visual Context
-  + 最近三个 Function Call / Result
+  + 最近八个 Function Call / Result
   + 小而稳定的 Function Space
 ```
 
@@ -30,10 +35,10 @@ Post-M1.2 的核心工作不再是继续硬编码新的面板，而是建立：
 1. **只使用一个 VLM**。同一个模型产生感知调用、Action Proposal、commit 和终止判断；
    不引入独立 Actor/Critic VLM。
 2. **每轮恰好一个 Function Call**。不执行批量、并行或同轮多动作。
-3. **策略可见 History 最多三个 Function Transaction**。旧图片、旧 rationale 和完整
+3. **策略可见 History 最多八个 Function Transaction**。旧图片、旧 rationale 和完整
    对话不保留；M1.3 不尝试用后台世界模型补回长期历史。
 4. **Context 是 revision-local 的类马尔可夫状态**：当前 observation、当前区域/点证据、
-   proprioception、active action proposal 与最近三个调用共同近似充分状态。
+   proprioception、active action proposal 与最近八个调用共同近似充分状态。
 5. **Intent 与 Preview 合并为一次 Action Proposal**。每个运动动作函数同时描述“想做
    什么”并自动尝试生成 IK/FK prediction；Agent 下一次只需决定 commit、修改还是放弃。
    `solve_ik` returned/error/unavailable 会如实显示，但 Runtime 不增加额外 pass/fail
@@ -146,7 +151,7 @@ source_revision
 `region_id` 是 episode 内唯一、但只在当前 revision 可调用的证据 handle。它表示“在这张
 图像上，对 query 执行感知得到的区域”，不宣称它与其他 revision 中某个物体具有持久身份。
 
-`inspect(query)` 在一次 Agent-visible Function Call 内完成现有 VLM detection → SAM3 →
+`detection_and_sam(query)` 在一次 Agent-visible Function Call 内完成现有 VLM detection → SAM3 →
 segmentation 链路。`within_region_id` 可选：提供时在已有 region 的 crop 内继续查找杯把、
 容器内部或局部表面；不提供时直接搜索完整 agentview。bbox 和可视化 contour 可以进入
 Context；raw mask 仍只存在于 Private EnvContext。失败调用只进入 FunctionRecord，不伪造
@@ -154,7 +159,7 @@ RegionEvidence。Private EnvContext 以同一个 region ID 保存对应 raw mask
 `propose_grasps(region_id)` 使用，但该内部引用不序列化给 Agent。
 
 RegionEvidence 不包含 OBB。OBB 不是物体、部件、表面和自由空间的通用表达，也不再是
-`inspect` 的固定输出；动作工具按需要直接消费 region 对应的 mask/depth/局部点云。
+`detection_and_sam` 的固定输出；动作工具按需要直接消费 region 对应的 mask/depth/局部点云。
 
 #### PointEvidence
 
@@ -334,17 +339,17 @@ collision 未检查边界。
 
 M1.3 使用简单而严格的证据生命周期：
 
-1. `inspect`、`locate_point` 和 proposal Function 不改变 revision，可继续引用当前
+1. `detection_and_sam`、`locate_point` 和 proposal Function 不改变 revision，可继续引用当前
    region/point/candidate；
 2. Runtime 在 reset 时自动采集 R1；`commit`、`open_gripper`、`close_gripper` 等物理
    Function 执行后自动采集新 observation，revision +1。M1.3 不把 `observe` 暴露给 Agent；
 3. 任何 revision 更新都会使旧 RegionEvidence、PointEvidence、ActionCandidate 和未执行的
    ActionProposal 失效；旧 region/point/candidate 从**当前 Context**移除，active
    ActionProposal 在物理执行后结算为 receipt，未执行 proposal 则直接清空；
-4. 最近三个 FunctionRecord 可继续说明“刚刚执行了什么”，但其中旧 ID 不再可调用；
+4. 最近八个 FunctionRecord 可继续说明“刚刚执行了什么”，但其中旧 ID 不再可调用；
 5. Runtime 若收到旧 revision 的 region/point/candidate/action ID，只返回结构化引用错误，
    不尝试猜测它在新图像中对应哪个物体；
-6. Agent 若仍需要该区域或位置，必须在新图像上再次调用 `inspect` 或 `locate_point`。
+6. Agent 若仍需要该区域或位置，可以在新图像上调用 `detection_and_sam` 或 `locate_point` 建立新的 revision-local 引用。
 
 这会牺牲物体持久性，但让 M1.3 的语义、实现与训练数据保持清楚。跨 revision 关联不以
 隐藏启发式混入该基线。
@@ -364,14 +369,14 @@ manifest，避免图片和 JSON 双份描述同一世界：
 }
 ```
 
-精确工具结果保留在最近三个 Function Result 中；当前有效 region/point 进入第二层
+精确工具结果保留在最近八个 Function Result 中；当前有效 region/point 进入第二层
 Evidence Board。
 M1.3 不额外构造“长期事实”。保留 `legacy_full_summary=true` 对照开关，但默认 Context
 不依赖全量 JSON。
 
-## 4. History：最多三个 Function Transaction
+## 4. History：最多八个 Function Transaction
 
-History 不是三张图，也不是最近三个自然语言回复，而是最近三个完整调用事务。模型输出的
+History 不是八张图，也不是最近八个自然语言回复，而是最近八个完整调用事务。模型输出的
 `decision_basis` 只写 trace，不作为下一轮的证据回放：
 
 ```text
@@ -384,7 +389,7 @@ assistant function call
 ```json
 [
   {
-    "name": "inspect",
+    "name": "detection_and_sam",
     "arguments": {"query": "basket"},
     "result": {"region_id": "region1", "bbox_xyxy_px": [311, 146, 492, 338]}
   },
@@ -415,13 +420,13 @@ assistant function call
 
 淘汰规则：
 
-1. 新 Function Result 写入后，超过三个时删除最旧 transaction；
+1. 新 Function Result 写入后，超过八个时删除最旧 transaction；
 2. assistant rationale 从不进入策略 History，旧 image 也不保留；
 3. System Prompt 与初始 User Task 始终保留；
 4. active action、当前 revision 的 region/point evidence 和 robot state 是 `ContextState`，
    不依赖 History 存活；
 5. protocol 需要的 assistant call + tool result 成对保留，不能留下 orphan tool call；
-6. trace 可以保留完整 episode，但策略输入严格只取最近三个 transaction。
+6. trace 可以保留完整 episode，但策略输入严格只取最近八个 transaction。
 
 这构成一个 bounded-memory POMDP：Runtime 内部可以保存完整 trace，VLM 只见当前
 类马尔可夫状态与有限短历史。
@@ -435,7 +440,7 @@ Function 描述语义动作，Runtime adapter 负责参数传递、frame 转换�
 
 | Agent Function | 语义 | 主要 CaP-X backend |
 |---|---|---|
-| `inspect(query, within_region_id?)` | 建立区域/部件证据 | VLM bbox + SAM3 |
+| `detection_and_sam(query, within_region_id?)` | 建立区域/部件证据 | VLM bbox + SAM3 |
 | `locate_point(query, within_region_id?)` | 建立有 metric XYZ 的操作点证据 | VLM point + RGB-D lift |
 | `propose_grasps(region_id)` | 从 region mask 产生 grasp candidates | GraspNet / plan_grasp |
 | `propose_pose(point_id, offset_xyz, quaternion_xyzw?)` | 从空间 anchor 创建 Action Proposal 并自动 prediction | point + offset + solve_ik/FK |
@@ -449,9 +454,9 @@ M1.3 的新协议固定为以上九个 Function。首帧 observation 和物理�
 由 Runtime 自动产生，不占 Agent turn；`view`、`delta_move` 和 `rotate` 不进入 M1.3
 Function Space。第一版也不增加 `pin/forget/compose_page` 等布局工具。
 
-`inspect` 和 `locate_point` 是 Agent-visible 的语义感知工具；内部 CaP-X primitive 仍写入
+`detection_and_sam` 和 `locate_point` 是 Agent-visible 的语义感知工具；内部 CaP-X primitive 仍写入
 完整 trace，但不要求 VLM 手工搬运 bbox、mask、depth 或相机矩阵。它们彼此没有固定先后：
-Agent 可以直接 `locate_point("basket center")`，也可以先 `inspect("basket")`，再通过
+Agent 可以直接 `locate_point("basket center")`，也可以先 `detection_and_sam("basket")`，再通过
 `within_region_id` 对杯把、容器内部或局部表面做细粒度查询。
 
 ### 5.2 最小输入与结构化返回
@@ -461,7 +466,7 @@ Agent 可以直接 `locate_point("basket center")`，也可以先 `inspect("bask
 Agent-visible contract：
 
 ```text
-inspect(query, within_region_id?)
+detection_and_sam(query, within_region_id?)
 → {
     "region_id": "region1",
     "bbox_xyxy_px": [x1, y1, x2, y2]
@@ -511,9 +516,9 @@ local TCP offset，不将 hand-link 原点与 TCP target 直接相减。`gripper
 ### 5.3 现有 op 的迁移
 
 - `commit_gripper(action)` 拆成 `open_gripper()` / `close_gripper()`，减少 union 参数；
-- 新 `inspect(query, within_region_id?)` 复用当前 `ground(text)` 的 detection → SAM3
+- 新 `detection_and_sam(query, within_region_id?)` 复用当前 `ground(text)` 的 detection → SAM3
   主链，但不计算或返回 OBB；旧
-  `ground(text)` 和 `inspect(object_id)` 仅作为 legacy trace adapter，不进入新协议；
+  `ground(text)` 和旧 `inspect(object_id)` 仅作为 legacy trace adapter，不进入新协议；
 - 现有 `ObjectEntry objN` 只可暂时存在于兼容实现内部；新 Context 和新 teacher 数据只
   暴露 revision-local region/point ID，不赋予 `objN` 跨 observation 身份；
 - `vlm_point_detection` 接入新 `locate_point`；point 的 XYZ 由当前 RGB-D 在 adapter 内
@@ -531,7 +536,7 @@ Runtime 不实现：
 
 ```text
 固定 pick/place phase 或 allowed_next_tools
-inspect 后自动调用 locate_point / propose_grasps
+detection_and_sam 后自动调用 locate_point / propose_grasps
 locate_point 后自动决定 hover/descend/release
 solve_ik returned 才允许 commit
 solve_ik error 自动换 candidate
@@ -557,7 +562,7 @@ repeat:
   → 单 VLM 输出一个 Function Call
   → 仅做调度所需解析与引用解析
   → 执行 Function
-  → 写入 FunctionRecord，裁剪为最近三个
+  → 写入 FunctionRecord，裁剪为最近八个
 
   if perception/context function:
       更新当前 revision 的 RegionEvidence 或 PointEvidence
@@ -630,7 +635,7 @@ Teacher、student、SFT replay 和 verl AgentLoop 必须调用同一个 `Context
 | M0.5 | 已完成 | 单 op Agent Runtime 与 provider 基线 |
 | M1.1 | 已完成 | CaP-X + LIBERO-PRO 真实接线 |
 | M1.2 | 已完成实验实现 | PIL/Web renderer、真实 trace 与早期固定 Canvas 原型 |
-| M1.3 | 已完成 | revision-local Context、九 Function、K=3 与真实 scripted trace |
+| M1.3 | 已完成 | revision-local Context、九 Function、K=8 与真实 scripted trace |
 | M1.3.1 | 已完成 | 通用 ActionCandidate、ContextPacket v2 与 `1440×1080` Dynamic Canvas |
 | 旧 M1.3 | 被本计划取代 | “reward 推迟”仍成立，但不再占一个空里程碑；reward 仍留 M5 |
 | 旧 M1.4 | 合并进新 M1.4 | 真模型实跑改为验证新 Context Runtime，而非固定四区 Canvas |
@@ -645,7 +650,7 @@ Teacher、student、SFT replay 和 verl AgentLoop 必须调用同一个 `Context
 1. 定义最小 `ContextState`、`RegionEvidence`、`PointEvidence`、`ActionCandidate`、`RobotState`、
    `ActionProposal`、`FunctionRecord`；Action Proposal 内部保留 intent 与 prediction
    两部分语义；
-2. 实现 `inspect(query, within_region_id?)`，复用现有 bbox detection → SAM3；只返回
+2. 实现 `detection_and_sam(query, within_region_id?)`，复用现有 bbox detection → SAM3；只返回
    revision-local region，不计算通用 OBB，不建立跨 observation 的 object ID；
 3. 实现 `locate_point(query, within_region_id?)`，接入 VLM point detection，并用局部有效
    depth 将像素提升为 robot-base XYZ；无可靠 depth 时返回错误而不是伪造坐标；
@@ -656,7 +661,7 @@ Teacher、student、SFT replay 和 verl AgentLoop 必须调用同一个 `Context
    显式执行；新 Context 协议不暴露独立 `preview`，旧 op 只留 replay adapter；
 5. 定义 Context compiler/packet 边界，renderer 从 packet 渲染，不直接读取
    固定 WorkspaceSnapshot；
-6. 实现最近三个 Function Transaction 的 protocol-safe History 裁剪；
+6. 实现最近八个 Function Transaction 的 protocol-safe History 裁剪；
 7. 每轮只发当前 Context image，移除最近 K 张 Canvas 的默认策略；
 8. 新建 Context System Prompt、九个 Function definitions 与 minimal manifest；
 9. 物理动作产生新 revision 时，从当前 Context 清除旧 region/point/candidate，旧 ID
@@ -667,11 +672,11 @@ Teacher、student、SFT replay 和 verl AgentLoop 必须调用同一个 `Context
 
 验收：
 
-- 任意 turn 的模型输入只包含当前 Context image 和最多三个 Function Transaction；
+- 任意 turn 的模型输入只包含当前 Context image 和最多八个 Function Transaction；
 - 移除更早 History 后，当前 revision 的 region/point、robot、active action 不丢失；
 - 新协议精确暴露九个 Function，不包含 `observe`、`view`、`preview`、`delta_move`、
   `rotate` 或 OBB 工具；
-- `inspect` 返回 bbox/contour region，`locate_point` 返回 pixel + metric XYZ；Agent 不需要
+- `detection_and_sam` 返回 bbox/contour region，`locate_point` 返回 pixel + metric XYZ；Agent 不需要
   手工传递 mask、depth、intrinsics 或 camera pose；
 - `select` / `propose_pose` 一次调用同时得到 Action Proposal 和 prediction，模型可见
   tool definitions 中不存在独立 `preview`；
@@ -692,7 +697,7 @@ Teacher、student、SFT replay 和 verl AgentLoop 必须调用同一个 `Context
   `33 passed`；
 - TypeScript production build 与 Ruff 检查通过；
 - 真实 `libero_object_swap:0` scripted smoke 完成
-  `open_gripper → inspect → locate_point → propose_grasps → select → commit →
+  `open_gripper → detection_and_sam → locate_point → propose_grasps → select → commit →
   close_gripper → done`，共生成九张 Context trace；
 - 02 证据层重构后，同一五候选真实状态由约 `2783px` 收敛到约 `2473px`，同时增加
   region→point 关系、候选相对位移、approach/双指方向、selected attribution 和本体视觉
@@ -764,6 +769,58 @@ TypeScript build 通过；真实 `libero_object_swap:0` scripted smoke 覆盖了
 旋转链路，没有执行完整 place，因此环境任务结果为未完成；真实单 VLM 多任务成功率仍在
 后续实验中评估。
 
+### 8.4.1 M1.4.1 — Persistent Waypoint 连续 Preview
+
+目标：把 pose、局部平移、旋转与夹爪目标统一为一个 revision-local、可连续编辑的虚拟
+Waypoint；只有 `commit(action_id)` 能改变真实世界。
+
+实施项：
+
+1. 公共核心状态收敛为最小 `WaypointDraft(action_id, target_pose?,
+   target_gripper_state?)`；motion plan、grasp planning context、latest visual edit 与
+   trace-only edit index 保存在 episode-private `DraftArtifacts`；
+2. `select/propose_pose/delta_move/rotate/open_gripper/close_gripper` 在当前 revision 内持续
+   编辑同一个 action ID；`delta_move/rotate` 不再接收 `action_id`；
+3. `open_gripper/close_gripper` 只设置虚拟目标指宽，不访问 controller、不刷新 observation；
+4. `commit` 固定按 `ARM → GRIPPER` 执行最新 cached plan；arm 失败跳过 gripper，任何结果只
+   refresh 一次，并在 trace receipt 标记实际完成阶段和失败阶段；
+5. Context 升级为 `vaw-context-v4` / Web schema 5 / `context-web-v4-waypoint`。Proposal
+   继续采用经真实实验验证更清楚的 RGB focus preview：当前 RGB 上叠加紫色预测整臂/夹爪，
+   并保留小型全局整臂 inset；Persistent World 仍提供当前 gripper-local 点云；
+6. Persistent agentview 只增加标定后的大号 BASE axes；gripper-local 增加完整 TOOL axes。
+   无 returned joints 时不伪造 predicted FK；上区统一标为 `OBSERVED NOW`，下区 proposal
+   统一标为 `IF COMMITTED · VIRTUAL PREVIEW · NOT OBSERVED`，避免把当前近场点云误读为
+   Waypoint 的未来结果；Prompt 不允许以 closed/opening 或局部邻近关系单独证明抓持。
+7. GraspNet→Franka adapter 在既有 local-Z `+90°` 轴映射后，对平行夹爪的 `R` 与
+   `R·RotZ(π)` 等价姿态做 current-hand canonicalization，避免不改变抓取几何的无意义腕部翻转。
+
+验收：Function 仍严格为十一项；所有 preview editor 保持相同 action ID、revision 和证据；
+纯 arm、纯 gripper、arm+gripper Waypoint 都可 commit；cached plan 原子替换；只有 commit
+计入 physical-op budget 与 environment success 检查；截图保持固定 `1440×1080`。
+
+### 8.4.2 M1.4.2 — Geometry Preview Canvas
+
+目标：让 VLM 在同一个当前近场点云中直接比较真实夹爪与虚拟 Waypoint，减少把 planner
+状态误读为抓取质量的情况，并让 `delta_move` / `rotate` 具备明确的视觉参数映射。
+
+实施项：
+
+1. Context 升级为 `vaw-context-v5` / Web schema 6 / `context-web-v5-geometry`，固定输出
+   `1920×1440`，DPR=1；near-field 原生 raster 提升到 `640×720`；
+2. agentview 保持真实 RGB 与 BASE axes，不叠加 Waypoint；gripper-local 使用同一份当前
+   RGB-D 点云叠加蓝色 current FK 与紫色 preview FK；
+3. gripper-local 角落显示投影到当前近场视图的 `BASE / WORLD` 三轴，与 agentview 使用同一
+   公共坐标语义；`delta_move` 显示 reference→target 的绿色位移箭头和 frame/XYZ 数值，
+   `rotate` 显示符合右手定则的旋转圆弧以及 axis/frame/angle；
+4. Canvas 删除 `solve_ik returned`、`FK RETURNED`、路径/碰撞检查与 contact/dynamics 等
+   planner 协议文字；这些状态继续保留在 Function History、trace 与 debug log；
+5. Proposal facts 只保留 action ID、target position/quaternion、目标指宽、最近一次 adjustment
+   和精简的 Move/Rotate Function 提示；candidate card 只保留 ID 与视觉候选。
+
+验收：无 Waypoint 时近场只显示蓝色 current；连续 editor 只更新紫色 preview 和几何提示，
+不刷新当前点云；commit 后紫色消失并以新 observation 更新蓝色 current；Canvas 严格为
+`1920×1440×3`，且 planner 状态仍可在 trace 中审计。
+
 ### 8.5 M2 — Scene Memory（由真实失败驱动的可选扩展）
 
 M2 不预先塞进 M1.3，也不把当前 region/point ID 悄悄升级成永久 object ID。只有满足以下
@@ -789,7 +846,7 @@ revision-local `RegionEvidence` / `PointEvidence`。
 - 双区 Dynamic Context 页面语法；
 - System Prompt；
 - Function names/parameters；
-- History K=3；
+- History K=8；
 - minimal manifest；
 - renderer 分辨率与字体。
 
@@ -801,7 +858,7 @@ version，并原则上重新采集数据。
 - **M4 SFT**：成功 trace 过滤、图文交错 Function Call 数据、单 VLM student baseline；
 - **M5 RL**：verl 多轮 AgentLoop，reward 只在训练侧；比较 GRPO/PPO；
 - **M6 实验**：CaP-X ReAct、legacy Canvas、Dynamic Context、去动态决策区、
-  History K={0,1,3,all}、有/无 prediction evidence、high-level-only vs hybrid action space，
+  History K={0,1,3,8,all}、有/无 prediction evidence、high-level-only vs hybrid action space，
   以及在 M2 被启动时的有/无 Scene Memory 对照。
 
 ## 9. 非目标
@@ -825,9 +882,11 @@ M1.3/M1.4 不做：
 ```text
 M1.2 visual prototypes（已有）
   → M1.3 region/point evidence + candidate ActionProposal pipeline
-  → M1.3 History K=3 + Prompt input
+  → M1.3 History K=8 + Prompt input
   → M1.3 ContextCompiler + real LIBERO rendering
-  → M1.4 ActionProposal + delta/rotate + gripper direct ops
+  → M1.4 ActionProposal + delta/rotate baseline
+  → M1.4.1 Persistent Waypoint + continuous preview + commit-only physics
+  → M1.4.2 current/preview near-field geometry + Move/Rotate cues
   → M1.4 single-VLM multi-task validation
   → failure analysis
       ├─ object persistence is a major failure source → M2 versioned Scene Memory

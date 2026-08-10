@@ -15,16 +15,15 @@ from vaw.context_runtime.geometry import (
     tcp_position_from_hand_pose,
 )
 from vaw.context_runtime.model import (
-    ActionCandidate,
+    ActionSeed,
     ContextState,
-    FunctionRecord,
     PointEvidence,
     Pose,
     RegionEvidence,
     RobotState,
 )
 from vaw.context_runtime.motion import MotionBackend, create_motion_backend
-from vaw.context_runtime.private import PrivateEnvContext
+from vaw.context_runtime.private import PresentationEvent, PrivateEnvContext
 from vaw.context_runtime.protocol import parse_action
 
 
@@ -36,7 +35,6 @@ class ContextStepResult:
     revision_before: int
     revision_after: int
     manifest: dict[str, Any]
-    trace_receipt: dict[str, Any] | None = None
     trace_diagnostics: dict[str, Any] | None = None
 
     @property
@@ -48,7 +46,9 @@ class ContextWorkspace:
     """Own one episode's public state, private sensors and function dispatcher."""
 
     MAX_GRASP_CANDIDATES = 5
-    PHYSICAL_FUNCTIONS = frozenset({"commit", "open_gripper", "close_gripper"})
+    # Waypoint editors never mutate the environment.  Runtime physical-op
+    # accounting and environment-success checks share this single boundary.
+    PHYSICAL_FUNCTIONS = frozenset({"commit"})
 
     def __init__(
         self,
@@ -86,7 +86,14 @@ class ContextWorkspace:
         self.finished = False
         self.claimed_success = False
         self._functions = ContextFunctions(self)
+        self.refinement_goal = task_prompt
         self.refresh_observation()
+
+    def set_refinement_goal(self, text: str) -> None:
+        """Set the session-local goal used if the next call starts imagination."""
+
+        normalized = " ".join(str(text).split())
+        self.refinement_goal = normalized or f"为任务“{self.state.task_prompt}”检查并调整动作"
 
     def refresh_observation(self) -> dict[str, Any]:
         observation = self._call_backend("get_observation")
@@ -129,6 +136,17 @@ class ContextWorkspace:
             return self.reject("invalid", {"payload": shown_payload}, str(exc))
         return self.execute(name, **arguments)
 
+    def limit_imagination(self) -> ContextStepResult:
+        """Return control to Main when the Imagination turn budget is spent."""
+
+        before = self.state.observation_revision
+        self._private.begin_function_call()
+        try:
+            result = self._functions.limit_imagination()
+        except ContextFunctionError as exc:
+            result = {"error": str(exc)}
+        return self._record("imagination_limit", {}, result, before)
+
     def reject(
         self,
         function_name: str,
@@ -153,25 +171,10 @@ class ContextWorkspace:
         revision_before: int,
     ) -> ContextStepResult:
         revision_after = self.state.observation_revision
-        action_id = _record_action_id(function_name, arguments, result)
-        receipt = self.state.last_receipt
-        trace_receipt = (
-            receipt.summary()
-            if receipt is not None
-            and receipt.revision_before == revision_before
-            and receipt.revision_after == revision_after
-            and revision_after != revision_before
-            else None
-        )
-        self.state.add_record(
-            FunctionRecord(
-                function_name=function_name,
-                arguments=dict(arguments),
-                result=dict(result),
-                revision_before=revision_before,
-                revision_after=revision_after,
-                action_id=action_id,
-            )
+        self._private.presentation_event = PresentationEvent(
+            function_name=function_name,
+            result=dict(result),
+            error=str(result["error"]) if "error" in result else None,
         )
         return ContextStepResult(
             function_name=function_name,
@@ -180,7 +183,6 @@ class ContextWorkspace:
             revision_before=revision_before,
             revision_after=revision_after,
             manifest=self.state.manifest(),
-            trace_receipt=trace_receipt,
             trace_diagnostics=(
                 dict(self._private.trace_diagnostics)
                 if self._private.trace_diagnostics
@@ -232,22 +234,11 @@ class ContextWorkspace:
             raise ContextFunctionError(f"unknown or expired point_id '{point_id}'")
         return point
 
-    def _current_candidate(self, candidate_id: str) -> ActionCandidate:
-        candidate = self.state.candidates.get(candidate_id)
-        if candidate is None or candidate.source_revision != self.state.observation_revision:
-            raise ContextFunctionError(f"unknown or expired candidate_id '{candidate_id}'")
-        return candidate
-
-
-def _record_action_id(
-    function_name: str,
-    arguments: dict[str, Any],
-    result: dict[str, Any],
-) -> str | None:
-    value = result.get("action_id")
-    if value is None and function_name == "commit":
-        value = arguments.get("action_id")
-    return str(value) if value is not None else None
+    def _current_seed(self, seed_id: str) -> ActionSeed:
+        seed = self.state.seeds.get(seed_id)
+        if seed is None or seed.source_revision != self.state.observation_revision:
+            raise ContextFunctionError(f"unknown or expired seed_id '{seed_id}'")
+        return seed
 
 
 def _robot_state(

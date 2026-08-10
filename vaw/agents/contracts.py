@@ -89,7 +89,7 @@ class StepRecord:
     args: dict[str, Any]
     ok: bool
     physical: bool
-    receipt: str
+    result: str
     thought: str = ""
 
 

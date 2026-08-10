@@ -18,17 +18,27 @@ from vaw.context_runtime.gripper_mesh import (
     mask_outline,
     rasterize_silhouette,
 )
-from vaw.context_runtime.model import RobotState
+from vaw.context_runtime.model import Pose, RobotState
+from vaw.context_runtime.private import VisualEdit
 
-NEAR_FIELD_WIDTH = 480
-NEAR_FIELD_HEIGHT = 540
+NEAR_FIELD_WIDTH = 640
+NEAR_FIELD_HEIGHT = 720
 
 _PANEL_GAP = 8
 _PANEL_HEIGHT = (NEAR_FIELD_HEIGHT - _PANEL_GAP) // 2
 _BACKGROUND = np.array([232, 239, 247], dtype=np.uint8)
 _GRIPPER = np.array([37, 99, 235], dtype=np.uint8)
 _GRIPPER_OUTLINE = np.array([23, 55, 130], dtype=np.uint8)
-_MAX_POINTS = 80_000
+_PREVIEW = np.array([124, 58, 237], dtype=np.uint8)
+_PREVIEW_OUTLINE = np.array([76, 29, 149], dtype=np.uint8)
+_MOVE = (22, 163, 74, 255)
+_AXIS_COLORS = (
+    (220, 38, 38, 255),
+    (22, 163, 74, 255),
+    (37, 99, 235, 255),
+)
+_MAX_POINTS_OBSERVED = 80_000
+_MAX_POINTS_IMAGINATION = 160_000
 
 
 @dataclass(frozen=True)
@@ -42,10 +52,21 @@ class _View:
     half_height_m: float
 
 
+@dataclass(frozen=True)
+class NearFieldPreview:
+    """Geometry-only view of the active, unexecuted Waypoint."""
+
+    target_pose: Pose | None
+    joint_positions_rad: tuple[float, ...] | None
+    gripper_opening: float | None
+    visual_edit: VisualEdit | None = None
+
+
 def render_near_field(
     agentview: dict,
     wrist: dict | None,
     robot: RobotState | None,
+    preview: NearFieldPreview | None = None,
 ) -> np.ndarray | None:
     """Render current fused RGB-D around the contact TCP from two fixed views."""
 
@@ -57,6 +78,17 @@ def render_near_field(
     ):
         return None
 
+    return _render_geometry_pair(agentview, wrist, robot, preview)
+
+
+def _render_geometry_pair(
+    agentview: dict,
+    wrist: dict | None,
+    robot: RobotState,
+    preview: NearFieldPreview | None,
+) -> np.ndarray | None:
+    if robot.tcp_pose is None or robot.joint_positions_rad is None or robot.gripper_opening is None:
+        return None
     tcp_position = np.asarray(robot.tcp_pose.position_xyz, dtype=np.float64)
     tcp_quaternion = np.asarray(robot.tcp_pose.quaternion_xyzw, dtype=np.float64)
     if not (
@@ -68,6 +100,16 @@ def render_near_field(
     tcp_rotation = Rotation.from_quat(
         tcp_quaternion / np.linalg.norm(tcp_quaternion)
     ).as_matrix()
+    focus_center_local = np.array([0.0, 0.0, -0.015], dtype=np.float64)
+    if preview is not None and preview.target_pose is not None:
+        target_position_local, _ = _pose_in_current_tcp(
+            preview.target_pose,
+            tcp_position,
+            tcp_rotation,
+        )
+        # Keep the observed and virtual TCP in the same local comparison view.
+        focus_center_local = target_position_local * 0.5
+        focus_center_local[2] -= 0.015
 
     point_parts: list[np.ndarray] = []
     color_parts: list[np.ndarray] = []
@@ -79,11 +121,11 @@ def render_near_field(
             continue
         points, colors = sampled
         local = (points - tcp_position) @ tcp_rotation
+        relative_to_focus = local - focus_center_local
         keep = (
-            (np.abs(local[:, 0]) <= 0.18)
-            & (np.abs(local[:, 1]) <= 0.18)
-            & (local[:, 2] >= -0.17)
-            & (local[:, 2] <= 0.14)
+            (np.abs(relative_to_focus[:, 0]) <= 0.22)
+            & (np.abs(relative_to_focus[:, 1]) <= 0.22)
+            & (np.abs(relative_to_focus[:, 2]) <= 0.20)
         )
         if np.any(keep):
             point_parts.append(local[keep])
@@ -92,9 +134,12 @@ def render_near_field(
     if point_parts:
         points_local = np.concatenate(point_parts, axis=0)
         colors = np.concatenate(color_parts, axis=0)
-        if len(points_local) > _MAX_POINTS:
+        point_limit = (
+            _MAX_POINTS_IMAGINATION if preview is not None else _MAX_POINTS_OBSERVED
+        )
+        if len(points_local) > point_limit:
             indices = np.linspace(
-                0, len(points_local) - 1, num=_MAX_POINTS, dtype=np.int64
+                0, len(points_local) - 1, num=point_limit, dtype=np.int64
             )
             points_local = points_local[indices]
             colors = colors[indices]
@@ -102,10 +147,63 @@ def render_near_field(
         points_local = np.empty((0, 3), dtype=np.float64)
         colors = np.empty((0, 3), dtype=np.uint8)
 
-    triangles_local = _gripper_triangles_local(robot, tcp_position, tcp_rotation)
-    views = _near_field_views()
+    triangles_local = _gripper_triangles_local(
+        robot.joint_positions_rad,
+        robot.gripper_opening,
+        tcp_position,
+        tcp_rotation,
+    )
+    preview_triangles_local = None
+    preview_is_target_ghost = False
+    if (
+        preview is not None
+        and preview.joint_positions_rad is not None
+        and preview.gripper_opening is not None
+    ):
+        preview_triangles_local = _gripper_triangles_local(
+            preview.joint_positions_rad,
+            preview.gripper_opening,
+            tcp_position,
+            tcp_rotation,
+        )
+    elif (
+        preview is not None
+        and preview.target_pose is not None
+        and preview.gripper_opening is not None
+    ):
+        target_shape_local = _gripper_triangles_local(
+            robot.joint_positions_rad,
+            preview.gripper_opening,
+            tcp_position,
+            tcp_rotation,
+        )
+        if target_shape_local is not None:
+            target_position_local, target_rotation_local = _pose_in_current_tcp(
+                preview.target_pose,
+                tcp_position,
+                tcp_rotation,
+            )
+            preview_triangles_local = (
+                target_shape_local @ target_rotation_local.T
+                + target_position_local
+            )
+            preview_is_target_ghost = True
+    views = _near_field_views(
+        "CURRENT + PREVIEW" if preview is not None else "OBSERVED NOW",
+        focus_center_local,
+    )
     panels = [
-        _render_view(points_local, colors, triangles_local, view)
+        _render_view(
+            points_local,
+            colors,
+            triangles_local,
+            preview_triangles_local,
+            view,
+            current_tcp_position=tcp_position,
+            current_tcp_rotation=tcp_rotation,
+            preview=preview,
+            preview_is_target_ghost=preview_is_target_ghost,
+        )
         for view in views
     ]
     canvas = np.full(
@@ -162,7 +260,8 @@ def _colored_points_base(camera: dict) -> tuple[np.ndarray, np.ndarray] | None:
 
 
 def _gripper_triangles_local(
-    robot: RobotState,
+    joints_rad: tuple[float, ...],
+    opening: float,
     tcp_position: np.ndarray,
     tcp_rotation: np.ndarray,
 ) -> np.ndarray | None:
@@ -171,15 +270,23 @@ def _gripper_triangles_local(
         return None
     try:
         triangles = fk.triangles(
-            np.asarray(robot.joint_positions_rad, dtype=np.float64),
-            float(robot.gripper_opening),
+            np.asarray(joints_rad, dtype=np.float64),
+            float(opening),
         )
     except (RuntimeError, ValueError):
         return None
     return (triangles - tcp_position) @ tcp_rotation
 
 
-def _near_field_views() -> tuple[_View, _View]:
+def _near_field_views(
+    label_suffix: str,
+    center: np.ndarray | None = None,
+) -> tuple[_View, _View]:
+    view_center = (
+        np.array([0.0, 0.0, -0.015], dtype=np.float64)
+        if center is None
+        else np.asarray(center, dtype=np.float64).reshape(3)
+    )
     forward = _unit(np.array([0.72, -0.92, 0.62], dtype=np.float64))
     right = _unit(np.cross(forward, np.array([0.0, 0.0, 1.0])))
     # Franka local +Z runs from panda_hand toward the fingertip/contact TCP.
@@ -188,20 +295,20 @@ def _near_field_views() -> tuple[_View, _View]:
     up = -_unit(np.cross(right, forward))
     return (
         _View(
-            label="LOCAL 3/4 · CURRENT FUSED RGB-D",
+            label=f"LOCAL 3/4 · {label_suffix}",
             forward=forward,
             right=right,
             up=up,
-            center=np.array([0.0, 0.0, -0.015], dtype=np.float64),
+            center=view_center,
             half_width_m=0.155,
-            half_height_m=0.09,
+            half_height_m=0.115 if label_suffix == "CURRENT + PREVIEW" else 0.09,
         ),
         _View(
-            label="JAW PLANE · CURRENT FUSED RGB-D",
+            label=f"JAW PLANE · {label_suffix}",
             forward=np.array([1.0, 0.0, 0.0], dtype=np.float64),
             right=np.array([0.0, 1.0, 0.0], dtype=np.float64),
             up=np.array([0.0, 0.0, -1.0], dtype=np.float64),
-            center=np.array([0.0, 0.0, -0.015], dtype=np.float64),
+            center=view_center,
             half_width_m=0.13,
             half_height_m=0.135,
         ),
@@ -211,8 +318,14 @@ def _near_field_views() -> tuple[_View, _View]:
 def _render_view(
     points: np.ndarray,
     colors: np.ndarray,
-    triangles: np.ndarray | None,
+    current_triangles: np.ndarray | None,
+    preview_triangles: np.ndarray | None,
     view: _View,
+    *,
+    current_tcp_position: np.ndarray,
+    current_tcp_rotation: np.ndarray,
+    preview: NearFieldPreview | None,
+    preview_is_target_ghost: bool,
 ) -> np.ndarray:
     height, width = _PANEL_HEIGHT, NEAR_FIELD_WIDTH
     image = np.full((height, width, 3), _BACKGROUND, dtype=np.uint8)
@@ -237,8 +350,71 @@ def _render_view(
             radius=2,
         )
 
+    if current_triangles is not None and len(current_triangles):
+        _overlay_triangles(
+            image,
+            current_triangles,
+            view,
+            _GRIPPER,
+            _GRIPPER_OUTLINE,
+            alpha=0.62,
+        )
+    if preview_triangles is not None and len(preview_triangles):
+        _overlay_triangles(
+            image,
+            preview_triangles,
+            view,
+            _PREVIEW,
+            _PREVIEW_OUTLINE,
+            alpha=0.52 if preview_is_target_ghost else 0.76,
+        )
+
+    pil = Image.fromarray(image)
+    draw = ImageDraw.Draw(pil, "RGBA")
+    font = _label_font()
+    draw.rounded_rectangle(
+        (8, 8, 330, 31),
+        radius=4,
+        fill=(255, 255, 255, 226),
+        outline=(190, 204, 221, 255),
+        width=1,
+    )
+    draw.text((15, 12), view.label, fill=(30, 41, 59, 255), font=font)
+    _draw_corner_axes(
+        draw,
+        view,
+        current_tcp_rotation.T,
+        width,
+        label="BASE +AXES",
+        origin=(width - 72.0, 88.0),
+    )
+    if preview is not None and preview.target_pose is not None:
+        _draw_adjustment(
+            draw,
+            view,
+            width,
+            height,
+            preview,
+            current_tcp_position,
+            current_tcp_rotation,
+        )
+    _draw_legend(draw, width, height, preview is not None)
+    _draw_scale_bar(draw, view, width, height)
+    return np.asarray(pil, dtype=np.uint8)
+
+
+def _overlay_triangles(
+    image: np.ndarray,
+    triangles: np.ndarray,
+    view: _View,
+    color: np.ndarray,
+    outline_color: np.ndarray,
+    *,
+    alpha: float,
+) -> None:
     if triangles is not None and len(triangles):
         flat = triangles.reshape(-1, 3)
+        height, width = image.shape[:2]
         u, v, depth = _project(flat, view, width, height)
         projected = np.column_stack((u, v)).reshape(-1, 3, 2)
         triangle_depths = depth.reshape(-1, 3)
@@ -250,26 +426,11 @@ def _render_view(
         )
         if np.any(mask):
             blended = (
-                image[mask].astype(np.float64) * 0.25
-                + _GRIPPER.astype(np.float64) * 0.75
+                image[mask].astype(np.float64) * (1.0 - alpha)
+                + color.astype(np.float64) * alpha
             )
             image[mask] = np.asarray(np.round(blended), dtype=np.uint8)
-            image[mask_outline(mask)] = _GRIPPER_OUTLINE
-
-    pil = Image.fromarray(image)
-    draw = ImageDraw.Draw(pil, "RGBA")
-    font = _label_font()
-    draw.rounded_rectangle(
-        (8, 8, 286, 31),
-        radius=4,
-        fill=(255, 255, 255, 226),
-        outline=(190, 204, 221, 255),
-        width=1,
-    )
-    draw.text((15, 12), view.label, fill=(30, 41, 59, 255), font=font)
-    _draw_contact_axis(draw, view, width)
-    _draw_scale_bar(draw, view, width, height)
-    return np.asarray(pil, dtype=np.uint8)
+            image[mask_outline(mask)] = outline_color
 
 
 def _project(
@@ -359,44 +520,277 @@ def _draw_scale_bar(
     draw.text((left, y - 18), "5 cm", fill=(30, 41, 59, 255), font=_label_font())
 
 
-def _draw_contact_axis(
+def _pose_in_current_tcp(
+    pose: Pose,
+    current_tcp_position: np.ndarray,
+    current_tcp_rotation: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    target_position = np.asarray(pose.position_xyz, dtype=np.float64)
+    target_rotation = Rotation.from_quat(
+        np.asarray(pose.quaternion_xyzw, dtype=np.float64)
+    ).as_matrix()
+    position_local = (target_position - current_tcp_position) @ current_tcp_rotation
+    rotation_local = current_tcp_rotation.T @ target_rotation
+    return position_local, rotation_local
+
+
+def _draw_corner_axes(
+    draw: ImageDraw.ImageDraw,
+    view: _View,
+    rotation_local: np.ndarray,
+    width: int,
+    *,
+    label: str,
+    origin: tuple[float, float],
+) -> None:
+    del width
+    accent = (30, 64, 175, 255)
+    title = label
+    title_font = _label_font()
+    title_box = draw.textbbox((0, 0), title, font=title_font)
+    title_width = title_box[2] - title_box[0]
+    plate_left = origin[0] - 68
+    # Keep the title in its own band; projected axes may point upward.
+    plate_top = origin[1] - 62
+    plate_right = max(origin[0] + 52, plate_left + title_width + 14)
+    plate_bottom = origin[1] + 45
+    draw.rounded_rectangle(
+        (plate_left, plate_top, plate_right, plate_bottom),
+        radius=6,
+        fill=(255, 255, 255, 228),
+        outline=accent,
+        width=2,
+    )
+    draw.text(
+        (plate_left + 7, plate_top + 6),
+        title,
+        fill=accent,
+        font=title_font,
+    )
+    draw.ellipse(
+        (origin[0] - 5, origin[1] - 5, origin[0] + 5, origin[1] + 5),
+        fill=(255, 255, 255, 255),
+        outline=accent,
+        width=3,
+    )
+    for index, (color, axis_name) in enumerate(
+        zip(_AXIS_COLORS, "XYZ", strict=True)
+    ):
+        axis_label = f"+{axis_name}"
+        axis_local = rotation_local[:, index]
+        direction = np.array(
+            [float(axis_local @ view.right), -float(axis_local @ view.up)],
+            dtype=np.float64,
+        )
+        norm = float(np.linalg.norm(direction))
+        axis_color = (*color[:3], 255)
+        if norm <= 0.08:
+            draw.ellipse(
+                (
+                    origin[0] - 7,
+                    origin[1] - 7,
+                    origin[0] + 7,
+                    origin[1] + 7,
+                ),
+                outline=axis_color,
+                width=3,
+            )
+            draw.ellipse(
+                (
+                    origin[0] - 2,
+                    origin[1] - 2,
+                    origin[0] + 2,
+                    origin[1] + 2,
+                ),
+                fill=axis_color,
+            )
+            _draw_axis_label_box(
+                draw,
+                (origin[0] + 20, origin[1]),
+                axis_label,
+                axis_color,
+                title_font,
+            )
+            continue
+        unit = direction / norm
+        endpoint_array = np.asarray(origin) + unit * 44.0
+        endpoint = (float(endpoint_array[0]), float(endpoint_array[1]))
+        draw.line((*origin, *endpoint), fill=axis_color, width=6)
+        _draw_arrow_head(draw, origin, endpoint, axis_color, size=11.0)
+        label_anchor = endpoint_array + unit * 13.0
+        _draw_axis_label_box(
+            draw,
+            (float(label_anchor[0]), float(label_anchor[1])),
+            axis_label,
+            axis_color,
+            title_font,
+        )
+
+
+def _draw_axis_label_box(
+    draw: ImageDraw.ImageDraw,
+    anchor: tuple[float, float],
+    label: str,
+    color: tuple[int, int, int, int],
+    font: ImageFont.ImageFont,
+) -> None:
+    bounds = draw.textbbox((0, 0), label, font=font)
+    width = bounds[2] - bounds[0] + 10
+    height = bounds[3] - bounds[1] + 7
+    left = anchor[0] - width * 0.5
+    top = anchor[1] - height * 0.5
+    draw.rounded_rectangle(
+        (left, top, left + width, top + height),
+        radius=3,
+        fill=(255, 255, 255, 232),
+        outline=color,
+        width=2,
+    )
+    draw.text(
+        (left + 5, top + 3 - bounds[1]),
+        label,
+        fill=color,
+        font=font,
+    )
+
+
+def _draw_adjustment(
     draw: ImageDraw.ImageDraw,
     view: _View,
     width: int,
+    height: int,
+    preview: NearFieldPreview,
+    current_tcp_position: np.ndarray,
+    current_tcp_rotation: np.ndarray,
 ) -> None:
-    local_z = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    direction = np.array(
-        [
-            float(local_z @ view.right),
-            -float(local_z @ view.up),
-        ],
-        dtype=np.float64,
-    )
-    norm = float(np.linalg.norm(direction))
-    if norm <= 1e-12:
+    edit = preview.visual_edit
+    target = preview.target_pose
+    if edit is None or target is None:
         return
-    direction /= norm
-    start = np.array([width - 34.0, 13.0], dtype=np.float64)
-    end = start + direction * 24.0
-    normal = np.array([-direction[1], direction[0]], dtype=np.float64)
-    wing_a = end - direction * 7.0 + normal * 3.5
-    wing_b = end - direction * 7.0 - normal * 3.5
-    draw.text(
-        (width - 128, 11),
-        "+Z CONTACT",
-        fill=(30, 64, 175, 255),
-        font=_label_font(),
+    reference_position_local, _ = _pose_in_current_tcp(
+        edit.reference_pose,
+        current_tcp_position,
+        current_tcp_rotation,
     )
-    draw.line((*start, *end), fill=(37, 99, 235, 255), width=3)
+    target_position_local, _ = _pose_in_current_tcp(
+        target,
+        current_tcp_position,
+        current_tcp_rotation,
+    )
+    if edit.kind == "delta_move" and edit.delta_xyz_m is not None:
+        points = np.vstack([reference_position_local, target_position_local])
+        u, v, _ = _project(points, view, width, height)
+        if np.isfinite(np.column_stack((u, v))).all():
+            start = (float(u[0]), float(v[0]))
+            end = (float(u[1]), float(v[1]))
+            draw.line((*start, *end), fill=_MOVE, width=6)
+            _draw_arrow_head(draw, start, end, _MOVE, size=11.0)
+        delta_cm = np.asarray(edit.delta_xyz_m, dtype=np.float64) * 100.0
+        label = (
+            f"MOVE {edit.frame.upper()}  "
+            f"dX {delta_cm[0]:+.1f}  dY {delta_cm[1]:+.1f}  dZ {delta_cm[2]:+.1f} cm"
+        )
+        _draw_adjustment_label(draw, label, width, height, _MOVE)
+        return
+    if edit.kind != "rotate" or edit.axis is None or edit.angle_deg is None:
+        return
+
+    axis_index = "xyz".index(edit.axis)
+    axis_unit = np.eye(3, dtype=np.float64)[axis_index]
+    reference_rotation = Rotation.from_quat(
+        np.asarray(edit.reference_pose.quaternion_xyzw, dtype=np.float64)
+    ).as_matrix()
+    axis_base = axis_unit if edit.frame == "base" else reference_rotation @ axis_unit
+    radial_base = (
+        np.eye(3, dtype=np.float64)[(axis_index + 1) % 3]
+        if edit.frame == "base"
+        else reference_rotation[:, (axis_index + 1) % 3]
+    )
+    center_base = np.asarray(edit.reference_pose.position_xyz, dtype=np.float64)
+    radians = np.deg2rad(float(edit.angle_deg))
+    samples = np.linspace(0.0, radians, num=25, dtype=np.float64)
+    arc_base = np.vstack(
+        [
+            center_base
+            + Rotation.from_rotvec(axis_base * angle).apply(radial_base * 0.045)
+            for angle in samples
+        ]
+    )
+    arc_local = (arc_base - current_tcp_position) @ current_tcp_rotation
+    u, v, _ = _project(arc_local, view, width, height)
+    finite = np.isfinite(u) & np.isfinite(v)
+    arc_2d = [(float(x), float(y)) for x, y in zip(u[finite], v[finite], strict=True)]
+    axis_color = _AXIS_COLORS[axis_index]
+    if len(arc_2d) >= 2:
+        draw.line(arc_2d, fill=axis_color, width=6, joint="curve")
+        _draw_arrow_head(draw, arc_2d[-2], arc_2d[-1], axis_color, size=11.0)
+    label = f"ROTATE {edit.frame.upper()}  {edit.axis.upper()} {edit.angle_deg:+.1f} deg"
+    _draw_adjustment_label(draw, label, width, height, axis_color)
+
+
+def _draw_adjustment_label(
+    draw: ImageDraw.ImageDraw,
+    label: str,
+    width: int,
+    height: int,
+    color: tuple[int, int, int, int],
+) -> None:
+    font = _label_font()
+    box = draw.textbbox((0, 0), label, font=font)
+    label_width = box[2] - box[0]
+    top = height - 54
+    draw.rounded_rectangle(
+        (10, top, min(width - 10, label_width + 30), top + 31),
+        radius=5,
+        fill=(255, 255, 255, 235),
+        outline=color,
+        width=2,
+    )
+    draw.text((19, top + 7), label, fill=color, font=font)
+
+
+def _draw_legend(
+    draw: ImageDraw.ImageDraw,
+    width: int,
+    height: int,
+    has_preview: bool,
+) -> None:
+    labels = [((37, 99, 235, 235), "BLUE CURRENT")]
+    if has_preview:
+        labels.append(((124, 58, 237, 235), "PURPLE PREVIEW"))
+    x = 10
+    y = height - 20
+    for color, label in labels:
+        draw.rectangle((x, y - 1, x + 12, y + 11), fill=color)
+        draw.text((x + 17, y - 3), label, fill=(30, 41, 59, 255), font=_label_font())
+        x += 126
+
+
+def _draw_arrow_head(
+    draw: ImageDraw.ImageDraw,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    color: tuple[int, int, int, int],
+    *,
+    size: float,
+) -> None:
+    direction = np.asarray(end, dtype=np.float64) - np.asarray(start, dtype=np.float64)
+    norm = float(np.linalg.norm(direction))
+    if norm <= 1e-9:
+        return
+    unit = direction / norm
+    normal = np.array([-unit[1], unit[0]], dtype=np.float64)
+    tip = np.asarray(end, dtype=np.float64)
+    base = tip - unit * size
     draw.polygon(
-        [tuple(end), tuple(wing_a), tuple(wing_b)],
-        fill=(37, 99, 235, 255),
+        [tuple(tip), tuple(base + normal * size * 0.48), tuple(base - normal * size * 0.48)],
+        fill=color,
     )
 
 
 def _label_font() -> ImageFont.ImageFont:
     try:
-        return ImageFont.truetype("DejaVuSansMono-Bold.ttf", 11)
+        return ImageFont.truetype("DejaVuSansMono-Bold.ttf", 14)
     except OSError:
         return ImageFont.load_default()
 
@@ -411,5 +805,6 @@ def _unit(vector: np.ndarray) -> np.ndarray:
 __all__ = [
     "NEAR_FIELD_HEIGHT",
     "NEAR_FIELD_WIDTH",
+    "NearFieldPreview",
     "render_near_field",
 ]

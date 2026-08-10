@@ -2,17 +2,12 @@ import type { ReactNode } from 'react'
 
 import type { ContextSnapshot } from '../types'
 
-type Candidate = ContextSnapshot['catalog']['candidates'][number]
+type Seed = ContextSnapshot['catalog']['seeds'][number]
 type Tone = 'neutral' | 'blue' | 'green' | 'violet' | 'amber' | 'red'
 
 function fmt(values: number[] | undefined, digits = 4): string {
   if (!values) return '不可用'
   return `[${values.map((value) => value.toFixed(digits)).join(', ')}]`
-}
-
-function compactJson(value: unknown, limit = 180): string {
-  const encoded = JSON.stringify(value ?? {}, null, 0)
-  return encoded.length > limit ? `${encoded.slice(0, limit - 1)}…` : encoded
 }
 
 function Chip({ tone = 'neutral', children }: { tone?: Tone; children: ReactNode }) {
@@ -45,15 +40,19 @@ function CompactRobot({ snapshot }: { snapshot: ContextSnapshot }) {
 }
 
 function PersistentWorld({ snapshot }: { snapshot: ContextSnapshot }) {
+  const imagining = snapshot.world.owner === 'imagination'
   return (
     <section className="ctx-section ctx-world">
       <div className="ctx-world-grid">
         <article className="ctx-main-view">
-          <div className="ctx-view-label"><strong>AGENTVIEW · PRIMARY</strong><span>CURRENT RGB</span></div>
+          <div className="ctx-view-label ctx-view-label--observed"><strong>OBSERVED NOW · AGENTVIEW</strong><span>REAL RGB</span></div>
           <Raster snapshot={snapshot} id={snapshot.world.agentviewRasterId} alt="当前主视角" />
         </article>
         <article className="ctx-near-field-view">
-          <div className="ctx-view-label"><strong>GRIPPER-LOCAL · GEOMETRY</strong><span>CURRENT FUSED RGB-D</span></div>
+          <div className={`ctx-view-label ${imagining ? 'ctx-view-label--preview' : 'ctx-view-label--observed'}`}>
+            <strong>{imagining ? 'CURRENT + PREVIEW · GRIPPER LOCAL' : 'OBSERVED NOW · GRIPPER LOCAL'}</strong>
+            <span>{imagining ? 'CURRENT RGB-D + VIRTUAL FK' : 'REAL FK + CURRENT RGB-D'}</span>
+          </div>
           <Raster snapshot={snapshot} id={snapshot.world.nearFieldRasterId} alt="当前夹爪近场几何" />
         </article>
       </div>
@@ -92,40 +91,30 @@ function GroundingWorkspace({ snapshot }: { snapshot: ContextSnapshot }) {
   )
 }
 
-function millimeters(values: number[] | null): string {
-  if (!values) return '无 point anchor'
-  return `[${values.map((value) => `${value >= 0 ? '+' : ''}${(value * 1000).toFixed(0)}`).join(', ')}] mm`
-}
-
 function CandidateCard({ snapshot, item, compact = false }: {
   snapshot: ContextSnapshot
-  item: Candidate
+  item: Seed
   compact?: boolean
 }) {
-  const selected = snapshot.world.activeAction?.source_ref === item.id
-  const statusTone: Tone = item.solveIk === 'returned' ? 'violet' : item.solveIk === 'error' ? 'red' : 'amber'
+  const tone: Tone = item.solveIk === 'returned' ? 'green' : item.solveIk === 'error' ? 'red' : 'amber'
   return (
-    <article className={`ctx-candidate${selected ? ' ctx-candidate--selected' : ''}${compact ? ' ctx-candidate--compact' : ''}`}>
-      <header><strong>{item.id}</strong><Chip tone={selected ? 'green' : statusTone}>{selected ? 'SELECTED' : `FK ${item.solveIk.toUpperCase()}`}</Chip></header>
+    <article className={`ctx-candidate${compact ? ' ctx-candidate--compact' : ''}`}>
+      <header><strong>{item.id}</strong><Chip tone={tone}>{item.solveIk.toUpperCase()}</Chip></header>
       <div className="ctx-candidate-raster"><Raster snapshot={snapshot} id={item.rasterId} alt={`候选 ${item.id}`} /></div>
-      {!compact && <div className="ctx-candidate-facts">
-        <span>delta <code>{millimeters(item.deltaFromAnchor)}</code></span>
-        <span>approach <code>{fmt(item.approachVector ?? undefined, 2)}</code></span>
-      </div>}
     </article>
   )
 }
 
 function CandidatesWorkspace({ snapshot }: { snapshot: ContextSnapshot }) {
-  const items = snapshot.decision.candidateIds
-    .map((id) => snapshot.catalog.candidates.find((item) => item.id === id))
-    .filter((item): item is Candidate => Boolean(item))
+  const items = snapshot.decision.seedIds
+    .map((id) => snapshot.catalog.seeds.find((item) => item.id === id))
+    .filter((item): item is Seed => Boolean(item))
   return (
     <div className="ctx-candidates-mode">
-      <div className="ctx-candidate-intro"><strong>{items.length} 个候选动作</strong></div>
+      <div className="ctx-candidate-intro"><strong>{items.length} 个 Action Seeds</strong></div>
       <div
         className="ctx-candidate-row"
-        style={{ gridTemplateColumns: `repeat(${Math.max(items.length, 1)}, minmax(0, 1fr))` }}
+        style={{ gridTemplateColumns: `repeat(${Math.max(items.length, 1)}, minmax(0, 360px))` }}
       >
         {items.map((item) => <CandidateCard snapshot={snapshot} item={item} key={item.id} />)}
       </div>
@@ -134,90 +123,83 @@ function CandidatesWorkspace({ snapshot }: { snapshot: ContextSnapshot }) {
 }
 
 function ProposalWorkspace({ snapshot }: { snapshot: ContextSnapshot }) {
-  const action = snapshot.world.activeAction
-  const alternatives = snapshot.decision.candidateIds
-    .map((id) => snapshot.catalog.candidates.find((item) => item.id === id))
-    .filter((item): item is Candidate => Boolean(item))
-  if (!action || action.action_id !== snapshot.decision.actionId) {
-    return <ErrorWorkspace snapshot={snapshot} message="proposal mode 与 active action 不一致" />
-  }
-  const adjustment = action.adjustment
-  const statusTone: Tone = action.prediction.solve_ik === 'returned' ? 'violet' : action.prediction.solve_ik === 'error' ? 'red' : 'amber'
+  const action = snapshot.world.action
+  const alternatives = snapshot.decision.seedIds
+    .map((id) => snapshot.catalog.seeds.find((item) => item.id === id))
+    .filter((item): item is Seed => Boolean(item))
+  if (!action) return <ErrorWorkspace snapshot={snapshot} message="缺少 ActionTarget" />
+  const adjustment = action.latest_edit
+  const editing = action.status === 'editing'
+  const reviewReason = action.handoff_reason === 'budget_exhausted'
+    ? 'BUDGET EXHAUSTED · MAIN REVIEW REQUIRED'
+    : 'IMAGINATION COMPLETE · MAIN REVIEW REQUIRED'
+  const pose = action.target.pose
+  const prediction = action.prediction
+  const planReturned = prediction?.solve_ik === 'returned'
   return (
     <div className="ctx-proposal-mode">
       <div className="ctx-proposal-image">
         <Raster snapshot={snapshot} id={snapshot.decision.primaryRasterId} alt="局部动作想象与整臂概览" />
-        <div className="ctx-image-legend"><span className="blue">current / reference</span><span className="green">motion</span><span className="violet">imagined hand + arm</span></div>
+        <div className={`ctx-preview-banner${planReturned ? '' : ' ctx-preview-banner--error'}`}>
+          <strong>{planReturned ? 'IMAGINATION' : 'TARGET ONLY'}</strong>
+          <span>{planReturned ? 'VIRTUAL PREVIEW · NOT OBSERVED' : 'NO EXECUTABLE FK PREVIEW'}</span>
+        </div>
+        <div className="ctx-image-legend"><span className="blue">current / source</span><span className="green">motion</span><span className="violet">imagined hand + arm</span></div>
       </div>
       <aside className="ctx-proposal-facts">
-        <div className="ctx-proposal-title"><div><small>ACTION PROPOSAL · IMAGINED · NOT EXECUTED</small><h3>{action.action_id} · {action.kind}</h3></div><Chip tone={statusTone}>solve_ik {action.prediction.solve_ik}</Chip></div>
+        <div className="ctx-proposal-title">
+          <div><small>{editing ? 'IMAGINATION AGENT EDITING' : reviewReason}</small><h3>{editing ? 'EDITING · NOT COMMITTABLE' : `${action.action_id} · AWAITING MAIN DECISION`}</h3></div>
+          <Chip tone={planReturned ? 'green' : 'red'}>{planReturned ? 'PLAN RETURNED' : `PLAN ${prediction?.solve_ik?.toUpperCase() ?? 'UNAVAILABLE'}`}</Chip>
+        </div>
+        {snapshot.world.refinementGoal && <div className="ctx-target-pose"><small>REFINEMENT GOAL</small><p>{snapshot.world.refinementGoal}</p></div>}
+        <div className={`ctx-plan-status${planReturned ? '' : ' ctx-plan-status--error'}`}>
+          <small>MOTION PREDICTION</small>
+          <code>
+            solve_ik {prediction?.solve_ik ?? 'unavailable'}<br />
+            trajectory {prediction?.trajectory_checked ? 'checked' : 'not checked'} · collision {prediction?.collision_checked ? 'checked' : 'not checked'}
+          </code>
+          {!planReturned && prediction?.detail && <p>{prediction.detail}</p>}
+        </div>
+        <div className="ctx-target-pose">
+          <small>ACTION TARGET</small>
+          <code>
+            POS {pose ? fmt(pose.position_xyz, 4) : 'inherit current'}<br />
+            QUAT {pose ? fmt(pose.quaternion_xyzw, 4) : 'inherit current'}<br />
+            GRIP {action.target.gripper ?? 'inherit current'}
+          </code>
+        </div>
         {adjustment && <div className="ctx-target-pose">
           <small>LOCAL REFINEMENT · {adjustment.frame.toUpperCase()} FRAME</small>
           <code>
-            from {adjustment.parent_action_id ?? 'current TCP'}<br />
             {adjustment.kind === 'delta_move'
               ? `delta_xyz_m ${fmt(adjustment.delta_xyz_m)}`
               : `rotate ${adjustment.axis} ${adjustment.angle_deg?.toFixed(1)} deg`}
           </code>
         </div>}
-        {action.prediction.detail && <p className="ctx-proposal-error">{action.prediction.detail}</p>}
-        <div className="ctx-checks">
-          <Chip tone={action.prediction.trajectory_checked ? 'green' : 'amber'}>
-            {action.prediction.trajectory_checked ? '路径已检查' : '路径未检查'}
-          </Chip>
-          <Chip tone={action.prediction.collision_checked ? 'green' : 'amber'}>
-            {action.prediction.collision_checked ? '碰撞已检查' : '碰撞未检查'}
-          </Chip>
-        </div>
-        {alternatives.length > 0 && <div className="ctx-alternative-rail"><small>可重新选择的候选</small><div>{alternatives.map((item) => <CandidateCard snapshot={snapshot} item={item} compact key={item.id} />)}</div></div>}
+        {editing && <div className="ctx-refine-cue">
+          <small>REFINE PREVIEW</small>
+          <code>delta_move([dx,dy,dz], frame) · rotate(axis, angle_deg, frame)</code>
+        </div>}
+        {!editing && alternatives.length > 0 && <div className="ctx-alternative-rail"><small>Main Agent 可重新选择的 Action Seeds</small><div>{alternatives.map((item) => <CandidateCard snapshot={snapshot} item={item} compact key={item.id} />)}</div></div>}
       </aside>
     </div>
   )
 }
 
-function ReceiptWorkspace({ snapshot }: { snapshot: ContextSnapshot }) {
-  const receipt = snapshot.world.lastReceipt ?? {}
-  const event = snapshot.world.latestEvent
-  const functionName = String(receipt.function_name ?? event?.function_name ?? 'physical_action').toUpperCase()
-  const actionId = typeof receipt.action_id === 'string' ? receipt.action_id : null
-  const positionError = typeof receipt.position_error_m === 'number'
-    ? `TCP error ${(receipt.position_error_m * 1000).toFixed(1)} mm`
-    : null
-  const opening = typeof receipt.gripper_opening === 'number'
-    ? `opening ${receipt.gripper_opening.toFixed(3)}`
-    : null
-  return (
-    <div className="ctx-receipt-mode">
-      <div className="ctx-receipt-strip">
-        <strong>{functionName}{actionId ? ` ${actionId}` : ''}</strong>
-        {positionError && <span>{positionError}</span>}
-        {opening && <span>{opening}</span>}
-        <b>TASK EFFECT UNVERIFIED</b>
-      </div>
-      <div className="ctx-receipt-review">
-        <div className="ctx-receipt-raster"><Raster snapshot={snapshot} id={snapshot.decision.primaryRasterId} alt="动作后目标区域" /></div>
-        <div className="ctx-receipt-cue"><small>POST-ACTION CHECK</small><strong>CURRENT RGB</strong><span>LAST ACTION AREA</span></div>
-      </div>
-    </div>
-  )
-}
-
 function ErrorWorkspace({ snapshot, message }: { snapshot: ContextSnapshot; message?: string }) {
-  const event = snapshot.world.latestEvent
-  const error = message ?? String(event?.result.error ?? 'unknown error')
+  const error = message ?? snapshot.world.latestError ?? 'unknown error'
   return (
     <div className="ctx-status-mode ctx-status-mode--error">
-      <section><small>FUNCTION ERROR</small><h3>{event?.function_name ?? 'Context compiler'}</h3><p>{error}</p><code>arguments {compactJson(event?.arguments, 360)}</code></section>
-      <section><small>CURRENT RGB</small><h3>RECOVERY</h3>{snapshot.world.activeAction && <Chip tone="blue">ACTIVE {snapshot.world.activeAction.action_id}</Chip>}</section>
+      <section><small>FUNCTION ERROR</small><h3>RECOVERY</h3><p>{error}</p></section>
+      <section><small>CURRENT RGB</small><h3>重新观察并选择下一步</h3></section>
     </div>
   )
 }
 
 function QuietWorkspace({ snapshot, terminal = false }: { snapshot: ContextSnapshot; terminal?: boolean }) {
-  const claim = snapshot.world.latestEvent?.arguments.success
   return (
     <div className="ctx-status-mode ctx-status-mode--quiet">
-      <section><small>{terminal ? 'AGENT TERMINAL CLAIM' : 'CURRENT DECISION STATE'}</small><h3>{terminal ? `done(success=${String(claim)})` : '等待下一次 Function Call'}</h3></section>
+      <section><small>{terminal ? 'AGENT TERMINAL CLAIM' : 'CURRENT DECISION STATE'}</small><h3>{terminal ? 'Episode ended by Main Agent' : '等待 Main Agent 决策'}</h3></section>
       <section><small>CURRENT RGB</small><h3>观察当前场景</h3></section>
     </div>
   )
@@ -230,9 +212,8 @@ function DynamicWorkspace({ snapshot }: { snapshot: ContextSnapshot }) {
       <CompactRobot snapshot={snapshot} />
       <div className="ctx-decision-body">
         {mode === 'grounding' && <GroundingWorkspace snapshot={snapshot} />}
-        {mode === 'candidates' && <CandidatesWorkspace snapshot={snapshot} />}
-        {mode === 'proposal' && <ProposalWorkspace snapshot={snapshot} />}
-        {mode === 'receipt' && <ReceiptWorkspace snapshot={snapshot} />}
+        {mode === 'seeds' && <CandidatesWorkspace snapshot={snapshot} />}
+        {(mode === 'editing' || mode === 'reviewed') && <ProposalWorkspace snapshot={snapshot} />}
         {mode === 'error' && <ErrorWorkspace snapshot={snapshot} />}
         {mode === 'idle' && <QuietWorkspace snapshot={snapshot} />}
         {mode === 'terminal' && <QuietWorkspace snapshot={snapshot} terminal />}

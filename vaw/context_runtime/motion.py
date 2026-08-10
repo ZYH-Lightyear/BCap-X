@@ -1,7 +1,7 @@
 """Private motion backends for the VAW Context Runtime.
 
 The policy never calls these objects directly.  They translate an
-``ActionProposal`` target into either the legacy one-waypoint PyRoki command or
+``ActionTarget`` pose into either the legacy one-waypoint PyRoki command or
 a collision-aware trajectory produced by CaP-X's shared CuRobo planner.
 """
 
@@ -27,7 +27,7 @@ class MotionBackendError(RuntimeError):
 
 @dataclass(frozen=True)
 class MotionPlan:
-    """Episode-private plan associated with one Action Proposal."""
+    """Episode-private plan associated with an imagined action target."""
 
     backend: str
     prediction: ActionPrediction

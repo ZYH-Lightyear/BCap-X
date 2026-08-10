@@ -1,145 +1,134 @@
 # VAW — Visual Action Workspace
 
-`vaw` 当前只保留 revision-local Context Runtime。它把 LIBERO-PRO 的当前双相机观测、
-工具产生的局部证据、机器人本体状态和动作想象编译为一张固定 `1440×1080` Context
-图，供单个 VLM 逐轮调用 Function 控制机器人。
+`vaw` 是面向 LIBERO-PRO 的双 Agent Visual Context Runtime。它把当前真实观测与动作想象
+编译为固定 `1920×1440` Canvas，但模型不点击页面：动作通道始终是 structured Function
+call。
 
-VAW 不是 GUI Agent：模型不点击页面，也不操作 DOM。Web 页面只是确定性的只读视觉
-renderer；动作通道始终是 structured Function call。
+当前架构不再回放 Function history，也不维护 Persistent Waypoint。Main Agent 负责语义决策
+和物理提交；Imagination Agent 在独立、无物理副作用的会话中连续检查和微调一个
+`ActionTarget`。
 
-设计与里程碑见：
+双 Agent 基线见 [`M1_4_2_DUAL_AGENT_RUNTIME.md`](M1_4_2_DUAL_AGENT_RUNTIME.md)。当前的
+20-turn 真实抓取优化、Context Builder 审计和逐版本验收记录见
+[`M1_4_3_GRASP_CONTEXT_OPTIMIZATION.md`](M1_4_3_GRASP_CONTEXT_OPTIMIZATION.md)。
 
-- [`CONTEXT_RUNTIME_MILESTONES.md`](CONTEXT_RUNTIME_MILESTONES.md)
-- [`M1_3_2_VISUAL_DENSITY.md`](M1_3_2_VISUAL_DENSITY.md)
+## Runtime
 
-## Agent 每轮看到什么
+```text
+CURRENT OBSERVED
+      │
+      ▼
+Main Agent ── perception / ActionSeed ──► Imagination Agent
+   ▲                                      │
+   │                  delta / rotate / gripper preview
+   │                                      │
+   └──── ActionReview / failed / budget exhausted ┘
+   │
+   └── Main reviews ── commit(ActionReview) ──► physical world ──► fresh observation
+```
 
-每次 provider 请求都重新构造，仅包含：
-
-1. 中文 System Prompt 与 LIBERO-PRO task prompt；
-2. 当前一张 `1440×1080` Context PNG；
-3. 当前 minimal manifest；
-4. 最近最多三个完整的 Function call/result transaction。
-
-旧图片、旧 decision basis、receipt ID、renderer/schema 元数据、reward 和环境成功真值不会
-进入下一轮策略上下文。Depth、相机参数、raw mask/cloud 和 backend 也只存在于 episode-local
-private context。
+每次 provider 请求都从零构造。Main 只看到 task、当前 Canvas、minimal policy state、最近一次
+handoff，以及 commit 后仅出现一次的 previous-observed 图。Imagination 只看到 task、
+refinement goal、当前 `ActionTarget` 和当前 Canvas。两边都看不到对方或自己的历史
+call/result/rationale。
 
 ## Function space
 
-当前 Agent-visible Function 固定为 11 个：
+Main Agent：
 
 ```text
-inspect(query, within_region_id?)
+detection_and_sam(query, within_region_id?)
 locate_point(query, within_region_id?)
-propose_grasps(region_id)
+propose_grasps(region_id) -> seed_ids
 propose_pose(point_id, offset_xyz, quaternion_xyzw?)
-select(candidate_id)
-delta_move(delta_xyz_m, frame?, action_id?)
-rotate(axis, angle_deg, frame?, action_id?)
-commit(action_id)
+select(seed_id)
+delta_move(delta_xyz_m, frame)
+rotate(axis, angle_deg, frame)
 open_gripper()
 close_gripper()
+commit(action_id)
 done(success)
 ```
 
-`inspect`、`locate_point`、`propose_grasps` 产生当前 revision 的证据；`select`、
-`propose_pose`、`delta_move`、`rotate` 只创建或编辑 Action Proposal；`commit` 与两个
-gripper Function 才改变物理世界。物理动作刷新 observation，并使旧 revision 的
-region/point/candidate/action 引用失效。
-
-## 当前代码结构
+Imagination Agent：
 
 ```text
-vaw/
-  context_runtime/
-    model.py              # evidence、candidate、proposal、receipt 与 ContextState
-    workspace.py          # 私有 episode context、revision 生命周期与 Function dispatch
-    functions.py          # 11 个 Function handler
-    protocol.py           # Function schema、解析与中文 System Prompt
-    history.py            # protocol-safe K=3 transaction window
-    packet.py             # trusted state → policy-visible ContextPacket
-    web_renderer.py       # ContextPacket → 固定 Web screenshot
-    browser_renderer.py   # 持久 Playwright/Chromium bridge
-    runtime.py            # 单 VLM loop
-    trace.py / video.py   # trace 与视频产物
-    motion.py             # Pyroki/CuRobo proposal prediction 与执行边界
-    geometry.py           # frame、四元数、投影与 TCP 几何
-    gripper_mesh.py       # URDF/FK robot imagination raster
-    near_field.py         # 双相机 RGB-D 的 TCP 近场几何 raster
-  agents/
-    contracts.py          # provider/runtime 公共数据结构
-    providers/            # OpenAI-compatible native/text tool-call transport
-    teacher.py/student.py # provider 配置
-  scripts/
-    run_context_agent.py  # 真实 LIBERO-PRO agent/scripted runner
-    check_gripper_overlay.py
+delta_move(delta_xyz_m, frame)
+rotate(axis, angle_deg, frame)
+open_gripper()
+close_gripper()
+finish_imagination(status="ready" | "failed")
 ```
 
-`vaw-ui/` 只保留 schemaVersion 4 的 Context 页面。Persistent World 中 raw wrist RGB
-已替换为当前双相机 RGB-D 融合的 gripper-local 双视图；raw wrist 仍只进入 trace 视频。
-旧 `Workspace`、PIL renderer、
-schema-v1 Web 页面、14-op protocol 和旧 runner 已从当前代码删除；删除前状态保存在 Git
-checkpoint `fd8d89a`，不会与当前运行路径并存。
+除 `commit` 外，所有 Function 都不会改变真实世界。`select/propose_pose` 以及 Main 直接调用
+空间或夹爪 editor 时进入 Imagination；结束后产生等待 Main 判断的 `ActionReview`。
+默认最多连续想象 6 轮，达到上限时以 `budget_exhausted` 原因交回 Main。无论显式完成还是
+预算耗尽都不代表动作获批；只有 Main 查看最终 Preview 后调用 `commit` 才构成批准。
 
-## 构建 Web renderer
+## Canvas
+
+Web schema 8 / `vaw-context-v7-dual-agent-review` / renderer
+`context-web-v7-dual-agent-review`：
+
+- 上层 `CURRENT OBSERVED`：agentview 始终为真实 RGB；非想象时 gripper-local 为真实 RGB-D，
+  Imagination 期间在同一份当前点云上叠加紫色虚拟机器人并提高近场采样密度；
+- 下层 `IMAGINATION WORKSPACE`：grounding、ActionSeed、editing、reviewed、error 或 idle；
+- 紫色机器人只存在于下层，并始终表示未执行的预测；
+- 无 receipt 页面、旧 Function history、Task 重复文本或 privileged state。
+
+Depth、相机参数、raw mask/cloud、planner trajectory 和环境 success 只存在于 private context
+或 trace，不进入策略消息。
+
+## 代码结构
+
+```text
+vaw/context_runtime/
+  model.py          # evidence、ActionTarget/Seed、ImaginationState、ActionReview
+  private.py        # sensor、planner、source provenance、visual edit artifacts
+  functions.py      # Main/Imagination 共用的无物理 editor 与唯一 commit
+  workspace.py      # revision 生命周期与 dispatch
+  protocol.py       # 两个独立 System Prompt 和工具视图
+  runtime.py        # history-free Main/Imagination ownership loop
+  packet.py         # private state → policy-visible ContextPacket
+  web_renderer.py   # fixed Playwright screenshot
+  trace.py          # 完整审计记录；不回灌策略
+```
+
+## 构建与运行
 
 ```bash
 cd /mnt/data/zyh/BCap-X/vaw-ui
-npm ci
 npm run build
-```
 
-一次性安装浏览器（若环境尚未安装）：
-
-```bash
-source /mnt/data/zyh/BCap-X/.venv-libero/bin/activate
-python -m pip install "playwright>=1.50,<2"
-python -m playwright install chromium
-```
-
-## 真实 LIBERO-PRO 运行
-
-服务启动后：
-
-```bash
 cd /mnt/data/zyh/BCap-X
 source .venv-libero/bin/activate
-
 python -m vaw.scripts.run_context_agent \
   --mode agent \
   --suite libero_object_swap \
   --task-id 0 \
-  --model vapi/qwen3.5-plus \
+  --seed 1 \
+  --model vapi/gpt-5.5 \
+  --imagination-model vapi/qwen3.5-plus \
   --protocol text \
+  --max-turns 32 \
+  --max-imagination-turns 6 \
   --motion-backend curobo \
   --record-video
 ```
 
-真实接线 smoke（脚本不属于 Agent policy）：
+省略 `--imagination-model` 时两个角色复用 `--model`，但 provider 请求和 Context 仍完全
+隔离。
+
+## 测试
 
 ```bash
-python -m vaw.scripts.run_context_agent \
-  --mode scripted \
-  --suite libero_object_swap \
-  --task-id 0 \
-  --motion-backend pyroki
-```
-
-默认 trace 写入 `vaw/out/context_runs/`，包含当前 Context PNG、结构化 trace、meta 和
-可用时导出的 agentview/wrist/context 视频。
-
-## 回归测试
-
-```bash
-cd /mnt/data/zyh/BCap-X
-source .venv-libero/bin/activate
-
+source /mnt/data/zyh/BCap-X/.venv-libero/bin/activate
 python -m pytest -q \
+  tests/test_vaw_context_runtime.py \
   tests/test_vaw_context_agent.py \
   tests/test_vaw_context_packet.py \
-  tests/test_vaw_context_runtime.py \
+  tests/test_vaw_near_field.py \
   tests/test_vaw_gripper_fk.py
 ```
 
-当前代码不会修改 CaP-X、RoboMEx、`capx_skill_rl` 或其他项目路径。
+当前实现不修改 CaP-X、RoboMEx、`capx_skill_rl` 或已有输出 trace。

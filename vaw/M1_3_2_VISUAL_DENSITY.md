@@ -44,7 +44,7 @@ COMMAND EXECUTED ≠ TASK EFFECT VERIFIED
 - 完整 receipt JSON、完整错误 JSON 和 revision 生命周期说明。
 - Agent 后续不会作为参数引用的 `receipt_id`。
 
-Function result、receipt ID 和完整错误仍保留在 K=3 Function History 与 trace 中，不从协议或日志删除。
+Function result 和完整错误仍保留在 K=8 Function History 与 trace 中；receipt ID 仅保留在 trace。
 
 ## 3. 固定 Canvas 与动态布局
 
@@ -159,7 +159,7 @@ Receipt mode 的主要内容是最新 observation，而不是执行报告。
 ## 5. 数据与兼容边界
 
 - Agent-visible Function 保持 M1.4 当前十一个，名称、参数与返回 schema 均不变化。
-- `solve_ik`、motion backend、revision invalidation、K=3 History 和 provider loop 均不变化。
+- `solve_ik`、motion backend、revision invalidation、K=8 History 和 provider loop 均不变化。
 - 保持 `vaw-context-v2` 和 Web `schemaVersion: 3`。
 - ContextPacket 继续通过现有 `primaryRasterId` 引用 post-action raster，不增加策略必读字段。
 - Runtime/Compiler 只增加最近 spatial target 的 episode-local 摘要，用于当前 RGB 投影。
@@ -200,8 +200,8 @@ Receipt mode 的主要内容是最新 observation，而不是执行报告。
 - post-action raster 与 packet summary 不泄露 depth、intrinsics、camera matrix、raw mask/cloud、reward 或 environment success。
 - Function 列表保持 M1.4 十一个；Agent-visible result 不含 `receipt_id` 或重复 revision，manifest
   不含 renderer/schema 元数据。
-- `decision_basis` 只进入 trace，K=3 History 只回放 structured call/result。
-- K=3 History、revision 失效、active action 生命周期和 trace 记录保持兼容。
+- `decision_basis` 只进入 trace，K=8 History 只回放 structured call/result。
+- K=8 History、revision 失效、active action 生命周期和 trace 记录保持兼容。
 - 当前 schema-v3 `1440×1080` renderer 回归通过，且代码中不存在 schema-v1 分流。
 
 ### 6.4 真实案例验收

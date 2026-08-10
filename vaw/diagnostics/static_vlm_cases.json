@@ -1,0 +1,163 @@
+{
+  "schema": "vaw-static-vlm-diagnostic-v1",
+  "description": "Isolated visual questions over frozen VAW Context rasters. No task history, manifest, or tools are provided.",
+  "cases": [
+    {
+      "id": "grasp_state_01",
+      "category": "grasp_state",
+      "canvas_version": "v5",
+      "image": "vaw/out/context_runs/vapi_gpt55_m141_k8_libero_object_swap_t0_s0/context_0006.png",
+      "image_sha256": "9153194d15eacf475453fd6275cab47e569674ed0390a3432217ffdaa5b52f97",
+      "question": "只根据图中的 OBSERVED NOW，目标 alphabet soup 罐当前是否已经被夹爪稳定抓住？",
+      "choices": [
+        {"id": "A", "text": "已抓住：罐体可见地被两指约束并离开原支撑面"},
+        {"id": "B", "text": "未抓住：罐体仍在原支撑面或明显不在有效夹持通道内"},
+        {"id": "C", "text": "无法确认：单张静态图不足以区分，需小幅抬升后观察是否随动"}
+      ],
+      "answer": "B",
+      "label_notes": "夹爪已闭合，但蓝黄罐仍清楚地留在地面，未随夹爪离开。"
+    },
+    {
+      "id": "grasp_state_02",
+      "category": "grasp_state",
+      "canvas_version": "v5",
+      "image": "vaw/out/context_runs/vapi_gpt55_m141_k8_libero_object_swap_t0_s0/context_0016.png",
+      "image_sha256": "e66f9182c66bca003aa4a5cb3813aa911f4854ec22f116d953a0c2114c3588a2",
+      "question": "这是闭合夹爪后的第一张真实观测。仅凭当前图，能否确认 alphabet soup 罐已稳定抓住？",
+      "choices": [
+        {"id": "A", "text": "可以确认已抓住"},
+        {"id": "B", "text": "可以确认未抓住"},
+        {"id": "C", "text": "仍不能确认；需要抬升或其他可逆动作观察物体是否随动"}
+      ],
+      "answer": "C",
+      "label_notes": "闭合本身不构成抓持证据；物体尚未经过随动验证。"
+    },
+    {
+      "id": "grasp_state_03",
+      "category": "grasp_state",
+      "canvas_version": "v5",
+      "image": "vaw/out/context_runs/vapi_gpt55_m141_k8_libero_object_swap_t0_s0/context_0019.png",
+      "image_sha256": "aa93e70bf8c6ddc074f3f8014228c0bfd36a732b4d8eda21bb47d17d5802adeb",
+      "question": "夹爪已经执行过一次向上 3 cm 的真实运动。当前真实图像支持哪一结论？",
+      "choices": [
+        {"id": "A", "text": "目标罐随夹爪上移，抓持得到支持"},
+        {"id": "B", "text": "目标罐仍留在支撑面，抓取失败"},
+        {"id": "C", "text": "目标罐已经进入篮子"},
+        {"id": "D", "text": "图像完全无法提供任何判断"}
+      ],
+      "answer": "B",
+      "label_notes": "抬升后夹爪上移，而蓝黄罐仍处于原桌面位置。"
+    },
+    {
+      "id": "grasp_state_04",
+      "category": "grasp_state",
+      "canvas_version": "v4",
+      "image": "vaw/out/context_runs/vapi_gpt55_m141_k8_libero_object_swap_t0_s1/context_0016.png",
+      "image_sha256": "7b169fd61c22700194fa843bfb6049c3537b27ef05acb73e353a5963c29dbe67",
+      "question": "只看当前真实场景，alphabet soup 罐是否随夹爪离开了支撑面？",
+      "choices": [
+        {"id": "A", "text": "是，罐体正在夹爪中并已离开支撑面"},
+        {"id": "B", "text": "否，罐体仍留在支撑面"},
+        {"id": "C", "text": "无法确认"}
+      ],
+      "answer": "B",
+      "label_notes": "蓝黄罐仍可见于桌面，未跟随机器人。"
+    },
+    {
+      "id": "close_readiness_01",
+      "category": "close_readiness",
+      "canvas_version": "v4",
+      "image": "vaw/out/context_runs/vapi_gpt55_m14_libero_object_swap_t0_s1_new_grasp_2/context_0004.png",
+      "image_sha256": "8a4ccb6190b207aa0c634abd194deb7883743d9e02dd551e325c9fc22a37835f",
+      "question": "若目标是稳定夹住蓝黄 alphabet soup 罐，当前夹爪位姿最合理的下一步是什么？",
+      "choices": [
+        {"id": "A", "text": "立即闭合夹爪"},
+        {"id": "B", "text": "先小幅向下平移，使罐体更深地进入两指有效闭合通道"},
+        {"id": "C", "text": "先大幅向上移动"},
+        {"id": "D", "text": "直接移动到篮子上方"}
+      ],
+      "answer": "B",
+      "label_notes": "夹爪位于罐体顶部偏高；直接闭合只会扫过上缘。"
+    },
+    {
+      "id": "close_readiness_02",
+      "category": "close_readiness",
+      "canvas_version": "v5",
+      "image": "vaw/out/context_runs/vapi_gpt55_m141_k8_libero_object_swap_t0_s0/context_0005.png",
+      "image_sha256": "ffd6593888522c7d06029d8ec97e5ae6b2b6a46760e7cfb4af4e1235bbbde895",
+      "question": "紫色部分是尚未执行的夹爪闭合 preview。它是否已经表现出足够可靠的夹持几何，适合直接 commit？",
+      "choices": [
+        {"id": "A", "text": "是，直接 commit"},
+        {"id": "B", "text": "否，应先平移和/或旋转，让目标进入两指闭合通道"},
+        {"id": "C", "text": "紫色是当前真实状态，因此无需 commit"},
+        {"id": "D", "text": "先把夹爪移动到篮子"}
+      ],
+      "answer": "B",
+      "label_notes": "preview 中夹爪与罐体的中心、深度和方向仍不理想；紫色也不是观测真值。"
+    },
+    {
+      "id": "pose_refinement_01",
+      "category": "pose_refinement",
+      "canvas_version": "v4",
+      "image": "vaw/out/context_runs/vapi_gpt55_m14_libero_object_swap_t0_s1_new_grasp_6/context_0007.png",
+      "image_sha256": "3f814c944c0d28ae0e3d70cc5f33fe55f19fab62f98a156bfe103cdb8086ce46",
+      "question": "紫色机器人是抓取 Waypoint 的虚拟 preview。为了形成对圆柱罐更合理的抓取，首要判断是什么？",
+      "choices": [
+        {"id": "A", "text": "姿态和位置都已合理，直接执行并闭合"},
+        {"id": "B", "text": "主要只需打开夹爪"},
+        {"id": "C", "text": "夹爪方向和位置均明显不理想，应 rotate 并配合 delta_move 后再执行"},
+        {"id": "D", "text": "目标罐已在篮子中"}
+      ],
+      "answer": "C",
+      "label_notes": "整臂/夹爪以明显侧倾姿态压向罐体，手指未形成清晰对称夹持通道。"
+    },
+    {
+      "id": "preview_semantics_01",
+      "category": "preview_semantics",
+      "canvas_version": "v5",
+      "image": "vaw/out/context_runs/vapi_gpt55_m141_k8_libero_object_swap_t0_s0/context_0004.png",
+      "image_sha256": "0d098d15f55f3b7be7c83d56afd8c88163087013e5987113c1ffe08f918498db",
+      "question": "图中紫色机器人表示什么？",
+      "choices": [
+        {"id": "A", "text": "当前真实机器人，已经到达该位置"},
+        {"id": "B", "text": "尚未执行的虚拟 Waypoint；不能据此断言物体已接触或被抓住"},
+        {"id": "C", "text": "环境真值中的成功轨迹"},
+        {"id": "D", "text": "过去某一帧的机器人"}
+      ],
+      "answer": "B",
+      "label_notes": "该题隔离测试 observed/preview attribution。"
+    },
+    {
+      "id": "preview_semantics_02",
+      "category": "preview_semantics",
+      "canvas_version": "v5",
+      "image": "vaw/out/context_runs/vapi_gpt55_m141_k8_libero_object_swap_t0_s0/context_0018.png",
+      "image_sha256": "a831731abce44313d2f9a5827463bedece2ee56a603809787ed322124559bdc1",
+      "question": "该 preview 表示 BASE frame 的 dz=+3 cm。若执行，目标 TCP 的主要变化方向是什么？",
+      "choices": [
+        {"id": "A", "text": "沿 world/base +Z 上升约 3 cm"},
+        {"id": "B", "text": "沿 world/base -Z 下降约 3 cm"},
+        {"id": "C", "text": "只旋转，不平移"},
+        {"id": "D", "text": "立即打开夹爪"}
+      ],
+      "answer": "A",
+      "label_notes": "BASE +Z 是抬升方向，用于测试坐标轴和 delta_move 语义。"
+    },
+    {
+      "id": "epistemic_01",
+      "category": "epistemic_calibration",
+      "canvas_version": "v5",
+      "image": "vaw/out/context_runs/vapi_gpt55_m141_k8_libero_object_swap_t0_s0/context_0029.png",
+      "image_sha256": "e9e66d5c35675cf6e5efdd871e311879ca4c8713a227914724cfeb53b8e5f7bb",
+      "question": "夹爪刚刚闭合。哪条陈述最符合当前可见证据的边界？",
+      "choices": [
+        {"id": "A", "text": "gripper opening 很小，因此必然抓住了目标"},
+        {"id": "B", "text": "闭合只证明夹爪执行了闭合；是否抓住仍需观察目标是否受约束或随抬升运动"},
+        {"id": "C", "text": "目标必然已经进入篮子"},
+        {"id": "D", "text": "CuRobo 规划成功，因此抓取必然成功"}
+      ],
+      "answer": "B",
+      "label_notes": "测试模型能否区分命令状态、规划状态与物理任务效果。"
+    }
+  ]
+}

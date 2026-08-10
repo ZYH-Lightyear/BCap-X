@@ -1,4 +1,4 @@
-"""Deterministic compiler for the fixed-size M1.3.1 Dynamic Context Canvas."""
+"""Deterministic compiler for the fixed-size persistent-Waypoint Canvas."""
 
 from __future__ import annotations
 
@@ -18,14 +18,25 @@ from vaw.context_runtime.gripper_mesh import (
     mask_outline,
     rasterize_silhouette,
 )
-from vaw.context_runtime.model import ContextState, PointEvidence, Pose, RobotState
-from vaw.context_runtime.near_field import render_near_field
+from vaw.context_runtime.model import (
+    ActionTarget,
+    ContextState,
+    PointEvidence,
+    Pose,
+    RobotState,
+)
+from vaw.context_runtime.near_field import NearFieldPreview, render_near_field
+from vaw.context_runtime.private import (
+    ActionReviewArtifacts,
+    ImaginationArtifacts,
+    PrivateEnvContext,
+)
 from vaw.context_runtime.workspace import ContextWorkspace
 
-CONTEXT_SCHEMA = "vaw-context-v3"
-CONTEXT_WEB_SCHEMA_VERSION = 4
-CONTEXT_WIDTH = 1440
-CONTEXT_HEIGHT = 1080
+CONTEXT_SCHEMA = "vaw-context-v7-dual-agent-review"
+CONTEXT_WEB_SCHEMA_VERSION = 8
+CONTEXT_WIDTH = 1920
+CONTEXT_HEIGHT = 1440
 
 BLUE = (37, 99, 235)
 GREEN = (22, 163, 74)
@@ -37,9 +48,9 @@ _CANDIDATE_FK_ROTATION_TOLERANCE_RAD = 0.10
 DecisionMode = Literal[
     "idle",
     "grounding",
-    "candidates",
-    "proposal",
-    "receipt",
+    "seeds",
+    "editing",
+    "reviewed",
     "error",
     "terminal",
 ]
@@ -92,10 +103,8 @@ class PointSpec:
 
 
 @dataclass(frozen=True)
-class CandidateSpec:
-    candidate_id: str
-    kind: str
-    source_ref: str | None
+class SeedSpec:
+    seed_id: str
     target_pose: Pose
     delta_from_anchor_xyz_m: tuple[float, float, float] | None
     approach_vector_base: tuple[float, float, float] | None
@@ -105,8 +114,7 @@ class CandidateSpec:
 
     def summary(self) -> dict[str, Any]:
         out: dict[str, Any] = {
-            "id": self.candidate_id,
-            "kind": self.kind,
+            "id": self.seed_id,
             "targetPose": self.target_pose.summary(),
             "deltaFromAnchor": (
                 _rounded(self.delta_from_anchor_xyz_m, 5)
@@ -122,30 +130,28 @@ class CandidateSpec:
             "sourceRevision": self.source_revision,
             "rasterId": self.raster_id,
         }
-        if self.source_ref is not None:
-            out["sourceRef"] = self.source_ref
         return out
 
 
 @dataclass(frozen=True)
 class WorldContextSpec:
-    task_prompt: str
     agentview_raster_id: str
     near_field_raster_id: str | None
     robot: RobotState | None
-    active_action: dict[str, Any] | None
-    latest_event: dict[str, Any] | None
-    last_receipt: dict[str, Any] | None
+    owner: str
+    action: dict[str, Any] | None
+    refinement_goal: str | None
+    latest_error: str | None
 
     def summary(self) -> dict[str, Any]:
         return {
-            "taskPrompt": self.task_prompt,
             "agentviewRasterId": self.agentview_raster_id,
             "nearFieldRasterId": self.near_field_raster_id,
             "robot": self.robot.summary() if self.robot is not None else None,
-            "activeAction": self.active_action,
-            "latestEvent": self.latest_event,
-            "lastReceipt": self.last_receipt,
+            "owner": self.owner,
+            "action": self.action,
+            "refinementGoal": self.refinement_goal,
+            "latestError": self.latest_error,
         }
 
 
@@ -153,13 +159,13 @@ class WorldContextSpec:
 class EvidenceCatalogSpec:
     regions: tuple[RegionSpec, ...]
     points: tuple[PointSpec, ...]
-    candidates: tuple[CandidateSpec, ...]
+    seeds: tuple[SeedSpec, ...]
 
     def summary(self) -> dict[str, Any]:
         return {
             "regions": [item.summary() for item in self.regions],
             "points": [item.summary() for item in self.points],
-            "candidates": [item.summary() for item in self.candidates],
+            "seeds": [item.summary() for item in self.seeds],
         }
 
 
@@ -168,7 +174,7 @@ class DecisionWorkspaceSpec:
     mode: DecisionMode
     region_ids: tuple[str, ...] = ()
     point_ids: tuple[str, ...] = ()
-    candidate_ids: tuple[str, ...] = ()
+    seed_ids: tuple[str, ...] = ()
     action_id: str | None = None
     primary_raster_id: str | None = None
 
@@ -177,7 +183,7 @@ class DecisionWorkspaceSpec:
             "mode": self.mode,
             "regionIds": list(self.region_ids),
             "pointIds": list(self.point_ids),
-            "candidateIds": list(self.candidate_ids),
+            "seedIds": list(self.seed_ids),
             "actionId": self.action_id,
             "primaryRasterId": self.primary_raster_id,
         }
@@ -206,13 +212,16 @@ class ContextPacket:
         }
 
     def manifest(self) -> dict[str, Any]:
-        active = self.world.active_action
         return {
-            "revision": self.revision,
-            "active_action_id": active.get("action_id") if active is not None else None,
+            "owner": self.world.owner,
+            "review_action_id": (
+                self.world.action.get("action_id")
+                if self.world.action is not None
+                else None
+            ),
             "valid_region_ids": [item.region_id for item in self.catalog.regions],
             "valid_point_ids": [item.point_id for item in self.catalog.points],
-            "valid_candidate_ids": [item.candidate_id for item in self.catalog.candidates],
+            "valid_seed_ids": [item.seed_id for item in self.catalog.seeds],
         }
 
     def web_snapshot(self, *, render_id: str) -> dict[str, Any]:
@@ -238,73 +247,78 @@ class ContextCompiler:
         wrist_camera = None
         with suppress(RuntimeError, ValueError):
             wrist_camera = private.camera(workspace.wrist_camera_name)
-        near_field = render_near_field(camera, wrist_camera, state.robot)
+        target, active_artifacts, action_presentation = _active_presentation(workspace)
+        near_field_preview = (
+            _near_field_preview(state, target, active_artifacts)
+            if state.imagination is not None and target is not None
+            else None
+        )
+        near_field = render_near_field(
+            camera,
+            wrist_camera,
+            state.robot,
+            near_field_preview,
+        )
 
         # The persistent world view is deliberately sensor-clean.  All
         # grounding, self and imagination overlays belong to the dynamic
         # decision workspace below it.
-        rasters: dict[str, np.ndarray] = {"agentview": rgb.copy()}
+        rasters: dict[str, np.ndarray] = {
+            "agentview": _agentview_with_base_axes(rgb, camera, state.robot)
+        }
         if near_field is not None:
             rasters["near_field"] = near_field
 
         region_specs = self._compile_regions(state, rgb, private.region_masks, rasters)
         point_specs = self._compile_points(state, rgb, rasters)
-        candidate_specs = self._compile_candidates(
+        seed_specs = self._compile_seeds(
             state,
+            private,
             rgb,
             camera,
             rasters,
             tcp_to_hand_local_xyz=workspace._tcp_to_hand_local_xyz,
         )
-        decision = _decision_spec(state)
-        if decision.mode == "proposal" and state.active_action is not None:
-            raster_id = "decision:proposal"
-            rasters[raster_id] = _proposal_raster(rgb, state, camera, state.active_action)
+        decision = _decision_spec(workspace)
+        if decision.mode in {"editing", "reviewed"} and target is not None:
+            raster_id = "decision:imagination"
+            rasters[raster_id] = _proposal_raster(
+                rgb,
+                state,
+                camera,
+                target,
+                active_artifacts,
+            )
             decision = DecisionWorkspaceSpec(
                 mode=decision.mode,
                 region_ids=decision.region_ids,
                 point_ids=decision.point_ids,
-                candidate_ids=decision.candidate_ids,
+                seed_ids=decision.seed_ids,
                 action_id=decision.action_id,
                 primary_raster_id=raster_id,
             )
-        elif decision.mode == "receipt":
-            raster_id = "decision:post_action"
-            target = (
-                state.last_spatial_target.target_pose
-                if state.last_spatial_target is not None
-                else None
-            )
-            rasters[raster_id] = _post_action_raster(rgb, camera, target)
-            decision = DecisionWorkspaceSpec(
-                mode=decision.mode,
-                primary_raster_id=raster_id,
-            )
-
-        latest = state.recent_calls[-1] if state.recent_calls else None
+        event = private.presentation_event
         packet = ContextPacket(
             revision=state.observation_revision,
             world=WorldContextSpec(
-                task_prompt=state.task_prompt,
                 agentview_raster_id="agentview",
                 near_field_raster_id=(
                     "near_field" if near_field is not None else None
                 ),
                 robot=state.robot,
-                active_action=(
-                    state.active_action.summary() if state.active_action is not None else None
-                ),
-                latest_event=latest.summary() if latest is not None else None,
-                last_receipt=(
-                    _receipt_presentation(state.last_receipt)
-                    if state.last_receipt is not None
+                owner=state.owner,
+                action=action_presentation,
+                refinement_goal=(
+                    state.imagination.refinement_goal
+                    if state.imagination is not None
                     else None
                 ),
+                latest_error=event.error if event is not None else None,
             ),
             catalog=EvidenceCatalogSpec(
                 regions=tuple(region_specs),
                 points=tuple(point_specs),
-                candidates=tuple(candidate_specs),
+                seeds=tuple(seed_specs),
             ),
             decision=decision,
             rasters=rasters,
@@ -369,32 +383,38 @@ class ContextCompiler:
         return specs
 
     @staticmethod
-    def _compile_candidates(
+    def _compile_seeds(
         state: ContextState,
+        private: PrivateEnvContext,
         rgb: np.ndarray,
         camera: dict[str, Any],
         rasters: dict[str, np.ndarray],
         *,
         tcp_to_hand_local_xyz: np.ndarray,
-    ) -> list[CandidateSpec]:
-        specs: list[CandidateSpec] = []
-        for candidate in state.candidates.values():
-            raster_id = f"candidate:{candidate.candidate_id}"
-            source = (
-                state.regions.get(candidate.source_ref)
-                if candidate.source_ref is not None
+    ) -> list[SeedSpec]:
+        specs: list[SeedSpec] = []
+        for seed in state.seeds.values():
+            raster_id = f"seed:{seed.seed_id}"
+            artifact = private.seed_artifacts.get(seed.seed_id)
+            region_id = (
+                artifact.planning_context.region_id
+                if artifact is not None and artifact.planning_context is not None
                 else None
             )
+            source = state.regions.get(region_id) if region_id is not None else None
+            pose = seed.target.pose
+            if pose is None:
+                continue
             anchor = next(
                 (
                     point
                     for point in state.points.values()
-                    if point.within_region_id == candidate.source_ref
+                    if point.within_region_id == region_id
                 ),
                 None,
             )
             rotation = Rotation.from_quat(
-                np.asarray(candidate.target_pose.quaternion_xyzw)
+                np.asarray(pose.quaternion_xyzw)
             ).as_matrix()
             approach = tuple(float(value) for value in rotation[:, 2])
             delta = None
@@ -402,17 +422,22 @@ class ContextCompiler:
                 delta = tuple(
                     float(value)
                     for value in (
-                        np.asarray(candidate.target_pose.position_xyz)
+                        np.asarray(pose.position_xyz)
                         - np.asarray(anchor.position_xyz)
                     )
                 )
             robot_mask = None
             gripper_mask = None
-            displayed_solve_ik = candidate.prediction.solve_ik
-            if candidate.prediction.joint_positions_rad is not None:
+            prediction = (
+                artifact.preview_plan.prediction
+                if artifact is not None and artifact.preview_plan is not None
+                else None
+            )
+            displayed_solve_ik = prediction.solve_ik if prediction is not None else "unavailable"
+            if prediction is not None and prediction.joint_positions_rad is not None:
                 preview_matches = _candidate_fk_matches_target(
-                    candidate.prediction.joint_positions_rad,
-                    candidate.target_pose,
+                    prediction.joint_positions_rad,
+                    pose,
                     tcp_to_hand_local_xyz,
                 )
                 if preview_matches:
@@ -423,14 +448,14 @@ class ContextCompiler:
                         else 1.0
                     )
                     robot_mask = _robot_mask(
-                        candidate.prediction.joint_positions_rad,
+                        prediction.joint_positions_rad,
                         opening,
                         camera,
                         rgb.shape[1],
                         rgb.shape[0],
                     )
                     gripper_mask = _gripper_mask(
-                        candidate.prediction.joint_positions_rad,
+                        prediction.joint_positions_rad,
                         opening,
                         camera,
                         rgb.shape[1],
@@ -441,99 +466,141 @@ class ContextCompiler:
             rasters[raster_id] = _candidate_crop(
                 rgb,
                 source.bbox_xyxy_px if source is not None else None,
-                candidate.target_pose,
+                pose,
                 camera,
                 robot_mask=robot_mask,
                 gripper_mask=gripper_mask,
             )
             specs.append(
-                CandidateSpec(
-                    candidate_id=candidate.candidate_id,
-                    kind=candidate.kind,
-                    source_ref=candidate.source_ref,
-                    target_pose=candidate.target_pose,
+                SeedSpec(
+                    seed_id=seed.seed_id,
+                    target_pose=pose,
                     delta_from_anchor_xyz_m=delta,
                     approach_vector_base=approach,
                     solve_ik=displayed_solve_ik,
-                    source_revision=candidate.source_revision,
+                    source_revision=seed.source_revision,
                     raster_id=raster_id,
                 )
             )
         return specs
 
 
-def _decision_spec(state: ContextState) -> DecisionWorkspaceSpec:
-    """Derive presentation from result shape, never from an action phase."""
-
-    if not state.recent_calls:
-        return DecisionWorkspaceSpec(mode="idle")
-    latest = state.recent_calls[-1]
-    result = latest.result
-    if "error" in result:
-        return DecisionWorkspaceSpec(mode="error")
-    if latest.function_name == "done":
-        return DecisionWorkspaceSpec(mode="terminal")
-
-    action_id = result.get("action_id")
-    action = state.active_action
-    if isinstance(action_id, str) and action is not None and action.action_id == action_id:
-        regions, points, candidates = _action_references(state, action.source_ref)
+def _decision_spec(workspace: ContextWorkspace) -> DecisionWorkspaceSpec:
+    state = workspace.state
+    event = workspace._private.presentation_event
+    if state.imagination is not None:
         return DecisionWorkspaceSpec(
-            mode="proposal",
-            region_ids=regions,
-            point_ids=points,
-            candidate_ids=candidates,
-            action_id=action_id,
+            mode="editing",
+            seed_ids=tuple(state.seeds)[:5],
         )
 
-    candidate_ids = result.get("candidate_ids")
-    if isinstance(candidate_ids, list):
-        valid_candidates = tuple(
-            str(value) for value in candidate_ids if str(value) in state.candidates
-        )[:5]
-        region_ids = _candidate_source_regions(state, valid_candidates)
+    # A Main-review target may remain available while Main gathers newer evidence.
+    # The lower canvas must show that latest evidence instead of pinning an old
+    # reviewed preview over every subsequent detection/proposal result.
+    if event is not None:
+        if event.error is not None:
+            return DecisionWorkspaceSpec(mode="error")
+        if event.function_name == "done":
+            return DecisionWorkspaceSpec(mode="terminal")
+        result = event.result
+        seed_ids = result.get("seed_ids")
+        if isinstance(seed_ids, list):
+            valid = tuple(
+                str(value) for value in seed_ids if str(value) in state.seeds
+            )[:5]
+            return DecisionWorkspaceSpec(mode="seeds", seed_ids=valid)
+        region_id = result.get("region_id")
+        point_id = result.get("point_id")
+        if isinstance(region_id, str) or isinstance(point_id, str):
+            regions, points = _grounding_references(state, region_id, point_id)
+            primary = None
+            if isinstance(point_id, str) and point_id in state.points:
+                primary = f"point:{point_id}"
+            elif isinstance(region_id, str) and region_id in state.regions:
+                primary = f"region:{region_id}"
+            return DecisionWorkspaceSpec(
+                mode="grounding",
+                region_ids=regions,
+                point_ids=points,
+                primary_raster_id=primary,
+            )
+
+    if state.action_review is not None:
         return DecisionWorkspaceSpec(
-            mode="candidates",
-            region_ids=region_ids,
-            candidate_ids=valid_candidates,
+            mode="reviewed",
+            seed_ids=tuple(state.seeds)[:5],
+            action_id=state.action_review.action_id,
+        )
+    if (
+        state.last_handoff is not None
+        and state.last_handoff.status == "failed"
+        and state.seeds
+    ):
+        return DecisionWorkspaceSpec(
+            mode="seeds",
+            seed_ids=tuple(state.seeds)[:5],
         )
 
-    region_id = result.get("region_id")
-    point_id = result.get("point_id")
-    if isinstance(region_id, str) or isinstance(point_id, str):
-        regions, points = _grounding_references(state, region_id, point_id)
-        primary = None
-        if isinstance(point_id, str) and point_id in state.points:
-            primary = f"point:{point_id}"
-        elif isinstance(region_id, str) and region_id in state.regions:
-            primary = f"region:{region_id}"
-        return DecisionWorkspaceSpec(
-            mode="grounding",
-            region_ids=regions,
-            point_ids=points,
-            primary_raster_id=primary,
-        )
-
-    # A refreshed observation is the semantic receipt event. The private
-    # receipt identifier is an audit handle and must not control presentation.
-    if latest.revision_after != latest.revision_before:
-        return DecisionWorkspaceSpec(mode="receipt")
     return DecisionWorkspaceSpec(mode="idle")
 
 
-def _receipt_presentation(receipt: Any) -> dict[str, Any]:
-    """Return only receipt facts that the raster actually communicates."""
+def _active_presentation(
+    workspace: ContextWorkspace,
+) -> tuple[
+    ActionTarget | None,
+    ImaginationArtifacts | ActionReviewArtifacts | None,
+    dict[str, Any] | None,
+]:
+    state = workspace.state
+    if state.imagination is not None:
+        artifacts = workspace._private.imagination_artifacts
+        return (
+            state.imagination.target,
+            artifacts,
+            _target_presentation(
+                state.imagination.target,
+                artifacts,
+                status="editing",
+                action_id=None,
+            ),
+        )
+    if state.action_review is not None:
+        artifacts = workspace._private.review_artifacts.get(
+            state.action_review.action_id
+        )
+        return (
+            state.action_review.target,
+            artifacts,
+            _target_presentation(
+                state.action_review.target,
+                artifacts,
+                status="review",
+                action_id=state.action_review.action_id,
+                handoff_reason=state.action_review.handoff_reason,
+            ),
+        )
+    return None, None, None
 
-    out: dict[str, Any] = {"function_name": receipt.function_name}
-    if receipt.action_id is not None:
-        out["action_id"] = receipt.action_id
-    if receipt.position_error_m is not None:
-        out["position_error_m"] = round(float(receipt.position_error_m), 6)
-    if receipt.gripper_opening is not None:
-        out["gripper_opening"] = round(float(receipt.gripper_opening), 6)
-    if receipt.discrepancy:
-        out["discrepancy"] = dict(receipt.discrepancy)
-    return out
+
+def _target_presentation(
+    target: ActionTarget,
+    artifacts: ImaginationArtifacts | ActionReviewArtifacts | None,
+    *,
+    status: str,
+    action_id: str | None,
+    handoff_reason: str | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {"status": status, "target": target.summary()}
+    if action_id is not None:
+        result["action_id"] = action_id
+    if handoff_reason is not None:
+        result["handoff_reason"] = handoff_reason
+    plan = _artifact_plan(artifacts)
+    if plan is not None:
+        result["prediction"] = plan.prediction.summary()
+    if isinstance(artifacts, ImaginationArtifacts) and artifacts.latest_visual_edit:
+        result["latest_edit"] = artifacts.latest_visual_edit.summary()
+    return result
 
 
 def _grounding_references(
@@ -557,45 +624,6 @@ def _grounding_references(
             regions.append(point.within_region_id)
         points.append(point_id)
     return _unique(regions), _unique(points)
-
-
-def _candidate_source_regions(
-    state: ContextState, candidate_ids: tuple[str, ...]
-) -> tuple[str, ...]:
-    return _unique(
-        candidate.source_ref
-        for candidate_id in candidate_ids
-        if (candidate := state.candidates.get(candidate_id)) is not None
-        and candidate.source_ref in state.regions
-    )
-
-
-def _action_references(
-    state: ContextState, source_ref: str | None
-) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    if source_ref is None:
-        return (), (), ()
-    point = state.points.get(source_ref)
-    if point is not None:
-        regions = (point.within_region_id,) if point.within_region_id in state.regions else ()
-        return regions, (point.point_id,), ()
-    candidate = state.candidates.get(source_ref)
-    if candidate is not None:
-        related = tuple(
-            item.candidate_id
-            for item in state.candidates.values()
-            if item.source_ref == candidate.source_ref
-        )[:5]
-        regions = (candidate.source_ref,) if candidate.source_ref in state.regions else ()
-        points = tuple(
-            point.point_id
-            for point in state.points.values()
-            if point.within_region_id == candidate.source_ref
-        )
-        return regions, points, related
-    if source_ref in state.regions:
-        return (source_ref,), (), ()
-    return (), (), ()
 
 
 def _unique(values) -> tuple[str, ...]:
@@ -728,7 +756,10 @@ def _candidate_crop(
             max(float(crop_box[2]), float(glyph[:, 0].max())),
             max(float(crop_box[3]), float(glyph[:, 1].max())),
         )
-    crop_box = _fit_box_aspect(crop_box, target_aspect=1.15)
+    # Candidate cards have a stable portrait-ish viewport.  Keeping the
+    # raster close to that aspect prevents one remaining seed from becoming
+    # a full-width, heavily cropped strip in the Web renderer.
+    crop_box = _fit_box_aspect(crop_box, target_aspect=0.82)
     left, top, right, bottom = _expanded_bounds(
         crop_box,
         rgb.shape[1],
@@ -740,13 +771,23 @@ def _candidate_crop(
     local_gripper = (
         gripper_mask[top:bottom, left:right] if has_gripper_mask else None
     )
-    raster = _overlay_robot_imagination(
-        raster,
-        robot_mask=local_robot,
-        gripper_mask=local_gripper,
-    )
+    # The hand/object relationship is the decision evidence.  Preserve the
+    # true whole-arm silhouette, but keep it subordinate to the target hand.
+    raster = _overlay_mask(raster, local_robot, VIOLET, alpha=0.18)
+    raster = _overlay_mask(raster, local_gripper, VIOLET, alpha=0.80)
     image = Image.fromarray(raster).convert("RGB")
     draw = ImageDraw.Draw(image, "RGBA")
+    if bbox is not None:
+        draw.rectangle(
+            (
+                bbox[0] - left,
+                bbox[1] - top,
+                bbox[2] - left,
+                bbox[3] - top,
+            ),
+            outline=(*BLUE, 235),
+            width=3,
+        )
     target = _project_pose(pose, camera)
     if glyph is not None:
         local = glyph - np.array([left, top], dtype=np.float64)
@@ -838,7 +879,7 @@ def _overlay_robot_imagination(
 ) -> np.ndarray:
     """Make the target hand dominant while keeping arm geometry translucent."""
 
-    raster = _overlay_mask(rgb, robot_mask, VIOLET, alpha=0.45)
+    raster = _overlay_mask(rgb, robot_mask, VIOLET, alpha=0.26)
     return _overlay_mask(raster, gripper_mask, VIOLET, alpha=0.80)
 
 
@@ -882,35 +923,57 @@ def _proposal_raster(
     rgb: np.ndarray,
     state: ContextState,
     camera: dict[str, Any],
-    action,
+    target: ActionTarget,
+    artifacts: ImaginationArtifacts | ActionReviewArtifacts | None,
 ) -> np.ndarray:
+    """Render current RGB plus the reviewed target without predicting dynamics."""
+
     robot = state.robot
-    joints = action.prediction.joint_positions_rad
-    opening = robot.gripper_opening if robot is not None else None
+    plan = _artifact_plan(artifacts)
+    joints = plan.prediction.joint_positions_rad if plan is not None else None
+    if target.pose is None and robot is not None:
+        joints = robot.joint_positions_rad
+    current_opening = robot.gripper_opening if robot is not None else None
+    target_opening = (
+        1.0
+        if target.gripper == "open"
+        else 0.0
+        if target.gripper == "closed"
+        else current_opening
+    )
     robot_mask = None
     gripper_mask = None
-    if joints is not None and opening is not None:
-        robot_mask = _robot_mask(joints, opening, camera, rgb.shape[1], rgb.shape[0])
+    if joints is not None and target_opening is not None:
+        robot_mask = _robot_mask(
+            joints,
+            target_opening,
+            camera,
+            rgb.shape[1],
+            rgb.shape[0],
+        )
         gripper_mask = _gripper_mask(
             joints,
-            opening,
+            target_opening,
             camera,
             rgb.shape[1],
             rgb.shape[0],
         )
 
     raster = rgb.copy()
-    adjustment = action.adjustment
+    visual_edit = (
+        artifacts.latest_visual_edit
+        if isinstance(artifacts, ImaginationArtifacts)
+        else None
+    )
     if (
-        adjustment is not None
-        and adjustment.parent_action_id is None
+        visual_edit is not None
         and robot is not None
         and robot.joint_positions_rad is not None
-        and opening is not None
+        and current_opening is not None
     ):
         observed_gripper = _gripper_mask(
             robot.joint_positions_rad,
-            opening,
+            current_opening,
             camera,
             rgb.shape[1],
             rgb.shape[0],
@@ -924,46 +987,53 @@ def _proposal_raster(
 
     image = Image.fromarray(raster).convert("RGB")
     draw = ImageDraw.Draw(image, "RGBA")
+    source_ref = _observed_source_ref(artifacts)
+    source_bbox = _source_bbox(state, source_ref, camera)
     reference_pixel = None
-    target_pixel = _pose_origin_pixel(action.target_pose, camera)
-    if adjustment is not None:
-        reference = adjustment.reference_pose
+    target_pixel = (
+        _pose_origin_pixel(target.pose, camera)
+        if target.pose is not None
+        else None
+    )
+    if visual_edit is not None and target.pose is not None:
+        reference = visual_edit.reference_pose
         reference_pixel = _pose_origin_pixel(reference, camera)
         axes_rotation = (
             Rotation.identity()
-            if adjustment.frame == "base"
-            else Rotation.from_quat(np.asarray(reference.quaternion_xyzw, dtype=np.float64))
-        )
-        if adjustment.kind == "rotate":
-            _draw_pose_axes(
-                draw,
-                reference.position_xyz,
-                axes_rotation,
-                camera,
-                BLUE,
+            if visual_edit.frame == "base"
+            else Rotation.from_quat(
+                np.asarray(reference.quaternion_xyzw, dtype=np.float64)
             )
+        )
+        if visual_edit.kind == "rotate":
+            _draw_pose_axes(draw, reference.position_xyz, axes_rotation, camera, BLUE)
             _draw_pose_axes(
                 draw,
-                action.target_pose.position_xyz,
+                target.pose.position_xyz,
                 Rotation.from_quat(
-                    np.asarray(action.target_pose.quaternion_xyzw, dtype=np.float64)
+                    np.asarray(target.pose.quaternion_xyzw, dtype=np.float64)
                 ),
                 camera,
                 GREEN,
             )
-        if (
-            adjustment.kind == "delta_move"
-            and reference_pixel is not None
-            and target_pixel is not None
-        ):
+            _draw_rotation_arc(
+                draw,
+                visual_edit,
+                camera,
+            )
+        elif reference_pixel is not None and target_pixel is not None:
             _arrow(draw, reference_pixel, target_pixel, GREEN, width=4)
-    else:
-        source_bbox = _source_bbox(state, action.source_ref, camera)
-        if source_bbox is not None:
-            draw.rectangle(source_bbox, outline=(*BLUE, 230), width=2)
+    elif source_bbox is not None:
+        draw.rectangle(source_bbox, outline=(*BLUE, 230), width=2)
+        if source_ref is not None:
+            _label(
+                draw,
+                (source_bbox[0] + 3, max(2.0, source_bbox[1] - 18.0)),
+                source_ref,
+                BLUE,
+            )
 
     annotated = np.asarray(image, dtype=np.uint8)
-    source_bbox = _source_bbox(state, action.source_ref, camera)
     focus_box = _union_boxes(
         [
             source_bbox,
@@ -984,27 +1054,163 @@ def _proposal_raster(
         ratio=0.28,
     )
     focus = Image.fromarray(annotated[top:bottom, left:right]).convert("RGB")
-    focus = focus.resize((960, 480), Image.Resampling.BILINEAR)
+    focus_width, focus_height = 1280, 640
+    focus = focus.resize((focus_width, focus_height), Image.Resampling.BILINEAR)
 
-    # A small whole-arm inset preserves global configuration evidence without
-    # forcing the main interaction crop to zoom out.
     overview = Image.fromarray(annotated).convert("RGB")
-    overview.thumbnail((260, 190), Image.Resampling.BILINEAR)
+    overview.thumbnail((346, 253), Image.Resampling.BILINEAR)
     inset = Image.new("RGB", (overview.width + 8, overview.height + 8), "white")
     inset.paste(overview, (4, 4))
-    focus.paste(inset, (960 - inset.width - 10, 10))
-    focus_draw = ImageDraw.Draw(focus, "RGBA")
-    focus_draw.rectangle(
+    focus.paste(inset, (focus_width - inset.width - 12, 12))
+    ImageDraw.Draw(focus, "RGBA").rectangle(
         (
-            960 - inset.width - 10,
-            10,
-            960 - 10,
-            10 + inset.height,
+            focus_width - inset.width - 12,
+            12,
+            focus_width - 12,
+            12 + inset.height,
         ),
         outline=(*VIOLET, 255),
-        width=2,
+        width=3,
     )
     return np.asarray(focus, dtype=np.uint8)
+
+
+def _observed_source_ref(
+    artifacts: ImaginationArtifacts | ActionReviewArtifacts | None,
+) -> str | None:
+    if artifacts is None or artifacts.planning_context is None:
+        return None
+    context = artifacts.planning_context
+    # A grasp seed's source_ref identifies the virtual seed itself; region_id
+    # identifies the observed object that seed is supposed to manipulate.
+    # Prefer observed evidence so a bad seed remains visibly inconsistent.
+    return context.region_id or context.source_ref
+
+
+def _artifact_plan(
+    artifacts: ImaginationArtifacts | ActionReviewArtifacts | None,
+):
+    if isinstance(artifacts, ImaginationArtifacts):
+        return artifacts.preview_plan
+    if isinstance(artifacts, ActionReviewArtifacts):
+        return artifacts.motion_plan
+    return None
+
+
+def _near_field_preview(
+    state: ContextState,
+    target: ActionTarget,
+    artifacts: ImaginationArtifacts | ActionReviewArtifacts | None,
+) -> NearFieldPreview | None:
+    """Compile the active virtual target for the observed near-field cloud.
+
+    Point samples always come from the current sensor revision.  Only the
+    robot geometry is virtual, so this preview cannot imply object motion or
+    contact success.
+    """
+
+    robot = state.robot
+    if robot is None or robot.gripper_opening is None:
+        return None
+    plan = _artifact_plan(artifacts)
+    joints = (
+        plan.prediction.joint_positions_rad
+        if plan is not None and plan.prediction.solve_ik == "returned"
+        else None
+    )
+    if target.pose is None:
+        joints = robot.joint_positions_rad
+    opening = (
+        1.0
+        if target.gripper == "open"
+        else 0.0
+        if target.gripper == "closed"
+        else robot.gripper_opening
+    )
+    visual_edit = (
+        artifacts.latest_visual_edit
+        if isinstance(artifacts, ImaginationArtifacts)
+        else None
+    )
+    return NearFieldPreview(
+        target_pose=target.pose,
+        joint_positions_rad=joints,
+        gripper_opening=opening,
+        visual_edit=visual_edit,
+    )
+
+
+def _agentview_with_base_axes(
+    rgb: np.ndarray,
+    camera: dict[str, Any],
+    robot: RobotState | None,
+) -> np.ndarray:
+    """Draw the fixed LIBERO agentview control legend used by base-frame edits.
+
+    This is deliberately a command-direction legend rather than a projected
+    3-D gizmo.  LIBERO-PRO uses one fixed agentview: base +Z raises the TCP,
+    base +Y moves screen-right, and base +X moves toward the image bottom.
+    """
+
+    del camera, robot
+    image = Image.fromarray(rgb).convert("RGB")
+    draw = ImageDraw.Draw(image, "RGBA")
+    origin = np.array([90.0, float(rgb.shape[0] - 112)], dtype=np.float64)
+    directions = (
+        np.array([0.0, 1.0]),   # BASE +X: image down
+        np.array([1.0, 0.0]),   # BASE +Y: image right
+        np.array([0.0, -1.0]),  # BASE +Z: image up / physical lift
+    )
+    colors = ((220, 38, 38), (22, 163, 74), (37, 99, 235))
+    draw.ellipse(
+        (origin[0] - 7, origin[1] - 7, origin[0] + 7, origin[1] + 7),
+        fill=(255, 255, 255, 245),
+        outline=(71, 85, 105, 255),
+        width=2,
+    )
+    for index, (color, axis_name) in enumerate(zip(colors, "XYZ", strict=True)):
+        direction = directions[index]
+        length = float(np.linalg.norm(direction))
+        label = f"+{axis_name}"
+        unit = direction / length
+        endpoint = origin + unit * 64.0
+        _arrow(draw, tuple(origin), tuple(endpoint), color, width=7)
+        _axis_label_box(draw, tuple(endpoint + unit * 20.0), label, color)
+    return np.asarray(image, dtype=np.uint8)
+
+
+def _axis_label_box(
+    draw: ImageDraw.ImageDraw,
+    anchor: tuple[float, float],
+    label: str,
+    color: tuple[int, int, int],
+) -> None:
+    font = _font(17)
+    box = draw.textbbox((0, 0), label, font=font)
+    width = box[2] - box[0] + 14
+    height = box[3] - box[1] + 10
+    left = float(anchor[0]) - width * 0.5
+    top = float(anchor[1]) - height * 0.5
+    draw.rounded_rectangle(
+        (left, top, left + width, top + height),
+        radius=4,
+        fill=(255, 255, 255, 232),
+        outline=(*color, 255),
+        width=3,
+    )
+    draw.text(
+        (left + 7, top + 4 - box[1]),
+        label,
+        fill=(*color, 255),
+        font=font,
+    )
+
+
+def _font(size: int) -> ImageFont.ImageFont:
+    try:
+        return ImageFont.truetype("DejaVuSansMono-Bold.ttf", size)
+    except OSError:
+        return ImageFont.load_default()
 
 
 def _pose_origin_pixel(pose: Pose, camera: dict[str, Any]) -> tuple[float, float] | None:
@@ -1041,6 +1247,56 @@ def _draw_pose_axes(
         )
 
 
+def _draw_rotation_arc(
+    draw: ImageDraw.ImageDraw,
+    edit: Any,
+    camera: dict[str, Any],
+) -> None:
+    if edit.axis not in {"x", "y", "z"} or edit.angle_deg is None:
+        return
+    axis_index = "xyz".index(edit.axis)
+    axis_unit = np.eye(3, dtype=np.float64)[axis_index]
+    reference_rotation = Rotation.from_quat(
+        np.asarray(edit.reference_pose.quaternion_xyzw, dtype=np.float64)
+    ).as_matrix()
+    axis_base = axis_unit if edit.frame == "base" else reference_rotation @ axis_unit
+    radial_base = (
+        np.eye(3, dtype=np.float64)[(axis_index + 1) % 3]
+        if edit.frame == "base"
+        else reference_rotation[:, (axis_index + 1) % 3]
+    )
+    center = np.asarray(edit.reference_pose.position_xyz, dtype=np.float64)
+    samples = np.linspace(
+        0.0,
+        np.deg2rad(float(edit.angle_deg)),
+        num=25,
+        dtype=np.float64,
+    )
+    arc = np.vstack(
+        [
+            center
+            + Rotation.from_rotvec(axis_base * angle).apply(radial_base * 0.05)
+            for angle in samples
+        ]
+    )
+    try:
+        projected = project_world_to_pixel(
+            arc,
+            camera["intrinsics"],
+            camera["pose_mat"],
+        )
+    except (KeyError, ValueError, np.linalg.LinAlgError):
+        return
+    if not np.isfinite(projected).all() or np.any(projected[:, 2] <= 0):
+        return
+    points = [tuple(float(value) for value in pixel[:2]) for pixel in projected]
+    colors = ((220, 38, 38), GREEN, BLUE)
+    color = colors[axis_index]
+    draw.line(points, fill=(*color, 240), width=5, joint="curve")
+    if len(points) >= 2:
+        _arrow(draw, points[-2], points[-1], color, width=5)
+
+
 def _arrow(
     draw: ImageDraw.ImageDraw,
     start: tuple[float, float],
@@ -1065,29 +1321,6 @@ def _arrow(
     )
 
 
-def _post_action_raster(
-    rgb: np.ndarray,
-    camera: dict[str, Any],
-    target_pose: Pose | None,
-) -> np.ndarray:
-    """Render a current-RGB target band for post-action world verification."""
-
-    if target_pose is None:
-        return rgb.copy()
-    projected = _project_pose(target_pose, camera)
-    if projected is None:
-        return rgb.copy()
-    target_x, target_y = projected[:2]
-    height, width = rgb.shape[:2]
-    if not (0.0 <= target_x < width and 0.0 <= target_y < height):
-        return rgb.copy()
-
-    crop_height = min(height, max(96, int(round(width / 3.6))))
-    top = int(round(target_y - crop_height / 2))
-    top = min(max(0, top), height - crop_height)
-    return rgb[top : top + crop_height].copy()
-
-
 def _source_bbox(
     state: ContextState,
     source_ref: str | None,
@@ -1101,14 +1334,10 @@ def _source_bbox(
     point = state.points.get(source_ref)
     if point is not None:
         return _pixel_box(point.pixel_xy, radius=18.0)
-    candidate = state.candidates.get(source_ref)
-    if candidate is None:
+    seed = state.seeds.get(source_ref)
+    if seed is None or seed.target.pose is None:
         return None
-    if candidate.source_ref is not None:
-        source_region = state.regions.get(candidate.source_ref)
-        if source_region is not None:
-            return source_region.bbox_xyxy_px
-    projected = _pose_origin_pixel(candidate.target_pose, camera)
+    projected = _pose_origin_pixel(seed.target.pose, camera)
     return _pixel_box(projected, radius=18.0)
 
 
@@ -1205,7 +1434,7 @@ def _project_pose(pose: Pose, camera: dict[str, Any]) -> tuple[float, float, flo
     origin = np.asarray(pose.position_xyz, dtype=np.float64)
     # The public approach vector is local +Z from panda_hand toward the TCP.
     # Draw the arrow from the hand side into the contact point so the raster
-    # direction matches CandidateSpec.approachVector exactly.
+    # direction matches SeedSpec.approachVector exactly.
     hand_side = origin - rotation[:, 2] * 0.06
     try:
         projected = project_world_to_pixel(
@@ -1308,7 +1537,7 @@ __all__ = [
     "CONTEXT_SCHEMA",
     "CONTEXT_WEB_SCHEMA_VERSION",
     "CONTEXT_WIDTH",
-    "CandidateSpec",
+    "SeedSpec",
     "ContextCompiler",
     "ContextPacket",
     "DecisionMode",

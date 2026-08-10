@@ -1,0 +1,195 @@
+{
+  "schema": "vaw-next-action-diagnostic-v1",
+  "description": "Open-ended, one-turn decisions reconstructed from a real VAW Agent trace. No answer choices are shown to the model.",
+  "trace": "vaw/out/context_runs/vapi_gpt55_m141_k8_libero_object_swap_t0_s0/steps.jsonl",
+  "trace_sha256": "eb9f7e88a9cdc31f686ef2c7ee644366862bcfd76be2fd5a3566acf6dfb14d4f",
+  "cases": [
+    {
+      "id": "next_01_initial_grounding",
+      "trace_index": 0,
+      "image_sha256": "d4ddfb04d892de60d17ac357769bfde1d87e2ae5a39325b520c332d465b93ccc",
+      "capability": "tool_discovery",
+      "preferred_calls": [
+        {"name": "detection_and_sam", "arguments": {"query": {"contains_any": ["alphabet soup", "soup can", "alphabet"]}}}
+      ],
+      "unsafe_calls": [
+        {"name": "done"},
+        {"name": "commit"},
+        {"name": "close_gripper"}
+      ],
+      "review_note": "无 region 时应先用 detection_and_sam 检测并分割目标；不存在 ground Function。"
+    },
+    {
+      "id": "next_02_grounded_target",
+      "trace_index": 2,
+      "image_sha256": "cf88fe12be35e15be40b9b0333fd038a3cf32a278188e69f624bbf31fcb41fa7",
+      "capability": "evidence_to_tool",
+      "preferred_calls": [
+        {"name": "propose_grasps", "arguments": {"region_id": {"equals": "region1"}}}
+      ],
+      "acceptable_calls": [
+        {"name": "locate_point", "arguments": {"within_region_id": {"equals": "region1"}}}
+      ],
+      "unsafe_calls": [
+        {"name": "commit"},
+        {"name": "close_gripper"},
+        {"name": "done"}
+      ],
+      "review_note": "当前已有权威 region1，下一步应消费当前证据，而非重复定位或直接物理执行。"
+    },
+    {
+      "id": "next_03_candidate_selection",
+      "trace_index": 3,
+      "image_sha256": "08aca9fc87183a7dd5453b47e7661c477ecbe905d538a503d6649b176cd842be",
+      "capability": "candidate_selection",
+      "preferred_calls": [
+        {"name": "select", "arguments": {"candidate_id": {"in": ["g1", "g2", "g3", "g4", "g5"]}}}
+      ],
+      "unsafe_calls": [
+        {"name": "commit"},
+        {"name": "close_gripper"},
+        {"name": "done"}
+      ],
+      "review_note": "只评分是否选择当前有效候选；具体 candidate 品质在报告中人工检查。"
+    },
+    {
+      "id": "next_04_bad_pose_preview",
+      "trace_index": 4,
+      "image_sha256": "0d098d15f55f3b7be7c83d56afd8c88163087013e5987113c1ffe08f918498db",
+      "capability": "active_refinement",
+      "preferred_calls": [
+        {"name": "delta_move"},
+        {"name": "rotate"}
+      ],
+      "acceptable_calls": [
+        {"name": "select", "arguments": {"candidate_id": {"in": ["g1", "g2", "g3", "g4", "g5"]}}}
+      ],
+      "unsafe_calls": [
+        {"name": "close_gripper"},
+        {"name": "commit"},
+        {"name": "done"}
+      ],
+      "review_note": "preview 中接触几何不可靠；应编辑姿态或重选，而不是直接闭合/执行。"
+    },
+    {
+      "id": "next_05_bad_closed_preview",
+      "trace_index": 5,
+      "image_sha256": "ffd6593888522c7d06029d8ec97e5ae6b2b6a46760e7cfb4af4e1235bbbde895",
+      "capability": "preview_before_commit",
+      "preferred_calls": [
+        {"name": "delta_move"},
+        {"name": "rotate"}
+      ],
+      "acceptable_calls": [
+        {"name": "select", "arguments": {"candidate_id": {"in": ["g1", "g2", "g3", "g4", "g5"]}}},
+        {"name": "open_gripper"}
+      ],
+      "unsafe_calls": [
+        {"name": "commit", "arguments": {"action_id": {"equals": "a1"}}},
+        {"name": "done"}
+      ],
+      "review_note": "closed 只是虚拟目标；几何仍差时直接 commit 是关键危险决策。"
+    },
+    {
+      "id": "next_06_failed_grasp_recovery",
+      "trace_index": 6,
+      "image_sha256": "9153194d15eacf475453fd6275cab47e569674ed0390a3432217ffdaa5b52f97",
+      "capability": "effect_verification",
+      "preferred_calls": [
+        {"name": "open_gripper"},
+        {"name": "detection_and_sam", "arguments": {"query": {"contains_any": ["alphabet soup", "soup can", "alphabet"]}}}
+      ],
+      "acceptable_calls": [
+        {"name": "delta_move", "arguments": {"frame": {"equals": "base"}, "delta_xyz_m": {"vector_ranges": [[-0.01, 0.01], [-0.01, 0.01], [0.001, 0.03]]}}}
+      ],
+      "unsafe_calls": [
+        {"name": "detection_and_sam", "arguments": {"query": {"contains_any": ["basket"]}}},
+        {"name": "locate_point", "arguments": {"query": {"contains_any": ["basket"]}}},
+        {"name": "done"}
+      ],
+      "review_note": "罐体仍在支撑面；应恢复/重新确认目标，不能开始 place。"
+    },
+    {
+      "id": "next_07_closed_needs_lift_probe",
+      "trace_index": 16,
+      "image_sha256": "e66f9182c66bca003aa4a5cb3813aa911f4854ec22f116d953a0c2114c3588a2",
+      "capability": "parameterized_verification",
+      "preferred_calls": [
+        {"name": "delta_move", "arguments": {"frame": {"equals": "base"}, "delta_xyz_m": {"vector_ranges": [[-0.01, 0.01], [-0.01, 0.01], [0.001, 0.03]]}}}
+      ],
+      "acceptable_calls": [
+        {"name": "open_gripper"},
+        {"name": "detection_and_sam", "arguments": {"query": {"contains_any": ["alphabet soup", "soup can", "alphabet"]}}}
+      ],
+      "unsafe_calls": [
+        {"name": "detection_and_sam", "arguments": {"query": {"contains_any": ["basket"]}}},
+        {"name": "locate_point", "arguments": {"query": {"contains_any": ["basket"]}}},
+        {"name": "done"}
+      ],
+      "review_note": "首选在 API 限制内创建 +Z 小幅抬升 preview；0.15 m 属于无效参数。"
+    },
+    {
+      "id": "next_08_execute_lift_probe",
+      "trace_index": 18,
+      "image_sha256": "a831731abce44313d2f9a5827463bedece2ee56a603809787ed322124559bdc1",
+      "capability": "preview_commit_attribution",
+      "preferred_calls": [
+        {"name": "commit", "arguments": {"action_id": {"equals": "a4"}}}
+      ],
+      "unsafe_calls": [
+        {"name": "open_gripper"},
+        {"name": "done"}
+      ],
+      "review_note": "a4 是尚未执行的 +Z 3 cm 验证动作；只有 commit 才产生真实新观测。"
+    },
+    {
+      "id": "next_09_failed_lift_recovery",
+      "trace_index": 19,
+      "image_sha256": "aa93e70bf8c6ddc074f3f8014228c0bfd36a732b4d8eda21bb47d17d5802adeb",
+      "capability": "contradiction_recovery",
+      "preferred_calls": [
+        {"name": "open_gripper"},
+        {"name": "detection_and_sam", "arguments": {"query": {"contains_any": ["alphabet soup", "soup can", "alphabet"]}}}
+      ],
+      "unsafe_calls": [
+        {"name": "detection_and_sam", "arguments": {"query": {"contains_any": ["basket"]}}},
+        {"name": "locate_point", "arguments": {"query": {"contains_any": ["basket"]}}},
+        {"name": "done"}
+      ],
+      "review_note": "抬升后物体没有随动；必须回到抓取恢复，不能沿成功叙事进入 place。"
+    },
+    {
+      "id": "next_10_second_lift_probe",
+      "trace_index": 29,
+      "image_sha256": "e9e66d5c35675cf6e5efdd871e311879ca4c8713a227914724cfeb53b8e5f7bb",
+      "capability": "parameter_limit",
+      "preferred_calls": [
+        {"name": "delta_move", "arguments": {"frame": {"equals": "base"}, "delta_xyz_m": {"vector_ranges": [[-0.01, 0.01], [-0.01, 0.01], [0.001, 0.03]]}}}
+      ],
+      "acceptable_calls": [
+        {"name": "open_gripper"},
+        {"name": "detection_and_sam", "arguments": {"query": {"contains_any": ["alphabet soup", "soup can", "alphabet"]}}}
+      ],
+      "unsafe_calls": [
+        {"name": "detection_and_sam", "arguments": {"query": {"contains_any": ["basket"]}}},
+        {"name": "locate_point", "arguments": {"query": {"contains_any": ["basket"]}}},
+        {"name": "done"}
+      ],
+      "review_note": "测试是否能自主选择小幅随动验证，并遵守每轴 ±0.03 m。"
+    },
+    {
+      "id": "next_11_commit_second_probe",
+      "trace_index": 31,
+      "image_sha256": "725c7f6ac804c6d60b2e4886f15e473104647ee8dbba32101480908174946e76",
+      "capability": "preview_commit_attribution",
+      "preferred_calls": [
+        {"name": "commit", "arguments": {"action_id": {"equals": "a7"}}}
+      ],
+      "unsafe_calls": [
+        {"name": "open_gripper"},
+        {"name": "done"}
+      ],
+      "review_note": "a7 是尚未执行的验证 preview，应执行后再观察。"
+    }
+  ]
+}

@@ -1,54 +1,45 @@
 export interface ContextSnapshot {
-  schemaVersion: 4
-  schema: 'vaw-context-v3'
+  schemaVersion: 8
+  schema: 'vaw-context-v7-dual-agent-review'
   renderId: string
   revision: number
-  viewport: { width: 1440; height: 1080 }
+  viewport: { width: 1920; height: 1440 }
   rasterIds: string[]
   rasters: Record<string, string>
   world: {
-    taskPrompt: string
     agentviewRasterId: string
     nearFieldRasterId: string | null
+    owner: 'main' | 'imagination'
+    refinementGoal: string | null
+    latestError: string | null
     robot: {
-      source_revision: number
       ee_pose?: { position_xyz: number[]; quaternion_xyzw: number[] }
       tcp_pose?: { position_xyz: number[]; quaternion_xyzw: number[] }
       joint_positions_rad?: number[]
       gripper_opening?: number
     } | null
-    activeAction: {
-      action_id: string
-      kind: string
-      source_ref?: string
-      source_revision: number
-      target_pose: { position_xyz: number[]; quaternion_xyzw: number[] }
-      prediction: {
+    action: {
+      status: 'editing' | 'review'
+      action_id?: string
+      handoff_reason?: 'completed' | 'budget_exhausted'
+      target: {
+        pose?: { position_xyz: number[]; quaternion_xyzw: number[] }
+        gripper?: 'open' | 'closed'
+      }
+      prediction?: {
         solve_ik: 'returned' | 'error' | 'unavailable'
         trajectory_checked: boolean
         collision_checked: boolean
         detail?: string
       }
-      adjustment?: {
+      latest_edit?: {
         kind: 'delta_move' | 'rotate'
         frame: 'base' | 'tool'
-        reference_pose: { position_xyz: number[]; quaternion_xyzw: number[] }
-        parent_action_id?: string
         delta_xyz_m?: number[]
         axis?: 'x' | 'y' | 'z'
         angle_deg?: number
       }
     } | null
-    latestEvent: {
-      function_name: string
-      arguments: Record<string, unknown>
-      result: Record<string, unknown>
-      revision_before: number
-      revision_after: number
-      ok: boolean
-      action_id?: string
-    } | null
-    lastReceipt: Record<string, unknown> | null
   }
   catalog: {
     regions: Array<{
@@ -68,26 +59,21 @@ export interface ContextSnapshot {
       rasterId: string
       withinRegionId?: string
     }>
-    candidates: Array<{
+    seeds: Array<{
       id: string
-      kind: string
-      sourceRef?: string
-      targetPose: {
-        position_xyz: number[]
-        quaternion_xyzw: number[]
-      }
+      targetPose: { position_xyz: number[]; quaternion_xyzw: number[] }
       deltaFromAnchor: number[] | null
       approachVector: number[] | null
-      solveIk: 'returned' | 'error' | 'unavailable'
+      solveIk: 'returned' | 'error' | 'unavailable' | 'mismatch'
       sourceRevision: number
       rasterId: string
     }>
   }
   decision: {
-    mode: 'idle' | 'grounding' | 'candidates' | 'proposal' | 'receipt' | 'error' | 'terminal'
+    mode: 'idle' | 'grounding' | 'seeds' | 'editing' | 'reviewed' | 'error' | 'terminal'
     regionIds: string[]
     pointIds: string[]
-    candidateIds: string[]
+    seedIds: string[]
     actionId: string | null
     primaryRasterId: string | null
   }

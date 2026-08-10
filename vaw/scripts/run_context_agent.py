@@ -1,6 +1,6 @@
 """Run the VAW M1.4 Context Runtime on a real LIBERO-PRO task.
 
-The default ``agent`` mode runs one VLM with the eleven-function hybrid contract.
+The default ``agent`` mode runs the Main/Imagination dual-agent contract.
 ``scripted`` is an environment wiring/visual trace smoke, not an agent policy.
 
 Examples:
@@ -30,7 +30,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--suite", default="libero_object_swap")
     parser.add_argument("--task-id", type=int, default=0)
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--model", default="vapi/qwen3.5-plus")
+    parser.add_argument("--model", default="vapi/qwen3.5-plus", help="Main Agent model")
+    parser.add_argument(
+        "--imagination-model",
+        default=None,
+        help="Imagination Agent model (default: reuse --model)",
+    )
     parser.add_argument("--server-url", default="http://127.0.0.1:8110/chat/completions")
     parser.add_argument("--api-key", default=os.environ.get("V_API_KEY"))
     parser.add_argument("--protocol", choices=("native", "text"), default="text")
@@ -39,12 +44,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-turns", type=int, default=32)
     parser.add_argument("--max-time-s", type=float, default=1800.0)
     parser.add_argument("--max-physical-ops", type=int, default=30)
+    parser.add_argument("--max-imagination-turns", type=int, default=6)
     parser.add_argument(
         "--motion-backend",
         choices=("pyroki", "curobo"),
         default="curobo",
         help=(
-            "private Action Proposal planner (default: curobo); "
+            "private imagination planner (default: curobo); "
             "delta_move/rotate remain virtual until commit"
         ),
     )
@@ -65,7 +71,7 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "in scripted mode, compose a +3 cm base-Z delta and a +5 degree "
-            "tool-Z rotation, then commit the resulting proposal"
+            "tool-Z rotation, then review and commit the resulting action"
         ),
     )
     return parser.parse_args()
@@ -174,31 +180,35 @@ def _run_agent(
     from vaw.context_runtime.runtime import ContextRunConfig, ContextRuntime
     from vaw.context_runtime.workspace import ContextWorkspace
 
-    provider = OpenAIProvider(
-        model=args.model,
-        server_url=args.server_url,
-        api_key=args.api_key,
-        temperature=args.temperature,
-        max_tokens=args.max_tokens,
-    )
-    if args.protocol == "text":
-        provider = TextProtocolProvider(provider)
+    def make_provider(model: str) -> Any:
+        provider: Any = OpenAIProvider(
+            model=model,
+            server_url=args.server_url,
+            api_key=args.api_key,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+        )
+        return TextProtocolProvider(provider) if args.protocol == "text" else provider
+
+    provider = make_provider(args.model)
+    imagination_provider = make_provider(args.imagination_model or args.model)
 
     def on_turn(turn: int, record: Any) -> None:
         flag = "ok" if record.ok else "ERROR"
         if record.thought:
             print(f"[basis {turn:02d}] {record.thought}")
-        print(f"[turn {turn:02d}] {flag:<5} {record.op} {record.args} -> {record.receipt}")
+        print(f"[turn {turn:02d}] {flag:<5} {record.op} {record.args} -> {record.result}")
 
     runtime = ContextRuntime(
         provider,
         ContextWorkspace(api, task_prompt, motion_backend=args.motion_backend),
         renderer,
+        imagination_provider=imagination_provider,
         config=ContextRunConfig(
-            max_turns=args.max_turns,
+            max_main_turns=args.max_turns,
+            max_imagination_turns=args.max_imagination_turns,
             max_time_s=args.max_time_s,
             max_physical_ops=args.max_physical_ops,
-            history_k=3,
             on_turn=on_turn,
         ),
         trace=trace,
@@ -245,14 +255,13 @@ def _run_scripted(
         nonlocal turn
         packet = compiler.compile(workspace)
         image = renderer.render(packet)
-        visible_before = [item.summary() for item in workspace.state.recent_calls]
         result = workspace.execute(name, **arguments)
         env_success = bool(env.task_completed()) if name in workspace.PHYSICAL_FUNCTIONS else None
         trace.log_turn(
             turn=turn,
+            agent_owner=("imagination" if name == "finish_imagination" else workspace.state.owner),
             image=image,
             packet=packet,
-            visible_recent_calls=visible_before,
             function_call={"name": name, "arguments": arguments},
             step=result,
             thought="scripted smoke",
@@ -267,27 +276,32 @@ def _run_scripted(
         return result.result
 
     step("open_gripper")
-    region_id = step("inspect", query=object_query)["region_id"]
+    action_id = step("finish_imagination", status="ready")["action_id"]
+    step("commit", action_id=action_id)
+    region_id = step("detection_and_sam", query=object_query)["region_id"]
     step("locate_point", query=point_query, within_region_id=region_id)
-    candidate_ids = step("propose_grasps", region_id=region_id)["candidate_ids"]
-    if not candidate_ids:
+    seed_ids = step("propose_grasps", region_id=region_id)["seed_ids"]
+    if not seed_ids:
         raise RuntimeError("scripted smoke received no grasp candidates")
-    action_id = step("select", candidate_id=candidate_ids[0])["action_id"]
+    step("select", seed_id=seed_ids[0])
+    action_id = step("finish_imagination", status="ready")["action_id"]
     step("commit", action_id=action_id)
     step("close_gripper")
+    action_id = step("finish_imagination", status="ready")["action_id"]
+    step("commit", action_id=action_id)
     if scripted_refinement:
-        action_id = step(
+        step(
             "delta_move",
             delta_xyz_m=[0.0, 0.0, 0.03],
             frame="base",
-        )["action_id"]
-        action_id = step(
+        )
+        step(
             "rotate",
             axis="z",
             angle_deg=5.0,
             frame="tool",
-            action_id=action_id,
-        )["action_id"]
+        )
+        action_id = step("finish_imagination", status="ready")["action_id"]
         step("commit", action_id=action_id)
     step("done", success=False)
 
@@ -295,9 +309,9 @@ def _run_scripted(
     final_image = renderer.render(final_packet)
     trace.log_turn(
         turn=turn,
+        agent_owner="runtime",
         image=final_image,
         packet=final_packet,
-        visible_recent_calls=[item.summary() for item in workspace.state.recent_calls],
         function_call=None,
         step=None,
         thought="final post-action Context",

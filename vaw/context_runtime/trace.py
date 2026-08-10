@@ -1,4 +1,4 @@
-"""Trace format for policy-visible M1.3 Context turns."""
+"""Trace format for policy-visible revision-local Context turns."""
 
 from __future__ import annotations
 
@@ -31,9 +31,9 @@ class ContextTraceLogger:
         self,
         *,
         turn: int,
+        agent_owner: str,
         image: np.ndarray,
         packet: ContextPacket,
-        visible_recent_calls: list[dict[str, Any]],
         function_call: dict[str, Any] | None,
         step: ContextStepResult | None,
         thought: str,
@@ -41,6 +41,7 @@ class ContextTraceLogger:
         done: bool,
         raw_response_text: str = "",
         provider_reasoning: str = "",
+        state_summary: dict[str, Any] | None = None,
     ) -> pathlib.Path:
         name = f"context_{self.index:04d}.png"
         path = self.dir / name
@@ -48,6 +49,7 @@ class ContextTraceLogger:
         record: dict[str, Any] = {
             "index": self.index,
             "turn": turn,
+            "agent_owner": agent_owner,
             "context_schema_version": packet.schema,
             "context_image": name,
             "context_shape": list(np.asarray(image).shape),
@@ -58,10 +60,8 @@ class ContextTraceLogger:
             # the revision, so its post-call manifest is logged separately.
             "context_manifest": _packet_manifest(packet),
             "result_manifest": step.manifest if step is not None else None,
-            "visible_recent_calls": visible_recent_calls,
             "function_call": function_call,
             "function_result": step.result if step is not None else None,
-            "execution_receipt": step.trace_receipt if step is not None else None,
             "runtime_diagnostics": (
                 step.trace_diagnostics if step is not None else None
             ),
@@ -72,6 +72,7 @@ class ContextTraceLogger:
             "thought": thought,
             "raw_response_text": raw_response_text,
             "provider_reasoning": provider_reasoning,
+            "state_summary": state_summary,
             "env_reward": 1.0 if env_success else 0.0,
             "env_success": env_success,
             "done": done,

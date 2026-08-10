@@ -1,8 +1,8 @@
-"""Public, array-free state for the VAW visual Context Runtime.
+"""Small semantic state for the dual-agent Visual Action Workspace.
 
-Raw RGB-D, masks, camera matrices and point clouds do not belong here.  They
-stay in :class:`vaw.context_runtime.workspace.ContextWorkspace` and are keyed
-by the short handles defined below.
+The records in this module describe evidence and commands, not execution
+history.  Sensor arrays, planner results and presentation provenance stay in
+``private.py`` and are never serialized into a policy message.
 """
 
 from __future__ import annotations
@@ -10,23 +10,95 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+GripperTarget = Literal["open", "closed"]
+ImaginationOutcome = Literal["ready", "failed", "budget_exhausted"]
 
-def _float_list(values: tuple[float, ...]) -> list[float]:
+
+def _floats(values: tuple[float, ...]) -> list[float]:
     return [round(float(value), 6) for value in values]
 
 
 @dataclass(frozen=True)
 class Pose:
-    """Robot-base pose using the public ``xyzw`` quaternion convention."""
+    """Robot-base pose using the public ``xyzw`` convention."""
 
     position_xyz: tuple[float, float, float]
     quaternion_xyzw: tuple[float, float, float, float]
 
     def summary(self) -> dict[str, list[float]]:
         return {
-            "position_xyz": _float_list(self.position_xyz),
-            "quaternion_xyzw": _float_list(self.quaternion_xyzw),
+            "position_xyz": _floats(self.position_xyz),
+            "quaternion_xyzw": _floats(self.quaternion_xyzw),
         }
+
+
+@dataclass(frozen=True)
+class ActionTarget:
+    """The complete physical target under visual review."""
+
+    pose: Pose | None = None
+    gripper: GripperTarget | None = None
+
+    def __post_init__(self) -> None:
+        if self.pose is None and self.gripper is None:
+            raise ValueError("ActionTarget must contain a pose or gripper target")
+
+    def summary(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        if self.pose is not None:
+            result["pose"] = self.pose.summary()
+        if self.gripper is not None:
+            result["gripper"] = self.gripper
+        return result
+
+
+@dataclass(frozen=True)
+class ActionSeed:
+    """One revision-local starting point for an imagination session."""
+
+    seed_id: str
+    target: ActionTarget
+    source_revision: int
+
+
+@dataclass
+class ImaginationState:
+    """The one mutable target owned by the Imagination Agent."""
+
+    target: ActionTarget
+    refinement_goal: str
+
+
+@dataclass(frozen=True)
+class ActionReview:
+    """A final imagination target awaiting an explicit Main-Agent decision.
+
+    ``handoff_reason`` describes why control returned to Main; it is not an
+    approval signal.  Calling ``commit`` is the Main Agent's approval.
+    """
+
+    action_id: str
+    target: ActionTarget
+    handoff_reason: Literal["completed", "budget_exhausted"]
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "action_id": self.action_id,
+            "target": self.target.summary(),
+            "handoff_reason": self.handoff_reason,
+        }
+
+
+@dataclass(frozen=True)
+class ImaginationHandoff:
+    status: ImaginationOutcome
+    action_id: str | None = None
+
+    def summary(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"status": self.status}
+        if self.action_id is not None:
+            result["action_id"] = self.action_id
+        return result
 
 
 @dataclass(frozen=True)
@@ -38,15 +110,14 @@ class RegionEvidence:
     within_region_id: str | None = None
 
     def summary(self) -> dict[str, Any]:
-        out: dict[str, Any] = {
+        result: dict[str, Any] = {
             "region_id": self.region_id,
             "query": self.query,
-            "bbox_xyxy_px": _float_list(self.bbox_xyxy_px),
-            "source_revision": self.source_revision,
+            "bbox_xyxy_px": _floats(self.bbox_xyxy_px),
         }
         if self.within_region_id is not None:
-            out["within_region_id"] = self.within_region_id
-        return out
+            result["within_region_id"] = self.within_region_id
+        return result
 
 
 @dataclass(frozen=True)
@@ -59,45 +130,19 @@ class PointEvidence:
     within_region_id: str | None = None
 
     def summary(self) -> dict[str, Any]:
-        out: dict[str, Any] = {
+        result: dict[str, Any] = {
             "point_id": self.point_id,
             "query": self.query,
-            "pixel_xy": _float_list(self.pixel_xy),
-            "position_xyz": _float_list(self.position_xyz),
-            "source_revision": self.source_revision,
+            "pixel_xy": _floats(self.pixel_xy),
+            "position_xyz": _floats(self.position_xyz),
         }
         if self.within_region_id is not None:
-            out["within_region_id"] = self.within_region_id
-        return out
-
-
-@dataclass(frozen=True)
-class ActionCandidate:
-    candidate_id: str
-    kind: str
-    source_ref: str | None
-    target_pose: Pose
-    source_revision: int
-    prediction: ActionPrediction
-
-    def summary(self) -> dict[str, Any]:
-        out: dict[str, Any] = {
-            "candidate_id": self.candidate_id,
-            "kind": self.kind,
-            "target_pose": self.target_pose.summary(),
-            "source_revision": self.source_revision,
-            "prediction": self.prediction.summary(),
-        }
-        if self.source_ref is not None:
-            out["source_ref"] = self.source_ref
-        return out
+            result["within_region_id"] = self.within_region_id
+        return result
 
 
 @dataclass(frozen=True)
 class RobotState:
-    # ``ee_pose`` is the backend-observed panda_hand link retained for
-    # execution discrepancy checks.  ``tcp_pose`` is the policy-facing
-    # fingertip/contact frame shared by ActionProposal targets.
     ee_pose: Pose | None
     tcp_pose: Pose | None
     joint_positions_rad: tuple[float, ...] | None
@@ -105,16 +150,16 @@ class RobotState:
     source_revision: int
 
     def summary(self) -> dict[str, Any]:
-        out: dict[str, Any] = {"source_revision": self.source_revision}
+        result: dict[str, Any] = {}
         if self.ee_pose is not None:
-            out["ee_pose"] = self.ee_pose.summary()
+            result["ee_pose"] = self.ee_pose.summary()
         if self.tcp_pose is not None:
-            out["tcp_pose"] = self.tcp_pose.summary()
+            result["tcp_pose"] = self.tcp_pose.summary()
         if self.joint_positions_rad is not None:
-            out["joint_positions_rad"] = _float_list(self.joint_positions_rad)
+            result["joint_positions_rad"] = _floats(self.joint_positions_rad)
         if self.gripper_opening is not None:
-            out["gripper_opening"] = round(float(self.gripper_opening), 6)
-        return out
+            result["gripper_opening"] = round(float(self.gripper_opening), 6)
+        return result
 
 
 SolveIKStatus = Literal["returned", "error", "unavailable"]
@@ -129,138 +174,14 @@ class ActionPrediction:
     detail: str | None = None
 
     def summary(self) -> dict[str, Any]:
-        out: dict[str, Any] = {
+        result: dict[str, Any] = {
             "solve_ik": self.solve_ik,
             "trajectory_checked": self.trajectory_checked,
             "collision_checked": self.collision_checked,
         }
         if self.detail:
-            out["detail"] = self.detail
-        return out
-
-
-AdjustmentKind = Literal["delta_move", "rotate"]
-AdjustmentFrame = Literal["base", "tool"]
-
-
-@dataclass(frozen=True)
-class ActionAdjustment:
-    """Latest revision-local edit that produced an Action Proposal.
-
-    This is deliberately a single edit rather than an unbounded ancestry.  It
-    gives the trusted presenter enough geometry to explain the current virtual
-    waypoint while K=3 history and the trace retain the Function transaction.
-    """
-
-    kind: AdjustmentKind
-    frame: AdjustmentFrame
-    reference_pose: Pose
-    parent_action_id: str | None = None
-    delta_xyz_m: tuple[float, float, float] | None = None
-    axis: Literal["x", "y", "z"] | None = None
-    angle_deg: float | None = None
-
-    def summary(self) -> dict[str, Any]:
-        out: dict[str, Any] = {
-            "kind": self.kind,
-            "frame": self.frame,
-            "reference_pose": self.reference_pose.summary(),
-        }
-        if self.parent_action_id is not None:
-            out["parent_action_id"] = self.parent_action_id
-        if self.delta_xyz_m is not None:
-            out["delta_xyz_m"] = _float_list(self.delta_xyz_m)
-        if self.axis is not None:
-            out["axis"] = self.axis
-        if self.angle_deg is not None:
-            out["angle_deg"] = round(float(self.angle_deg), 6)
-        return out
-
-
-@dataclass(frozen=True)
-class ActionProposal:
-    action_id: str
-    kind: str
-    source_ref: str | None
-    source_revision: int
-    target_pose: Pose
-    prediction: ActionPrediction
-    adjustment: ActionAdjustment | None = None
-
-    def summary(self) -> dict[str, Any]:
-        out: dict[str, Any] = {
-            "action_id": self.action_id,
-            "kind": self.kind,
-            "source_revision": self.source_revision,
-            "target_pose": self.target_pose.summary(),
-            "prediction": self.prediction.summary(),
-        }
-        if self.source_ref is not None:
-            out["source_ref"] = self.source_ref
-        if self.adjustment is not None:
-            out["adjustment"] = self.adjustment.summary()
-        return out
-
-
-@dataclass(frozen=True)
-class SpatialTargetSummary:
-    """Most recently executed spatial target, retained only for visual review."""
-
-    action_id: str
-    target_pose: Pose
-    revision_after: int
-
-
-@dataclass(frozen=True)
-class ExecutionReceipt:
-    receipt_id: str
-    function_name: str
-    revision_before: int
-    revision_after: int
-    action_id: str | None = None
-    position_error_m: float | None = None
-    gripper_opening: float | None = None
-    discrepancy: dict[str, Any] | None = None
-
-    def summary(self) -> dict[str, Any]:
-        out: dict[str, Any] = {
-            "receipt_id": self.receipt_id,
-            "function_name": self.function_name,
-            "revision_before": self.revision_before,
-            "revision_after": self.revision_after,
-        }
-        if self.action_id is not None:
-            out["action_id"] = self.action_id
-        if self.position_error_m is not None:
-            out["position_error_m"] = round(float(self.position_error_m), 6)
-        if self.gripper_opening is not None:
-            out["gripper_opening"] = round(float(self.gripper_opening), 6)
-        if self.discrepancy:
-            out["discrepancy"] = dict(self.discrepancy)
-        return out
-
-
-@dataclass(frozen=True)
-class FunctionRecord:
-    function_name: str
-    arguments: dict[str, Any]
-    result: dict[str, Any]
-    revision_before: int
-    revision_after: int
-    action_id: str | None = None
-
-    def summary(self) -> dict[str, Any]:
-        out: dict[str, Any] = {
-            "function_name": self.function_name,
-            "arguments": self.arguments,
-            "result": self.result,
-            "revision_before": self.revision_before,
-            "revision_after": self.revision_after,
-            "ok": "error" not in self.result,
-        }
-        if self.action_id is not None:
-            out["action_id"] = self.action_id
-        return out
+            result["detail"] = self.detail
+        return result
 
 
 @dataclass
@@ -269,13 +190,16 @@ class ContextState:
     observation_revision: int = 0
     regions: dict[str, RegionEvidence] = field(default_factory=dict)
     points: dict[str, PointEvidence] = field(default_factory=dict)
-    candidates: dict[str, ActionCandidate] = field(default_factory=dict)
+    seeds: dict[str, ActionSeed] = field(default_factory=dict)
     robot: RobotState | None = None
-    active_action: ActionProposal | None = None
-    last_spatial_target: SpatialTargetSummary | None = None
-    last_receipt: ExecutionReceipt | None = None
-    recent_calls: list[FunctionRecord] = field(default_factory=list)
+    imagination: ImaginationState | None = None
+    action_review: ActionReview | None = None
+    last_handoff: ImaginationHandoff | None = None
     _counters: dict[str, int] = field(default_factory=dict, repr=False)
+
+    @property
+    def owner(self) -> Literal["main", "imagination"]:
+        return "imagination" if self.imagination is not None else "main"
 
     def next_id(self, prefix: str) -> str:
         self._counters[prefix] = self._counters.get(prefix, 0) + 1
@@ -285,44 +209,60 @@ class ContextState:
         self.observation_revision += 1
         self.regions.clear()
         self.points.clear()
-        self.candidates.clear()
-        self.active_action = None
+        self.seeds.clear()
+        self.imagination = None
+        self.action_review = None
+        self.last_handoff = None
         return self.observation_revision
-
-    def add_record(self, record: FunctionRecord) -> None:
-        self.recent_calls.append(record)
-        del self.recent_calls[:-3]
 
     def manifest(self) -> dict[str, Any]:
         return {
-            "revision": self.observation_revision,
-            "active_action_id": (
-                self.active_action.action_id if self.active_action is not None else None
+            "owner": self.owner,
+            "review_action_id": (
+                self.action_review.action_id if self.action_review is not None else None
             ),
             "valid_region_ids": list(self.regions),
             "valid_point_ids": list(self.points),
-            "valid_candidate_ids": list(self.candidates),
+            "valid_seed_ids": list(self.seeds),
         }
 
     def trace_summary(self) -> dict[str, Any]:
-        """Array-free semantic state for debugging and offline traces.
-
-        This is deliberately *not* the default policy prompt.  The policy gets
-        :meth:`manifest`, the current Context image and recent tool results.
-        """
-
         return {
             "task_prompt": self.task_prompt,
-            "manifest": self.manifest(),
+            "observation_revision": self.observation_revision,
+            "owner": self.owner,
             "regions": [item.summary() for item in self.regions.values()],
             "points": [item.summary() for item in self.points.values()],
-            "candidates": [item.summary() for item in self.candidates.values()],
+            "seed_ids": list(self.seeds),
             "robot": self.robot.summary() if self.robot is not None else None,
-            "active_action": (
-                self.active_action.summary() if self.active_action is not None else None
+            "imagination": (
+                {
+                    "target": self.imagination.target.summary(),
+                    "refinement_goal": self.imagination.refinement_goal,
+                }
+                if self.imagination is not None
+                else None
             ),
-            "last_receipt": (
-                self.last_receipt.summary() if self.last_receipt is not None else None
+            "action_review": (
+                self.action_review.summary() if self.action_review is not None else None
             ),
-            "recent_calls": [item.summary() for item in self.recent_calls],
+            "last_handoff": (
+                self.last_handoff.summary() if self.last_handoff is not None else None
+            ),
         }
+
+
+__all__ = [
+    "ActionPrediction",
+    "ActionSeed",
+    "ActionTarget",
+    "ContextState",
+    "GripperTarget",
+    "ImaginationHandoff",
+    "ImaginationState",
+    "PointEvidence",
+    "Pose",
+    "ActionReview",
+    "RegionEvidence",
+    "RobotState",
+]

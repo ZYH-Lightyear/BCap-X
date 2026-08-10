@@ -20,6 +20,7 @@ DEFAULT_TCP_TO_HAND_LOCAL_XYZ = (0.0, 0.0, -0.1)
 # LIBERO API applies the same +90 degree local-Z correction before sending a
 # sampled grasp to the robot.  Local Z (the grasp approach axis) is unchanged.
 _GRASPNET_TO_PANDA_HAND = Rotation.from_euler("z", np.pi / 2.0).as_matrix()
+_PARALLEL_JAW_SYMMETRY = Rotation.from_euler("z", np.pi).as_matrix()
 
 
 def approach_axis(quaternion_wxyz: np.ndarray) -> np.ndarray:
@@ -58,14 +59,35 @@ def project_world_to_pixel(
     return np.concatenate((pixels, depth), axis=1)
 
 
-def graspnet_pose_to_panda_hand(grasp_pose: np.ndarray) -> np.ndarray:
-    """Convert a Contact-GraspNet pose to the Franka ``panda_hand`` frame."""
+def graspnet_pose_to_panda_hand(
+    grasp_pose: np.ndarray,
+    *,
+    reference_quaternion_xyzw: tuple[float, float, float, float] | np.ndarray | None = None,
+) -> np.ndarray:
+    """Convert Contact-GraspNet axes and choose the nearest equivalent hand yaw.
+
+    A parallel-jaw grasp is unchanged when both finger axes are reversed by a
+    local-Z half turn.  Canonicalising that symmetry against the observed hand
+    avoids needless wrist rotation without changing position or approach.
+    """
 
     pose = np.asarray(grasp_pose, dtype=np.float64).reshape(4, 4)
     if not np.isfinite(pose).all():
         raise ValueError("grasp pose must contain finite numbers")
     converted = pose.copy()
     converted[:3, :3] = pose[:3, :3] @ _GRASPNET_TO_PANDA_HAND
+    if reference_quaternion_xyzw is not None:
+        reference = np.asarray(reference_quaternion_xyzw, dtype=np.float64).reshape(4)
+        if not np.isfinite(reference).all() or np.linalg.norm(reference) <= 1e-12:
+            raise ValueError("reference quaternion must be finite and non-zero")
+        reference_rotation = Rotation.from_quat(reference / np.linalg.norm(reference))
+        original_rotation = Rotation.from_matrix(converted[:3, :3])
+        flipped_matrix = converted[:3, :3] @ _PARALLEL_JAW_SYMMETRY
+        flipped_rotation = Rotation.from_matrix(flipped_matrix)
+        original_distance = (reference_rotation.inv() * original_rotation).magnitude()
+        flipped_distance = (reference_rotation.inv() * flipped_rotation).magnitude()
+        if flipped_distance + 1e-9 < original_distance:
+            converted[:3, :3] = flipped_matrix
     return converted
 
 
@@ -77,7 +99,7 @@ def tcp_position_from_hand_pose(
     """Recover the fingertip TCP position from an observed ``panda_hand`` pose.
 
     CaP-X solves ``p_hand = p_tcp + R(q) @ tcp_to_hand``.  Observation exposes
-    the resulting hand-link pose, so execution receipts must invert that same
+    the resulting hand-link pose, so execution diagnostics must invert that same
     transform before comparing it with the requested TCP target.
     """
 
