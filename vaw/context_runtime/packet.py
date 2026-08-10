@@ -26,7 +26,7 @@ from vaw.context_runtime.model import (
     Pose,
     RobotState,
 )
-from vaw.context_runtime.near_field import NearFieldPreview
+from vaw.context_runtime.near_field import NearFieldPreview, render_contact_focus
 from vaw.context_runtime.private import (
     ActionReviewArtifacts,
     ImaginationArtifacts,
@@ -35,8 +35,8 @@ from vaw.context_runtime.private import (
 from vaw.context_runtime.scene_view import render_scene_view
 from vaw.context_runtime.workspace import ContextWorkspace
 
-CONTEXT_SCHEMA = "vaw-context-v13-post-commit"
-CONTEXT_WEB_SCHEMA_VERSION = 14
+CONTEXT_SCHEMA = "vaw-context-v14-contact-focus"
+CONTEXT_WEB_SCHEMA_VERSION = 15
 CONTEXT_WIDTH = 1920
 CONTEXT_HEIGHT = 1080
 
@@ -141,6 +141,7 @@ class WorldContextSpec:
     agentview_raster_id: str
     observed_scene_raster_id: str
     imagination_scene_raster_id: str
+    contact_focus_raster_id: str | None
     robot: RobotState | None
     owner: str
     action: dict[str, Any] | None
@@ -155,6 +156,7 @@ class WorldContextSpec:
             "agentviewRasterId": self.agentview_raster_id,
             "observedSceneRasterId": self.observed_scene_raster_id,
             "imaginationSceneRasterId": self.imagination_scene_raster_id,
+            "contactFocusRasterId": self.contact_focus_raster_id,
             "robot": self.robot.summary() if self.robot is not None else None,
             "owner": self.owner,
             "action": self.action,
@@ -288,6 +290,13 @@ class ContextCompiler:
             dark=True,
             source_mask=source_mask,
         )
+        contact_focus = render_contact_focus(
+            camera,
+            wrist_camera,
+            state.robot,
+            scene_preview,
+            source_mask=source_mask,
+        )
 
         # The persistent world view is deliberately sensor-clean.  All
         # grounding, self and imagination overlays belong to the dynamic
@@ -297,6 +306,10 @@ class ContextCompiler:
             "observed_scene": observed_scene,
             "imagination_scene": imagination_scene,
         }
+        contact_focus_id = None
+        if contact_focus is not None:
+            contact_focus_id = "contact_focus"
+            rasters[contact_focus_id] = contact_focus
         post_before_id, post_current_id = _compile_post_commit_rasters(
             workspace,
             camera,
@@ -321,6 +334,7 @@ class ContextCompiler:
                 agentview_raster_id="agentview",
                 observed_scene_raster_id="observed_scene",
                 imagination_scene_raster_id="imagination_scene",
+                contact_focus_raster_id=contact_focus_id,
                 robot=state.robot,
                 owner=state.owner,
                 action=action_presentation,
@@ -513,7 +527,10 @@ def _decision_spec(workspace: ContextWorkspace) -> DecisionWorkspaceSpec:
             seed_ids=tuple(state.seeds)[:5],
         )
 
-    if state.last_physical_action is not None:
+    if (
+        state.last_physical_action is not None
+        and workspace._private.last_physical_artifacts is not None
+    ):
         return DecisionWorkspaceSpec(mode="post_commit")
 
     # A Main-review target may remain available while Main gathers newer evidence.
@@ -578,7 +595,10 @@ def _compile_post_commit_rasters(
     at the same metric scale, never the old raw frame as a second model image.
     """
 
-    if workspace.state.last_physical_action is None:
+    if (
+        workspace.state.last_physical_action is None
+        or workspace._private.last_physical_artifacts is None
+    ):
         return None, None
     artifacts = workspace._private.last_physical_artifacts
     try:

@@ -91,10 +91,41 @@ class ContextFunctions:
         query: str,
         within_region_id: str | None = None,
     ) -> dict[str, Any]:
+        normalized_query = " ".join(str(query).casefold().split())
+        for region in reversed(tuple(self.ws.state.regions.values())):
+            if (
+                " ".join(region.query.casefold().split()) == normalized_query
+                and region.within_region_id == within_region_id
+            ):
+                self.ws._private.trace_diagnostics["semantic_grounding"] = {
+                    "mode": "revision_local_cache",
+                    "region_id": region.region_id,
+                }
+                return {
+                    "region_id": region.region_id,
+                    "bbox_xyxy_px": [
+                        round(float(value), 3) for value in region.bbox_xyxy_px
+                    ],
+                }
         camera = self.ws._camera()
         rgb = _camera_image(camera, "rgb")
         crop_rgb, origin = self.ws._crop_rgb(rgb, within_region_id)
-        local_box = self._semantic_bbox(crop_rgb, str(query))
+        semantic_crop = self.ws._semantic_crop(within_region_id)
+        semantic_box = self._semantic_bbox(semantic_crop, str(query))
+        local_box = _scale_box_between_images(
+            semantic_box,
+            source_shape=semantic_crop.shape[:2],
+            target_shape=crop_rgb.shape[:2],
+        )
+        semantic_diagnostics = self.ws._private.trace_diagnostics.get(
+            "semantic_grounding"
+        )
+        if isinstance(semantic_diagnostics, dict):
+            semantic_diagnostics["semantic_rgb_shape"] = list(semantic_crop.shape)
+            semantic_diagnostics["observation_rgb_shape"] = list(crop_rgb.shape)
+            semantic_diagnostics["box_observation_px"] = [
+                round(float(value), 3) for value in local_box
+            ]
         results = self.ws._call_backend("segment_sam3_box_prompt", crop_rgb, list(local_box))
         if not isinstance(results, (list, tuple)):
             raise ContextFunctionError("segmentation did not return a result list")
@@ -868,15 +899,21 @@ class ContextFunctions:
         if imagination is None:
             raise ContextFunctionError("there is no active imagination session")
         if status == "failed":
+            source_ref = _planning_source_ref(
+                self.ws._private.imagination_artifacts
+            )
             self.ws.state.imagination = None
             self.ws._private.imagination_artifacts = None
-            self.ws.state.last_handoff = ImaginationHandoff(status="failed")
+            self.ws.state.last_handoff = ImaginationHandoff(
+                status="failed", source_ref=source_ref
+            )
             self.ws._private.trace_diagnostics["imagination_handoff"] = {
                 "status": "failed",
                 "termination_reason": "agent_failed",
                 "target": imagination.target.summary(),
+                "source_ref": source_ref,
             }
-            return {"status": "failed"}
+            return self.ws.state.last_handoff.summary()
         return self._handoff_review("agent_ready")
 
     def limit_imagination(self) -> dict[str, Any]:
@@ -896,15 +933,19 @@ class ContextFunctions:
         if imagination.target.pose is not None and (
             plan is None or plan.prediction.solve_ik != "returned"
         ):
+            source_ref = _planning_source_ref(artifacts)
             self.ws.state.imagination = None
             self.ws._private.imagination_artifacts = None
-            self.ws.state.last_handoff = ImaginationHandoff("failed")
+            self.ws.state.last_handoff = ImaginationHandoff(
+                "failed", source_ref=source_ref
+            )
             self.ws._private.trace_diagnostics["imagination_handoff"] = {
                 "status": "failed",
                 "termination_reason": f"{termination_reason}_without_executable_plan",
                 "target": imagination.target.summary(),
+                "source_ref": source_ref,
             }
-            return {"status": "failed"}
+            return self.ws.state.last_handoff.summary()
 
         action_id = self.ws.state.next_id("a")
         review = ActionReview(
@@ -923,12 +964,13 @@ class ContextFunctions:
         self.ws.state.imagination = None
         self.ws._private.imagination_artifacts = None
         self.ws.state.last_handoff = ImaginationHandoff(
-            "review_required", action_id
+            "review_required", action_id, _planning_source_ref(artifacts)
         )
         self.ws._private.trace_diagnostics["imagination_handoff"] = {
             "status": "review_required",
             "termination_reason": termination_reason,
             "action_id": action_id,
+            "source_ref": _planning_source_ref(artifacts),
             "target": review.target.summary(),
             "intent": review.intent,
         }
@@ -946,6 +988,12 @@ def _gripper_target(value: str | None) -> str | None:
     if value not in {"open", "closed"}:
         raise ValueError(f"invalid private gripper target {value!r}")
     return value
+
+
+def _planning_source_ref(artifacts: ImaginationArtifacts | None) -> str | None:
+    if artifacts is None or artifacts.planning_context is None:
+        return None
+    return artifacts.planning_context.source_ref
 
 
 def _preview_result(
@@ -1112,6 +1160,12 @@ def _prepare_grasps(
     hand below a tabletop contact.  Such candidates are rejected so the caller
     can fall back to the independent single-view planner; they are never
     repaired by rotating the gripper 180 degrees around the contact point.
+
+    A candidate must also remain spatially consistent with the segmented
+    source surface.  The admissible radius is derived from that surface's own
+    robust 3-D extent rather than from a task or object-class threshold.  This
+    catches occasional planner/frame outliers without ranking otherwise valid
+    candidates or hard-coding a pick strategy.
     """
 
     if not isinstance(planned, tuple) or len(planned) != 2:
@@ -1136,6 +1190,16 @@ def _prepare_grasps(
         if object_points_base is not None and _has_points(object_points_base)
         else np.empty((0, 3), dtype=np.float64)
     )
+    source_center: np.ndarray | None = None
+    source_radius_m: float | None = None
+    if object_points.shape[0]:
+        lower, upper = np.quantile(object_points, [0.02, 0.98], axis=0)
+        source_center = (lower + upper) / 2.0
+        # A valid grasp TCP may lie inside the object rather than directly on
+        # an observed surface, so use one complete source diagonal as the
+        # conservative consistency radius.  Four centimetres covers tiny or
+        # sparsely sampled targets without admitting scene-scale outliers.
+        source_radius_m = max(0.04, float(np.linalg.norm(upper - lower)))
     prepared: list[_PreparedGrasp] = []
     rejected: list[dict[str, Any]] = []
     for index, (pose, score) in enumerate(
@@ -1177,6 +1241,11 @@ def _prepare_grasps(
             nearest_object_m = float(
                 np.min(np.linalg.norm(object_points - contact[None, :], axis=1))
             )
+        source_center_distance_m = (
+            float(np.linalg.norm(contact - source_center))
+            if source_center is not None
+            else None
+        )
         if approach_z > 0.0:
             rejected.append(
                 {
@@ -1185,6 +1254,25 @@ def _prepare_grasps(
                     "approach_z": round(approach_z, 6),
                     "target_xyz": _rounded_vector(contact),
                     "nearest_object_m": _rounded_scalar(nearest_object_m),
+                }
+            )
+            continue
+        if (
+            source_center_distance_m is not None
+            and source_radius_m is not None
+            and source_center_distance_m > source_radius_m
+        ):
+            rejected.append(
+                {
+                    "index": index,
+                    "reasons": ["outside_source_geometry"],
+                    "approach_z": round(approach_z, 6),
+                    "target_xyz": _rounded_vector(contact),
+                    "nearest_object_m": _rounded_scalar(nearest_object_m),
+                    "source_center_distance_m": _rounded_scalar(
+                        source_center_distance_m
+                    ),
+                    "source_radius_m": _rounded_scalar(source_radius_m),
                 }
             )
             continue
@@ -1218,6 +1306,16 @@ def _prepare_grasps(
                 if object_points.shape[0]
                 else None
             ),
+            "source_center_distance_m": _rounded_scalar(
+                float(
+                    np.linalg.norm(
+                        np.asarray(item.target.position_xyz) - source_center
+                    )
+                )
+                if source_center is not None
+                else None
+            ),
+            "source_radius_m": _rounded_scalar(source_radius_m),
         }
         for item in prepared
     ]
@@ -1291,6 +1389,32 @@ def _grounding_coord_space(api: Any) -> str:
         if value in {"pixel", "norm1000"}:
             return value
     return "pixel"
+
+
+def _scale_box_between_images(
+    box: tuple[float, float, float, float],
+    *,
+    source_shape: tuple[int, int],
+    target_shape: tuple[int, int],
+) -> tuple[float, float, float, float]:
+    """Map one xyxy box between aligned rasters without changing its semantics."""
+
+    source_h, source_w = source_shape
+    target_h, target_w = target_shape
+    if min(source_h, source_w, target_h, target_w) <= 0:
+        raise ContextFunctionError("cannot map a box between empty images")
+    scale_x = target_w / source_w
+    scale_y = target_h / source_h
+    return _bounded_box(
+        (
+            box[0] * scale_x,
+            box[1] * scale_y,
+            box[2] * scale_x,
+            box[3] * scale_y,
+        ),
+        target_w,
+        target_h,
+    )
 
 
 def _vector(values: Any, length: int, label: str) -> np.ndarray:

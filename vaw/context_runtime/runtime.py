@@ -223,6 +223,11 @@ class ContextRuntime:
                 imagination.target,
                 self.workspace._private.imagination_artifacts,
             )
+            opening = (
+                self.workspace.state.robot.gripper_opening
+                if self.workspace.state.robot is not None
+                else None
+            )
             text = (
                 f"Refinement Goal：{imagination.refinement_goal}\n"
                 "Edit Summary："
@@ -232,6 +237,11 @@ class ContextRuntime:
                     separators=(",", ":"),
                 )
             )
+            if imagination.target.gripper is None and opening is not None:
+                text += (
+                    "\nTarget Gripper：inherit observed opening "
+                    f"{float(opening):.3f}（0≈闭合，1≈张开）"
+                )
             if feedback:
                 text += f"\n上轮协议错误：{feedback}"
             return _image_messages(IMAGINATION_SYSTEM_PROMPT, text, context_image)
@@ -284,12 +294,20 @@ class ContextRuntime:
             )
         except ValueError as exc:
             return self.workspace.reject(call.name, call.args, str(exc))
+        review_before = self.workspace.state.action_review
         step = self.workspace.execute(name, **arguments)
         if owner == "main" and name != "commit" and step.ok:
             # A rejected Function is not a valid decision: retain the causal
             # comparison so Main can repair its arguments without losing what
-            # just happened.  A successful commit refreshes/replaces this
-            # context atomically inside the workspace.
+            # just happened.  A reviewed action is a one-decision offer: any
+            # other successful Main call explicitly declines it, so a stale
+            # target cannot be committed on a later turn.  A successful commit
+            # refreshes/replaces causal state atomically inside the workspace.
+            if (
+                review_before is not None
+                and self.workspace.state.action_review is review_before
+            ):
+                self.workspace.discard_action_review()
             self.workspace.consume_main_context()
         return step
 

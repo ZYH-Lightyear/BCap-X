@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -57,6 +58,7 @@ class ContextWorkspace:
         *,
         motion_backend: str | MotionBackend = "curobo",
         tcp_to_hand_local_xyz: tuple[float, float, float] | None = None,
+        semantic_rgb_provider: Callable[[], np.ndarray] | None = None,
     ) -> None:
         self.api = api
         self.camera_name = str(getattr(api, "camera_name", "agentview"))
@@ -81,6 +83,7 @@ class ContextWorkspace:
         self._tcp_to_hand_local_xyz = _finite_vector3(
             backend_offset, "tcp_to_hand_local_xyz"
         )
+        self._semantic_rgb_provider = semantic_rgb_provider
         self.state = ContextState(task_prompt=task_prompt)
         self._private = PrivateEnvContext()
         self.finished = False
@@ -96,19 +99,29 @@ class ContextWorkspace:
         self.refinement_goal = normalized or f"为任务“{self.state.task_prompt}”检查并调整动作"
 
     def consume_main_context(self) -> None:
-        """Consume one-shot causal context after a valid Main decision.
+        """Consume one-shot visual context after a valid Main decision.
 
         The immediately following Main request may see the latest imagination
-        handoff and physical action comparison.  Once Main has produced a
-        valid Function call, those records must not turn into implicit
-        long-term history.  A later physical commit installs a new record
-        after this method has run.
+        handoff and the before/current physical comparison.  Once Main has
+        produced a valid Function call, those large visual artifacts no longer
+        belong in the current decision workspace.
+
+        ``LastPhysicalAction`` is deliberately *not* cleared here.  It is a
+        compact, overwrite-only fact about the current observation revision,
+        not transcript history.  Keeping it until the next commit prevents a
+        perception call (for example, locating a destination) from erasing why
+        the robot is currently holding or approaching something.
         """
 
         self.state.last_handoff = None
-        self.state.last_physical_action = None
         self._private.last_physical_artifacts = None
         self._private.previous_observation = None
+
+    def discard_action_review(self) -> None:
+        """Discard the current review offer without changing the real world."""
+
+        self.state.action_review = None
+        self._private.review_artifacts.clear()
 
     def refresh_observation(self) -> dict[str, Any]:
         observation = self._call_backend("get_observation")
@@ -219,6 +232,62 @@ class ContextWorkspace:
             return self._private.camera(self.camera_name)
         except RuntimeError as exc:
             raise ContextFunctionError(str(exc)) from exc
+
+    def _semantic_rgb(self) -> np.ndarray:
+        """Return one cached, revision-local RGB used only for semantic grounding."""
+
+        cached = self._private.semantic_rgb
+        if cached is not None:
+            return cached
+        if self._semantic_rgb_provider is None:
+            image = np.asarray(self._camera()["images"]["rgb"])
+        else:
+            try:
+                image = np.asarray(self._semantic_rgb_provider())
+            except Exception as exc:
+                raise ContextFunctionError(
+                    f"semantic RGB capture failed: {exc}"
+                ) from exc
+        if image.ndim != 3 or image.shape[2] not in {3, 4}:
+            raise ContextFunctionError(
+                f"semantic RGB must have shape (H,W,3/4), got {image.shape}"
+            )
+        if image.shape[0] < 2 or image.shape[1] < 2:
+            raise ContextFunctionError("semantic RGB is empty")
+        if image.dtype != np.uint8:
+            if not np.issubdtype(image.dtype, np.number) or not np.isfinite(image).all():
+                raise ContextFunctionError("semantic RGB contains non-finite values")
+            image = (
+                np.clip(image * 255.0, 0.0, 255.0)
+                if float(np.max(image)) <= 1.0
+                else np.clip(image, 0.0, 255.0)
+            ).astype(np.uint8)
+        image = np.ascontiguousarray(image[:, :, :3])
+        self._private.semantic_rgb = image
+        return image
+
+    def _semantic_crop(self, within_region_id: str | None) -> np.ndarray:
+        """Crop the semantic view to the same observed region as the RGB-D view."""
+
+        semantic = self._semantic_rgb()
+        if within_region_id is None:
+            return semantic
+        observed = np.asarray(self._camera()["images"]["rgb"])
+        observed_crop, (left, top) = self._crop_rgb(observed, within_region_id)
+        right = left + observed_crop.shape[1]
+        bottom = top + observed_crop.shape[0]
+        scale_x = semantic.shape[1] / observed.shape[1]
+        scale_y = semantic.shape[0] / observed.shape[0]
+        semantic_left = max(0, int(np.floor(left * scale_x)))
+        semantic_top = max(0, int(np.floor(top * scale_y)))
+        semantic_right = min(semantic.shape[1], int(np.ceil(right * scale_x)))
+        semantic_bottom = min(semantic.shape[0], int(np.ceil(bottom * scale_y)))
+        crop = semantic[semantic_top:semantic_bottom, semantic_left:semantic_right]
+        if crop.size == 0:
+            raise ContextFunctionError(
+                f"region '{within_region_id}' has an empty semantic crop"
+            )
+        return crop
 
     def _crop_rgb(
         self,

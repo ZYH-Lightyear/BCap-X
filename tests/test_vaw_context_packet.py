@@ -80,13 +80,37 @@ def test_failed_imagination_returns_to_visible_seed_catalog() -> None:
     workspace.set_refinement_goal("reject an unsuitable seed")
     workspace.execute("select", seed_id=seed_id)
 
-    workspace.execute("finish_imagination", status="failed")
+    result = workspace.execute("finish_imagination", status="failed")
     packet = compiler.compile(workspace)
 
+    assert result.result == {"status": "failed", "source_ref": seed_id}
+    assert workspace.state.last_handoff is not None
+    assert workspace.state.last_handoff.source_ref == seed_id
     assert packet.world.owner == "main"
     assert packet.world.action is None
     assert packet.decision.mode == "seeds"
     assert packet.decision.seed_ids == (seed_id,)
+
+
+def test_non_executable_limit_reports_rejected_source_to_main() -> None:
+    workspace = _workspace()
+    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    seed_id = workspace.execute("propose_grasps", region_id=region).result[
+        "seed_ids"
+    ][0]
+    workspace.set_refinement_goal("review this seed")
+    workspace.execute("select", seed_id=seed_id)
+    artifacts = workspace._private.imagination_artifacts
+    assert artifacts is not None
+    workspace._private.imagination_artifacts = type(artifacts)(
+        planning_context=artifacts.planning_context,
+        preview_plan=None,
+        initial_target=artifacts.initial_target,
+    )
+
+    result = workspace.limit_imagination()
+
+    assert result.result == {"status": "failed", "source_ref": seed_id}
 
 
 def test_turn_limit_is_presented_as_neutral_main_review() -> None:
@@ -150,7 +174,10 @@ def test_observed_views_stay_current_but_imagination_scene_gains_preview() -> No
         editing.rasters["imagination_scene"],
     )
     assert observed.rasters["observed_scene"].shape == (570, 960, 3)
-    assert editing.rasters["imagination_scene"].shape == (560, 1000, 3)
+    assert editing.rasters["imagination_scene"].shape == (560, 1260, 3)
+    assert "contact_focus" not in observed.rasters
+    assert editing.world.contact_focus_raster_id == "contact_focus"
+    assert editing.rasters["contact_focus"].shape == (356, 640, 3)
 
 
 def test_packet_is_deterministic_and_does_not_leak_private_state() -> None:
@@ -180,8 +207,8 @@ def test_packet_is_deterministic_and_does_not_leak_private_state() -> None:
     assert forbidden.isdisjoint(set(_walk_keys(snapshot)))
     encoded = json.dumps(snapshot).lower()
     assert "functionrecord" not in encoded and "waypointdraft" not in encoded
-    assert snapshot["schemaVersion"] == 14
-    assert snapshot["schema"] == "vaw-context-v13-post-commit"
+    assert snapshot["schemaVersion"] == 15
+    assert snapshot["schema"] == "vaw-context-v14-contact-focus"
     assert snapshot["viewport"] == {"width": CONTEXT_WIDTH, "height": CONTEXT_HEIGHT}
 
 
@@ -207,5 +234,7 @@ def test_commit_compiles_one_shot_post_action_visual_comparison() -> None:
     workspace.consume_main_context()
     consumed = ContextCompiler().compile(workspace)
     assert consumed.decision.mode == "idle"
-    assert consumed.world.last_physical_action is None
+    assert consumed.world.last_physical_action is not None
+    assert consumed.world.last_physical_action.executed_stages == "gripper"
     assert "post_commit:before" not in consumed.rasters
+    assert "post_commit:current" not in consumed.rasters

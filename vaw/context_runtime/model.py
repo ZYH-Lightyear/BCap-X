@@ -89,17 +89,24 @@ class ActionReview:
 class ImaginationHandoff:
     status: ImaginationOutcome
     action_id: str | None = None
+    source_ref: str | None = None
 
     def summary(self) -> dict[str, Any]:
         result: dict[str, Any] = {"status": self.status}
         if self.action_id is not None:
             result["action_id"] = self.action_id
+        if self.source_ref is not None:
+            result["source_ref"] = self.source_ref
         return result
 
 
 @dataclass(frozen=True)
 class LastPhysicalAction:
-    """One-shot causal continuity after a commit, never a task-effect claim."""
+    """Revision-local causal continuity, never a task-effect claim.
+
+    The record is overwrite-only and disappears at the next physical revision.
+    It is not a transcript and carries no assertion about grasp/place success.
+    """
 
     intent: str
     executed_stages: Literal["arm", "gripper", "arm+gripper"]

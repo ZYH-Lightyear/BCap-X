@@ -1,6 +1,6 @@
 export interface ContextSnapshot {
-  schemaVersion: 14
-  schema: 'vaw-context-v13-post-commit'
+  schemaVersion: 15
+  schema: 'vaw-context-v14-contact-focus'
   renderId: string
   revision: number
   viewport: { width: 1920; height: 1080 }
@@ -10,6 +10,7 @@ export interface ContextSnapshot {
     agentviewRasterId: string
     observedSceneRasterId: string
     imaginationSceneRasterId: string
+    contactFocusRasterId: string | null
     owner: 'main' | 'imagination'
     refinementGoal: string | null
     latestError: string | null

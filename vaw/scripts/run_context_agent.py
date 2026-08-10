@@ -63,6 +63,15 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--video-fps", type=int, default=30)
     parser.add_argument("--context-video-fps", type=int, default=2)
+    parser.add_argument(
+        "--semantic-render-scale",
+        type=float,
+        default=2.0,
+        help=(
+            "private agentview render scale used only by semantic grounding "
+            "(default: 2.0; Canvas and RGB-D geometry remain unchanged)"
+        ),
+    )
     parser.add_argument("--trace-dir", type=pathlib.Path, default=None)
     parser.add_argument("--object-query", default="the alphabet soup can")
     parser.add_argument("--point-query", default="the center of the alphabet soup can")
@@ -90,6 +99,7 @@ def main() -> int:
 
     from capx.envs.simulators.libero import FrankaLiberoTask
     from capx.integrations.franka.libero_reduced import FrankaLiberoApiReduced
+    from vaw.context_runtime.libero_sensor import make_libero_semantic_rgb_provider
     from vaw.context_runtime.trace import ContextTraceLogger
     from vaw.context_runtime.video import save_episode_videos
     from vaw.context_runtime.web_renderer import ContextWebRenderer
@@ -103,6 +113,10 @@ def main() -> int:
     _, reset_info = env.reset(seed=args.seed)
     task_prompt = str(reset_info["task_prompt"])
     api = FrankaLiberoApiReduced(env)
+    semantic_rgb_provider = make_libero_semantic_rgb_provider(
+        env,
+        scale=args.semantic_render_scale,
+    )
     condition = "scripted" if args.mode == "scripted" else _safe_name(args.model)
     trace_dir = args.trace_dir or (
         pathlib.Path(__file__).resolve().parent.parent
@@ -111,6 +125,7 @@ def main() -> int:
         / f"{condition}_{args.motion_backend}_{args.suite}_t{args.task_id}_s{args.seed}"
     )
     trace = ContextTraceLogger(trace_dir)
+    trace.log_meta({"semantic_render_scale": args.semantic_render_scale})
     video_capture_enabled = False
     if args.record_video:
         try:
@@ -137,8 +152,17 @@ def main() -> int:
                 point_query=args.point_query,
                 motion_backend=args.motion_backend,
                 scripted_refinement=args.scripted_refinement,
+                semantic_rgb_provider=semantic_rgb_provider,
             )
-        return _run_agent(api, env, task_prompt, renderer, trace, args)
+        return _run_agent(
+            api,
+            env,
+            task_prompt,
+            renderer,
+            trace,
+            args,
+            semantic_rgb_provider=semantic_rgb_provider,
+        )
     finally:
         if args.record_video:
             try:
@@ -173,7 +197,14 @@ def main() -> int:
 
 
 def _run_agent(
-    api: Any, env: Any, task_prompt: str, renderer: Any, trace: Any, args: argparse.Namespace
+    api: Any,
+    env: Any,
+    task_prompt: str,
+    renderer: Any,
+    trace: Any,
+    args: argparse.Namespace,
+    *,
+    semantic_rgb_provider: Any,
 ) -> int:
     from vaw.agents.providers.openai import OpenAIProvider
     from vaw.agents.providers.text_protocol import TextProtocolProvider
@@ -201,7 +232,12 @@ def _run_agent(
 
     runtime = ContextRuntime(
         provider,
-        ContextWorkspace(api, task_prompt, motion_backend=args.motion_backend),
+        ContextWorkspace(
+            api,
+            task_prompt,
+            motion_backend=args.motion_backend,
+            semantic_rgb_provider=semantic_rgb_provider,
+        ),
         renderer,
         imagination_provider=imagination_provider,
         config=ContextRunConfig(
@@ -234,11 +270,17 @@ def _run_scripted(
     point_query: str,
     motion_backend: str,
     scripted_refinement: bool,
+    semantic_rgb_provider: Any,
 ) -> int:
     from vaw.context_runtime.packet import CONTEXT_SCHEMA, ContextCompiler
     from vaw.context_runtime.workspace import ContextWorkspace
 
-    workspace = ContextWorkspace(api, task_prompt, motion_backend=motion_backend)
+    workspace = ContextWorkspace(
+        api,
+        task_prompt,
+        motion_backend=motion_backend,
+        semantic_rgb_provider=semantic_rgb_provider,
+    )
     compiler = ContextCompiler()
     trace.log_meta(
         {
@@ -256,8 +298,14 @@ def _run_scripted(
         owner = workspace.state.owner
         packet = compiler.compile(workspace)
         image = renderer.render(packet)
+        review_before = workspace.state.action_review
         result = workspace.execute(name, **arguments)
         if owner == "main" and name != "commit" and result.ok:
+            if (
+                review_before is not None
+                and workspace.state.action_review is review_before
+            ):
+                workspace.discard_action_review()
             workspace.consume_main_context()
         env_success = bool(env.task_completed()) if name in workspace.PHYSICAL_FUNCTIONS else None
         trace.log_turn(

@@ -29,7 +29,6 @@ function RobotStatePanel({ snapshot }: { snapshot: ContextSnapshot }) {
     <aside className="via-robot-state">
       <FactRow label="GRIP">{robot?.gripper_opening?.toFixed(3) ?? 'N/A'}</FactRow>
       <FactRow label="TCP XYZ">{fmt(tcp?.position_xyz)}</FactRow>
-      <FactRow label="QUAT XYZW">{fmt(tcp?.quaternion_xyzw)}</FactRow>
       <FactRow label="JOINTS">{fmt(robot?.joint_positions_rad, 2)}</FactRow>
     </aside>
   )
@@ -116,21 +115,42 @@ function ModeOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
   if (mode === 'seeds') return null
   if (mode === 'grounding') return <GroundingOverlay snapshot={snapshot} />
   if (mode === 'error') return <div className="via-error-overlay"><strong>FUNCTION ERROR</strong><p>{snapshot.world.latestError}</p></div>
-  return <EditOverlay snapshot={snapshot} />
+  if (mode === 'editing' || mode === 'reviewed') return <EditOverlay snapshot={snapshot} />
+  return null
+}
+
+function decisionHeader(snapshot: ContextSnapshot, seedHeader: string): string {
+  switch (snapshot.decision.mode) {
+    case 'seeds': return seedHeader
+    case 'editing':
+    case 'reviewed': return 'IMAGINATION · NOT EXECUTED'
+    case 'grounding': return 'CURRENT EVIDENCE · OBSERVED'
+    case 'error': return 'RECOVERY CONTEXT · OBSERVED'
+    case 'terminal': return 'FINAL OBSERVATION · REAL WORLD'
+    default: return 'CURRENT GEOMETRY · OBSERVED'
+  }
 }
 
 function WaypointPanel({ snapshot }: { snapshot: ContextSnapshot }) {
   const action = snapshot.world.action
   const prediction = action?.prediction
   const planned = prediction?.solve_ik === 'returned'
-  const grip = action?.target.gripper ?? 'INHERIT'
+  const observedGrip = snapshot.world.robot?.gripper_opening
+  const targetGrip = action?.target.gripper === 'open'
+    ? 1
+    : action?.target.gripper === 'closed'
+      ? 0
+      : observedGrip
+  const grip = targetGrip === undefined
+    ? 'N/A'
+    : `${targetGrip.toFixed(3)} ${action?.target.gripper ? 'TARGET' : 'INHERITED'}`
   const goal = snapshot.world.refinementGoal ?? action?.intent
   return (
     <aside className="via-waypoint-panel">
       <h2>WAYPOINT</h2>
       <FactRow label="OWNER">{snapshot.world.owner.toUpperCase()}</FactRow>
       <FactRow label="ARM">{action ? (planned ? 'PLANNED' : prediction?.solve_ik?.toUpperCase() ?? 'TARGET ONLY') : 'NONE'}</FactRow>
-      <FactRow label="GRIPPER">{grip.toUpperCase()}</FactRow>
+      <FactRow label="GRIP TARGET">{grip}</FactRow>
       <FactRow label="CONTACT"><em>UNKNOWN</em></FactRow>
       <FactRow label="DYNAMICS"><em>UNKNOWN</em></FactRow>
       {goal && <p className="via-goal">{goal}</p>}
@@ -141,15 +161,35 @@ function WaypointPanel({ snapshot }: { snapshot: ContextSnapshot }) {
 function ImaginationLayer({ snapshot }: { snapshot: ContextSnapshot }) {
   const active = snapshot.world.action !== null
   const selecting = snapshot.decision.mode === 'seeds'
+  const hasContactFocus = active && snapshot.world.contactFocusRasterId !== null
+  const observedGrip = snapshot.world.robot?.gripper_opening
+  const seedHeader = observedGrip === undefined
+    ? 'ACTION SEEDS · VIRTUAL OPTIONS'
+    : `ACTION SEEDS · GRIP ${observedGrip.toFixed(3)} INHERITED`
+  const header = decisionHeader(snapshot, seedHeader)
   return (
     <section className={`via-imagination${active ? ' via-imagination--active' : ''}${selecting ? ' via-imagination--seeds' : ''}`}>
-      <header><h1>{selecting ? 'ACTION SEEDS · SELECT ONE TO IMAGINE' : 'IMAGINATION · NOT EXECUTED'}</h1></header>
+      <header><h1>{header}</h1></header>
       <div className="via-imagination-stage">
         {selecting
           ? <SeedGallery snapshot={snapshot} />
-          : <Raster snapshot={snapshot} id={snapshot.world.imaginationSceneRasterId} alt="当前点云上的虚拟 Waypoint" />}
-        {!selecting && <ModeOverlay snapshot={snapshot} />}
-        {!selecting && active && <WaypointPanel snapshot={snapshot} />}
+          : hasContactFocus
+            ? <div className="via-imagination-visuals">
+                <div className="via-imagination-global">
+                  <Raster snapshot={snapshot} id={snapshot.world.imaginationSceneRasterId} alt="当前点云上的虚拟 Waypoint" />
+                  <ModeOverlay snapshot={snapshot} />
+                </div>
+                <aside className="via-contact-rail">
+                  <div className="via-contact-focus">
+                    <Raster snapshot={snapshot} id={snapshot.world.contactFocusRasterId} alt="目标夹爪 jaw-plane 接触视图" />
+                  </div>
+                  <WaypointPanel snapshot={snapshot} />
+                </aside>
+              </div>
+            : <>
+                <Raster snapshot={snapshot} id={snapshot.world.imaginationSceneRasterId} alt="当前点云上的虚拟 Waypoint" />
+                <ModeOverlay snapshot={snapshot} />
+              </>}
       </div>
     </section>
   )
@@ -180,9 +220,9 @@ function PostCommitLayer({ snapshot }: { snapshot: ContextSnapshot }) {
         </article>
         <aside className="via-post-commit-facts">
           <h2>LAST PHYSICAL ACTION</h2>
-          <FactRow label="INTENT">{action?.intent ?? 'N/A'}</FactRow>
+          <FactRow label="REQUESTED">{action?.intent ?? 'N/A'}</FactRow>
           <FactRow label="EXECUTED">{action?.executed_stages.toUpperCase() ?? 'N/A'}</FactRow>
-          <FactRow label="CONTROL">{action?.outcome.toUpperCase() ?? 'N/A'}</FactRow>
+          {action?.outcome !== 'completed' && <FactRow label="CONTROL ERROR">{action?.outcome.toUpperCase() ?? 'N/A'}</FactRow>}
           <p>TASK EFFECT · VERIFY FROM CURRENT IMAGE</p>
         </aside>
       </div>

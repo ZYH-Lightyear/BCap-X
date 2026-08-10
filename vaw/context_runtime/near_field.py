@@ -26,6 +26,8 @@ NEAR_FIELD_HEIGHT = 720
 
 _PANEL_GAP = 8
 _PANEL_HEIGHT = (NEAR_FIELD_HEIGHT - _PANEL_GAP) // 2
+CONTACT_FOCUS_WIDTH = NEAR_FIELD_WIDTH
+CONTACT_FOCUS_HEIGHT = _PANEL_HEIGHT
 _BACKGROUND = np.array([232, 239, 247], dtype=np.uint8)
 _GRIPPER = np.array([37, 99, 235], dtype=np.uint8)
 _GRIPPER_OUTLINE = np.array([23, 55, 130], dtype=np.uint8)
@@ -81,11 +83,44 @@ def render_near_field(
     return _render_geometry_pair(agentview, wrist, robot, preview)
 
 
+def render_contact_focus(
+    agentview: dict,
+    wrist: dict | None,
+    robot: RobotState | None,
+    preview: NearFieldPreview | None,
+    *,
+    source_mask: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """Render the orthogonal jaw-plane evidence for one virtual target.
+
+    The camera-aligned imagination scene preserves global context, but it does
+    not reveal whether an object is actually inside the two-finger channel.
+    This panel uses the same current RGB-D and exact URDF geometry and never
+    predicts object motion or task effects.
+    """
+
+    if preview is None:
+        return None
+    pair = _render_geometry_pair(
+        agentview,
+        wrist,
+        robot,
+        preview,
+        agentview_emphasis_mask=source_mask,
+    )
+    if pair is None:
+        return None
+    top = _PANEL_HEIGHT + _PANEL_GAP
+    return np.ascontiguousarray(pair[top : top + _PANEL_HEIGHT])
+
+
 def _render_geometry_pair(
     agentview: dict,
     wrist: dict | None,
     robot: RobotState,
     preview: NearFieldPreview | None,
+    *,
+    agentview_emphasis_mask: np.ndarray | None = None,
 ) -> np.ndarray | None:
     if robot.tcp_pose is None or robot.joint_positions_rad is None or robot.gripper_opening is None:
         return None
@@ -113,10 +148,15 @@ def _render_geometry_pair(
 
     point_parts: list[np.ndarray] = []
     color_parts: list[np.ndarray] = []
-    for camera in (agentview, wrist):
+    for camera_index, camera in enumerate((agentview, wrist)):
         if camera is None:
             continue
-        sampled = _colored_points_base(camera)
+        sampled = _colored_points_base(
+            camera,
+            emphasis_mask=(
+                agentview_emphasis_mask if camera_index == 0 else None
+            ),
+        )
         if sampled is None:
             continue
         points, colors = sampled
@@ -216,7 +256,11 @@ def _render_geometry_pair(
     return canvas
 
 
-def _colored_points_base(camera: dict) -> tuple[np.ndarray, np.ndarray] | None:
+def _colored_points_base(
+    camera: dict,
+    *,
+    emphasis_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
     try:
         images = camera["images"]
         rgb = np.asarray(images["rgb"], dtype=np.uint8)
@@ -256,7 +300,22 @@ def _colored_points_base(camera: dict) -> tuple[np.ndarray, np.ndarray] | None:
     )
     points_base = (base_from_camera @ points_camera.T).T[:, :3]
     finite = np.isfinite(points_base).all(axis=1)
-    return points_base[finite], np.ascontiguousarray(rgb[valid][finite])
+    colors = np.ascontiguousarray(rgb[valid][finite]).copy()
+    if emphasis_mask is not None:
+        mask = np.asarray(emphasis_mask, dtype=bool)
+        if mask.shape == depth.shape:
+            emphasized = np.ascontiguousarray(mask[valid][finite])
+            background = ~emphasized
+            colors[background] = np.asarray(
+                np.round(colors[background].astype(np.float64) * 0.50 + 92.0),
+                dtype=np.uint8,
+            )
+            cyan = np.array([14.0, 165.0, 233.0], dtype=np.float64)
+            colors[emphasized] = np.asarray(
+                np.round(colors[emphasized].astype(np.float64) * 0.52 + cyan * 0.48),
+                dtype=np.uint8,
+            )
+    return points_base[finite], colors
 
 
 def _gripper_triangles_local(
@@ -665,7 +724,12 @@ def _draw_adjustment(
 ) -> None:
     edit = preview.visual_edit
     target = preview.target_pose
-    if edit is None or target is None:
+    if (
+        edit is None
+        or target is None
+        or edit.kind not in {"delta_move", "rotate"}
+        or edit.reference_pose is None
+    ):
         return
     reference_position_local, _ = _pose_in_current_tcp(
         edit.reference_pose,
@@ -803,8 +867,11 @@ def _unit(vector: np.ndarray) -> np.ndarray:
 
 
 __all__ = [
+    "CONTACT_FOCUS_HEIGHT",
+    "CONTACT_FOCUS_WIDTH",
     "NEAR_FIELD_HEIGHT",
     "NEAR_FIELD_WIDTH",
     "NearFieldPreview",
+    "render_contact_focus",
     "render_near_field",
 ]

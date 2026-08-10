@@ -5,7 +5,13 @@ from scipy.spatial.transform import Rotation
 
 import vaw.context_runtime.near_field as near_field_module
 from vaw.context_runtime.model import Pose, RobotState
-from vaw.context_runtime.near_field import NearFieldPreview, render_near_field
+from vaw.context_runtime.near_field import (
+    CONTACT_FOCUS_HEIGHT,
+    CONTACT_FOCUS_WIDTH,
+    NearFieldPreview,
+    render_contact_focus,
+    render_near_field,
+)
 from vaw.context_runtime.private import VisualEdit
 
 
@@ -56,6 +62,23 @@ def test_near_field_fuses_both_current_rgbd_views_deterministically(monkeypatch)
     assert np.array_equal(first, second)
     assert np.any(np.all(first == np.array([220, 30, 30]), axis=-1))
     assert np.any(np.all(first == np.array([30, 210, 60]), axis=-1))
+
+
+def test_contact_focus_emphasizes_only_the_observed_source_surface() -> None:
+    camera = _camera((100, 120, 140))
+    mask = np.zeros((16, 20), dtype=bool)
+    mask[:, :10] = True
+
+    sampled = near_field_module._colored_points_base(
+        camera,
+        emphasis_mask=mask,
+    )
+
+    assert sampled is not None
+    _, colors = sampled
+    unique = {tuple(color) for color in colors}
+    assert (59, 142, 185) in unique  # source blended toward cyan
+    assert (142, 152, 162) in unique  # background retained but de-emphasized
 
 
 def test_near_field_places_contact_side_below_gripper(monkeypatch) -> None:
@@ -130,6 +153,18 @@ def test_near_field_overlays_preview_gripper_on_same_current_cloud(monkeypatch) 
     assert np.count_nonzero(blue) > 100
     assert np.count_nonzero(violet) > 100
 
+    focus = render_contact_focus(
+        _camera((180, 180, 180)), None, _robot(), preview
+    )
+    assert focus is not None
+    assert focus.shape == (CONTACT_FOCUS_HEIGHT, CONTACT_FOCUS_WIDTH, 3)
+    assert np.array_equal(
+        focus,
+        raster[
+            near_field_module._PANEL_HEIGHT + near_field_module._PANEL_GAP :
+        ],
+    )
+
 
 def test_near_field_rotate_preview_changes_visual_cue_deterministically(monkeypatch) -> None:
     monkeypatch.setattr(near_field_module, "load_panda_urdf_fk", lambda: None)
@@ -160,6 +195,26 @@ def test_near_field_rotate_preview_changes_visual_cue_deterministically(monkeypa
         first,
         render_near_field(_camera((180, 180, 180)), None, _robot()),
     )
+
+
+def test_gripper_only_edit_with_spatial_target_needs_no_reference_pose(monkeypatch) -> None:
+    monkeypatch.setattr(near_field_module, "load_panda_urdf_fk", lambda: None)
+    preview = NearFieldPreview(
+        target_pose=Pose((0.0, 0.0, 0.02), (0.0, 0.0, 0.0, 1.0)),
+        joint_positions_rad=tuple(np.zeros(7)),
+        gripper_opening=0.0,
+        visual_edit=VisualEdit(kind="gripper", gripper_target="closed"),
+    )
+
+    raster = render_contact_focus(
+        _camera((180, 180, 180)),
+        None,
+        _robot(),
+        preview,
+    )
+
+    assert raster is not None
+    assert raster.shape == (CONTACT_FOCUS_HEIGHT, CONTACT_FOCUS_WIDTH, 3)
 
 
 def test_near_field_requires_current_tcp_proprioception() -> None:

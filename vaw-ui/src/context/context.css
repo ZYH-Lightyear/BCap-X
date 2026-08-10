@@ -153,6 +153,53 @@ img { display: block; }
 .via-imagination-stage { position: relative; overflow: hidden; }
 .via-imagination-stage > img { object-fit: contain; background: #03070e; }
 
+.via-imagination-visuals {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 600px;
+  gap: 8px;
+  background: #03070e;
+}
+
+.via-imagination-global {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.via-imagination-global > img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #03070e;
+}
+
+.via-contact-rail {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: 356px minmax(0, 1fr);
+  gap: 8px;
+  padding: 8px 8px 8px 0;
+}
+
+.via-contact-focus {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+  border: 2px solid #7c3aed;
+  border-radius: 8px;
+  background: #e8eff7;
+}
+
+.via-contact-focus img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
 .via-waypoint-panel,
 .via-edit-overlay,
 .via-grounding-overlay,
@@ -171,6 +218,36 @@ img { display: block; }
   bottom: 18px;
   width: 342px;
   padding: 17px 20px;
+}
+
+.via-contact-rail .via-waypoint-panel {
+  position: static;
+  width: auto;
+  min-height: 0;
+  padding: 10px 16px;
+  overflow: hidden;
+  background: rgba(8, 13, 24, .98);
+}
+
+.via-contact-rail .via-waypoint-panel h2 {
+  margin-bottom: 4px;
+  padding-bottom: 5px;
+  font-size: 17px;
+}
+
+.via-contact-rail .via-waypoint-panel .via-fact-row {
+  min-height: 27px;
+}
+
+.via-contact-rail .via-waypoint-panel .via-fact-row strong,
+.via-contact-rail .via-waypoint-panel .via-fact-row code {
+  font-size: 12px;
+}
+
+.via-contact-rail .via-goal {
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.2;
 }
 
 .via-waypoint-panel h2 {

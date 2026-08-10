@@ -10,9 +10,15 @@ from vaw.context_runtime import (
     FUNCTION_NAMES,
     ActionPrediction,
     ContextWorkspace,
+    Pose,
     function_definitions,
 )
-from vaw.context_runtime.motion import CUROBO_TCP_TO_HAND_LOCAL_XYZ, MotionPlan
+from vaw.context_runtime.motion import (
+    CUROBO_TCP_TO_HAND_LOCAL_XYZ,
+    CuroboMotionBackend,
+    MotionBackendError,
+    MotionPlan,
+)
 from vaw.context_runtime.protocol import (
     IMAGINATION_FUNCTION_NAMES,
     SYSTEM_PROMPT,
@@ -138,6 +144,21 @@ class FakeCuroboContextApi(FakeContextApi):
         self.cartesian[3:7] = self._target_quaternion
 
 
+class SettlingCuroboApi(FakeCuroboContextApi):
+    def __init__(self, *, settle: bool) -> None:
+        super().__init__()
+        self.settle = settle
+
+    def execute_joint_trajectory(self, trajectory, **kwargs):
+        del kwargs
+        values = np.asarray(trajectory).copy()
+        self.curobo_execute_calls.append(values)
+        if len(self.curobo_execute_calls) == 1:
+            self.joints = values[-1] + 0.02
+        elif self.settle:
+            self.joints = values[-1]
+
+
 class FakeSemanticGroundingApi(FakeContextApi):
     def __init__(self, *, choice: int | None = 2) -> None:
         super().__init__()
@@ -149,12 +170,28 @@ class FakeSemanticGroundingApi(FakeContextApi):
         del kwargs
         self.query_prompts.append(str(prompt))
         self.query_images.append(np.asarray(images).copy())
-        if len(self.query_prompts) == 1:
+        if len(self.query_prompts) % 2 == 1:
             return (
                 '[{"box":[16,24,64,84],"evidence":"generic can"},'
                 '{"box":[96,12,144,60],"evidence":"exact label"}]'
             )
         return json.dumps({"candidate": self.choice})
+
+
+class SpatiallyInconsistentGraspApi(FakeContextApi):
+    def segment_sam3_box_prompt(self, rgb, box):
+        del box
+        mask = np.zeros(rgb.shape[:2], dtype=bool)
+        h, w = mask.shape
+        mask[h // 2 - 8 : h // 2 + 8, w // 2 - 8 : w // 2 + 8] = True
+        return [{"mask": mask, "score": 0.9}]
+
+    def plan_grasp(self, depth, intrinsics, mask):
+        del depth, intrinsics, mask
+        pose = np.eye(4, dtype=np.float64)
+        pose[:3, :3] = Rotation.from_euler("x", np.pi).as_matrix()
+        pose[:3, 3] = [0.25, 0.0, 0.45]
+        return [pose], [0.9]
 
 
 class FailedMotionBackend:
@@ -212,11 +249,81 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
         definition = next(x["function"] for x in main if x["function"]["name"] == name)
         assert "frame" in definition["parameters"]["required"]
         assert "refinement_goal" in definition["parameters"]["required"]
+    delta = next(x["function"] for x in main if x["function"]["name"] == "delta_move")
+    pose = next(x["function"] for x in main if x["function"]["name"] == "propose_pose")
+    assert "当前真实 TCP" in delta["description"]
+    assert "厘米级局部修正" in delta["description"]
+    assert "current_tcp" in pose["description"]
+    assert "绝不能虚构 `current_tcp`" in SYSTEM_PROMPT
+    assert "GRIP 仍大于 0 可能是物体阻挡手指" in SYSTEM_PROMPT
+    assert "within_region_id" in SYSTEM_PROMPT
     for name in ("select", "propose_pose", "open_gripper", "close_gripper"):
         definition = next(x["function"] for x in main if x["function"]["name"] == name)
         assert "refinement_goal" in definition["parameters"]["required"]
     for definition in imagination:
         assert "refinement_goal" not in definition["function"]["parameters"]["properties"]
+
+
+def test_curobo_retries_exact_final_waypoint_when_reduced_api_is_still_settling() -> None:
+    api = SettlingCuroboApi(settle=True)
+    backend = CuroboMotionBackend(api)
+    target = Pose((0.4, 0.0, 0.2), (0.0, 1.0, 0.0, 0.0))
+    trajectory = np.stack([np.zeros(7), np.full(7, 0.5)])
+    plan = MotionPlan(
+        "curobo",
+        ActionPrediction(
+            solve_ik="returned",
+            joint_positions_rad=tuple(trajectory[-1]),
+            trajectory_checked=True,
+            collision_checked=True,
+        ),
+        trajectory,
+    )
+
+    backend.execute(plan, target)
+
+    assert len(api.curobo_execute_calls) == 2
+    np.testing.assert_allclose(api.curobo_execute_calls[1], trajectory[-1:])
+
+
+def test_curobo_final_settle_does_not_relax_residual_threshold() -> None:
+    api = SettlingCuroboApi(settle=False)
+    backend = CuroboMotionBackend(api)
+    target = Pose((0.4, 0.0, 0.2), (0.0, 1.0, 0.0, 0.0))
+    trajectory = np.stack([np.zeros(7), np.full(7, 0.5)])
+    plan = MotionPlan(
+        "curobo",
+        ActionPrediction(
+            solve_ik="returned",
+            joint_positions_rad=tuple(trajectory[-1]),
+            trajectory_checked=True,
+            collision_checked=True,
+        ),
+        trajectory,
+    )
+
+    with pytest.raises(MotionBackendError, match="joint residual"):
+        backend.execute(plan, target)
+
+    assert len(api.curobo_execute_calls) == 2
+
+
+def test_detection_is_idempotent_within_one_observation_revision() -> None:
+    api = FakeContextApi()
+    workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
+
+    first = workspace.execute("detection_and_sam", query=" Alphabet   Soup Can ")
+    second = workspace.execute("detection_and_sam", query="alphabet soup can")
+
+    assert second.result == first.result
+    assert list(workspace.state.regions) == [first.result["region_id"]]
+    assert len(api.bbox_queries) == 1
+    assert second.trace_diagnostics == {
+        "semantic_grounding": {
+            "mode": "revision_local_cache",
+            "region_id": first.result["region_id"],
+        }
+    }
 
 
 def test_gripper_preview_enters_imagination_without_physical_effect() -> None:
@@ -265,6 +372,39 @@ def test_detection_reviews_enlarged_candidates_before_registering_region() -> No
     diagnostics = result.trace_diagnostics["semantic_grounding"]
     assert diagnostics["mode"] == "candidate_review"
     assert diagnostics["selected_candidate"] == 2
+
+
+def test_detection_uses_private_hires_semantic_view_and_maps_box_back() -> None:
+    api = FakeSemanticGroundingApi(choice=2)
+    captures = 0
+
+    def semantic_rgb_provider() -> np.ndarray:
+        nonlocal captures
+        captures += 1
+        return np.zeros((240, 320, 3), dtype=np.uint8)
+
+    workspace = ContextWorkspace(
+        api,
+        "task",
+        motion_backend="pyroki",
+        semantic_rgb_provider=semantic_rgb_provider,
+    )
+
+    first = workspace.execute("detection_and_sam", query="alphabet soup can")
+    second = workspace.execute("detection_and_sam", query="alphabet soup can")
+
+    assert first.ok and second.ok
+    assert first.result["bbox_xyxy_px"] == pytest.approx([48.0, 6.0, 72.0, 30.0])
+    assert captures == 1
+    assert api.query_images[0].shape == (240, 320, 3)
+    diagnostics = first.trace_diagnostics["semantic_grounding"]
+    assert diagnostics["semantic_rgb_shape"] == [240, 320, 3]
+    assert diagnostics["observation_rgb_shape"] == [120, 160, 3]
+    assert diagnostics["box_observation_px"] == pytest.approx([48.0, 6.0, 72.0, 30.0])
+
+    workspace.refresh_observation()
+    workspace.execute("detection_and_sam", query="alphabet soup can")
+    assert captures == 2
 
 
 def test_detection_rejects_ambiguous_semantic_review_without_region() -> None:
@@ -375,6 +515,25 @@ def test_grasp_proposal_returns_general_action_seeds() -> None:
     selected = workspace.execute("select", seed_id=seed_id)
     assert selected.ok and workspace.state.owner == "imagination"
     assert workspace.state.imagination.target.pose is not None
+
+
+def test_grasp_proposal_rejects_seed_outside_its_source_geometry() -> None:
+    workspace = ContextWorkspace(
+        SpatiallyInconsistentGraspApi(),
+        "task",
+        motion_backend="pyroki",
+    )
+    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+
+    result = workspace.execute("propose_grasps", region_id=region)
+
+    assert not result.ok
+    assert workspace.state.seeds == {}
+    rejected = result.trace_diagnostics["grasp_candidates"]["attempts"][0][
+        "rejected"
+    ]
+    assert rejected[0]["reasons"] == ["outside_source_geometry"]
+    assert rejected[0]["source_center_distance_m"] > rejected[0]["source_radius_m"]
 
 
 def test_imagination_limit_produces_main_review_not_approval() -> None:

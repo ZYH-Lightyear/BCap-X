@@ -109,7 +109,7 @@ def test_dual_agent_runtime_rebuilds_every_request_without_history(tmp_path: Pat
     assert all("execution_receipt" not in row for row in rows)
 
 
-def test_last_physical_action_is_visible_for_one_valid_main_decision() -> None:
+def test_last_physical_action_persists_across_main_perception_calls() -> None:
     main = RecordingProvider(
         [
             _response(
@@ -145,8 +145,44 @@ def test_last_physical_action_is_visible_for_one_valid_main_decision() -> None:
     assert "Last Physical Action" in _user_text(main.messages[3])
     assert "Last Physical Action" in _user_text(main.messages[4])
     assert "within [-0.03, 0.03]" in _user_text(main.messages[4])
-    assert "Last Physical Action" not in _user_text(main.messages[5])
+    assert "Last Physical Action" in _user_text(main.messages[5])
     assert all(_image_count(messages) == 1 for messages in main.messages)
+
+
+def test_noncommit_main_decision_discards_review_offer() -> None:
+    main = RecordingProvider(
+        [
+            _response(
+                1,
+                "delta_move",
+                delta_xyz_m=[0.0, 0.0, 0.01],
+                frame="base",
+                refinement_goal="检查目标位置",
+            ),
+            _response(3, "detection_and_sam", query="basket"),
+            _response(4, "commit", action_id="a1"),
+            _response(5, "done", success=False),
+        ]
+    )
+    imagination = RecordingProvider(
+        [_response(2, "finish_imagination", status="ready")]
+    )
+    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
+    runtime = ContextRuntime(
+        main,
+        workspace,
+        SolidRenderer(),
+        imagination_provider=imagination,
+    )
+
+    result = runtime.run()
+
+    commit = next(step for step in result.steps if step.op == "main:commit")
+    assert not commit.ok
+    assert json.loads(commit.result) == {
+        "error": "unknown or expired action_id 'a1'"
+    }
+    assert workspace.state.action_review is None
 
 
 def test_imagination_turn_limit_returns_neutral_review_to_main(tmp_path: Path) -> None:
@@ -221,6 +257,36 @@ def test_invalid_imagination_tool_is_one_shot_feedback_not_history() -> None:
     assert "call-2" not in second
 
 
+def test_failed_imagination_tells_main_which_seed_was_rejected() -> None:
+    main = RecordingProvider(
+        [
+            _response(1, "detection_and_sam", query="can"),
+            _response(2, "propose_grasps", region_id="region1"),
+            _response(
+                3,
+                "select",
+                seed_id="s1",
+                refinement_goal="check whether the fingers can surround the can",
+            ),
+            _response(5, "done", success=False),
+        ]
+    )
+    imagination = RecordingProvider(
+        [_response(4, "finish_imagination", status="failed")]
+    )
+
+    ContextRuntime(
+        main,
+        ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki"),
+        SolidRenderer(),
+        imagination_provider=imagination,
+    ).run()
+
+    handoff_text = _user_text(main.messages[3])
+    assert '"status":"failed"' in handoff_text
+    assert '"source_ref":"s1"' in handoff_text
+
+
 def test_main_starter_requires_explicit_refinement_goal() -> None:
     main = RecordingProvider(
         [
@@ -282,6 +348,8 @@ def test_imagination_receives_cumulative_edit_summary_not_transcript() -> None:
     third = _user_text(imagination.messages[2])
     assert "把 TCP 移到目标几何中心" in first
     assert '"total_translation_base_m":[0.01,0.0,0.0]' in first
+    assert "quaternion_xyzw" not in first
+    assert "Target Gripper：inherit observed opening" in first
     assert '"previous_edit"' in second and '"last_edit"' in second
     assert '"total_translation_base_m":[0.01,0.02,0.0]' in second
     assert '"total_translation_base_m":[0.01,0.01,0.0]' in third

@@ -105,9 +105,16 @@ class EditSummary:
     last_edit: VisualEdit | None
 
     def summary(self) -> dict[str, Any]:
+        # A quaternion is an exact transport representation, but its four
+        # components are not per-axis angles.  Exposing both endpoint
+        # quaternions encouraged vision-language models to invent an Euler
+        # interpretation and rotate otherwise useful seeds.  The control
+        # summary therefore carries position/gripper endpoints plus the exact
+        # relative axis-angle that was actually edited.  Full poses remain in
+        # private state and trace diagnostics.
         result: dict[str, Any] = {
-            "initial_target": self.initial_target.summary(),
-            "current_target": self.current_target.summary(),
+            "initial_target": _control_target_summary(self.initial_target),
+            "current_target": _control_target_summary(self.current_target),
         }
         if self.total_translation_base_m is not None:
             result["total_translation_base_m"] = [
@@ -124,6 +131,17 @@ class EditSummary:
         if self.last_edit is not None:
             result["last_edit"] = self.last_edit.command_summary()
         return result
+
+
+def _control_target_summary(target: ActionTarget) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    if target.pose is not None:
+        result["position_xyz"] = [
+            round(float(value), 6) for value in target.pose.position_xyz
+        ]
+    if target.gripper is not None:
+        result["gripper_target"] = target.gripper
+    return result
 
 
 def build_edit_summary(
@@ -176,6 +194,7 @@ class PresentationEvent:
 class PrivateEnvContext:
     observation: dict[str, Any] | None = None
     previous_observation: dict[str, Any] | None = None
+    semantic_rgb: np.ndarray | None = None
     region_masks: dict[str, np.ndarray] = field(default_factory=dict)
     region_geometry: dict[str, RegionGeometryArtifact] = field(default_factory=dict)
     seed_artifacts: dict[str, SeedArtifacts] = field(default_factory=dict)
@@ -188,6 +207,7 @@ class PrivateEnvContext:
     def begin_revision(self, observation: dict[str, Any]) -> None:
         self.previous_observation = self.observation
         self.observation = observation
+        self.semantic_rgb = None
         self.region_masks.clear()
         self.region_geometry.clear()
         self.seed_artifacts.clear()

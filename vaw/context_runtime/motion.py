@@ -141,6 +141,7 @@ class CuroboMotionBackend:
         waypoint_tolerance_rad: float = 0.01,
         max_steps_per_waypoint: int = 120,
         final_joint_tolerance_rad: float = 0.02,
+        final_settle_max_steps: int = 360,
     ) -> None:
         if trajectory_subsample < 1:
             raise ValueError("trajectory_subsample must be at least one")
@@ -150,6 +151,7 @@ class CuroboMotionBackend:
         self.waypoint_tolerance_rad = float(waypoint_tolerance_rad)
         self.max_steps_per_waypoint = int(max_steps_per_waypoint)
         self.final_joint_tolerance_rad = float(final_joint_tolerance_rad)
+        self.final_settle_max_steps = int(final_settle_max_steps)
 
     def preview(self, target: Pose) -> ActionPrediction:
         # Candidate previews remain cheap and explicitly unchecked.  Selected
@@ -261,6 +263,30 @@ class CuroboMotionBackend:
         if isinstance(status, dict) and status.get("all_converged") is False:
             raise MotionBackendError("execute_joint_trajectory did not converge")
 
+        residual = self._final_joint_residual(trajectory[-1])
+        if residual > self.final_joint_tolerance_rad and status is None:
+            # FrankaLiberoApiReduced does not expose the per-waypoint controller
+            # status.  Its last waypoint can still be settling when the call
+            # returns, even though the cached CuRobo path itself is valid.  Make
+            # one bounded attempt at the *same* endpoint: this neither relaxes
+            # the acceptance threshold nor silently replans a different path.
+            _call(
+                self.api,
+                "execute_joint_trajectory",
+                trajectory[-1:].copy(),
+                subsample=1,
+                tolerance=self.waypoint_tolerance_rad,
+                max_steps=self.final_settle_max_steps,
+            )
+            residual = self._final_joint_residual(trajectory[-1])
+        if residual > self.final_joint_tolerance_rad:
+            raise MotionBackendError(
+                "CuRobo trajectory execution did not converge: "
+                f"joint residual {residual:.6f} rad exceeds "
+                f"{self.final_joint_tolerance_rad:.6f} rad"
+            )
+
+    def _final_joint_residual(self, target_joints: np.ndarray) -> float:
         observation = _call(self.api, "get_observation")
         if not isinstance(observation, dict):
             raise MotionBackendError("get_observation returned no joint state")
@@ -269,13 +295,7 @@ class CuroboMotionBackend:
             minimum_length=7,
             label="observed robot joints",
         )[:7]
-        residual = float(np.linalg.norm(achieved - trajectory[-1]))
-        if residual > self.final_joint_tolerance_rad:
-            raise MotionBackendError(
-                "CuRobo trajectory execution did not converge: "
-                f"joint residual {residual:.6f} rad exceeds "
-                f"{self.final_joint_tolerance_rad:.6f} rad"
-            )
+        return float(np.linalg.norm(achieved - target_joints))
 
 
 def create_motion_backend(name: str, api: Any) -> MotionBackend:

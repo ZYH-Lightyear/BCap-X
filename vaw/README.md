@@ -24,15 +24,21 @@ Main Agent ── perception / ActionSeed ──► Imagination Agent
    ▲                                      │
    │                  delta / rotate / gripper preview
    │                                      │
-   └──── ActionReview / failed / budget exhausted ┘
+   └──────── ActionReview / failed ────────────────┘
    │
    └── Main reviews ── commit(ActionReview) ──► physical world ──► fresh observation
 ```
 
 每次 provider 请求都从零构造。Main 只看到 task、当前 Canvas、minimal policy state、最近一次
-handoff，以及 commit 后仅出现一次的 previous-observed 图。Imagination 只看到 task、
+handoff，以及当前 observation revision 的一条 overwrite-only `LastPhysicalAction`；大幅
+previous/current 对照只在 commit 后出现一次。Imagination 只看到 task、
 refinement goal、当前 `ActionTarget` 和当前 Canvas。两边都看不到对方或自己的历史
 call/result/rationale。
+
+感知与运动有明确的信息边界。同一 observation revision 中重复相同的
+`detection_and_sam` query 会复用已有 region，不会制造新的世界状态；已有准确 region 时，
+`locate_point` 应显式传 `within_region_id`。`delta_move` 是每轴最多 3cm 的当前/想象 TCP
+局部修正；远处语义目标应先定位 region 和 point，再通过 `propose_pose` 进入局部 Preview。
 
 ## Function space
 
@@ -68,20 +74,26 @@ Main 启动 Imagination 时必须显式提供一句短的 `refinement_goal`，�
 局部控制目标。Imagination 每次请求只收到当前 Canvas、目标几何和累计 `EditSummary`，不收到
 Function transcript。默认最多连续想象 6 轮；主动完成或达到上限都以中性的
 `review_required` 交回 Main，`turn_limit` 只写 trace。只有 Main 查看最终 Preview 后调用
-`commit` 才构成批准。
+`commit` 才构成批准。`ActionReview` 是一次决策的 offer：Main 的下一次成功调用若不是
+`commit`，旧 review 会被明确丢弃，不能在后续回合被误提交。
 
 ## Canvas
 
-Web schema 14 / `vaw-context-v13-post-commit` / renderer
-`context-web-v13-post-commit`：
+Web schema 15 / `vaw-context-v14-contact-focus` / renderer
+`context-web-v14-contact-focus`：
 
 - 上层 `OBSERVED NOW · REAL WORLD`：干净 agentview、与 agentview 标定透视一致的稠密
   RGB-D surface 和四行本体状态；
 - `ACTION SEEDS`：最多五个候选以固定五列占满下层，统一尺度并完整显示；
-- 下层 `IMAGINATION · NOT EXECUTED`：同一当前 RGB-D surface 的 metric target-centered
-  Contact Focus、蓝色当前夹爪、高显著度紫色 target gripper 和上一 target 的浅色轮廓；
+- active target 时下层为 `IMAGINATION · NOT EXECUTED`：同一当前 RGB-D surface 的
+  camera-aligned 全局 Preview，
+  以及由当前 agentview+wrist RGB-D 编译的正交 `JAW PLANE` Contact Focus；后者用于观察目标
+  物体是否真正位于两指通道，紫色 target 始终表示未执行；
+- 没有 active target 时，下层明确标成 `CURRENT EVIDENCE · OBSERVED` 或
+  `CURRENT GEOMETRY · OBSERVED`，不再把当前蓝色机器人误标成未执行想象；
 - commit 后下层短暂切换为同一 Canvas 内的 `BEFORE COMMIT → CURRENT OBSERVED` 目标区
-  对照；只显示一次 `LastPhysicalAction` 因果摘要，不额外发送旧图或声明任务效果；
+  对照；大图只显示一次，紧凑 `LastPhysicalAction` 在下一次 commit 前持续提供因果连续性，
+  不额外发送旧图或声明任务效果；
 - BASE/WORLD 坐标提示由 robot-base 几何投影产生，并固定在角落以避免遮挡 target；
 - grounding、ActionSeed 与 refinement 信息只占用下层固定 overlay，不改变双层版式；
 - 紫色几何只存在于下层，并始终表示未执行的预测；

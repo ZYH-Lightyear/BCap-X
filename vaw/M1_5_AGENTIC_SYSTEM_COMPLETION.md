@@ -38,8 +38,8 @@ M1.5 只有同时满足以下条件才算完成。
 - Main 必须看到最终 Preview，并能够选择 commit、重新进入 Imagination、换 seed 或放弃；
 - commit 后的新请求必须包含当前真实视觉和一条最小动作连续性信息，使 Main 知道刚执行的是
   arm、gripper 或二者，以及原始意图；
-- revision-local region/point/seed 不跨物理动作复用，但自然语言 focus 与最近一次物理意图可以
-  跨一次 commit 保留；
+- revision-local region/point/seed 不跨物理动作复用；最近一次物理意图在当前真实 observation
+  revision 内 overwrite-only 保留，直到下一次 commit 覆盖；
 - Agent-visible Context 不包含 reward、environment success、privileged object pose、raw depth、
   calibration、raw mask/cloud 或 planner trajectory。
 
@@ -180,9 +180,10 @@ LastPhysicalAction
 
 - overwrite-only，不形成列表；
 - 不含 receipt ID、revision、旧 action ID 或 reasoning；
-- 在下一次 Main 决策后消费；
+- 在当前真实 observation revision 内持续存在，由下一次 commit 覆盖；
 - 不判断 task effect，不替代当前真实视觉；
-- 可同时携带一次 before/current 视觉对照，但两张图必须在同一 Canvas 中呈现。
+- 可同时携带一次 before/current 视觉对照，但两张大图只在 commit 后的第一个 Main 请求中呈现；
+  后续感知调用只保留紧凑动作事实，避免既丢失因果又长期占据视觉面积。
 
 ## 6. Canvas 设计
 
@@ -234,16 +235,20 @@ Imagination 下层采用固定结构：
 Agent-visible handoff 只保留：
 
 ```text
-review_required(action_id)
-failed()
+review_required(action_id, source_ref?)
+failed(source_ref?)
 ```
 
 - Imagination 主动认为足够合理时产生 `review_required`；
 - 达到 turn limit 时也产生 `review_required`，但 `termination_reason=turn_limit` 仅写 trace；
 - Main 不能仅根据 handoff 原因 commit，必须看最终 Preview；
 - Main 也不能把达到编辑上限自动解释为失败；
+- ActionReview 是一次 Main 决策的 offer：下一次成功 Function 若不是 `commit`，即视为放弃，
+  action 与私有 plan 同步销毁；无效调用不消费 review；
 - 若 target 没有可执行 motion plan，必须产生 `failed` 或显式 planner error，不创建可 commit
   review。
+- `source_ref` 只携带当前被审查的 seed/point 引用，不是历史；它使 Main 知道刚被否决的动作
+  起点，避免在没有新视觉证据或不同修正策略时立即重复同一个 seed。
 
 Imagination 每轮的概念决策是：
 
@@ -296,10 +301,11 @@ OR fail this target
 验收：arm-only、gripper-only、arm+gripper commit 后，Main 能区分刚执行的内容，并分别选择
 继续微调、改变夹爪、验证 lift 或进入下一动作；无 Function history 泄漏。
 
-状态：已完成。真实模型 trace 中，Main 在 arm commit 后直接继续创建 close-gripper preview，
+状态：离线修订完成，待真实复测。真实模型 trace 中，Main 在 arm commit 后直接继续创建 close-gripper preview，
 没有重新从 detection/propose 启动任务；在 arm+gripper commit 后，也能够从当前真实画面提出
-小幅 lift 来核验抓持。Function 参数被 runtime 拒绝时不会消费这条一次性因果上下文，只有
-成功的 Main Function 才会消费；commit 则原子地用新物理动作替换旧记录。
+小幅 lift 来核验抓持。后续 trace 又证明“一次 Main 决策后删除物理意图”仍然过短：目的地感知
+会擦除正在运输的因果状态。修订后，Function 参数错误不会消费因果或 review；成功的非 commit
+调用只消费大幅视觉对照，紧凑 LastPhysicalAction 保留到下一次 commit。
 
 ### M1.5.4 — End-to-End Pick-and-Place
 
@@ -335,6 +341,65 @@ box 上移的 wiring bug。
 五个 grasp seed 与 CuRobo 链路均围绕正确目标完成。该 smoke 只证明 grounding wiring，不计入任务
 成功门槛。
 
+随后引入同一 observation 的 2× agentview semantic render。真实 scripted trace
+`m154_hires_grounding_scripted_t0_s1` 在高分辨率语义图上选择蓝色 alphabet soup can，并把 bbox
+无损映射回 `800×512` 观测后完成 SAM、point lift、五 seed 与 CuRobo 链路；高分辨率 RGB 仅活在
+private episode context，不进入 Canvas、manifest 或 Function result。
+
+真实 Agent trace `m154_qwen35plus_hires_grounding_t0_s1` 与
+`m154_qwen35plus_control_semantics_t0_s1` 进一步证明：多个 revision 的目标身份已经稳定正确，
+但任务仍未成功。前者将四元数分量误当旋转角度并反复旋转；删除该控制歧义后，后者不再出现
+无依据旋转，并首次让真实夹爪从 `0.968` 收到 `0.768`，说明发生了实体接触。然而下层单一
+camera-aligned Preview 被紫色 hand 遮挡，无法显示物体是否位于两指闭合通道；Imagination 因而
+在 Z 方向振荡，甚至将 TCP `z=-0.014m` 误判为合理，最终 CuRobo 执行不收敛。
+
+因此当前第一失败原因已经从 semantic grounding 转移为 **contact observability**。M1.5.4 的下一
+实现版本在全局 Preview 旁增加由当前 agentview+wrist RGB-D 编译的正交 `JAW PLANE`，并将失败
+handoff 的当前 `source_ref` 交回 Main。它不增加 phase、动作 gate、任务专用坐标或预测物体运动。
+
+真实 Agent trace `m154_qwen35plus_contact_focus_t0_s1` 证明 Contact Focus 本身有效：第一次抓取
+Imagination 只做一次 `+2 cm Z` 即主动 ready；close session 只做一次 `-2.5 cm Z` 即 ready；
+arm+gripper commit 后真实 `GRIP=0.246`，CURRENT 图中蓝色罐已经离开原支撑并位于两指间。Main
+也在下一轮明确判断“已经抓起”，随后正确检测 basket。
+
+同一 trace 同时暴露三个新的 harness 缺陷，而不是 Canvas idea 失败：
+
+1. basket detection 成功后，runtime 把 LastPhysicalAction 连同大图一起清除，下一轮 Main 失去
+   “刚抓起目标、正在找目的地”的因果状态，重新从检测并抓取罐头开始；
+2. Main 在后续 review 中用 detection 表达放弃，但旧 ActionReview 仍留在 manifest，下一轮又被
+   commit；
+3. 被夹持/遮挡状态下 Contact-GraspNet 偶发输出 target `[0.641,-0.102,0.145]`，而 source mask
+   点云中心为 `[0.407,-0.094,0.073]`、最近距离 `0.221 m`，该 scene-scale outlier 仍被注册成 seed。
+
+当前修复将“紧凑因果事实”和“一次性视觉对照”拆开；将 ActionReview 定义为一次决策 offer；
+并用 source 点云自身的 robust 3-D extent 做 candidate/source 一致性检查。该检查不排序 seed、
+不规定抓取方向，也不含任务或物体类别分支。
+
+真实 scripted trace `m154c_source_guard_scripted_t0_s1` 证明正常的单视角候选仍能通过上述检查。
+真实 Agent trace `m154c_qwen35plus_causal_t0_s1` 则在被遮挡 revision 中拒绝了唯一异常 seed：其
+target 到 source 点云最近距离为 `0.217 m`，同时保留其他 revision 的正常候选。该 run 还暴露
+gripper-only visual edit 没有 reference pose 时的 Canvas 崩溃，修复后已加入确定性回归。
+
+真实 Agent trace `m154d_qwen35plus_settle_t0_s1` 进一步把第一失败位置推进到 place：
+
+- 首次 CuRobo approach 曾因终点 joint residual `0.039 rad` 被误报失败。Reduced API 不返回
+  waypoint 状态，因此 adapter 现在只对同一个缓存终点做一次有界 settle；不放宽 `0.02 rad`
+  验收阈值、不重规划也不换目标。复测中 arm commit 达到 `11.1 mm` TCP error，后续 grasp/lift
+  commit 分别达到 `19.3 mm` 与 `9.6 mm`；罐头在 CURRENT 图中明确离开支撑面并随夹爪上移。
+- 闭合后 `GRIP≈0.77` 实际来自罐体阻挡，而不是“仍然打开”。Main 一度因此重复 close，说明
+  Context 可见但因果提示仍不完整；Prompt 现明确要求以小幅随动验证抓持，不能只按开度判定。
+- 抓起后 Main 没有 grounding basket interior，而把 `delta_move` 当成长距离导航；累计约 15cm
+  后过早 open，罐头落在篮子左侧。下一修订明确区分：远处语义目标必须
+  `detection_and_sam → locate_point(within_region_id) → propose_pose`，`delta_move` 只负责附近
+  厘米级修正。
+- 同一 revision、同一 query 的 detection 现在幂等复用 region，防止失败恢复时生成一串等价
+  ID 和重复 Canvas evidence。全图 point 曾错误落到 basket（`x=0.751m`）；Function 描述现要求
+  已有 region 时显式传 `within_region_id`。
+
+因此 M1.5.4 仍未验收，但真实闭环已经证明 identity grounding、candidate/source 对齐、arm
+execution、contact close 与 lift-follow verification 可连续工作。当前首要失败已收敛为
+**destination grounding 与 transport/place action selection**，而不是 Canvas 分辨率或 pick 执行。
+
 验收：主任务 seeds `0,1,2` 至少 `2/3` env success。
 
 ### M1.5.5 — Basic Generalization and Freeze
@@ -368,7 +433,11 @@ box 上移的 wiring bug。
 | M1.5.1 | metric Contact Focus 能让 2–3 cm/小角度修正可读 | `5d056f0` | 12 packet/agent tests + Ruff + Web build | `m151_v11_control_focus_scripted_t0_s1` | 五 seed 完整；3 cm 蓝紫分离和 5° 新旧轮廓可读；开放式静态 VLM probe 待完成 |
 | M1.5.2 | 最小 edit memory + neutral review 能结束振荡并促成 Main review | `07f0512` | 相关 runtime/packet/agent 回归 + Ruff + Web build | `m152_qwen35plus_review_t0_s1` | 首次 Imagination 一次修正后主动 ready，Main 审查并 commit；随后暴露 post-commit 因果丢失，进入 M1.5.3 |
 | M1.5.3 | one-shot physical continuity 能避免 commit 后任务重启 | `07f0512`, `ed590bf` | 40 full VAW tests + Ruff + Web build；post-commit fixture 为 `1920×1080` | `m153_post_commit_scripted_t0_s1`, `m153_qwen35plus_post_commit_t0_s1` | arm commit 后 Main 直接进入 close preview；arm+gripper 后提出 lift 核验；被拒绝的 Function 不再提前消费因果画面。下一首要失败是 detection 的语义错配，而非 post-commit 任务重启 |
-| M1.5.4 | 完整闭环可达到基本 pick-place 成功 | in progress | candidate parser/review/ambiguity tests + full VAW regression | `m154_qwen35plus_grounding_t0_s1`, `m154_candidate_review_pixel_scripted_t0_s1` | 单提示修复被真实 E2E 证伪；候选生成 + 放大 crop 复核已通过真实 wiring，下一步重新运行 Agent 并继续定位第一失败点 |
+| M1.5.4-a | 2× semantic render 能稳定区分相似容器 | in progress | high-resolution mapping/cache/revision tests | `m154_hires_grounding_scripted_t0_s1`, `m154_qwen35plus_hires_grounding_t0_s1` | identity grounding 稳定正确；下一失败转为错误姿态解释与接触不可观测 |
+| M1.5.4-b | 去除 quaternion 控制歧义后 Imagination 不再无依据旋转 | in progress | 49 full VAW tests + Ruff + Web build | `m154_qwen35plus_control_semantics_t0_s1` | 旋转错误消失并产生真实接触；单投影仍造成 Z 振荡，加入正交 JAW PLANE 与 rejected source handoff 后待真实复测 |
+| M1.5.4-c | 正交 Contact Focus 能收敛局部接触；revision-local cause + one-decision review 防止任务重启与 stale commit | in progress | 52 full VAW tests + Ruff + Web build | `m154_qwen35plus_contact_focus_t0_s1`, `m154c_source_guard_scripted_t0_s1`, `m154c_qwen35plus_causal_t0_s1` | 局部调整明显收敛且首次真实抓起；因果、stale review、source outlier 与 gripper-only Canvas crash 均已修复并回归 |
+| M1.5.4-d | 精确终点 settle + 幂等 grounding + local/semantic motion 分工能把闭环推进到可靠 place | in progress | 56 full VAW tests + Ruff + Web build | `m154d_qwen35plus_settle_t0_s1` | pick 与 3cm lift 真实成功；首次 place 因未 grounding basket、把 delta 当长距离导航而落在篮外；策略语义已修订，待复测 |
+| M1.5.4 | 完整闭环可达到基本 pick-place 成功 | in progress | 56 full VAW tests + Ruff + Web build | pending frozen seeds 0/1/2 | 尚未达到 `2/3 env_success`，不得宣称完成 |
 
 ## 11. 非目标
 
