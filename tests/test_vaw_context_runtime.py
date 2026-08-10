@@ -36,6 +36,7 @@ class FakeContextApi:
         self.solve_calls: list[tuple[np.ndarray, np.ndarray]] = []
         self.move_calls: list[np.ndarray] = []
         self.operation_log: list[str] = []
+        self.bbox_queries: list[str] = []
         self.move_error = False
         self.gripper_error = False
         self._last_position = self.cartesian[:3].copy()
@@ -55,7 +56,7 @@ class FakeContextApi:
         }
 
     def vlm_bbox_detection(self, rgb, query):
-        del query
+        self.bbox_queries.append(str(query))
         h, w = rgb.shape[:2]
         return [w * 0.35, h * 0.25, w * 0.65, h * 0.8]
 
@@ -210,6 +211,20 @@ def test_gripper_preview_enters_imagination_without_physical_effect() -> None:
     assert workspace.state.imagination.target.gripper == "closed"
     assert workspace.state.observation_revision == revision
     assert api.operation_log == []
+
+
+def test_detection_privately_requests_exact_semantic_disambiguation() -> None:
+    api = FakeContextApi()
+    workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
+
+    result = workspace.execute("detection_and_sam", query="alphabet soup can")
+
+    assert result.ok
+    assert len(api.bbox_queries) == 1
+    assert "exact semantic target described as alphabet soup can" in api.bbox_queries[0]
+    assert "generic visual match" in api.bbox_queries[0]
+    region = workspace.state.regions[result.result["region_id"]]
+    assert region.query == "alphabet soup can"
 
 
 def test_continuous_imagination_edits_one_target_then_hands_off() -> None:

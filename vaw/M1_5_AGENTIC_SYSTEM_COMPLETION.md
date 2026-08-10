@@ -296,11 +296,28 @@ OR fail this target
 验收：arm-only、gripper-only、arm+gripper commit 后，Main 能区分刚执行的内容，并分别选择
 继续微调、改变夹爪、验证 lift 或进入下一动作；无 Function history 泄漏。
 
+状态：已完成。真实模型 trace 中，Main 在 arm commit 后直接继续创建 close-gripper preview，
+没有重新从 detection/propose 启动任务；在 arm+gripper commit 后，也能够从当前真实画面提出
+小幅 lift 来核验抓持。Function 参数被 runtime 拒绝时不会消费这条一次性因果上下文，只有
+成功的 Main Function 才会消费；commit 则原子地用新物理动作替换旧记录。
+
 ### M1.5.4 — End-to-End Pick-and-Place
 
 - 在 `libero_object_swap:0` 完成 pick、lift verification、transport、place 和 release；
 - 修复只由真实 trace 证明的 Function/backend/Context 缺陷；
 - 每次真实 run 记录冻结配置、commit、trace 和第一失败原因。
+
+当前第一失败原因审计：`m153_qwen35plus_post_commit_t0_s1` 的初次
+`detection_and_sam("alphabet soup can")` 把前景红绿罐误识别为任务目标。SAM mask、对象点云、
+camera-to-base 变换与 grasp target 都与该错误 box 内部一致，因此不是坐标转换错误。根因是底层
+detector 被要求强制返回单个 box，却没有被要求在多个同类容器间做精确语义消歧。
+
+修复保持 Function schema 和 CaP-X 不变：VAW 在 detector 边界私下将简短 query 扩展为“精确
+语义目标；依据可见属性与关系区分其他对象/区域；不得因为更近或更大而选择 generic match”。
+Region 继续保存并向 Agent 展示原始简短 query。固定真实帧 probe 中，旧提示返回错误 box
+`[392,302,444,372]`，增强提示返回正确 box `[342,201,376,253]`；真实 scripted trace
+`m154_semantic_grounding_scripted_t0_s1` 使用原始无冠词 query 返回 `[342,201,375,252]`，且完成
+SAM、point lift、grasp seed 与 CuRobo 链路。该 smoke 只证明 grounding wiring，不计入任务成功门槛。
 
 验收：主任务 seeds `0,1,2` 至少 `2/3` env success。
 
@@ -333,9 +350,9 @@ OR fail this target
 |---|---|---|---|---|---|
 | M1.5.0 | dense world view 可作为清晰视觉基线 | `91f9d17` | 12 tests + Web build | `via_canvas_qwen35plus_t0_s1` | world 清晰；local control、handoff、continuity 失败 |
 | M1.5.1 | metric Contact Focus 能让 2–3 cm/小角度修正可读 | `5d056f0` | 12 packet/agent tests + Ruff + Web build | `m151_v11_control_focus_scripted_t0_s1` | 五 seed 完整；3 cm 蓝紫分离和 5° 新旧轮廓可读；开放式静态 VLM probe 待完成 |
-| M1.5.2 | 最小 edit memory + neutral review 能结束振荡并促成 Main review | pending | 相关 runtime/packet/agent 回归 + Ruff + Web build | `m152_qwen35plus_review_t0_s1` | 首次 Imagination 一次修正后主动 ready，Main 审查并 commit；随后暴露 post-commit 因果丢失，进入 M1.5.3 |
-| M1.5.3 | one-shot physical continuity 能避免 commit 后任务重启 | pending | 24 core tests / 40 full VAW tests + Ruff + Web build；post-commit fixture 为 `1920×1080` | pending | LastPhysicalAction、单图 BEFORE→CURRENT 对照与一次性消费已实现；待真实模型验证 |
-| M1.5.4 | 完整闭环可达到基本 pick-place 成功 | pending | pending | pending | pending |
+| M1.5.2 | 最小 edit memory + neutral review 能结束振荡并促成 Main review | `07f0512` | 相关 runtime/packet/agent 回归 + Ruff + Web build | `m152_qwen35plus_review_t0_s1` | 首次 Imagination 一次修正后主动 ready，Main 审查并 commit；随后暴露 post-commit 因果丢失，进入 M1.5.3 |
+| M1.5.3 | one-shot physical continuity 能避免 commit 后任务重启 | `07f0512`, `ed590bf` | 40 full VAW tests + Ruff + Web build；post-commit fixture 为 `1920×1080` | `m153_post_commit_scripted_t0_s1`, `m153_qwen35plus_post_commit_t0_s1` | arm commit 后 Main 直接进入 close preview；arm+gripper 后提出 lift 核验；被拒绝的 Function 不再提前消费因果画面。下一首要失败是 detection 的语义错配，而非 post-commit 任务重启 |
+| M1.5.4 | 完整闭环可达到基本 pick-place 成功 | in progress | semantic grounding regression + full VAW regression | `m154_semantic_grounding_scripted_t0_s1` | 首个真实失败源已从“错误目标 box”修复为可复现的精确语义 grounding；下一步重新运行真实 Agent，定位新的第一失败点 |
 
 ## 11. 非目标
 

@@ -88,7 +88,11 @@ class ContextFunctions:
         rgb = _camera_image(camera, "rgb")
         crop_rgb, origin = self.ws._crop_rgb(rgb, within_region_id)
         local_box = _bounded_box(
-            self.ws._call_backend("vlm_bbox_detection", crop_rgb, str(query)),
+            self.ws._call_backend(
+                "vlm_bbox_detection",
+                crop_rgb,
+                _semantic_grounding_query(query),
+            ),
             crop_rgb.shape[1],
             crop_rgb.shape[0],
         )
@@ -1182,6 +1186,25 @@ def _bounded_box(box: Any, width: int, height: int) -> tuple[float, float, float
     if x2 <= x1 or y2 <= y1:
         raise ContextFunctionError(f"VLM bbox has no area: {[x1, y1, x2, y2]}")
     return x1, y1, x2, y2
+
+
+def _semantic_grounding_query(query: Any) -> str:
+    """Make a forced single-box detector discriminate the requested semantics.
+
+    The reduced CaP-X detector must return one box.  Without an explicit
+    discrimination instruction, a VLM can select a larger or nearer generic
+    instance (for example, one food can instead of another).  Keep this
+    detector-only instruction private: the public evidence continues to store
+    the caller's concise query.
+    """
+
+    target = " ".join(str(query).split())
+    return (
+        f"the exact semantic target described as {target}; use visible semantic "
+        "attributes and relations to distinguish it from all other objects or "
+        "regions, and do not select a generic visual match merely because it is "
+        "closer or larger"
+    )
 
 
 def _vector(values: Any, length: int, label: str) -> np.ndarray:
