@@ -9,7 +9,6 @@ from vaw.context_runtime.packet import (
     CONTEXT_HEIGHT,
     CONTEXT_WIDTH,
     ContextCompiler,
-    _agentview_with_base_axes,
     _observed_source_ref,
 )
 from vaw.context_runtime.workspace import ContextWorkspace
@@ -31,17 +30,11 @@ def _workspace() -> ContextWorkspace:
     return ContextWorkspace(api, "place the can in the basket", motion_backend="pyroki")
 
 
-def test_agentview_base_control_legend_matches_libero_motion_semantics() -> None:
-    rgb = np.zeros((512, 800, 3), dtype=np.uint8)
-    raster = _agentview_with_base_axes(rgb, {}, None)
+def test_agentview_is_the_clean_current_rgb() -> None:
+    workspace = _workspace()
+    packet = ContextCompiler().compile(workspace)
 
-    # Legend origin is (90, 400): +X down, +Y right, +Z up.
-    red = raster[440, 90]
-    green = raster[400, 130]
-    blue = raster[360, 90]
-    assert red[0] > 180 and red[0] > red[1] * 4 and red[0] > red[2] * 4
-    assert green[1] > 140 and green[1] > green[0] * 4 and green[1] > green[2] * 2
-    assert blue[2] > 190 and blue[2] > blue[0] * 4 and blue[2] > blue[1] * 2
+    assert np.array_equal(packet.rasters["agentview"], workspace._private.camera("agentview")["images"]["rgb"])
 
 
 def test_packet_modes_follow_owner_and_evidence_not_history() -> None:
@@ -63,7 +56,7 @@ def test_packet_modes_follow_owner_and_evidence_not_history() -> None:
     assert packet.decision.mode == "editing"
     assert packet.world.owner == "imagination"
     assert packet.world.action["status"] == "editing"
-    assert packet.decision.primary_raster_id == "decision:imagination"
+    assert packet.world.imagination_scene_raster_id == "imagination_scene"
 
     action_id = workspace.execute("finish_imagination", status="ready").result[
         "action_id"
@@ -139,7 +132,7 @@ def test_grasp_preview_focuses_observed_region_instead_of_virtual_seed() -> None
     assert _observed_source_ref(workspace._private.imagination_artifacts) == region_id
 
 
-def test_agentview_stays_observed_but_near_field_gains_imagination_overlay() -> None:
+def test_observed_views_stay_current_but_imagination_scene_gains_preview() -> None:
     workspace = _workspace()
     compiler = ContextCompiler()
     observed = compiler.compile(workspace)
@@ -147,8 +140,15 @@ def test_agentview_stays_observed_but_near_field_gains_imagination_overlay() -> 
     editing = compiler.compile(workspace)
 
     assert np.array_equal(observed.rasters["agentview"], editing.rasters["agentview"])
-    assert not np.array_equal(observed.rasters["near_field"], editing.rasters["near_field"])
-    assert "decision:imagination" in editing.rasters
+    assert np.array_equal(
+        observed.rasters["observed_scene"], editing.rasters["observed_scene"]
+    )
+    assert not np.array_equal(
+        observed.rasters["imagination_scene"],
+        editing.rasters["imagination_scene"],
+    )
+    assert observed.rasters["observed_scene"].shape == (570, 960, 3)
+    assert editing.rasters["imagination_scene"].shape == (560, 1000, 3)
 
 
 def test_packet_is_deterministic_and_does_not_leak_private_state() -> None:
@@ -178,8 +178,8 @@ def test_packet_is_deterministic_and_does_not_leak_private_state() -> None:
     assert forbidden.isdisjoint(set(_walk_keys(snapshot)))
     encoded = json.dumps(snapshot).lower()
     assert "functionrecord" not in encoded and "waypointdraft" not in encoded
-    assert snapshot["schemaVersion"] == 8
-    assert snapshot["schema"] == "vaw-context-v7-dual-agent-review"
+    assert snapshot["schemaVersion"] == 11
+    assert snapshot["schema"] == "vaw-context-v10-via-dense"
     assert snapshot["viewport"] == {"width": CONTEXT_WIDTH, "height": CONTEXT_HEIGHT}
 
 

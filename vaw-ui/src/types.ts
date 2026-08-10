@@ -1,14 +1,15 @@
 export interface ContextSnapshot {
-  schemaVersion: 8
-  schema: 'vaw-context-v7-dual-agent-review'
+  schemaVersion: 11
+  schema: 'vaw-context-v10-via-dense'
   renderId: string
   revision: number
-  viewport: { width: 1920; height: 1440 }
+  viewport: { width: 1920; height: 1080 }
   rasterIds: string[]
   rasters: Record<string, string>
   world: {
     agentviewRasterId: string
-    nearFieldRasterId: string | null
+    observedSceneRasterId: string
+    imaginationSceneRasterId: string
     owner: 'main' | 'imagination'
     refinementGoal: string | null
     latestError: string | null

@@ -35,7 +35,7 @@ class SolidRenderer:
     name = "test-renderer"
 
     def render(self, packet):
-        return np.full((1440, 1920, 3), packet.revision, dtype=np.uint8)
+        return np.full((1080, 1920, 3), packet.revision, dtype=np.uint8)
 
     def close(self):
         return None

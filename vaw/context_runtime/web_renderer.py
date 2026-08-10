@@ -15,7 +15,7 @@ from vaw.context_runtime.packet import (
 
 
 class ContextWebRenderer:
-    name = "context-web-v7-dual-agent-review"
+    name = "context-web-v10-via-dense"
     width = CONTEXT_WIDTH
     height = CONTEXT_HEIGHT
 

@@ -1,7 +1,7 @@
 # VAW — Visual Action Workspace
 
 `vaw` 是面向 LIBERO-PRO 的双 Agent Visual Context Runtime。它把当前真实观测与动作想象
-编译为固定 `1920×1440` Canvas，但模型不点击页面：动作通道始终是 structured Function
+编译为固定 `1920×1080` Canvas，但模型不点击页面：动作通道始终是 structured Function
 call。
 
 当前架构不再回放 Function history，也不维护 Persistent Waypoint。Main Agent 负责语义决策
@@ -67,13 +67,16 @@ finish_imagination(status="ready" | "failed")
 
 ## Canvas
 
-Web schema 8 / `vaw-context-v7-dual-agent-review` / renderer
-`context-web-v7-dual-agent-review`：
+Web schema 11 / `vaw-context-v10-via-dense` / renderer
+`context-web-v10-via-dense`：
 
-- 上层 `CURRENT OBSERVED`：agentview 始终为真实 RGB；非想象时 gripper-local 为真实 RGB-D，
-  Imagination 期间在同一份当前点云上叠加紫色虚拟机器人并提高近场采样密度；
-- 下层 `IMAGINATION WORKSPACE`：grounding、ActionSeed、editing、reviewed、error 或 idle；
-- 紫色机器人只存在于下层，并始终表示未执行的预测；
+- 上层 `OBSERVED NOW · REAL WORLD`：干净 agentview、与 agentview 标定透视一致的稠密
+  RGB-D surface 和四行本体状态；
+- 下层 `IMAGINATION · NOT EXECUTED`：同一当前 RGB-D surface 的 target-centered 放大图、
+  蓝色当前夹爪和高显著度紫色 target gripper；
+- BASE/WORLD 坐标提示由 robot-base 几何投影产生，并固定在角落以避免遮挡 target；
+- grounding、ActionSeed 与 refinement 信息只占用下层固定 overlay，不改变双层版式；
+- 紫色几何只存在于下层，并始终表示未执行的预测；
 - 无 receipt 页面、旧 Function history、Task 重复文本或 privileged state。
 
 Depth、相机参数、raw mask/cloud、planner trajectory 和环境 success 只存在于 private context
@@ -90,6 +93,7 @@ vaw/context_runtime/
   protocol.py       # 两个独立 System Prompt 和工具视图
   runtime.py        # history-free Main/Imagination ownership loop
   packet.py         # private state → policy-visible ContextPacket
+  scene_view.py     # camera-aligned dense RGB-D surface + 当前/目标实体 FK silhouette
   web_renderer.py   # fixed Playwright screenshot
   trace.py          # 完整审计记录；不回灌策略
 ```

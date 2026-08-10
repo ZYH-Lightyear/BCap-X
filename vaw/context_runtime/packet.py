@@ -25,18 +25,19 @@ from vaw.context_runtime.model import (
     Pose,
     RobotState,
 )
-from vaw.context_runtime.near_field import NearFieldPreview, render_near_field
+from vaw.context_runtime.near_field import NearFieldPreview
 from vaw.context_runtime.private import (
     ActionReviewArtifacts,
     ImaginationArtifacts,
     PrivateEnvContext,
 )
+from vaw.context_runtime.scene_view import render_scene_view
 from vaw.context_runtime.workspace import ContextWorkspace
 
-CONTEXT_SCHEMA = "vaw-context-v7-dual-agent-review"
-CONTEXT_WEB_SCHEMA_VERSION = 8
+CONTEXT_SCHEMA = "vaw-context-v10-via-dense"
+CONTEXT_WEB_SCHEMA_VERSION = 11
 CONTEXT_WIDTH = 1920
-CONTEXT_HEIGHT = 1440
+CONTEXT_HEIGHT = 1080
 
 BLUE = (37, 99, 235)
 GREEN = (22, 163, 74)
@@ -136,7 +137,8 @@ class SeedSpec:
 @dataclass(frozen=True)
 class WorldContextSpec:
     agentview_raster_id: str
-    near_field_raster_id: str | None
+    observed_scene_raster_id: str
+    imagination_scene_raster_id: str
     robot: RobotState | None
     owner: str
     action: dict[str, Any] | None
@@ -146,7 +148,8 @@ class WorldContextSpec:
     def summary(self) -> dict[str, Any]:
         return {
             "agentviewRasterId": self.agentview_raster_id,
-            "nearFieldRasterId": self.near_field_raster_id,
+            "observedSceneRasterId": self.observed_scene_raster_id,
+            "imaginationSceneRasterId": self.imagination_scene_raster_id,
             "robot": self.robot.summary() if self.robot is not None else None,
             "owner": self.owner,
             "action": self.action,
@@ -248,26 +251,33 @@ class ContextCompiler:
         with suppress(RuntimeError, ValueError):
             wrist_camera = private.camera(workspace.wrist_camera_name)
         target, active_artifacts, action_presentation = _active_presentation(workspace)
-        near_field_preview = (
+        scene_preview = (
             _near_field_preview(state, target, active_artifacts)
-            if state.imagination is not None and target is not None
+            if target is not None
             else None
         )
-        near_field = render_near_field(
+        observed_scene = render_scene_view(
             camera,
             wrist_camera,
             state.robot,
-            near_field_preview,
+            dark=False,
+        )
+        imagination_scene = render_scene_view(
+            camera,
+            wrist_camera,
+            state.robot,
+            scene_preview,
+            dark=True,
         )
 
         # The persistent world view is deliberately sensor-clean.  All
         # grounding, self and imagination overlays belong to the dynamic
         # decision workspace below it.
         rasters: dict[str, np.ndarray] = {
-            "agentview": _agentview_with_base_axes(rgb, camera, state.robot)
+            "agentview": rgb.copy(),
+            "observed_scene": observed_scene,
+            "imagination_scene": imagination_scene,
         }
-        if near_field is not None:
-            rasters["near_field"] = near_field
 
         region_specs = self._compile_regions(state, rgb, private.region_masks, rasters)
         point_specs = self._compile_points(state, rgb, rasters)
@@ -280,31 +290,13 @@ class ContextCompiler:
             tcp_to_hand_local_xyz=workspace._tcp_to_hand_local_xyz,
         )
         decision = _decision_spec(workspace)
-        if decision.mode in {"editing", "reviewed"} and target is not None:
-            raster_id = "decision:imagination"
-            rasters[raster_id] = _proposal_raster(
-                rgb,
-                state,
-                camera,
-                target,
-                active_artifacts,
-            )
-            decision = DecisionWorkspaceSpec(
-                mode=decision.mode,
-                region_ids=decision.region_ids,
-                point_ids=decision.point_ids,
-                seed_ids=decision.seed_ids,
-                action_id=decision.action_id,
-                primary_raster_id=raster_id,
-            )
         event = private.presentation_event
         packet = ContextPacket(
             revision=state.observation_revision,
             world=WorldContextSpec(
                 agentview_raster_id="agentview",
-                near_field_raster_id=(
-                    "near_field" if near_field is not None else None
-                ),
+                observed_scene_raster_id="observed_scene",
+                imagination_scene_raster_id="imagination_scene",
                 robot=state.robot,
                 owner=state.owner,
                 action=action_presentation,

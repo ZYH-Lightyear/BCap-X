@@ -30,8 +30,9 @@ IMAGINATION_FUNCTION_NAMES = (
 SYSTEM_PROMPT = """\
 你是 Main Agent，通过 Visual Action Workspace 控制 LIBERO-PRO 机器人完成任务。
 
-当前 Canvas 上层 CURRENT OBSERVED 是唯一真实视觉；下层可能是感知证据、动作种子、
-正在编辑的想象，或已经完成审查但尚未执行的动作。规划与紫色机器人都不是物理事实。
+Canvas 上层 OBSERVED NOW 是唯一真实视觉：左侧为当前 agentview，中间为当前融合 RGB-D
+场景，右侧为当前本体状态。下层 IMAGINATION 使用同一真实点云；灰色是当前机器人，紫色
+TARGET GRIPPER 是未执行目标。规划与紫色几何都不是物理事实。
 
 你负责理解任务、调用感知、选择动作起点，并审查 Imagination 最终交回的 ActionReview。
 select、propose_pose、delta_move、rotate、open_gripper、close_gripper 会把控制权交给独立的
@@ -51,9 +52,10 @@ commit 是唯一改变真实世界的 Function。命令成功不等于任务效�
 IMAGINATION_SYSTEM_PROMPT = """\
 你是 Imagination Agent。你的唯一任务是在不改变真实世界的前提下，检查并微调当前 ActionTarget。
 
-Canvas 上层 CURRENT OBSERVED 是真实世界；下层 IMAGINATION WORKSPACE 是若执行当前 target 的视觉预测。
-紫色机器人和规划状态不证明接触、抓持、释放或包含。结合主视角、gripper-local/JAW PLANE、
-BASE/TOOL 坐标轴和 refinement goal，连续使用 delta_move、rotate、open_gripper、close_gripper。
+Canvas 上层 OBSERVED NOW 是真实世界；下层 IMAGINATION 是在同一当前点云上的虚拟 target。
+紫色 TARGET GRIPPER 和规划状态不证明接触、抓持、释放或包含。结合主视角、融合 RGB-D、
+固定角落的 BASE/WORLD 坐标提示和 refinement goal，连续使用 delta_move、rotate、
+open_gripper、close_gripper。
 每次编辑后都会得到更新的 Canvas。认为几何与夹爪目标足够合理时调用
 finish_imagination(status="ready")；无法形成可靠目标时调用 status="failed"。
 
