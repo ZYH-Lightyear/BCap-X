@@ -312,12 +312,28 @@ OR fail this target
 camera-to-base 变换与 grasp target 都与该错误 box 内部一致，因此不是坐标转换错误。根因是底层
 detector 被要求强制返回单个 box，却没有被要求在多个同类容器间做精确语义消歧。
 
-修复保持 Function schema 和 CaP-X 不变：VAW 在 detector 边界私下将简短 query 扩展为“精确
-语义目标；依据可见属性与关系区分其他对象/区域；不得因为更近或更大而选择 generic match”。
-Region 继续保存并向 Agent 展示原始简短 query。固定真实帧 probe 中，旧提示返回错误 box
-`[392,302,444,372]`，增强提示返回正确 box `[342,201,376,253]`；真实 scripted trace
-`m154_semantic_grounding_scripted_t0_s1` 使用原始无冠词 query 返回 `[342,201,375,252]`，且完成
-SAM、point lift、grasp seed 与 CuRobo 链路。该 smoke 只证明 grounding wiring，不计入任务成功门槛。
+第一次只增强 forced-single prompt 的尝试并不充分：固定帧和 scripted smoke 能返回正确目标，但
+`m154_qwen35plus_grounding_t0_s1` 在抓取失败后的再次检测中仍选择了红绿罐。这证明对同一个模型
+重复确认会产生自洽式错误，不能作为 verifier。
+
+最终修复保持 Function schema 和 CaP-X 不变，在 VAW 私有 detector 边界执行：
+
+```text
+最多三个 distinct semantic candidates
+→ full scene + 每个候选的放大 crop
+→ 独立选择一个候选，或明确返回 ambiguous
+→ 仅对通过复核的 box 调用 SAM
+```
+
+Agent 仍只看到原始简短 query、`region_id` 和最终 bbox；candidate evidence、复核回答和坐标约定
+只进入 trace。若复核无法区分则返回 error，不注册看似权威的 region。坐标解析复用 CaP-X 已配置
+的模型约定：GPT 使用 pixel，Qwen 使用 norm1000；真实测试曾捕获并修正强制 norm1000 导致 GPT
+box 上移的 wiring bug。
+
+真实 trace `m154_candidate_review_pixel_scripted_t0_s1` 中，生成器同时提出红绿罐
+`[397,303,447,371]` 和蓝色罐 `[339,203,372,251]`，放大复核选择第二项；随后 SAM、point lift、
+五个 grasp seed 与 CuRobo 链路均围绕正确目标完成。该 smoke 只证明 grounding wiring，不计入任务
+成功门槛。
 
 验收：主任务 seeds `0,1,2` 至少 `2/3` env success。
 
@@ -352,7 +368,7 @@ SAM、point lift、grasp seed 与 CuRobo 链路。该 smoke 只证明 grounding 
 | M1.5.1 | metric Contact Focus 能让 2–3 cm/小角度修正可读 | `5d056f0` | 12 packet/agent tests + Ruff + Web build | `m151_v11_control_focus_scripted_t0_s1` | 五 seed 完整；3 cm 蓝紫分离和 5° 新旧轮廓可读；开放式静态 VLM probe 待完成 |
 | M1.5.2 | 最小 edit memory + neutral review 能结束振荡并促成 Main review | `07f0512` | 相关 runtime/packet/agent 回归 + Ruff + Web build | `m152_qwen35plus_review_t0_s1` | 首次 Imagination 一次修正后主动 ready，Main 审查并 commit；随后暴露 post-commit 因果丢失，进入 M1.5.3 |
 | M1.5.3 | one-shot physical continuity 能避免 commit 后任务重启 | `07f0512`, `ed590bf` | 40 full VAW tests + Ruff + Web build；post-commit fixture 为 `1920×1080` | `m153_post_commit_scripted_t0_s1`, `m153_qwen35plus_post_commit_t0_s1` | arm commit 后 Main 直接进入 close preview；arm+gripper 后提出 lift 核验；被拒绝的 Function 不再提前消费因果画面。下一首要失败是 detection 的语义错配，而非 post-commit 任务重启 |
-| M1.5.4 | 完整闭环可达到基本 pick-place 成功 | in progress | semantic grounding regression + full VAW regression | `m154_semantic_grounding_scripted_t0_s1` | 首个真实失败源已从“错误目标 box”修复为可复现的精确语义 grounding；下一步重新运行真实 Agent，定位新的第一失败点 |
+| M1.5.4 | 完整闭环可达到基本 pick-place 成功 | in progress | candidate parser/review/ambiguity tests + full VAW regression | `m154_qwen35plus_grounding_t0_s1`, `m154_candidate_review_pixel_scripted_t0_s1` | 单提示修复被真实 E2E 证伪；候选生成 + 放大 crop 复核已通过真实 wiring，下一步重新运行 Agent 并继续定位第一失败点 |
 
 ## 11. 非目标
 

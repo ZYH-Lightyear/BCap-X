@@ -40,6 +40,13 @@ from vaw.context_runtime.private import (
     SeedArtifacts,
     VisualEdit,
 )
+from vaw.context_runtime.semantic_grounding import (
+    candidate_prompt,
+    parse_candidates,
+    parse_choice,
+    render_candidate_review,
+    review_prompt,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -87,15 +94,7 @@ class ContextFunctions:
         camera = self.ws._camera()
         rgb = _camera_image(camera, "rgb")
         crop_rgb, origin = self.ws._crop_rgb(rgb, within_region_id)
-        local_box = _bounded_box(
-            self.ws._call_backend(
-                "vlm_bbox_detection",
-                crop_rgb,
-                _semantic_grounding_query(query),
-            ),
-            crop_rgb.shape[1],
-            crop_rgb.shape[0],
-        )
+        local_box = self._semantic_bbox(crop_rgb, str(query))
         results = self.ws._call_backend("segment_sam3_box_prompt", crop_rgb, list(local_box))
         if not isinstance(results, (list, tuple)):
             raise ContextFunctionError("segmentation did not return a result list")
@@ -136,6 +135,79 @@ class ContextFunctions:
             "region_id": region_id,
             "bbox_xyxy_px": [round(float(value), 3) for value in global_box],
         }
+
+    def _semantic_bbox(
+        self,
+        rgb: np.ndarray,
+        query: str,
+    ) -> tuple[float, float, float, float]:
+        if not callable(getattr(self.ws.api, "query_vlm", None)):
+            box = self.ws._call_backend(
+                "vlm_bbox_detection",
+                rgb,
+                _semantic_grounding_query(query),
+            )
+            self.ws._private.trace_diagnostics["semantic_grounding"] = {
+                "mode": "single_box_fallback",
+            }
+            return _bounded_box(box, rgb.shape[1], rgb.shape[0])
+
+        coord_space = _grounding_coord_space(self.ws.api)
+        candidate_reply = self.ws._call_backend(
+            "query_vlm",
+            candidate_prompt(
+                query,
+                width=rgb.shape[1],
+                height=rgb.shape[0],
+                coord_space=coord_space,
+            ),
+            images=rgb,
+            temperature=0.0,
+            max_tokens=512,
+        )
+        try:
+            candidates = parse_candidates(
+                str(candidate_reply),
+                width=rgb.shape[1],
+                height=rgb.shape[0],
+                coord_space=coord_space,
+            )
+        except ValueError as exc:
+            raise ContextFunctionError(f"semantic candidate parsing failed: {exc}") from exc
+        diagnostics: dict[str, Any] = {
+            "mode": "candidate_review",
+            "coord_space": coord_space,
+            "candidate_reply": str(candidate_reply),
+            "candidate_boxes": [
+                [round(float(value), 3) for value in item.box_xyxy_px]
+                for item in candidates
+            ],
+        }
+        self.ws._private.trace_diagnostics["semantic_grounding"] = diagnostics
+        if not candidates:
+            raise ContextFunctionError(f"semantic grounding found no candidate for '{query}'")
+
+        review_raster = render_candidate_review(rgb, candidates)
+        review_reply = self.ws._call_backend(
+            "query_vlm",
+            review_prompt(query),
+            images=review_raster,
+            temperature=0.0,
+            max_tokens=160,
+        )
+        diagnostics["review_reply"] = str(review_reply)
+        try:
+            selected = parse_choice(str(review_reply), count=len(candidates))
+        except ValueError as exc:
+            raise ContextFunctionError(f"semantic candidate review failed: {exc}") from exc
+        diagnostics["selected_candidate"] = (
+            None if selected is None else int(selected + 1)
+        )
+        if selected is None:
+            raise ContextFunctionError(
+                f"semantic grounding is ambiguous for '{query}'; refine the query"
+            )
+        return candidates[selected].box_xyxy_px
 
     def locate_point(
         self,
@@ -1205,6 +1277,20 @@ def _semantic_grounding_query(query: Any) -> str:
         "regions, and do not select a generic visual match merely because it is "
         "closer or larger"
     )
+
+
+def _grounding_coord_space(api: Any) -> str:
+    """Reuse the configured CaP-X grounding convention at the VAW boundary."""
+
+    resolver = getattr(api, "_vlm_grounding_coord_space", None)
+    if callable(resolver):
+        try:
+            value = str(resolver(None, None))
+        except (TypeError, ValueError):
+            value = "pixel"
+        if value in {"pixel", "norm1000"}:
+            return value
+    return "pixel"
 
 
 def _vector(values: Any, length: int, label: str) -> np.ndarray:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pytest
 from scipy.spatial.transform import Rotation
 
 from vaw.context_runtime import (
@@ -137,6 +138,25 @@ class FakeCuroboContextApi(FakeContextApi):
         self.cartesian[3:7] = self._target_quaternion
 
 
+class FakeSemanticGroundingApi(FakeContextApi):
+    def __init__(self, *, choice: int | None = 2) -> None:
+        super().__init__()
+        self.choice = choice
+        self.query_images: list[np.ndarray] = []
+        self.query_prompts: list[str] = []
+
+    def query_vlm(self, prompt, images=None, **kwargs):
+        del kwargs
+        self.query_prompts.append(str(prompt))
+        self.query_images.append(np.asarray(images).copy())
+        if len(self.query_prompts) == 1:
+            return (
+                '[{"box":[16,24,64,84],"evidence":"generic can"},'
+                '{"box":[96,12,144,60],"evidence":"exact label"}]'
+            )
+        return json.dumps({"candidate": self.choice})
+
+
 class FailedMotionBackend:
     name = "failed-test"
     tcp_to_hand_local_xyz = (0.0, 0.0, -0.1)
@@ -225,6 +245,37 @@ def test_detection_privately_requests_exact_semantic_disambiguation() -> None:
     assert "generic visual match" in api.bbox_queries[0]
     region = workspace.state.regions[result.result["region_id"]]
     assert region.query == "alphabet soup can"
+
+
+def test_detection_reviews_enlarged_candidates_before_registering_region() -> None:
+    api = FakeSemanticGroundingApi(choice=2)
+    workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
+
+    result = workspace.execute("detection_and_sam", query="alphabet soup can")
+
+    assert result.ok
+    assert result.result["bbox_xyxy_px"] == pytest.approx([96.0, 12.0, 144.0, 60.0])
+    assert api.bbox_queries == []
+    assert [image.shape for image in api.query_images] == [
+        (120, 160, 3),
+        (720, 1200, 3),
+    ]
+    assert "up to three distinct plausible candidates" in api.query_prompts[0]
+    assert "enlarged candidate crops" in api.query_prompts[1]
+    diagnostics = result.trace_diagnostics["semantic_grounding"]
+    assert diagnostics["mode"] == "candidate_review"
+    assert diagnostics["selected_candidate"] == 2
+
+
+def test_detection_rejects_ambiguous_semantic_review_without_region() -> None:
+    api = FakeSemanticGroundingApi(choice=None)
+    workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
+
+    result = workspace.execute("detection_and_sam", query="ambiguous can")
+
+    assert not result.ok
+    assert "ambiguous" in result.result["error"]
+    assert workspace.state.regions == {}
 
 
 def test_continuous_imagination_edits_one_target_then_hands_off() -> None:
