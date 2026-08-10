@@ -284,12 +284,13 @@ class ContextRuntime:
             )
         except ValueError as exc:
             return self.workspace.reject(call.name, call.args, str(exc))
-        if owner == "main":
-            # Consume the context only after Main has returned a protocol-valid
-            # decision.  A commit may immediately install the next one-shot
-            # LastPhysicalAction during execution.
-            self.workspace.consume_main_context()
         step = self.workspace.execute(name, **arguments)
+        if owner == "main" and name != "commit" and step.ok:
+            # A rejected Function is not a valid decision: retain the causal
+            # comparison so Main can repair its arguments without losing what
+            # just happened.  A successful commit refreshes/replaces this
+            # context atomically inside the workspace.
+            self.workspace.consume_main_context()
         return step
 
     def _set_private_imagination_turn(self, count: int) -> None:

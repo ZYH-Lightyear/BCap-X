@@ -256,9 +256,9 @@ def _run_scripted(
         owner = workspace.state.owner
         packet = compiler.compile(workspace)
         image = renderer.render(packet)
-        if owner == "main":
-            workspace.consume_main_context()
         result = workspace.execute(name, **arguments)
+        if owner == "main" and name != "commit" and result.ok:
+            workspace.consume_main_context()
         env_success = bool(env.task_completed()) if name in workspace.PHYSICAL_FUNCTIONS else None
         trace.log_turn(
             turn=turn,

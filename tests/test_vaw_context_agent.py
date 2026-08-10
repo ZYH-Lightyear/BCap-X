@@ -119,8 +119,15 @@ def test_last_physical_action_is_visible_for_one_valid_main_decision() -> None:
             ),
             _response(3, "commit", action_id="a1"),
             ModelResponse(text="no function this time", tool_calls=()),
-            _response(5, "detection_and_sam", query="can"),
-            _response(6, "done", success=False),
+            _response(
+                5,
+                "delta_move",
+                delta_xyz_m=[0.0, 0.0, 0.05],
+                frame="base",
+                refinement_goal="抬升并检查物体是否随动",
+            ),
+            _response(6, "detection_and_sam", query="can"),
+            _response(7, "done", success=False),
         ]
     )
     imagination = RecordingProvider(
@@ -136,7 +143,9 @@ def test_last_physical_action_is_visible_for_one_valid_main_decision() -> None:
     assert "Last Physical Action" in _user_text(main.messages[2])
     assert "只设置真实执行后的张开目标" in _user_text(main.messages[2])
     assert "Last Physical Action" in _user_text(main.messages[3])
-    assert "Last Physical Action" not in _user_text(main.messages[4])
+    assert "Last Physical Action" in _user_text(main.messages[4])
+    assert "within [-0.03, 0.03]" in _user_text(main.messages[4])
+    assert "Last Physical Action" not in _user_text(main.messages[5])
     assert all(_image_count(messages) == 1 for messages in main.messages)
 
 
