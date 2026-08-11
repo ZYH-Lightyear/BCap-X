@@ -31,8 +31,8 @@ function Root() {
   useEffect(() => {
     window.__VAW_RENDER__ = async (next) => {
       if (
-        next.schemaVersion !== 18
-        || next.schema !== 'vaw-context-v17-contact-semantics'
+        next.schemaVersion !== 19
+        || next.schema !== 'vaw-context-v18-physical-continuity'
         || next.viewport.width !== 1920
         || next.viewport.height !== 1080
       ) {

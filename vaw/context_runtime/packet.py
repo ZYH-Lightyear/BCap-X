@@ -36,8 +36,8 @@ from vaw.context_runtime.private import (
 from vaw.context_runtime.scene_view import render_scene_view
 from vaw.context_runtime.workspace import ContextWorkspace
 
-CONTEXT_SCHEMA = "vaw-context-v17-contact-semantics"
-CONTEXT_WEB_SCHEMA_VERSION = 18
+CONTEXT_SCHEMA = "vaw-context-v18-physical-continuity"
+CONTEXT_WEB_SCHEMA_VERSION = 19
 CONTEXT_WIDTH = 1920
 CONTEXT_HEIGHT = 1080
 
@@ -539,15 +539,9 @@ def _decision_spec(workspace: ContextWorkspace) -> DecisionWorkspaceSpec:
             seed_ids=tuple(state.seeds)[:5],
         )
 
-    if (
-        state.last_physical_action is not None
-        and workspace._private.last_physical_artifacts is not None
-    ):
-        return DecisionWorkspaceSpec(mode="post_commit")
-
-    # A Main-review target may remain available while Main gathers newer evidence.
-    # The lower canvas must show that latest evidence instead of pinning an old
-    # reviewed preview over every subsequent detection/proposal result.
+    # A non-physical Function presents its new evidence in the large decision
+    # surface.  The last physical current crop remains available as a compact
+    # revision-local continuity inset; it must not replace the new evidence.
     if event is not None:
         if event.error is not None:
             return DecisionWorkspaceSpec(mode="error")
@@ -575,6 +569,12 @@ def _decision_spec(workspace: ContextWorkspace) -> DecisionWorkspaceSpec:
                 point_ids=points,
                 primary_raster_id=primary,
             )
+
+    if (
+        state.last_physical_action is not None
+        and workspace._private.last_physical_artifacts is not None
+    ):
+        return DecisionWorkspaceSpec(mode="post_commit")
 
     if state.action_review is not None:
         return DecisionWorkspaceSpec(

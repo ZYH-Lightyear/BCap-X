@@ -301,6 +301,8 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
     assert "不是 pre-grasp" in IMAGINATION_SYSTEM_PROMPT
     assert "TCP→SOURCE" in IMAGINATION_SYSTEM_PROMPT
     assert "继续随机" in IMAGINATION_SYSTEM_PROMPT
+    assert "非物理 Function 不刷新真实 observation" in SYSTEM_PROMPT
+    assert "不得仅因下层切换" in SYSTEM_PROMPT
     assert "within_region_id" in SYSTEM_PROMPT
     for name in ("select", "propose_pose", "open_gripper", "close_gripper"):
         definition = next(x["function"] for x in main if x["function"]["name"] == name)

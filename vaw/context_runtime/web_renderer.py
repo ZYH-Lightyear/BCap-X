@@ -15,7 +15,7 @@ from vaw.context_runtime.packet import (
 
 
 class ContextWebRenderer:
-    name = "context-web-v17-contact-semantics"
+    name = "context-web-v18-physical-continuity"
     width = CONTEXT_WIDTH
     height = CONTEXT_HEIGHT
 

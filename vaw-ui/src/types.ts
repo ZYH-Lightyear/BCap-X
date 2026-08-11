@@ -1,6 +1,6 @@
 export interface ContextSnapshot {
-  schemaVersion: 18
-  schema: 'vaw-context-v17-contact-semantics'
+  schemaVersion: 19
+  schema: 'vaw-context-v18-physical-continuity'
   renderId: string
   revision: number
   viewport: { width: 1920; height: 1080 }

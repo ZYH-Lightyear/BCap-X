@@ -234,12 +234,12 @@ def test_packet_is_deterministic_and_does_not_leak_private_state() -> None:
     assert forbidden.isdisjoint(set(_walk_keys(snapshot)))
     encoded = json.dumps(snapshot).lower()
     assert "functionrecord" not in encoded and "waypointdraft" not in encoded
-    assert snapshot["schemaVersion"] == 18
-    assert snapshot["schema"] == "vaw-context-v17-contact-semantics"
+    assert snapshot["schemaVersion"] == 19
+    assert snapshot["schema"] == "vaw-context-v18-physical-continuity"
     assert snapshot["viewport"] == {"width": CONTEXT_WIDTH, "height": CONTEXT_HEIGHT}
 
 
-def test_commit_compiles_one_shot_post_action_visual_comparison() -> None:
+def test_commit_comparison_persists_across_nonphysical_grounding() -> None:
     workspace = _workspace()
     workspace.execute("open_gripper")
     action_id = workspace.execute("finish_imagination", status="ready").result[
@@ -260,11 +260,23 @@ def test_commit_compiles_one_shot_post_action_visual_comparison() -> None:
 
     workspace.consume_main_context()
     consumed = ContextCompiler().compile(workspace)
-    assert consumed.decision.mode == "idle"
+    assert consumed.decision.mode == "post_commit"
     assert consumed.world.last_physical_action is not None
     assert consumed.world.last_physical_action.executed_stages == "gripper"
-    assert "post_commit:before" not in consumed.rasters
-    assert "post_commit:current" not in consumed.rasters
+    assert "post_commit:before" in consumed.rasters
+    assert "post_commit:current" in consumed.rasters
+
+    region_id = workspace.execute("detection_and_sam", query="basket").result[
+        "region_id"
+    ]
+    workspace.consume_main_context()
+    grounded = ContextCompiler().compile(workspace)
+    assert grounded.decision.mode == "grounding"
+    assert grounded.decision.region_ids == (region_id,)
+    assert grounded.world.post_commit_before_raster_id == "post_commit:before"
+    assert grounded.world.post_commit_current_raster_id == "post_commit:current"
+    assert "post_commit:before" in grounded.rasters
+    assert "post_commit:current" in grounded.rasters
 
     workspace.execute("delta_move", delta_xyz_m=[0.0, 0.0, 0.01], frame="base")
     editing = ContextCompiler().compile(workspace)

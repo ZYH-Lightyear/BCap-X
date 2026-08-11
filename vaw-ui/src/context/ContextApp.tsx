@@ -129,6 +129,29 @@ function ModeOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
   return null
 }
 
+function PhysicalContinuityInset({ snapshot }: { snapshot: ContextSnapshot }) {
+  const action = snapshot.world.lastPhysicalAction
+  const currentId = snapshot.world.postCommitCurrentRasterId
+  if (!action || !currentId) return null
+  const facts: string[] = []
+  if (action.requested_arm_delta_base_m) {
+    facts.push(`ARM Δ ${fmt(action.requested_arm_delta_base_m)} m`)
+  }
+  if (action.target_gripper) facts.push(`GRIP CMD ${action.target_gripper.toUpperCase()}`)
+  return (
+    <aside className="via-continuity-inset">
+      <div className="via-continuity-raster">
+        <Raster snapshot={snapshot} id={currentId} alt="最近 commit 后的当前真实目标区域" />
+        <strong>LAST COMMIT · CURRENT OBSERVED</strong>
+      </div>
+      <div className="via-continuity-facts">
+        <b>SAME OBSERVATION</b>
+        <code>{facts.join(' · ') || action.executed_stages.toUpperCase()}</code>
+      </div>
+    </aside>
+  )
+}
+
 function decisionHeader(snapshot: ContextSnapshot, seedHeader: string): string {
   switch (snapshot.decision.mode) {
     case 'seeds': return seedHeader
@@ -197,6 +220,9 @@ function ImaginationLayer({ snapshot }: { snapshot: ContextSnapshot }) {
     ? 'ACTION SEEDS · VIRTUAL OPTIONS'
     : `ACTION SEEDS · GRIP ${observedGrip.toFixed(3)} INHERITED`
   const header = decisionHeader(snapshot, seedHeader)
+  const showContinuity = !active
+    && snapshot.world.postCommitCurrentRasterId !== null
+    && ['idle', 'grounding', 'error'].includes(snapshot.decision.mode)
   return (
     <section className={`via-imagination${active ? ' via-imagination--active' : ''}${selecting ? ' via-imagination--seeds' : ''}`}>
       <header><h1>{header}</h1></header>
@@ -219,6 +245,7 @@ function ImaginationLayer({ snapshot }: { snapshot: ContextSnapshot }) {
             : <>
                 <Raster snapshot={snapshot} id={snapshot.world.imaginationSceneRasterId} alt="当前点云上的虚拟 Waypoint" />
                 <ModeOverlay snapshot={snapshot} />
+                {showContinuity && <PhysicalContinuityInset snapshot={snapshot} />}
               </>}
       </div>
     </section>

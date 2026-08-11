@@ -480,6 +480,21 @@ Imagination 却把它当作需要先抬高的 pre-grasp。首个 seed 被累计�
 消除了当前已知的 pre-grasp 误读，但旋转是否改善接触仍必须由连续 Preview 和真实闭环验证，不能
 作为任务成功证据。
 
+真实 Agent trace `m154r_qwen35plus_contact_semantics_t0_s0` 验证了 contact 修订的真实作用：Main
+使用首个 grasp seed，Imagination 没有上抬或随机旋转；arm+close 后 `GRIP=0.796`，随后 base +Z
+`3 cm` 的 POST-COMMIT 画面清晰显示 alphabet soup can 随夹爪离开支撑面。Main 当轮正确判断
+“grasp verified”并转向检测 basket。但 basket detection 是非物理调用，Context Builder 却在下一轮
+完全移除了 before→current 核验画面，只留下 basket grounding 与紧凑文本；Main 随即在同一真实
+observation 上反转为“罐头仍在桌面”，开始重新抓取手中物体。
+
+因此下一修订不是 object tracking，也不是把“已抓住”写成真值，而是让当前 observation 的物理因果
+视觉在非物理调用间持续：完整 POST-COMMIT 对照仍只显示一轮；之后 grounding/idle/error 模式在
+下层保留小型 `LAST COMMIT · CURRENT OBSERVED` 当前 crop，与新 evidence 并列。该 crop 与当前
+RGB 属于同一 revision，不是旧图或历史截图；进入新 Imagination/Review 时隐藏，下一次 commit
+自动替换。Prompt 只补充一条因果约束：非物理 Function 不改变 observation，不能仅因 evidence
+面板切换或 GRIP 数值反转刚从当前 RGB 得出的随动结论。版本更新为 Web schema 19 /
+`vaw-context-v18-physical-continuity` / renderer `context-web-v18-physical-continuity`。
+
 验收：主任务 seeds `0,1,2` 至少 `2/3` env success。
 
 ### M1.5.5 — Basic Generalization and Freeze
@@ -527,6 +542,7 @@ Imagination 却把它当作需要先抬高的 pre-grasp。首个 seed 被累计�
 | M1.5.4-l | Action Review 应审查局部 refinement goal，而不是要求每个动作直接完成 User Task | in progress | Review prompt contract regression | `m154o_qwen35plus_review_focus_t0_s0` | pick/lift 失败被正确识别；Review 却以“没有抓住/没去篮子”为由否决必要的纯 open 和 side-grasp approach。补充通用 prerequisite/局部动作审查原则后待复测 |
 | M1.5.4-m | gripper-only Preview 之后的空间编辑必须以启动时真实 TCP 为累计位移基线 | in progress | private baseline / cumulative EditSummary regression | `m154p_qwen35plus_local_review_t0_s0` | Imagination 实际累计 base Z `-9.5 cm`，但 Review 只看到最后一步 `-2 cm` 后错误 commit；根因是 gripper-only target 无 pose 时私有 baseline 缺失，修复不改变公共 target 的 gripper-only 语义 |
 | M1.5.4-n | grasp seed 必须被解释为最终接触目标，并提供当前 source surface 的可视距离证据 | in progress | 64 full VAW tests + Ruff + Web build；同任务无物理 contact probe：`TCP→SOURCE=1.6 mm` 后不再自动上抬 | `m154q_qwen35plus_cumulative_review_t0_s0` | 旧图仅换 Prompt 仍上抬 2.5 cm；v17 probe 改为一次姿态微调，证明 contact metric 有效但尚未证明真实闭环成功，进入 frozen seed 复测 |
+| M1.5.4-o | 非物理 grounding 不得抹去同一 observation 中刚验证的物理因果视觉 | in progress | revision-local post-commit raster persistence / grounding precedence / Web regression | `m154r_qwen35plus_contact_semantics_t0_s0` | 首次真实抓持与 +3cm 随动成功；basket detection 后核验画面消失，Main 在同一 RGB 上反转结论并重抓手中物体。新增紧凑 current-observed continuity inset，待 frozen seed 复测 |
 | M1.5.4 | 完整闭环可达到基本 pick-place 成功 | in progress | 63 full VAW tests + Ruff + Web build | pending frozen seeds 0/1/2 | 尚未达到 `2/3 env_success`，不得宣称完成 |
 
 ## 11. 非目标

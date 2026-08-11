@@ -94,8 +94,8 @@ Main 自己的一句依据，用于在感知调用后保留“抓取失败，正
 
 ## Canvas
 
-Web schema 18 / `vaw-context-v17-contact-semantics` / renderer
-`context-web-v17-contact-semantics`：
+Web schema 19 / `vaw-context-v18-physical-continuity` / renderer
+`context-web-v18-physical-continuity`：
 
 - 上层 `OBSERVED NOW · REAL WORLD`：干净 agentview、与 agentview 标定透视一致的稠密
   RGB-D surface 和四行本体状态；
@@ -107,8 +107,9 @@ Web schema 18 / `vaw-context-v17-contact-semantics` / renderer
 - 没有 active target 时，下层明确标成 `CURRENT EVIDENCE · OBSERVED` 或
   `CURRENT GEOMETRY · OBSERVED`，不再把当前蓝色机器人误标成未执行想象；
 - commit 后下层短暂切换为同一 Canvas 内的 `BEFORE COMMIT → CURRENT OBSERVED` 目标区
-  对照；大图只显示一次，紧凑 `LastPhysicalAction` 在下一次 commit 前持续提供因果连续性，
-  不额外发送旧图或声明任务效果；
+  对照；大图只显示一次，后续非物理 grounding 在同一 observation 内保留一个紧凑的
+  `LAST COMMIT · CURRENT OBSERVED` 当前画面锚点，并与新 evidence 并列；它在进入新
+  Imagination/Review 时隐藏，在下一次 commit 时替换，不声明任务效果；
 - BASE/WORLD 坐标提示由 robot-base 几何投影产生，并固定在角落以避免遮挡 target；
 - grounding、ActionSeed 与 refinement 信息只占用下层固定 overlay，不改变双层版式；
 - 紫色几何只存在于下层，并始终表示未执行的预测；

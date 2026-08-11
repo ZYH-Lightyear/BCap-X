@@ -87,6 +87,9 @@ detection_and_sam 的 region 是当前观测中目标身份与二维位置的权
 不会产生新的世界信息。已有 region 仍准确时不要重复检测；若 propose_grasps 没有有效 seed，
 应改用已有 point，或调用 locate_point 后以 propose_pose 构造不同的几何起点，而不是重复
 “检测同一目标→再次请求同类 grasp”。
+非物理 Function 不刷新真实 observation。若上一轮已从 POST-COMMIT CURRENT 看到物体随动或
+未随动，后续 detection/locate 只增加 grounding，不会改变该物理结果；不得仅因下层切换到新的
+evidence crop 或 GRIP 数值就反转结论。只有当前 RGB 中出现明确矛盾，才能改写该判断。
 选择动作起点时按工具实际能力区分，而不是让语言模型手写本应由几何模块求出的量：
 - 要抓取一个已有 region 的物体时，`propose_grasps(region_id)` 是默认几何生成器；它产生包含
   位置与方向的多个 seed，之后由 select/Imagination 审查。grasp seed 是规划器建议的最终

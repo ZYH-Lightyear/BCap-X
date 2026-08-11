@@ -102,9 +102,11 @@ class ContextWorkspace:
         """Consume one-shot visual context after a valid Main decision.
 
         The immediately following Main request may see the latest imagination
-        handoff and the before/current physical comparison.  Once Main has
-        produced a valid Function call, those large visual artifacts no longer
-        belong in the current decision workspace.
+        handoff and the full before/current physical comparison.  Later
+        non-physical calls may replace the large decision surface with new
+        evidence, while retaining a compact crop from the same current
+        observation as physical continuity.  The crop is revision-local and is
+        replaced automatically by the next commit; it is not object tracking.
 
         ``LastPhysicalAction`` is deliberately *not* cleared here.  It is a
         compact, overwrite-only fact about the current observation revision,
@@ -114,8 +116,6 @@ class ContextWorkspace:
         """
 
         self.state.last_handoff = None
-        self._private.last_physical_artifacts = None
-        self._private.previous_observation = None
 
     def discard_action_review(self) -> None:
         """Discard the current review offer without changing the real world."""
