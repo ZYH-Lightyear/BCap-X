@@ -94,8 +94,8 @@ Main 自己的一句依据，用于在感知调用后保留“抓取失败，正
 
 ## Canvas
 
-Web schema 17 / `vaw-context-v16-review-contract` / renderer
-`context-web-v16-review-contract`：
+Web schema 18 / `vaw-context-v17-contact-semantics` / renderer
+`context-web-v17-contact-semantics`：
 
 - 上层 `OBSERVED NOW · REAL WORLD`：干净 agentview、与 agentview 标定透视一致的稠密
   RGB-D surface 和四行本体状态；

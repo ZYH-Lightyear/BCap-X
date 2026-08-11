@@ -165,11 +165,20 @@ function WaypointPanel({ snapshot }: { snapshot: ContextSnapshot }) {
   }
   if (lastPhysical) lastRealParts.push(lastPhysical.outcome.toUpperCase())
   const lastReal = lastRealParts.length > 0 ? lastRealParts.join(' · ') : null
+  const targetRole = action?.target_role
+    ?.replaceAll('_', ' ')
+    .toUpperCase() ?? 'NONE'
+  const sourceGap = action?.source_surface_distance_m
+  const sourceGapText = sourceGap === undefined
+    ? null
+    : `${(sourceGap * 1000).toFixed(0)} mm`
   return (
     <aside className="via-waypoint-panel">
       <h2>WAYPOINT</h2>
       <FactRow label="OWNER">{snapshot.world.owner.toUpperCase()}</FactRow>
       {lastReal && <FactRow label="LAST REAL">{lastReal}</FactRow>}
+      <FactRow label="TARGET ROLE">{targetRole}</FactRow>
+      {sourceGapText && <FactRow label="TCP→SOURCE">{sourceGapText}</FactRow>}
       <FactRow label="ARM">{action ? (planned ? 'PLANNED' : prediction?.solve_ik?.toUpperCase() ?? 'TARGET ONLY') : 'NONE'}</FactRow>
       <FactRow label="GRIP TARGET">{grip}</FactRow>
       <FactRow label="CONTACT"><em>UNKNOWN</em></FactRow>

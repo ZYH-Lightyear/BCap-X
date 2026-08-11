@@ -919,7 +919,19 @@ class ContextFunctions:
             )
             pose = review.target.pose
         else:
-            artifacts = ImaginationArtifacts()
+            robot = self.ws.state.robot
+            if robot is None or robot.tcp_pose is None:
+                raise ContextFunctionError("current TCP pose is unavailable")
+            # Keep a private spatial baseline even though the public target is
+            # deliberately gripper-only.  If Imagination later adds pose edits,
+            # EditSummary can then report their true cumulative displacement
+            # from the observed TCP instead of showing only the last edit.
+            artifacts = ImaginationArtifacts(
+                initial_target=ActionTarget(
+                    pose=robot.tcp_pose,
+                    gripper=_gripper_target(target),
+                )
+            )
             pose = None
         edit = VisualEdit(kind="gripper", gripper_target=target)
         return self._store_imagination(

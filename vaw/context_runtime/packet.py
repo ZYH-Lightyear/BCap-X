@@ -36,8 +36,8 @@ from vaw.context_runtime.private import (
 from vaw.context_runtime.scene_view import render_scene_view
 from vaw.context_runtime.workspace import ContextWorkspace
 
-CONTEXT_SCHEMA = "vaw-context-v16-review-contract"
-CONTEXT_WEB_SCHEMA_VERSION = 17
+CONTEXT_SCHEMA = "vaw-context-v17-contact-semantics"
+CONTEXT_WEB_SCHEMA_VERSION = 18
 CONTEXT_WIDTH = 1920
 CONTEXT_HEIGHT = 1080
 
@@ -703,6 +703,12 @@ def _active_presentation(
                 artifacts,
                 status="editing",
                 action_id=None,
+                target_role=_target_role(state.imagination.target, artifacts),
+                source_surface_distance_m=_source_surface_distance_m(
+                    workspace,
+                    state.imagination.target,
+                    artifacts,
+                ),
             ),
         )
     if state.action_review is not None:
@@ -718,6 +724,12 @@ def _active_presentation(
                 status="review",
                 action_id=state.action_review.action_id,
                 intent=state.action_review.intent,
+                target_role=_target_role(state.action_review.target, artifacts),
+                source_surface_distance_m=_source_surface_distance_m(
+                    workspace,
+                    state.action_review.target,
+                    artifacts,
+                ),
             ),
         )
     return None, None, None
@@ -729,9 +741,20 @@ def _target_presentation(
     *,
     status: str,
     action_id: str | None,
+    target_role: str,
+    source_surface_distance_m: float | None,
     intent: str | None = None,
 ) -> dict[str, Any]:
-    result: dict[str, Any] = {"status": status, "target": target.summary()}
+    result: dict[str, Any] = {
+        "status": status,
+        "target": target.summary(),
+        "target_role": target_role,
+    }
+    if source_surface_distance_m is not None:
+        result["source_surface_distance_m"] = round(
+            float(source_surface_distance_m),
+            4,
+        )
     if action_id is not None:
         result["action_id"] = action_id
     if intent is not None:
@@ -751,6 +774,57 @@ def _target_presentation(
     if edit_summary is not None:
         result["edit_summary"] = edit_summary.summary()
     return result
+
+
+def _target_role(
+    target: ActionTarget,
+    artifacts: ImaginationArtifacts | ActionReviewArtifacts | None,
+) -> str:
+    """Describe what the virtual pose means without exposing planner internals."""
+
+    if target.pose is None:
+        return "gripper_only"
+    context = artifacts.planning_context if artifacts is not None else None
+    if context is not None and context.source_kind == "grasp":
+        # GraspNet poses are intended contact/closure poses.  Treating them as
+        # clearance waypoints caused the VLM to lift otherwise useful seeds.
+        return "grasp_contact"
+    if context is not None and context.source_kind == "point":
+        return "point_pose"
+    return "relative_pose"
+
+
+def _source_surface_distance_m(
+    workspace: ContextWorkspace,
+    target: ActionTarget,
+    artifacts: ImaginationArtifacts | ActionReviewArtifacts | None,
+) -> float | None:
+    """Nearest observed source surface to the contact TCP, as a compact cue.
+
+    This is derived only from the current revision's segmented RGB-D points.
+    It is not a collision/contact oracle; it makes a visible free-space gap
+    explicit without exposing masks or point clouds in the packet.
+    """
+
+    if target.pose is None or artifacts is None or artifacts.planning_context is None:
+        return None
+    region_id = artifacts.planning_context.region_id
+    if region_id is None:
+        return None
+    geometry = workspace._private.region_geometry.get(region_id)
+    if geometry is None:
+        return None
+    points = np.asarray(geometry.filtered_object_points_base, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] < 3 or len(points) == 0:
+        points = np.asarray(geometry.object_points_base, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] < 3 or len(points) == 0:
+        return None
+    points = points[:, :3]
+    points = points[np.isfinite(points).all(axis=1)]
+    if len(points) == 0:
+        return None
+    target_xyz = np.asarray(target.pose.position_xyz, dtype=np.float64)
+    return float(np.min(np.linalg.norm(points - target_xyz, axis=1)))
 
 
 def _grounding_references(

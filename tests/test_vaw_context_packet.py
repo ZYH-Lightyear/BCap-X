@@ -57,6 +57,8 @@ def test_packet_modes_follow_owner_and_evidence_not_history() -> None:
     assert packet.decision.mode == "editing"
     assert packet.world.owner == "imagination"
     assert packet.world.action["status"] == "editing"
+    assert packet.world.action["target_role"] == "grasp_contact"
+    assert packet.world.action["source_surface_distance_m"] >= 0.0
     assert packet.world.imagination_scene_raster_id == "imagination_scene"
 
     action_id = workspace.execute("finish_imagination", status="ready").result[
@@ -232,8 +234,8 @@ def test_packet_is_deterministic_and_does_not_leak_private_state() -> None:
     assert forbidden.isdisjoint(set(_walk_keys(snapshot)))
     encoded = json.dumps(snapshot).lower()
     assert "functionrecord" not in encoded and "waypointdraft" not in encoded
-    assert snapshot["schemaVersion"] == 17
-    assert snapshot["schema"] == "vaw-context-v16-review-contract"
+    assert snapshot["schemaVersion"] == 18
+    assert snapshot["schema"] == "vaw-context-v17-contact-semantics"
     assert snapshot["viewport"] == {"width": CONTEXT_WIDTH, "height": CONTEXT_HEIGHT}
 
 

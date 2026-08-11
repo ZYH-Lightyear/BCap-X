@@ -1,6 +1,6 @@
 export interface ContextSnapshot {
-  schemaVersion: 17
-  schema: 'vaw-context-v16-review-contract'
+  schemaVersion: 18
+  schema: 'vaw-context-v17-contact-semantics'
   renderId: string
   revision: number
   viewport: { width: 1920; height: 1080 }
@@ -33,6 +33,8 @@ export interface ContextSnapshot {
       status: 'editing' | 'review'
       action_id?: string
       intent?: string
+      target_role: 'grasp_contact' | 'point_pose' | 'relative_pose' | 'gripper_only'
+      source_surface_distance_m?: number
       target: {
         pose?: { position_xyz: number[]; quaternion_xyzw: number[] }
         gripper?: 'open' | 'closed'

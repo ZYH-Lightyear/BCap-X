@@ -74,6 +74,9 @@ ActionReview 是一次决策的 offer：交回后你的下一次成功 Function 
 审查 ActionReview 时，必须把 refinement goal 与最终 Target XYZ、当前真实 TCP XYZ 和累计
 BASE 位移逐轴比较。若目标要求沿某个 base 轴增加/减少，而最终 target 却沿反方向变化，几何
 意图已经矛盾，不得 commit；应重新进入 Imagination 修正。
+若 Canvas 标记 TARGET ROLE 为 GRASP CONTACT，必须把它当作最终接触位姿审查：只有物体表面
+进入两指闭合通道、TCP 与观测 source surface 没有明显自由空间间隙时才可批准。不能因为它在
+二维图上位于物体“上方”就把悬空 target 当作可闭合抓取。
 当 Function 会启动 Imagination 时，必须在 refinement_goal 参数中写一句短的目标几何；不要把
 整段理由、旧失败、预算或未经验证的物理效果写进去。它应描述需要形成或检查的物理关系，
 不得预先断言 top-down、vertical 或某个旋转方向；除非当前几何已经清楚支持该约束。
@@ -86,7 +89,8 @@ detection_and_sam 的 region 是当前观测中目标身份与二维位置的权
 “检测同一目标→再次请求同类 grasp”。
 选择动作起点时按工具实际能力区分，而不是让语言模型手写本应由几何模块求出的量：
 - 要抓取一个已有 region 的物体时，`propose_grasps(region_id)` 是默认几何生成器；它产生包含
-  位置与方向的多个 seed，之后由 select/Imagination 审查。
+  位置与方向的多个 seed，之后由 select/Imagination 审查。grasp seed 是规划器建议的最终
+  接触/闭合位姿，不是需要自动上抬的 pre-grasp 或 clearance waypoint。
 - `locate_point` 只给一个语义点的 XYZ，不提供抓取方向；`propose_pose` 适合放置点、表面点或
   已有明确姿态约束的直接位姿。不要在尚未尝试 grasp seeds 时，凭空手写 quaternion 来替代它们。
 - 只有 `propose_grasps` 实际返回无 seed，或所有不同 seed 均失败，才把 point-derived pose 作为
@@ -130,6 +134,13 @@ ACTION_REVIEW_SYSTEM_PROMPT = """\
 
 Canvas 上层 OBSERVED NOW 是当前真实世界；下层紫色 IMAGINATION 是若 commit 才会执行的虚拟
 目标。对照 refinement goal、当前真实 TCP/GRIP、最终 target、累计 BASE edit 和局部接触几何。
+审查对象是一个局部、可执行的下一步，不是整项 User Task。应先判断它是否正确完成
+`refinement_goal`、是否为后续动作建立必要条件；不要仅因为它还没到最终目的地而否决。比如真实
+夹爪闭合且下一次接近需要张开时，gripper-only open 是有用且必要的动作，即使它本身不抓取、
+运输或放置物体；同理，明确用于 grasp approach 的 target 不应因为它尚未移动到容器而被否决。
+TARGET ROLE 为 GRASP CONTACT 时，它是最终接触/闭合位姿而非 pre-grasp：若 jaw-plane 仍显示
+物体与两指通道分离，或 TCP→SOURCE 有明显自由空间间隙，不得把“在物体上方”当作可执行接触；
+应继续局部修正或 reject。TCP→SOURCE 只是当前 RGB-D 的最近表面距离，不是接触成功真值。
 
 本轮必须明确选择且只调用一个提供的 Review Function：
 - 几何与目标一致：commit(action_id)；
@@ -159,6 +170,10 @@ ActionSeed 是几何规划器给出的起点，不要仅为了让二维投影“
 x/y/z/w 分量不是绕各轴的角度，禁止从单个分量推断倾斜方向。姿态调整只能依据紫色目标与真实
 表面之间一个具体、可见的接触/碰撞缺陷；若目标只是平移已经形成的姿态（例如抬升或运输），
 默认保持方向不变。
+若 TARGET ROLE 是 GRASP CONTACT，它表示规划器建议的最终接触/闭合位姿，不是 pre-grasp。
+不要为了“先安全接近”自动增加 base +Z；这会把 seed 从物体表面移开。TCP→SOURCE 是 contact
+TCP 到当前分割物体最近观测表面的距离，只是几何间隙提示，不是接触真值；该距离明显增大或
+jaw-plane 中物体与两指通道分离时，不能宣称抓取接触已经合理。
 
 每轮只做三种选择之一：若当前 target 已满足目标，调用 finish_imagination(status="ready")；若能
 指出一个当前可见的几何缺陷，只做一次 delta_move、rotate、open_gripper 或 close_gripper；若该
@@ -168,7 +183,8 @@ target 无法可靠修复，调用 status="failed"。不要为了用满轮数而
 GRIP/Target Gripper 使用归一化开度（0≈闭合，1≈张开）；INHERIT 表示保持当前真实数值。
 组合 target 的实际顺序是 ARM→GRIPPER，因此不要用组合 target 表达“先张开再接近”。
 若一次空间编辑使 motion prediction 变为 error，不要沿同一趋势盲目累计；应撤回、换方向，或
-在无法恢复时结束为 failed。Edit Summary 中的累计位移、累计旋转和最近两次编辑是当前控制
+在一次明确纠正后仍无法恢复 returned plan 时结束为 failed。不得把 ARM ERROR 当作继续随机
+搜索各轴的理由。Edit Summary 中的累计位移、累计旋转和最近两次编辑是当前控制
 状态，不是对话历史；若两次编辑相互抵消且没有新的可见改进，应接受当前 target 或失败，而不是
 继续振荡。refinement goal 是审查意图，不是已经成立的视觉事实。
 BASE 是固定 robot-base/world 坐标：base +Z 恒为竖直上抬，base -Z 恒为下降。TOOL 是随当前
@@ -297,7 +313,7 @@ def function_definitions() -> list[dict[str, Any]]:
         ),
         _function(
             "propose_grasps",
-            "抓取已有 region 中物体时的默认几何生成器：生成多个同时包含位置和方向的粗略 ActionSeed，供 select/Imagination 视觉审查；不执行，也不保证抓取成功。不要在尚未尝试这些 seed 时用手写 quaternion 的 point pose 替代。若实际返回无有效候选，重复检测同一目标不会改善几何；此时可换用 locate_point + propose_pose 等不同起点。",
+            "抓取已有 region 中物体时的默认几何生成器：生成多个同时包含位置和方向的粗略 ActionSeed，供 select/Imagination 视觉审查；不执行，也不保证抓取成功。每个 seed target 是建议的最终抓取接触/闭合位姿，不是 pre-grasp 或 clearance waypoint，不应被自动上抬。不要在尚未尝试这些 seed 时用手写 quaternion 的 point pose 替代。若实际返回无有效候选，重复检测同一目标不会改善几何；此时可换用 locate_point + propose_pose 等不同起点。",
             {"region_id": {"type": "string"}},
             ("region_id",),
         ),
@@ -328,6 +344,8 @@ def function_definitions() -> list[dict[str, Any]]:
             "select",
             (
                 "选择一个 ActionSeed 并进入 Imagination；不执行，且默认继承当前真实夹爪开度。"
+                "grasp seed 是最终接触位姿起点，不是安全悬停位；refinement_goal 应描述两指与"
+                "目标表面的接触/通道关系，不要把它改写成泛泛的 approach。"
                 "若接近动作要求夹爪预先张开，应先单独 commit gripper-only 目标。"
             ),
             {

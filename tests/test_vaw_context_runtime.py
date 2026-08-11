@@ -19,6 +19,7 @@ from vaw.context_runtime.motion import (
     MotionBackendError,
     MotionPlan,
 )
+from vaw.context_runtime.private import build_edit_summary
 from vaw.context_runtime.protocol import (
     ACTION_REVIEW_SYSTEM_PROMPT,
     IMAGINATION_FUNCTION_NAMES,
@@ -278,6 +279,7 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
     )
     point = next(x["function"] for x in main if x["function"]["name"] == "locate_point")
     assert "默认几何生成器" in grasps["description"]
+    assert "最终抓取接触/闭合位姿" in grasps["description"]
     assert "不生成抓取方向" in point["description"]
     assert "应先使用 propose_grasps" in pose["description"]
     assert "当前真实 TCP" in delta["description"]
@@ -292,6 +294,13 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
     assert "GRIP 仍大于 0 可能是物体阻挡手指" in SYSTEM_PROMPT
     assert "requested_arm_delta_base_m" in SYSTEM_PROMPT
     assert "reject_action(action_id)" in ACTION_REVIEW_SYSTEM_PROMPT
+    assert "局部、可执行的下一步" in ACTION_REVIEW_SYSTEM_PROMPT
+    assert "gripper-only open" in ACTION_REVIEW_SYSTEM_PROMPT
+    assert "尚未移动到容器" in ACTION_REVIEW_SYSTEM_PROMPT
+    assert "GRASP CONTACT" in ACTION_REVIEW_SYSTEM_PROMPT
+    assert "不是 pre-grasp" in IMAGINATION_SYSTEM_PROMPT
+    assert "TCP→SOURCE" in IMAGINATION_SYSTEM_PROMPT
+    assert "继续随机" in IMAGINATION_SYSTEM_PROMPT
     assert "within_region_id" in SYSTEM_PROMPT
     for name in ("select", "propose_pose", "open_gripper", "close_gripper"):
         definition = next(x["function"] for x in main if x["function"]["name"] == name)
@@ -529,6 +538,28 @@ def test_spatial_edit_of_gripper_only_review_preserves_gripper_target() -> None:
     assert (
         workspace._private.imagination_artifacts.initial_target.gripper == "open"
     )
+
+
+def test_gripper_only_preview_keeps_private_tcp_baseline_for_cumulative_edits() -> None:
+    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
+    observed_tcp = workspace.state.robot.tcp_pose
+    workspace.set_refinement_goal("先闭合，再连续调整接触位置")
+    workspace.execute("close_gripper")
+
+    # The public command remains gripper-only and therefore cannot move the arm.
+    assert workspace.state.imagination.target.pose is None
+    assert workspace._private.imagination_artifacts.initial_target.pose == observed_tcp
+
+    workspace.execute("delta_move", delta_xyz_m=[0.0, 0.0, -0.03], frame="base")
+    workspace.execute("delta_move", delta_xyz_m=[0.0, 0.0, -0.02], frame="base")
+    summary = build_edit_summary(
+        workspace.state.imagination.target,
+        workspace._private.imagination_artifacts,
+    )
+
+    assert summary.total_translation_base_m == pytest.approx((0.0, 0.0, -0.05))
+    assert summary.initial_target.pose == observed_tcp
+    assert summary.initial_target.gripper == "closed"
 
 
 def test_commit_is_only_physical_boundary_and_invalidates_revision_state() -> None:

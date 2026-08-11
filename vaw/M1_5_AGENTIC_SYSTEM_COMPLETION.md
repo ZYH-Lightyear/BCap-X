@@ -460,6 +460,26 @@ IK error；每次失败后又调用幂等 detection，误以为能获得“fresh
 位置+方向 seed；`locate_point` 只提供 XYZ，`propose_pose` 用于放置/表面点或已有明确方向约束的直接
 pose；motion failure 不会让同 revision 的 perception 变旧，重复 detection 不能恢复 IK。
 
+真实 Agent trace `m154q_qwen35plus_cumulative_review_t0_s0` 证明 gripper-only baseline 与局部 Review
+修订有效，但进一步暴露了 grasp seed 的控制语义缺口：GraspNet seed 已是最终接触/闭合目标，Main 与
+Imagination 却把它当作需要先抬高的 pre-grasp。首个 seed 被累计上抬约 `5 cm` 后执行，夹爪悬在罐头
+上方；后续 point pose 又把绝对 target Z 误读成“离物体表面的高度”，生成过低目标并在真实执行中推走
+物体。终点验收正确拒绝了这些大误差，因此不能靠放宽 executor gate 掩盖该问题。
+
+修订不加入 pick 流程或接触真值，而是在当前视觉证据上补齐通用语义：grasp 来源的 target 标记为
+`GRASP CONTACT`，明确它是最终接触位姿而非 pre-grasp；compiler 从当前 revision 的 region RGB-D
+表面计算 `TCP→SOURCE` 最近距离，作为是否仍明显悬空的度量提示。该标量不是抓持判定，也不预测
+动力学。Prompt 同时要求持续 `ARM ERROR` 在一次有依据修正后交回失败，禁止用随机轴旋转搜索 IK。
+版本更新为 Web schema 18 / `vaw-context-v17-contact-semantics` / renderer
+`context-web-v17-contact-semantics`。
+
+冻结静态对照进一步分离了 Prompt 与 Context 的作用：仅把新 Prompt 加到缺少距离标量的旧
+`context_0003.png` 上，Qwen3.5-Plus 仍以“安全 approach”为由执行 `base +Z 2.5 cm`；在同一冻结
+任务/seed 重新生成的 v17 无物理 contact probe 中，所选 grasp target 的
+`TCP→SOURCE = 1.6 mm`，模型不再上抬，而是提出一次 `base-Z 15°` 姿态修正。该结果证明距离证据
+消除了当前已知的 pre-grasp 误读，但旋转是否改善接触仍必须由连续 Preview 和真实闭环验证，不能
+作为任务成功证据。
+
 验收：主任务 seeds `0,1,2` 至少 `2/3` env success。
 
 ### M1.5.5 — Basic Generalization and Freeze
@@ -504,6 +524,9 @@ pose；motion failure 不会让同 revision 的 perception 变旧，重复 detec
 | M1.5.4-i | Main 只在独立 Review 决策面批准动作，普通决策不会遗留 stale review | in progress | Review tool-surface、reject、packet 与 runtime 回归 | `m154k_qwen35plus_review_contract_t0_s1` | Main 能 commit/reject/revise，未再用 detection 隐式跳过 review；发现 7-D joint L2 对小分量误差的重复放大 |
 | M1.5.4-j | overwrite-only Main Working Focus 能跨一次非物理调用维持失败结论 | in progress | 单 focus 覆盖/隔离测试；无 transcript/history | `m154l_qwen35plus_per_joint_t0_s1`, `m154m_qwen35plus_working_focus_t0_s1` | 抓持随动失败后，下一轮保留“失败并重试”而没有转向 basket；发现 gripper-only review 加空间编辑时丢失 gripper target，已修复 |
 | M1.5.4-k | Review 编辑必须保留完整 arm+gripper target，终点验收不应随关节维数人为收紧 | in progress | 63 full VAW tests + Ruff + Web build | `m154n_qwen35plus_preserve_target_t0_s1` | target 保真修复通过；真实失败 target 的 achieved TCP 仍偏差约 3.8 cm，正确拒绝并跳过 gripper。恢复随后陷入无可行 seed/手工侧抓 IK error，主任务仍未成功 |
+| M1.5.4-l | Action Review 应审查局部 refinement goal，而不是要求每个动作直接完成 User Task | in progress | Review prompt contract regression | `m154o_qwen35plus_review_focus_t0_s0` | pick/lift 失败被正确识别；Review 却以“没有抓住/没去篮子”为由否决必要的纯 open 和 side-grasp approach。补充通用 prerequisite/局部动作审查原则后待复测 |
+| M1.5.4-m | gripper-only Preview 之后的空间编辑必须以启动时真实 TCP 为累计位移基线 | in progress | private baseline / cumulative EditSummary regression | `m154p_qwen35plus_local_review_t0_s0` | Imagination 实际累计 base Z `-9.5 cm`，但 Review 只看到最后一步 `-2 cm` 后错误 commit；根因是 gripper-only target 无 pose 时私有 baseline 缺失，修复不改变公共 target 的 gripper-only 语义 |
+| M1.5.4-n | grasp seed 必须被解释为最终接触目标，并提供当前 source surface 的可视距离证据 | in progress | 64 full VAW tests + Ruff + Web build；同任务无物理 contact probe：`TCP→SOURCE=1.6 mm` 后不再自动上抬 | `m154q_qwen35plus_cumulative_review_t0_s0` | 旧图仅换 Prompt 仍上抬 2.5 cm；v17 probe 改为一次姿态微调，证明 contact metric 有效但尚未证明真实闭环成功，进入 frozen seed 复测 |
 | M1.5.4 | 完整闭环可达到基本 pick-place 成功 | in progress | 63 full VAW tests + Ruff + Web build | pending frozen seeds 0/1/2 | 尚未达到 `2/3 env_success`，不得宣称完成 |
 
 ## 11. 非目标
