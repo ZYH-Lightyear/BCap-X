@@ -36,8 +36,8 @@ from vaw.context_runtime.private import (
 from vaw.context_runtime.scene_view import render_scene_view
 from vaw.context_runtime.workspace import ContextWorkspace
 
-CONTEXT_SCHEMA = "vaw-context-v19-causal-verification"
-CONTEXT_WEB_SCHEMA_VERSION = 20
+CONTEXT_SCHEMA = "vaw-context-v20-physical-verification"
+CONTEXT_WEB_SCHEMA_VERSION = 21
 CONTEXT_WIDTH = 1920
 CONTEXT_HEIGHT = 1080
 
@@ -154,6 +154,7 @@ class WorldContextSpec:
     causal_source_before_raster_id: str | None = None
     causal_source_current_raster_id: str | None = None
     causal_source_label: str | None = None
+    physical_verification: PhysicalVerificationSpec | None = None
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -176,6 +177,34 @@ class WorldContextSpec:
             "causalSourceBeforeRasterId": self.causal_source_before_raster_id,
             "causalSourceCurrentRasterId": self.causal_source_current_raster_id,
             "causalSourceLabel": self.causal_source_label,
+            "physicalVerification": (
+                self.physical_verification.summary()
+                if self.physical_verification is not None
+                else None
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class PhysicalVerificationSpec:
+    """Non-privileged interpretation boundary for the latest physical command.
+
+    This never predicts task success.  It states only which command effect is
+    still unverified and what kind of current visual evidence could resolve
+    it, so Main does not have to reinterpret a normalized jaw opening on every
+    ownership handoff.
+    """
+
+    kind: Literal["closure", "release", "arm_motion"]
+    evidence_needed: str
+    ambiguity: str
+
+    def summary(self) -> dict[str, str]:
+        return {
+            "status": "unverified",
+            "kind": self.kind,
+            "evidenceNeeded": self.evidence_needed,
+            "ambiguity": self.ambiguity,
         }
 
 
@@ -367,6 +396,13 @@ class ContextCompiler:
                     and private.last_physical_artifacts.causal_subject is not None
                     else None
                 ),
+                physical_verification=_physical_verification_spec(
+                    _visible_last_physical_action(state),
+                    has_causal_subject=(
+                        private.last_physical_artifacts is not None
+                        and private.last_physical_artifacts.causal_subject is not None
+                    ),
+                ),
             ),
             catalog=EvidenceCatalogSpec(
                 regions=tuple(region_specs),
@@ -547,6 +583,49 @@ def _visible_last_physical_action(state: ContextState) -> LastPhysicalAction | N
     if state.imagination is None and state.action_review is None:
         return action
     return action if action.outcome == "completed" else None
+
+
+def _physical_verification_spec(
+    action: LastPhysicalAction | None,
+    *,
+    has_causal_subject: bool,
+) -> PhysicalVerificationSpec | None:
+    """Describe evidence still missing after a successful control command.
+
+    The mapping is deliberately command-causal rather than task-specific.  It
+    does not claim that closing grasps, opening releases, or moving transports
+    an object.  Those effects remain for the VLM to verify from current RGB-D.
+    """
+
+    if action is None or action.outcome != "completed":
+        return None
+    if action.target_gripper == "closed":
+        return PhysicalVerificationSpec(
+            kind="closure",
+            evidence_needed="OBJECT FOLLOWING AFTER ARM MOTION",
+            ambiguity="PARTIAL GRIP OPENING MAY BE CONTACT OR FAILED CLOSURE",
+        )
+    if action.target_gripper == "open":
+        return PhysicalVerificationSpec(
+            kind="release",
+            evidence_needed="OBJECT / TARGET RELATION IN CURRENT RGB",
+            ambiguity="OPENING CONFIRMS COMMAND ONLY, NOT RELEASE OR PLACEMENT",
+        )
+    if action.executed_stages == "arm":
+        return PhysicalVerificationSpec(
+            kind="arm_motion",
+            evidence_needed=(
+                "COMPARE CURRENT SOURCE AND ACTION AREA"
+                if has_causal_subject
+                else "TASK-RELEVANT CHANGE IN CURRENT RGB"
+            ),
+            ambiguity=(
+                "FIXED SOURCE CHANGE MAY BE OCCLUSION, NOT OBJECT FOLLOWING"
+                if has_causal_subject
+                else "ARM ARRIVAL DOES NOT PROVE OBJECT MOTION"
+            ),
+        )
+    return None
 
 
 def _decision_spec(workspace: ContextWorkspace) -> DecisionWorkspaceSpec:

@@ -510,6 +510,21 @@ v19 修订不加入 object tracker 或任务 phase。`ActionReview` 现在始终
 跨相机 tracking，也不注入环境真值。版本更新为 Web schema 20 /
 `vaw-context-v19-causal-verification` / renderer `context-web-v19-causal-verification`。
 
+真实 trace `m154t_qwen35plus_causal_verification_t0_s0` 证明 v19 的 Review 优先级与固定 source
+对照均已生效，Agent 也能自主完成 grasp、lift、basket grounding、placement Preview 与 release
+commit；但环境仍为失败。完整轨迹暴露的不是新的视觉缺口，而是所有权交接时的语义缺口：普通
+Main 已知“部分开度可能来自物体阻挡、需要随动测试”，Action Review 却看不到发起动作的
+`Main Working Focus`，其独立 Prompt 也缺少同一开度语义。模型于是把同一个 `GRIP 0.325/0.785`
+先解释为可能接触，下一轮又解释成仍然张开；同时把固定 source crop 的遮挡变化误当成物体移动。
+
+v20 把这类物理因果边界从长 Prompt 中提升为当前 Context 的一等但非真值状态。每次成功的
+close/open/arm commit 分别编译为 `closure/release/arm_motion · UNVERIFIED`，并给出仍需的视觉
+证据；它不判断抓取、释放或运输成功。Review 继续接收 Main 发起本次 Preview 的 overwrite-only
+短意图，右侧 Waypoint 栏显示最近效果与证据缺口；固定 source 图明确标注 occlusion possible。
+这不是 phase machine、自动动作建议或 privileged verifier，只是让 Main/Imagination 在同一个
+当前 observation 上共享一致的证据语义。版本更新为 Web schema 21 /
+`vaw-context-v20-physical-verification` / renderer `context-web-v20-physical-verification`。
+
 验收：主任务 seeds `0,1,2` 至少 `2/3` env success。
 
 ### M1.5.5 — Basic Generalization and Freeze
@@ -558,7 +573,8 @@ v19 修订不加入 object tracker 或任务 phase。`ActionReview` 现在始终
 | M1.5.4-m | gripper-only Preview 之后的空间编辑必须以启动时真实 TCP 为累计位移基线 | in progress | private baseline / cumulative EditSummary regression | `m154p_qwen35plus_local_review_t0_s0` | Imagination 实际累计 base Z `-9.5 cm`，但 Review 只看到最后一步 `-2 cm` 后错误 commit；根因是 gripper-only target 无 pose 时私有 baseline 缺失，修复不改变公共 target 的 gripper-only 语义 |
 | M1.5.4-n | grasp seed 必须被解释为最终接触目标，并提供当前 source surface 的可视距离证据 | in progress | 64 full VAW tests + Ruff + Web build；同任务无物理 contact probe：`TCP→SOURCE=1.6 mm` 后不再自动上抬 | `m154q_qwen35plus_cumulative_review_t0_s0` | 旧图仅换 Prompt 仍上抬 2.5 cm；v17 probe 改为一次姿态微调，证明 contact metric 有效但尚未证明真实闭环成功，进入 frozen seed 复测 |
 | M1.5.4-o | 非物理 grounding 不得抹去同一 observation 中刚验证的物理因果视觉 | in progress | revision-local post-commit raster persistence / grounding precedence / Web regression | `m154r_qwen35plus_contact_semantics_t0_s0` | 首次真实抓持与 +3cm 随动成功；basket detection 后核验画面消失，Main 在同一 RGB 上反转结论并重抓手中物体。新增紧凑 current-observed continuity inset，待 frozen seed 复测 |
-| M1.5.4-p | Main 必须看见当前 ActionReview；抓持核验必须显式比较同一 source 原位置 | in progress | 65 full VAW tests + Ruff + Web build；review-priority、causal-source persistence、固定 ROI 与 `1920×1080` fixture | `m154s_qwen35plus_physical_continuity_t0_s0` | v18 自主走完整条 pick/place 决策链但把未随动对象误判为已抓持；v19 以固定 source 前后对照提供直接反证，待 frozen seed 复测 |
+| M1.5.4-p | Main 必须看见当前 ActionReview；抓持核验必须显式比较同一 source 原位置 | in progress | 65 full VAW tests + Ruff + Web build；review-priority、causal-source persistence、固定 ROI 与 `1920×1080` fixture | `m154s_qwen35plus_physical_continuity_t0_s0`, `m154t_qwen35plus_causal_verification_t0_s0` | v19 能走到 release，但 Action Review 丢失 Main 短意图、固定 crop 受遮挡、部分开度解释反转，最终 `env_success=false` |
+| M1.5.4-q | 物理命令效果必须以一致的 UNVERIFIED 状态跨 Main/Review 所有权传播 | in progress | 65 full VAW tests + Ruff + Web build；closure/release/arm-motion cue、Review focus 与 `1920×1080` fixture | pending v20 frozen seeds | 不加入真值或 phase；待证明 arm+close 后不会因开度歧义跳过随动测试 |
 | M1.5.4 | 完整闭环可达到基本 pick-place 成功 | in progress | 65 full VAW tests + Ruff + Web build | pending frozen seeds 0/1/2 | 尚未达到 `2/3 env_success`，不得宣称完成 |
 
 ## 11. 非目标

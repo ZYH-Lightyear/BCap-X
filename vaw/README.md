@@ -87,15 +87,16 @@ Main 启动 Imagination 时必须显式提供一句短的 `refinement_goal`，�
 局部控制目标。Imagination 每次请求只收到当前 Canvas、目标几何和累计 `EditSummary`，不收到
 Function transcript。普通 Main 只额外收到一条 overwrite-only `Main Working Focus`：上一轮
 Main 自己的一句依据，用于在感知调用后保留“抓取失败，正在重试”这类短期任务关系；它不是
-环境真值，也不会进入 Imagination 或 Action Review。默认最多连续想象 6 轮；主动完成或达到上限都以中性的
+环境真值，也不会进入 Imagination；Action Review 会继续看到发起本次 Preview 的这条短意图，
+避免所有权交接后失去动作目的。默认最多连续想象 6 轮；主动完成或达到上限都以中性的
 `review_required` 交回 Main，`turn_limit` 只写 trace。只有 Main 查看最终 Preview 后调用
 `commit` 才构成批准。`ActionReview` 是一次决策的 offer：Main 的下一次成功调用若不是
 `commit`，旧 review 会被明确丢弃，不能在后续回合被误提交。
 
 ## Canvas
 
-Web schema 20 / `vaw-context-v19-causal-verification` / renderer
-`context-web-v19-causal-verification`：
+Web schema 21 / `vaw-context-v20-physical-verification` / renderer
+`context-web-v20-physical-verification`：
 
 - 上层 `OBSERVED NOW · REAL WORLD`：干净 agentview、与 agentview 标定透视一致的稠密
   RGB-D surface 和四行本体状态；
@@ -107,13 +108,17 @@ Web schema 20 / `vaw-context-v19-causal-verification` / renderer
 - 没有 active target 时，下层明确标成 `CURRENT EVIDENCE · OBSERVED` 或
   `CURRENT GEOMETRY · OBSERVED`，不再把当前蓝色机器人误标成未执行想象；
 - Main 审查 Imagination 交回的 ActionReview 时，当前紫色 Preview 始终优先于旧的
-  post-commit 页面，确保 commit 审查的是将要执行的 target；
+  post-commit 页面，确保 commit 审查的是将要执行的 target；右侧 Waypoint 事实栏同时保留
+  最近物理命令的 `UNVERIFIED` 效果与仍缺少的证据，不遮挡 Preview；
 - commit 后下层切换为同一 Canvas 内的真实因果对照；若存在最近 grasp source，同时显示
-  `SOURCE BEFORE → SAME SOURCE LOCATION NOW` 与 `CURRENT ACTION AREA`。前两张图使用固定
-  像素区域而非 tracking，用于直接判断对象是否仍留在原处；大图只显示一次，后续非物理
+  `SOURCE BEFORE → FIXED SOURCE CROP NOW` 与 `CURRENT ACTION AREA`。前两张图使用固定
+  像素区域而非 tracking，明确标注机器人遮挡也可能造成变化；大图只显示一次，后续非物理
   grounding 在同一 observation 内保留一个紧凑的
   `LAST COMMIT · CURRENT OBSERVED` 当前画面锚点，并与新 evidence 并列；它在进入新
   Imagination/Review 时隐藏，在下一次 commit 时替换，不声明任务效果；
+- close/open/arm commit 分别编译为 `closure/release/arm_motion · UNVERIFIED`。中间夹爪开度
+  不再被当作 open/closed 真值；状态只说明仍需物体随动、当前目标关系或当前 RGB 变化证据，
+  不注入抓取/放置成功结论；
 - BASE/WORLD 坐标提示由 robot-base 几何投影产生，并固定在角落以避免遮挡 target；
 - grounding、ActionSeed 与 refinement 信息只占用下层固定 overlay，不改变双层版式；
 - 紫色几何只存在于下层，并始终表示未执行的预测；

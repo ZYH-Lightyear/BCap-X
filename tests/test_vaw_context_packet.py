@@ -234,8 +234,8 @@ def test_packet_is_deterministic_and_does_not_leak_private_state() -> None:
     assert forbidden.isdisjoint(set(_walk_keys(snapshot)))
     encoded = json.dumps(snapshot).lower()
     assert "functionrecord" not in encoded and "waypointdraft" not in encoded
-    assert snapshot["schemaVersion"] == 20
-    assert snapshot["schema"] == "vaw-context-v19-causal-verification"
+    assert snapshot["schemaVersion"] == 21
+    assert snapshot["schema"] == "vaw-context-v20-physical-verification"
     assert snapshot["viewport"] == {"width": CONTEXT_WIDTH, "height": CONTEXT_HEIGHT}
 
 
@@ -253,6 +253,8 @@ def test_commit_comparison_persists_across_nonphysical_grounding() -> None:
     assert packet.world.last_physical_action is not None
     assert packet.world.last_physical_action.executed_stages == "gripper"
     assert packet.world.last_physical_action.outcome == "completed"
+    assert packet.world.physical_verification is not None
+    assert packet.world.physical_verification.kind == "release"
     assert packet.world.post_commit_before_raster_id == "post_commit:before"
     assert packet.world.post_commit_current_raster_id == "post_commit:current"
     assert packet.rasters["post_commit:before"].shape == (390, 760, 3)
@@ -323,6 +325,9 @@ def test_grasp_source_location_persists_for_lift_causal_verification() -> None:
     assert first.world.causal_source_label == "can"
     assert first.world.causal_source_before_raster_id == "causal_source:before"
     assert first.world.causal_source_current_raster_id == "causal_source:current"
+    assert first.world.physical_verification is not None
+    assert first.world.physical_verification.kind == "closure"
+    assert "PARTIAL GRIP OPENING" in first.world.physical_verification.ambiguity
 
     workspace.set_refinement_goal("lift to verify following")
     workspace.execute(
@@ -338,6 +343,9 @@ def test_grasp_source_location_persists_for_lift_causal_verification() -> None:
     lifted = ContextCompiler().compile(workspace)
     assert lifted.decision.mode == "post_commit"
     assert lifted.world.causal_source_label == "can"
+    assert lifted.world.physical_verification is not None
+    assert lifted.world.physical_verification.kind == "arm_motion"
+    assert "OCCLUSION" in lifted.world.physical_verification.ambiguity
     for raster_id in ("causal_source:before", "causal_source:current"):
         assert raster_id in lifted.rasters
         assert lifted.rasters[raster_id].shape == (390, 520, 3)

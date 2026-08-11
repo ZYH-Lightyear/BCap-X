@@ -1,6 +1,6 @@
 export interface ContextSnapshot {
-  schemaVersion: 20
-  schema: 'vaw-context-v19-causal-verification'
+  schemaVersion: 21
+  schema: 'vaw-context-v20-physical-verification'
   renderId: string
   revision: number
   viewport: { width: 1920; height: 1080 }
@@ -26,6 +26,12 @@ export interface ContextSnapshot {
     causalSourceBeforeRasterId: string | null
     causalSourceCurrentRasterId: string | null
     causalSourceLabel: string | null
+    physicalVerification: {
+      status: 'unverified'
+      kind: 'closure' | 'release' | 'arm_motion'
+      evidenceNeeded: string
+      ambiguity: string
+    } | null
     robot: {
       ee_pose?: { position_xyz: number[]; quaternion_xyzw: number[] }
       tcp_pose?: { position_xyz: number[]; quaternion_xyzw: number[] }

@@ -101,6 +101,9 @@ def test_dual_agent_runtime_rebuilds_every_request_without_history(tmp_path: Pat
         imagination.messages[0], ensure_ascii=False
     )
     assert "reason 1" not in json.dumps(imagination.messages[0], ensure_ascii=False)
+    review_text = _user_text(main.messages[1])
+    assert "Main Working Focus" in review_text
+    assert "reason 1" in review_text
     assert "Edit Summary" in json.dumps(imagination.messages[0], ensure_ascii=False)
     assert "reason 2" not in json.dumps(main.messages[1], ensure_ascii=False)
 
@@ -114,7 +117,7 @@ def test_dual_agent_runtime_rebuilds_every_request_without_history(tmp_path: Pat
     assert all("visible_recent_calls" not in row for row in rows)
     assert all("execution_receipt" not in row for row in rows)
     assert rows[0]["main_working_focus"] is None
-    assert rows[2]["main_working_focus"] is None
+    assert rows[2]["main_working_focus"] == "reason 1"
     assert rows[3]["main_working_focus"] == "reason 3"
 
 

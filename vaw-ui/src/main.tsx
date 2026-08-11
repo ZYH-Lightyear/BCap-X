@@ -31,8 +31,8 @@ function Root() {
   useEffect(() => {
     window.__VAW_RENDER__ = async (next) => {
       if (
-        next.schemaVersion !== 20
-        || next.schema !== 'vaw-context-v19-causal-verification'
+        next.schemaVersion !== 21
+        || next.schema !== 'vaw-context-v20-physical-verification'
         || next.viewport.width !== 1920
         || next.viewport.height !== 1080
       ) {

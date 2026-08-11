@@ -335,6 +335,13 @@ class ContextRuntime:
             text += "\nLast Physical Action：" + json.dumps(
                 last_physical.summary(), ensure_ascii=False, separators=(",", ":")
             )
+        verification = packet.world.physical_verification
+        if verification is not None:
+            text += "\nPhysical Effect Verification：" + json.dumps(
+                verification.summary(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
         if feedback:
             text += f"\n上轮协议错误：{feedback}"
         system_prompt = (
@@ -345,7 +352,7 @@ class ContextRuntime:
         return _image_messages(system_prompt, text, context_image)
 
     def _visible_main_working_focus(self, owner: str) -> str | None:
-        if owner != "main" or self.workspace.state.action_review is not None:
+        if owner != "main":
             return None
         return self._main_working_focus
 

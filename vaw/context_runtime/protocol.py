@@ -156,6 +156,11 @@ TARGET ROLE 为 GRASP CONTACT 时，它是最终接触/闭合位姿而非 pre-gr
 
 不要用感知 Function 隐式跳过 Review。规划 returned/checked 不保证任务效果。Last Physical Action
 是最近真实命令的因果事实，不是当前 Preview，也不证明抓取/释放成功。
+GRIP 是当前真实归一化开度：0≈闭合，1≈张开；中间值具有歧义，既可能是物体阻挡手指，也
+可能是闭合失败，不能单凭数值宣告“仍然打开”或“已经抓住”。若 Physical Effect Verification
+显示 CLOSURE / UNVERIFIED，且此前尚未执行能检验物体随动的 arm motion，固定源位置仍有物体
+并不能证明闭合失败；审查一个保持夹爪状态的小幅可逆 arm verification 是合理的。固定 source
+crop 可能被机器人遮挡，source 变空也不能单独证明物体随夹爪移动。
 组合 target 的真实顺序固定为 ARM→GRIPPER。若当前真实夹爪闭合，而下一段 arm motion 需要先
 张开通道，应先 commit 纯 open target；不要给它追加 pose，因为那只会在 arm 到达后才张开。
 `requested_arm_delta_base_m` 是上一 commit 从执行前真实 TCP 到请求 target 的 BASE 位移，不是物体

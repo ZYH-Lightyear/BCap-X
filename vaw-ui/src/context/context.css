@@ -505,3 +505,21 @@ img { display: block; }
   background: #fffbeb;
   font: 900 15px/1.35 "DejaVu Sans Mono", monospace;
 }
+
+.via-verification-card b,
+.via-verification-card span,
+.via-verification-card small {
+  display: block;
+}
+
+.via-verification-card span {
+  margin-top: 6px;
+  color: #78350f;
+  font-size: 13px;
+}
+
+.via-verification-card small {
+  margin-top: 4px;
+  color: #92400e;
+  font: 12px/1.3 "DejaVu Sans Mono", monospace;
+}

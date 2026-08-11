@@ -195,17 +195,19 @@ function WaypointPanel({ snapshot }: { snapshot: ContextSnapshot }) {
   const sourceGapText = sourceGap === undefined
     ? null
     : `${(sourceGap * 1000).toFixed(0)} mm`
+  const verification = snapshot.world.physicalVerification
   return (
     <aside className="via-waypoint-panel">
       <h2>WAYPOINT</h2>
-      <FactRow label="OWNER">{snapshot.world.owner.toUpperCase()}</FactRow>
       {lastReal && <FactRow label="LAST REAL">{lastReal}</FactRow>}
       <FactRow label="TARGET ROLE">{targetRole}</FactRow>
       {sourceGapText && <FactRow label="TCP→SOURCE">{sourceGapText}</FactRow>}
       <FactRow label="ARM">{action ? (planned ? 'PLANNED' : prediction?.solve_ik?.toUpperCase() ?? 'TARGET ONLY') : 'NONE'}</FactRow>
       <FactRow label="GRIP TARGET">{grip}</FactRow>
-      <FactRow label="CONTACT"><em>UNKNOWN</em></FactRow>
-      <FactRow label="DYNAMICS"><em>UNKNOWN</em></FactRow>
+      {verification && (
+        <FactRow label="LAST EFFECT">{verification.kind.replace('_', ' ').toUpperCase()} · UNVERIFIED</FactRow>
+      )}
+      {verification && <FactRow label="NEEDS">{verification.evidenceNeeded}</FactRow>}
       {goal && <p className="via-goal">{goal}</p>}
     </aside>
   )
@@ -271,7 +273,7 @@ function PostCommitLayer({ snapshot }: { snapshot: ContextSnapshot }) {
               <div className="via-causal-arrow" aria-hidden="true">→</div>
               <article className="via-compare-card via-compare-current">
                 <Raster snapshot={snapshot} id={sourceCurrent} alt="同一固定图像位置的当前真实画面" />
-                <strong>SAME SOURCE LOCATION · NOW</strong>
+                <strong>FIXED SOURCE CROP · NOW · OCCLUSION POSSIBLE</strong>
               </article>
               <article className="via-compare-card via-action-area-current">
                 <Raster
@@ -312,7 +314,13 @@ function PostCommitLayer({ snapshot }: { snapshot: ContextSnapshot }) {
             <FactRow label="GRIP CMD">{action.target_gripper.toUpperCase()}</FactRow>
           )}
           {action?.outcome !== 'completed' && <FactRow label="CONTROL ERROR">{action?.outcome.toUpperCase() ?? 'N/A'}</FactRow>}
-          <p>TASK EFFECT · VERIFY FROM CURRENT IMAGE</p>
+          {snapshot.world.physicalVerification
+            ? <p className="via-verification-card">
+                <b>{snapshot.world.physicalVerification.kind.replace('_', ' ').toUpperCase()} EFFECT · UNVERIFIED</b>
+                <span>NEEDED · {snapshot.world.physicalVerification.evidenceNeeded}</span>
+                <small>{snapshot.world.physicalVerification.ambiguity}</small>
+              </p>
+            : <p>TASK EFFECT · VERIFY FROM CURRENT IMAGE</p>}
         </aside>
       </div>
     </section>

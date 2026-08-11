@@ -298,6 +298,9 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
     assert "gripper-only open" in ACTION_REVIEW_SYSTEM_PROMPT
     assert "尚未移动到容器" in ACTION_REVIEW_SYSTEM_PROMPT
     assert "GRASP CONTACT" in ACTION_REVIEW_SYSTEM_PROMPT
+    assert "0≈闭合，1≈张开" in ACTION_REVIEW_SYSTEM_PROMPT
+    assert "中间值具有歧义" in ACTION_REVIEW_SYSTEM_PROMPT
+    assert "固定 source" in ACTION_REVIEW_SYSTEM_PROMPT
     assert "不是 pre-grasp" in IMAGINATION_SYSTEM_PROMPT
     assert "TCP→SOURCE" in IMAGINATION_SYSTEM_PROMPT
     assert "继续随机" in IMAGINATION_SYSTEM_PROMPT
