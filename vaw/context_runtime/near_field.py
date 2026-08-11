@@ -34,6 +34,8 @@ _GRIPPER = np.array([37, 99, 235], dtype=np.uint8)
 _GRIPPER_OUTLINE = np.array([23, 55, 130], dtype=np.uint8)
 _PREVIEW = np.array([124, 58, 237], dtype=np.uint8)
 _PREVIEW_OUTLINE = np.array([76, 29, 149], dtype=np.uint8)
+_PREVIOUS = np.array([71, 180, 196], dtype=np.uint8)
+_PREVIOUS_OUTLINE = np.array([15, 118, 132], dtype=np.uint8)
 _MOVE = (22, 163, 74, 255)
 _AXIS_COLORS = (
     (220, 38, 38, 255),
@@ -63,6 +65,9 @@ class NearFieldPreview:
     joint_positions_rad: tuple[float, ...] | None
     gripper_opening: float | None
     visual_edit: VisualEdit | None = None
+    previous_target_pose: Pose | None = None
+    previous_gripper_opening: float | None = None
+    rotation_gizmo_frame: Literal["base", "tool"] | None = None
 
 
 def render_near_field(
@@ -195,6 +200,7 @@ def _render_geometry_pair(
         tcp_rotation,
     )
     preview_triangles_local = None
+    previous_triangles_local = None
     preview_is_target_ghost = False
     if (
         preview is not None
@@ -229,6 +235,27 @@ def _render_geometry_pair(
                 + target_position_local
             )
             preview_is_target_ghost = True
+    if preview is not None and preview.previous_target_pose is not None:
+        previous_shape_local = _gripper_triangles_local(
+            robot.joint_positions_rad,
+            (
+                preview.previous_gripper_opening
+                if preview.previous_gripper_opening is not None
+                else robot.gripper_opening
+            ),
+            tcp_position,
+            tcp_rotation,
+        )
+        if previous_shape_local is not None:
+            previous_position_local, previous_rotation_local = _pose_in_current_tcp(
+                preview.previous_target_pose,
+                tcp_position,
+                tcp_rotation,
+            )
+            previous_triangles_local = (
+                previous_shape_local @ previous_rotation_local.T
+                + previous_position_local
+            )
     views = _near_field_views(
         "CURRENT + PREVIEW" if preview is not None else "OBSERVED NOW",
         focus_center_local,
@@ -238,6 +265,7 @@ def _render_geometry_pair(
             points_local,
             colors,
             triangles_local,
+            previous_triangles_local,
             preview_triangles_local,
             view,
             current_tcp_position=tcp_position,
@@ -380,6 +408,7 @@ def _render_view(
     points: np.ndarray,
     colors: np.ndarray,
     current_triangles: np.ndarray | None,
+    previous_triangles: np.ndarray | None,
     preview_triangles: np.ndarray | None,
     view: _View,
     *,
@@ -420,6 +449,15 @@ def _render_view(
             _GRIPPER,
             _GRIPPER_OUTLINE,
             alpha=0.62,
+        )
+    if previous_triangles is not None and len(previous_triangles):
+        _overlay_triangles(
+            image,
+            previous_triangles,
+            view,
+            _PREVIOUS,
+            _PREVIOUS_OUTLINE,
+            alpha=0.38,
         )
     if preview_triangles is not None and len(preview_triangles):
         _overlay_triangles(
@@ -472,7 +510,23 @@ def _render_view(
             current_tcp_position,
             current_tcp_rotation,
         )
-    _draw_legend(draw, width, height, preview is not None)
+        if preview.rotation_gizmo_frame is not None:
+            _draw_rotation_gizmo(
+                draw,
+                view,
+                width,
+                height,
+                preview,
+                current_tcp_position,
+                current_tcp_rotation,
+            )
+    _draw_legend(
+        draw,
+        width,
+        height,
+        preview is not None,
+        previous_triangles is not None,
+    )
     _draw_scale_bar(draw, view, width, height)
     return np.asarray(pil, dtype=np.uint8)
 
@@ -830,13 +884,81 @@ def _draw_adjustment_label(
     draw.text((19, top + 7), label, fill=color, font=font)
 
 
+def _draw_rotation_gizmo(
+    draw: ImageDraw.ImageDraw,
+    view: _View,
+    width: int,
+    height: int,
+    preview: NearFieldPreview,
+    current_tcp_position: np.ndarray,
+    current_tcp_rotation: np.ndarray,
+) -> None:
+    """Draw three projected right-hand rotation rings around the target TCP."""
+
+    target = preview.target_pose
+    frame = preview.rotation_gizmo_frame
+    if target is None or frame is None:
+        return
+    center = np.asarray(target.position_xyz, dtype=np.float64)
+    target_rotation = Rotation.from_quat(
+        np.asarray(target.quaternion_xyzw, dtype=np.float64)
+    ).as_matrix()
+    frame_rotation = np.eye(3, dtype=np.float64) if frame == "base" else target_rotation
+    radius_m = 0.052
+    samples = np.linspace(0.0, np.deg2rad(320.0), num=49, dtype=np.float64)
+    font = _label_font()
+    for axis_index, (color, axis_name) in enumerate(
+        zip(_AXIS_COLORS, "XYZ", strict=True)
+    ):
+        radial_a = frame_rotation[:, (axis_index + 1) % 3]
+        radial_b = frame_rotation[:, (axis_index + 2) % 3]
+        ring_base = center + radius_m * (
+            np.cos(samples)[:, None] * radial_a[None, :]
+            + np.sin(samples)[:, None] * radial_b[None, :]
+        )
+        ring_local = (ring_base - current_tcp_position) @ current_tcp_rotation
+        u, v, _ = _project(ring_local, view, width, height)
+        visible = (
+            np.isfinite(u)
+            & np.isfinite(v)
+            & (u >= -20)
+            & (u <= width + 20)
+            & (v >= -20)
+            & (v <= height + 20)
+        )
+        curve = [
+            (float(x), float(y))
+            for x, y in zip(u[visible], v[visible], strict=True)
+        ]
+        if len(curve) < 3:
+            continue
+        opaque = (*color[:3], 230)
+        draw.line(curve, fill=opaque, width=5, joint="curve")
+        _draw_arrow_head(draw, curve[-2], curve[-1], opaque, size=10.0)
+        _draw_axis_label_box(draw, curve[-1], axis_name, opaque, font)
+    label = f"ROTATION GIZMO · {frame.upper()} · RIGHT-HAND +"
+    box = draw.textbbox((0, 0), label, font=font)
+    label_width = box[2] - box[0]
+    draw.rounded_rectangle(
+        (10, 38, min(width - 10, label_width + 28), 68),
+        radius=5,
+        fill=(255, 255, 255, 238),
+        outline=(124, 58, 237, 255),
+        width=2,
+    )
+    draw.text((18, 46), label, fill=(76, 29, 149, 255), font=font)
+
+
 def _draw_legend(
     draw: ImageDraw.ImageDraw,
     width: int,
     height: int,
     has_preview: bool,
+    has_previous: bool,
 ) -> None:
     labels = [((37, 99, 235, 235), "BLUE CURRENT")]
+    if has_previous:
+        labels.append(((71, 180, 196, 215), "CYAN PREVIOUS"))
     if has_preview:
         labels.append(((124, 58, 237, 235), "PURPLE PREVIEW"))
     x = 10
@@ -844,7 +966,7 @@ def _draw_legend(
     for color, label in labels:
         draw.rectangle((x, y - 1, x + 12, y + 11), fill=color)
         draw.text((x + 17, y - 3), label, fill=(30, 41, 59, 255), font=_label_font())
-        x += 126
+        x += 142
 
 
 def _draw_arrow_head(

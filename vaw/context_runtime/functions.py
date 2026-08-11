@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -78,12 +78,15 @@ class ContextFunctions:
             "propose_grasps": self.propose_grasps,
             "propose_pose": self.propose_pose,
             "select": self.select,
+            "start_imagination": self.start_imagination,
             "delta_move": self.delta_move,
             "rotate": self.rotate,
             "commit": self.commit,
             "open_gripper": self.open_gripper,
             "close_gripper": self.close_gripper,
+            "show_rotation_gizmo": self.show_rotation_gizmo,
             "finish_imagination": self.finish_imagination,
+            "revise_action": self.revise_action,
             "reject_action": self.reject_action,
             "done": self.done,
         }
@@ -481,6 +484,55 @@ class ContextFunctions:
             ),
         )
 
+    def start_imagination(self) -> dict[str, Any]:
+        """Transfer the observed TCP to Imagination without editing it.
+
+        This explicit handoff keeps Main out of local manipulation.  The
+        baseline pose is public so the Imagination Agent can subsequently
+        translate or rotate it; no planner call is needed until the first
+        spatial edit.
+        """
+
+        robot = self.ws.state.robot
+        if robot is None or robot.tcp_pose is None:
+            raise ContextFunctionError("current TCP pose is unavailable")
+        target = ActionTarget(pose=robot.tcp_pose)
+        return self._start_imagination(
+            target,
+            ImaginationArtifacts(
+                planning_context=PlanningContext(source_kind="current"),
+                initial_target=target,
+            ),
+        )
+
+    def revise_action(self, action_id: str) -> dict[str, Any]:
+        """Return one reviewed target to Imagination without changing it."""
+
+        review = self.ws.state.action_review
+        if review is None or review.action_id != action_id:
+            raise ContextFunctionError(f"unknown or expired action_id '{action_id}'")
+        private = self.ws._private.review_artifacts.get(action_id)
+        summary = private.edit_summary if private is not None else None
+        self.ws.state.action_review = None
+        self.ws._private.review_artifacts.clear()
+        self.ws.state.imagination = ImaginationState(
+            target=review.target,
+            refinement_goal=self.ws.refinement_goal,
+        )
+        self.ws._private.imagination_artifacts = ImaginationArtifacts(
+            planning_context=private.planning_context if private is not None else None,
+            preview_plan=private.motion_plan if private is not None else None,
+            initial_target=(summary.initial_target if summary is not None else review.target),
+            previous_visual_edit=(summary.previous_edit if summary is not None else None),
+            latest_visual_edit=(summary.last_edit if summary is not None else None),
+        )
+        self.ws._private.trace_diagnostics["imagination_handoff"] = {
+            "status": "revision_requested",
+            "replaced_action_id": action_id,
+            "refinement_goal": self.ws.refinement_goal,
+        }
+        return _preview_result(review.target, self.ws._private.imagination_artifacts)
+
     def delta_move(
         self,
         delta_xyz_m: list[float],
@@ -530,6 +582,7 @@ class ContextFunctions:
                 initial_target=artifacts.initial_target,
                 previous_visual_edit=artifacts.previous_visual_edit,
                 latest_visual_edit=visual_edit,
+                rotation_gizmo_frame=artifacts.rotation_gizmo_frame,
                 turn_count=artifacts.turn_count,
             ),
         )
@@ -597,6 +650,7 @@ class ContextFunctions:
                 initial_target=artifacts.initial_target,
                 previous_visual_edit=artifacts.previous_visual_edit,
                 latest_visual_edit=visual_edit,
+                rotation_gizmo_frame=artifacts.rotation_gizmo_frame,
                 turn_count=artifacts.turn_count,
             ),
         )
@@ -705,6 +759,7 @@ class ContextFunctions:
             initial_target=target,
             previous_visual_edit=None,
             latest_visual_edit=artifacts.latest_visual_edit,
+            rotation_gizmo_frame=None,
             turn_count=0,
         )
         return self._store_imagination(target, artifacts)
@@ -732,6 +787,13 @@ class ContextFunctions:
             else:
                 latest_edit = previous.latest_visual_edit
                 previous_edit = previous.previous_visual_edit
+        rotation_gizmo_frame = (
+            artifacts.rotation_gizmo_frame
+            if artifacts.rotation_gizmo_frame is not None
+            else previous.rotation_gizmo_frame
+            if previous is not None
+            else None
+        )
         self.ws.state.action_review = None
         self.ws._private.review_artifacts.clear()
         self.ws.state.imagination = ImaginationState(
@@ -744,6 +806,7 @@ class ContextFunctions:
             initial_target=initial_target,
             previous_visual_edit=previous_edit,
             latest_visual_edit=latest_edit,
+            rotation_gizmo_frame=rotation_gizmo_frame,
             turn_count=turn_count,
         )
         self.ws._private.trace_diagnostics["imagination_edit"] = {
@@ -919,11 +982,40 @@ class ContextFunctions:
     def close_gripper(self) -> dict[str, Any]:
         return self._preview_gripper("closed")
 
+    def show_rotation_gizmo(self, frame: str) -> dict[str, Any]:
+        """Request a presenter-only rotation aid for the active target."""
+
+        normalized_frame = _frame(frame)
+        imagination = self.ws.state.imagination
+        if imagination is None:
+            raise ContextFunctionError("there is no active imagination session")
+        artifacts = self.ws._private.imagination_artifacts or ImaginationArtifacts()
+        self.ws._private.imagination_artifacts = replace(
+            artifacts,
+            rotation_gizmo_frame=normalized_frame,
+        )
+        self.ws._private.trace_diagnostics["rotation_gizmo"] = {
+            "frame": normalized_frame,
+            "target": imagination.target.summary(),
+        }
+        return {"preview": "updated", "rotation_gizmo": normalized_frame}
+
     def _preview_gripper(self, target: str) -> dict[str, Any]:
         imagination = self.ws.state.imagination
         if imagination is not None:
             artifacts = self.ws._private.imagination_artifacts or ImaginationArtifacts()
             pose = imagination.target.pose
+            # ``start_imagination`` uses the observed TCP as a neutral spatial
+            # baseline.  If the first actual edit is gripper-only, drop that
+            # unchanged pose so commit does not execute a redundant arm plan.
+            if (
+                artifacts.planning_context is not None
+                and artifacts.planning_context.source_kind == "current"
+                and artifacts.preview_plan is None
+                and artifacts.previous_visual_edit is None
+                and artifacts.latest_visual_edit is None
+            ):
+                pose = None
         elif self.ws.state.action_review is not None:
             review = self.ws.state.action_review
             review_artifacts = self.ws._private.review_artifacts.get(review.action_id)
@@ -965,6 +1057,7 @@ class ContextFunctions:
                 initial_target=artifacts.initial_target,
                 previous_visual_edit=artifacts.previous_visual_edit,
                 latest_visual_edit=edit,
+                rotation_gizmo_frame=artifacts.rotation_gizmo_frame,
                 turn_count=artifacts.turn_count,
             ),
         )

@@ -197,6 +197,52 @@ def test_near_field_rotate_preview_changes_visual_cue_deterministically(monkeypa
     )
 
 
+def test_near_field_exposes_previous_preview_and_on_demand_rotation_gizmo(
+    monkeypatch,
+) -> None:
+    triangle = np.array(
+        [[[-0.04, -0.04, 0.0], [0.04, -0.04, 0.0], [0.0, 0.05, 0.04]]],
+        dtype=np.float64,
+    )
+
+    class FakeFK:
+        def triangles(self, joints, opening):
+            del opening
+            shifted = triangle.copy()
+            shifted[:, :, 0] += float(np.asarray(joints)[0])
+            return shifted
+
+    monkeypatch.setattr(near_field_module, "load_panda_urdf_fk", lambda: FakeFK())
+    previous = Pose((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+    target = Pose(
+        (0.02, 0.0, 0.0),
+        tuple(Rotation.from_euler("y", 12.0, degrees=True).as_quat()),
+    )
+    preview = NearFieldPreview(
+        target_pose=target,
+        joint_positions_rad=(0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        gripper_opening=0.5,
+        previous_target_pose=previous,
+        previous_gripper_opening=0.5,
+        rotation_gizmo_frame="tool",
+    )
+    without_memory = NearFieldPreview(
+        target_pose=target,
+        joint_positions_rad=(0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        gripper_opening=0.5,
+    )
+
+    first = render_near_field(_camera((180, 180, 180)), None, _robot(), preview)
+    second = render_near_field(_camera((180, 180, 180)), None, _robot(), preview)
+    baseline = render_near_field(
+        _camera((180, 180, 180)), None, _robot(), without_memory
+    )
+
+    assert first is not None and baseline is not None
+    assert np.array_equal(first, second)
+    assert not np.array_equal(first, baseline)
+
+
 def test_near_field_keeps_base_axes_fixed_but_rotates_target_tool_guide(
     monkeypatch,
 ) -> None:

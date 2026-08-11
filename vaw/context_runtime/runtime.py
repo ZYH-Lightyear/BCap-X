@@ -44,7 +44,7 @@ from vaw.context_runtime.workspace import ContextStepResult, ContextWorkspace
 NO_CALL_FEEDBACK = "未执行：本轮必须且只能调用一个 Function。"
 MULTI_CALL_ERROR = "未执行：一轮只能调用一个 Function。"
 IMAGINATION_STARTERS = frozenset(
-    {"select", "propose_pose", "delta_move", "rotate", "open_gripper", "close_gripper"}
+    {"select", "propose_pose", "start_imagination", "revise_action"}
 )
 
 

@@ -77,6 +77,9 @@ class ImaginationArtifacts:
     initial_target: ActionTarget | None = None
     previous_visual_edit: VisualEdit | None = None
     latest_visual_edit: VisualEdit | None = None
+    # On-demand visual aid selected by the Imagination Agent.  This is a
+    # presenter hint, not part of the physical target or planner input.
+    rotation_gizmo_frame: str | None = None
     turn_count: int = 0
 
 

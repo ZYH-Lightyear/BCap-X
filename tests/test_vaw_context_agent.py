@@ -64,15 +64,18 @@ def test_dual_agent_runtime_rebuilds_every_request_without_history(tmp_path: Pat
         [
             _response(
                 1,
-                "close_gripper",
+                "start_imagination",
                 refinement_goal="设置闭合目标并检查两指通道",
             ),
-            _response(3, "commit", action_id="a1"),
-            _response(4, "done", success=False),
+            _response(4, "commit", action_id="a1"),
+            _response(5, "done", success=False),
         ]
     )
     imagination = RecordingProvider(
-        [_response(2, "finish_imagination", status="ready")]
+        [
+            _response(2, "close_gripper"),
+            _response(3, "finish_imagination", status="ready"),
+        ]
     )
     runtime = ContextRuntime(
         main,
@@ -85,8 +88,8 @@ def test_dual_agent_runtime_rebuilds_every_request_without_history(tmp_path: Pat
 
     result = runtime.run()
 
-    assert result.turns == 4
-    assert len(main.messages) == 3 and len(imagination.messages) == 1
+    assert result.turns == 5
+    assert len(main.messages) == 3 and len(imagination.messages) == 2
     for messages in [*main.messages, *imagination.messages]:
         assert [message["role"] for message in messages] == ["system", "user"]
         assert not any(message.get("role") in {"assistant", "tool"} for message in messages)
@@ -96,7 +99,7 @@ def test_dual_agent_runtime_rebuilds_every_request_without_history(tmp_path: Pat
     assert "Last Physical Action" in post_commit_text
     assert "设置闭合目标并检查两指通道" in post_commit_text
     assert "Main Working Focus" in post_commit_text
-    assert "reason 3" in post_commit_text
+    assert "reason 4" in post_commit_text
     assert "Refinement Goal：设置闭合目标并检查两指通道" in json.dumps(
         imagination.messages[0], ensure_ascii=False
     )
@@ -111,14 +114,15 @@ def test_dual_agent_runtime_rebuilds_every_request_without_history(tmp_path: Pat
     assert [row["agent_owner"] for row in rows] == [
         "main",
         "imagination",
+        "imagination",
         "main",
         "main",
     ]
     assert all("visible_recent_calls" not in row for row in rows)
     assert all("execution_receipt" not in row for row in rows)
     assert rows[0]["main_working_focus"] is None
-    assert rows[2]["main_working_focus"] == "reason 1"
-    assert rows[3]["main_working_focus"] == "reason 3"
+    assert rows[3]["main_working_focus"] == "reason 1"
+    assert rows[4]["main_working_focus"] == "reason 4"
 
 
 def test_main_keeps_only_one_overwrite_only_working_focus() -> None:
@@ -168,15 +172,18 @@ def test_runtime_stops_after_environment_terminates_during_commit() -> None:
         [
             _response(
                 1,
-                "open_gripper",
+                "start_imagination",
                 refinement_goal="只设置张开目标",
             ),
-            _response(3, "commit", action_id="a1"),
-            _response(4, "done", success=False),
+            _response(4, "commit", action_id="a1"),
+            _response(5, "done", success=False),
         ]
     )
     imagination = RecordingProvider(
-        [_response(2, "finish_imagination", status="ready")]
+        [
+            _response(2, "open_gripper"),
+            _response(3, "finish_imagination", status="ready"),
+        ]
     )
     terminated = False
 
@@ -201,10 +208,11 @@ def test_runtime_stops_after_environment_terminates_during_commit() -> None:
     ).run()
 
     assert result.terminate_mode.value == "env_terminated"
-    assert result.turns == 3
+    assert result.turns == 4
     assert len(main.messages) == 2
     assert [step.op for step in result.steps] == [
-        "main:open_gripper",
+        "main:start_imagination",
+        "imagination:open_gripper",
         "imagination:finish_imagination",
         "main:commit",
     ]
@@ -215,24 +223,27 @@ def test_last_physical_action_persists_across_main_perception_calls() -> None:
         [
             _response(
                 1,
-                "open_gripper",
+                "start_imagination",
                 refinement_goal="只设置真实执行后的张开目标",
             ),
-            _response(3, "commit", action_id="a1"),
+            _response(4, "commit", action_id="a1"),
             ModelResponse(text="no function this time", tool_calls=()),
             _response(
-                5,
-                "delta_move",
-                delta_xyz_m=[0.0, 0.0, 0.05],
-                frame="base",
+                6,
+                "start_imagination",
                 refinement_goal="抬升并检查物体是否随动",
             ),
-            _response(6, "detection_and_sam", query="can"),
-            _response(7, "done", success=False),
+            _response(9, "detection_and_sam", query="can"),
+            _response(10, "done", success=False),
         ]
     )
     imagination = RecordingProvider(
-        [_response(2, "finish_imagination", status="ready")]
+        [
+            _response(2, "open_gripper"),
+            _response(3, "finish_imagination", status="ready"),
+            _response(7, "delta_move", delta_xyz_m=[0.0, 0.0, 0.05], frame="base"),
+            _response(8, "finish_imagination", status="failed"),
+        ]
     )
     ContextRuntime(
         main,
@@ -245,30 +256,30 @@ def test_last_physical_action_persists_across_main_perception_calls() -> None:
     assert "只设置真实执行后的张开目标" in _user_text(main.messages[2])
     assert "Last Physical Action" in _user_text(main.messages[3])
     assert "Last Physical Action" in _user_text(main.messages[4])
-    assert "within [-0.03, 0.03]" in _user_text(main.messages[4])
     assert "Last Physical Action" in _user_text(main.messages[5])
+    assert "within [-0.03, 0.03]" in _user_text(imagination.messages[3])
     assert all(_image_count(messages) == 1 for messages in main.messages)
 
 
 def test_completed_gripper_action_remains_visible_during_lift_review() -> None:
     main = RecordingProvider(
         [
-            _response(1, "close_gripper", refinement_goal="闭合真实夹爪"),
-            _response(3, "commit", action_id="a1"),
+            _response(1, "start_imagination", refinement_goal="闭合真实夹爪"),
+            _response(4, "commit", action_id="a1"),
             _response(
-                4,
-                "delta_move",
-                delta_xyz_m=[0.0, 0.0, 0.03],
-                frame="base",
+                5,
+                "start_imagination",
                 refinement_goal="保持闭合并上抬 3cm 核验随动",
             ),
-            _response(6, "done", success=False),
+            _response(8, "done", success=False),
         ]
     )
     imagination = RecordingProvider(
         [
-            _response(2, "finish_imagination", status="ready"),
-            _response(5, "finish_imagination", status="ready"),
+            _response(2, "close_gripper"),
+            _response(3, "finish_imagination", status="ready"),
+            _response(6, "delta_move", delta_xyz_m=[0.0, 0.0, 0.03], frame="base"),
+            _response(7, "finish_imagination", status="ready"),
         ]
     )
     ContextRuntime(
@@ -290,19 +301,20 @@ def test_review_tool_surface_requires_explicit_commit_revise_or_reject() -> None
         [
             _response(
                 1,
-                "delta_move",
-                delta_xyz_m=[0.0, 0.0, 0.01],
-                frame="base",
+                "start_imagination",
                 refinement_goal="检查目标位置",
             ),
-            _response(3, "detection_and_sam", query="basket"),
-            _response(4, "reject_action", action_id="a1"),
-            _response(5, "detection_and_sam", query="basket"),
-            _response(6, "done", success=False),
+            _response(4, "detection_and_sam", query="basket"),
+            _response(5, "reject_action", action_id="a1"),
+            _response(6, "detection_and_sam", query="basket"),
+            _response(7, "done", success=False),
         ]
     )
     imagination = RecordingProvider(
-        [_response(2, "finish_imagination", status="ready")]
+        [
+            _response(2, "delta_move", delta_xyz_m=[0.0, 0.0, 0.01], frame="base"),
+            _response(3, "finish_imagination", status="ready"),
+        ]
     )
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
     runtime = ContextRuntime(
@@ -314,7 +326,7 @@ def test_review_tool_surface_requires_explicit_commit_revise_or_reject() -> None
 
     result = runtime.run()
 
-    invalid_perception = result.steps[2]
+    invalid_perception = result.steps[3]
     assert invalid_perception.op == "main:detection_and_sam"
     assert not invalid_perception.ok
     assert "unknown function 'detection_and_sam'" in invalid_perception.result
@@ -343,7 +355,7 @@ def test_imagination_turn_limit_returns_neutral_review_to_main(tmp_path: Path) -
         [
             _response(
                 1,
-                "open_gripper",
+                "start_imagination",
                 refinement_goal="仅预览张开夹爪",
             ),
             _response(4, "done", success=False),
@@ -385,7 +397,7 @@ def test_invalid_imagination_tool_is_one_shot_feedback_not_history() -> None:
         [
             _response(
                 1,
-                "open_gripper",
+                "start_imagination",
                 refinement_goal="仅预览张开夹爪",
             ),
             _response(4, "done", success=False),
@@ -443,7 +455,7 @@ def test_failed_imagination_tells_main_which_seed_was_rejected() -> None:
 def test_main_starter_requires_explicit_refinement_goal() -> None:
     main = RecordingProvider(
         [
-            _response(1, "close_gripper"),
+            _response(1, "start_imagination"),
             _response(2, "done", success=False),
         ]
     )
@@ -464,9 +476,7 @@ def test_imagination_receives_cumulative_edit_summary_not_transcript() -> None:
         [
             _response(
                 1,
-                "delta_move",
-                delta_xyz_m=[0.01, 0.0, 0.0],
-                frame="base",
+                "start_imagination",
                 refinement_goal="把 TCP 移到目标几何中心",
             ),
             _response(5, "done", success=False),
@@ -477,16 +487,22 @@ def test_imagination_receives_cumulative_edit_summary_not_transcript() -> None:
             _response(
                 2,
                 "delta_move",
-                delta_xyz_m=[0.0, 0.02, 0.0],
+                delta_xyz_m=[0.01, 0.0, 0.0],
                 frame="base",
             ),
             _response(
                 3,
                 "delta_move",
+                delta_xyz_m=[0.0, 0.02, 0.0],
+                frame="base",
+            ),
+            _response(
+                4,
+                "delta_move",
                 delta_xyz_m=[0.0, -0.01, 0.0],
                 frame="base",
             ),
-            _response(4, "finish_imagination", status="ready"),
+            _response(5, "finish_imagination", status="ready"),
         ]
     )
     ContextRuntime(
@@ -499,13 +515,16 @@ def test_imagination_receives_cumulative_edit_summary_not_transcript() -> None:
     first = _user_text(imagination.messages[0])
     second = _user_text(imagination.messages[1])
     third = _user_text(imagination.messages[2])
+    fourth = _user_text(imagination.messages[3])
     assert "把 TCP 移到目标几何中心" in first
-    assert '"total_translation_base_m":[0.01,0.0,0.0]' in first
+    assert '"total_translation_base_m":[0.0,0.0,0.0]' in first
     assert "quaternion_xyzw" not in first
     assert "Target Gripper：inherit observed opening" in first
-    assert '"previous_edit"' in second and '"last_edit"' in second
-    assert '"total_translation_base_m":[0.01,0.02,0.0]' in second
-    assert '"total_translation_base_m":[0.01,0.01,0.0]' in third
+    assert '"last_edit"' in second
+    assert '"total_translation_base_m":[0.01,0.0,0.0]' in second
+    assert '"previous_edit"' in third and '"last_edit"' in third
+    assert '"total_translation_base_m":[0.01,0.02,0.0]' in third
+    assert '"total_translation_base_m":[0.01,0.01,0.0]' in fourth
     assert "reason 2" not in second and "reason 3" not in third
     main_review = _user_text(main.messages[1])
     assert "Action Review Edit Summary" in main_review

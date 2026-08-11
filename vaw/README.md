@@ -50,10 +50,7 @@ locate_point(query, within_region_id?)
 propose_grasps(region_id) -> seed_ids
 propose_pose(point_id, offset_xyz, refinement_goal, quaternion_xyzw?)
 select(seed_id, refinement_goal)
-delta_move(delta_xyz_m, frame, refinement_goal)
-rotate(axis, angle_deg, frame, refinement_goal)
-open_gripper(refinement_goal)
-close_gripper(refinement_goal)
+start_imagination(refinement_goal)
 done(success)
 ```
 
@@ -62,13 +59,13 @@ Action Review 决策面只在 Imagination 交回一个待审动作时出现：
 ```text
 commit(action_id)
 reject_action(action_id)
-delta_move / rotate / open_gripper / close_gripper
+revise_action(action_id, refinement_goal)
 select / propose_pose
 done(success)
 ```
 
 普通 Main 看不到 `commit`；因此只有在最终 Preview 已进入 Action Review 后才可能执行。审查时
-若调用 editor，会把同一完整 target 交回 Imagination；若调用 `reject_action`，则显式销毁该
+若调用 `revise_action`，会把同一完整 target 交回 Imagination；若调用 `reject_action`，则显式销毁该
 offer，不刷新真实 observation。
 
 Imagination Agent：
@@ -78,11 +75,13 @@ delta_move(delta_xyz_m, frame)
 rotate(axis, angle_deg, frame)
 open_gripper()
 close_gripper()
+show_rotation_gizmo(frame)
 finish_imagination(status="ready" | "failed")
 ```
 
-除 `commit` 外，所有 Function 都不会改变真实世界。`select/propose_pose` 以及 Main 直接调用
-空间或夹爪 editor 时进入 Imagination；结束后产生等待 Main 判断的 `ActionReview`。
+除 `commit` 外，所有 Function 都不会改变真实世界。`select/propose_pose/start_imagination`
+创建 Imagination；Main 和 Review 均不再直接拥有空间或夹爪 editor。`revise_action` 把现有
+Review 原样交回 Imagination；结束后产生等待 Main 判断的 `ActionReview`。
 Main 启动 Imagination 时必须显式提供一句短的 `refinement_goal`，不能把整段 rationale 当成
 局部控制目标。Imagination 每次请求只收到当前 Canvas、目标几何和累计 `EditSummary`，不收到
 Function transcript。普通 Main 只额外收到一条 overwrite-only `Main Working Focus`：上一轮
@@ -95,8 +94,8 @@ Main 自己的一句依据，用于在感知调用后保留“抓取失败，正
 
 ## Canvas
 
-Web schema 24 / `vaw-context-v23-source-vector` / renderer
-`context-web-v23-source-vector`：
+Web schema 25 / `vaw-context-v24-imagination-agent` / renderer
+`context-web-v24-imagination-agent`：
 
 - 上层 `OBSERVED NOW · REAL WORLD`：干净 agentview、与 agentview 标定透视一致的稠密
   RGB-D surface 和四行本体状态；
@@ -109,6 +108,9 @@ Web schema 24 / `vaw-context-v23-source-vector` / renderer
 - near-field 的 `LOCAL 3/4` 角落固定显示 `BASE / WORLD` +轴，`JAW PLANE` 角落显示随当前
   紫色目标旋转的 `TARGET TOOL` +轴。`rotate` 使用所选 +轴的右手定则；Prompt 要求符号或幅度
   不确定时先用 5–15° Preview，不能用 ±90° 猜方向；
+- 每次空间编辑后，Contact Focus 同时显示青色 `PREVIOUS PREVIEW` 和紫色 `CURRENT PREVIEW`，
+  让 history-free Agent 在一张当前图里比较编辑前后；`show_rotation_gizmo(frame)` 可按需在目标
+  周围显示 VIA 风格三轴旋转环，默认不占据画面；
 - Waypoint 卡使用 `TCP→SOURCE BASE [dx,dy,dz]` 表示从 target TCP 指向最近当前 source surface
   的 BASE 向量；距离只由该向量派生显示，不再暴露一个缺少修正方向的孤立标量；
 - 没有 active target 时，下层明确标成 `CURRENT EVIDENCE · OBSERVED` 或
@@ -141,7 +143,8 @@ Depth、相机参数、raw mask/cloud、planner trajectory 和环境 success 只
 vaw/context_runtime/
   model.py          # evidence、ActionTarget/Seed、ImaginationState、ActionReview
   private.py        # sensor、planner、source provenance、visual edit artifacts
-  functions.py      # Main/Imagination 共用的无物理 editor 与唯一 commit
+  functions.py      # Function 语义、Imagination-only editor 与唯一 commit
+  presentation.py   # semantic/runtime state → policy-visible presentation
   workspace.py      # revision 生命周期与 dispatch
   protocol.py       # 两个独立 System Prompt 和工具视图
   runtime.py        # history-free Main/Imagination ownership loop

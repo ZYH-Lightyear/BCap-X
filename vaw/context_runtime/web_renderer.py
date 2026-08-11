@@ -15,7 +15,7 @@ from vaw.context_runtime.packet import (
 
 
 class ContextWebRenderer:
-    name = "context-web-v23-source-vector"
+    name = "context-web-v24-imagination-agent"
     width = CONTEXT_WIDTH
     height = CONTEXT_HEIGHT
 

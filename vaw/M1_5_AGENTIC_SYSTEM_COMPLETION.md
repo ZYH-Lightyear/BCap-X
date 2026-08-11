@@ -551,6 +551,17 @@ TCP 指向最近当前 source surface 的 `TCP→SOURCE BASE [dx,dy,dz]`；Canva
 Prompt 要求沿同号 BASE 分量小步试探，并逐轮确认向量范数缩小。版本更新为 Web schema 24 /
 `vaw-context-v23-source-vector` / renderer `context-web-v23-source-vector`。
 
+v23 的真实短 probe 进一步证明，仅给当前 source vector 仍不足以支持无 transcript 的逐步比较：
+下一轮看不到上一版 target，模型会在向量翻转后继续沿旧方向编辑。v24 因此收紧 Agent 所有权：
+Main 只能通过 `select/propose_pose/start_imagination` 创建局部控制会话，Review 只能
+`commit/reject/revise_action` 或换起点，`delta_move/rotate/open/close` 仅属于 Imagination。
+每次空间编辑后的 Contact Focus 同时显示青色 previous Preview 与紫色 current Preview；按需
+`show_rotation_gizmo(frame)` 显示 VIA 风格三轴旋转环，不改变 target 或 planner。Main、Review、
+Imagination 的 Prompt 顶部共享抓取接近前 open、校准时保持 open、运输时 closed、释放前检查当前
+真实目标区域的因果前提。active target 与 near-field presentation 选择逻辑从巨型 `packet.py`
+拆入独立 presenter。版本更新为 Web schema 25 / `vaw-context-v24-imagination-agent` / renderer
+`context-web-v24-imagination-agent`。
+
 验收：主任务 seeds `0,1,2` 至少 `2/3` env success。
 
 ### M1.5.5 — Basic Generalization and Freeze

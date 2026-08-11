@@ -26,18 +26,29 @@ from vaw.context_runtime.model import (
     Pose,
     RobotState,
 )
-from vaw.context_runtime.near_field import NearFieldPreview, render_contact_focus
+from vaw.context_runtime.near_field import render_contact_focus
+from vaw.context_runtime.presentation import (
+    artifact_plan as _artifact_plan,
+)
+from vaw.context_runtime.presentation import (
+    compile_active_presentation as _active_presentation,
+)
+from vaw.context_runtime.presentation import (
+    compile_near_field_preview as _near_field_preview,
+)
+from vaw.context_runtime.presentation import (
+    observed_source_ref as _observed_source_ref,
+)
 from vaw.context_runtime.private import (
     ActionReviewArtifacts,
     ImaginationArtifacts,
     PrivateEnvContext,
-    build_edit_summary,
 )
 from vaw.context_runtime.scene_view import render_scene_view
 from vaw.context_runtime.workspace import ContextWorkspace
 
-CONTEXT_SCHEMA = "vaw-context-v23-source-vector"
-CONTEXT_WEB_SCHEMA_VERSION = 24
+CONTEXT_SCHEMA = "vaw-context-v24-imagination-agent"
+CONTEXT_WEB_SCHEMA_VERSION = 25
 CONTEXT_WIDTH = 1920
 CONTEXT_HEIGHT = 1080
 
@@ -840,150 +851,6 @@ def _metric_focus_crop(
     return np.asarray(image, dtype=np.uint8)
 
 
-def _active_presentation(
-    workspace: ContextWorkspace,
-) -> tuple[
-    ActionTarget | None,
-    ImaginationArtifacts | ActionReviewArtifacts | None,
-    dict[str, Any] | None,
-]:
-    state = workspace.state
-    if state.imagination is not None:
-        artifacts = workspace._private.imagination_artifacts
-        return (
-            state.imagination.target,
-            artifacts,
-            _target_presentation(
-                state.imagination.target,
-                artifacts,
-                status="editing",
-                action_id=None,
-                target_role=_target_role(state.imagination.target, artifacts),
-                source_surface_delta_base_m=_source_surface_delta_base_m(
-                    workspace,
-                    state.imagination.target,
-                    artifacts,
-                ),
-            ),
-        )
-    if state.action_review is not None:
-        artifacts = workspace._private.review_artifacts.get(
-            state.action_review.action_id
-        )
-        return (
-            state.action_review.target,
-            artifacts,
-            _target_presentation(
-                state.action_review.target,
-                artifacts,
-                status="review",
-                action_id=state.action_review.action_id,
-                intent=state.action_review.intent,
-                target_role=_target_role(state.action_review.target, artifacts),
-                source_surface_delta_base_m=_source_surface_delta_base_m(
-                    workspace,
-                    state.action_review.target,
-                    artifacts,
-                ),
-            ),
-        )
-    return None, None, None
-
-
-def _target_presentation(
-    target: ActionTarget,
-    artifacts: ImaginationArtifacts | ActionReviewArtifacts | None,
-    *,
-    status: str,
-    action_id: str | None,
-    target_role: str,
-    source_surface_delta_base_m: tuple[float, float, float] | None,
-    intent: str | None = None,
-) -> dict[str, Any]:
-    result: dict[str, Any] = {
-        "status": status,
-        "target": target.summary(),
-        "target_role": target_role,
-    }
-    if source_surface_delta_base_m is not None:
-        result["source_surface_delta_base_m"] = _rounded(
-            source_surface_delta_base_m,
-            4,
-        )
-    if action_id is not None:
-        result["action_id"] = action_id
-    if intent is not None:
-        result["intent"] = intent
-    plan = _artifact_plan(artifacts)
-    if plan is not None:
-        result["prediction"] = plan.prediction.summary()
-    if isinstance(artifacts, ImaginationArtifacts) and artifacts.latest_visual_edit:
-        result["latest_edit"] = artifacts.latest_visual_edit.summary()
-    edit_summary = (
-        build_edit_summary(target, artifacts)
-        if isinstance(artifacts, ImaginationArtifacts)
-        else artifacts.edit_summary
-        if isinstance(artifacts, ActionReviewArtifacts)
-        else None
-    )
-    if edit_summary is not None:
-        result["edit_summary"] = edit_summary.summary()
-    return result
-
-
-def _target_role(
-    target: ActionTarget,
-    artifacts: ImaginationArtifacts | ActionReviewArtifacts | None,
-) -> str:
-    """Describe what the virtual pose means without exposing planner internals."""
-
-    if target.pose is None:
-        return "gripper_only"
-    context = artifacts.planning_context if artifacts is not None else None
-    if context is not None and context.source_kind == "grasp":
-        # GraspNet poses are intended contact/closure poses.  Treating them as
-        # clearance waypoints caused the VLM to lift otherwise useful seeds.
-        return "grasp_contact"
-    if context is not None and context.source_kind == "point":
-        return "point_pose"
-    return "relative_pose"
-
-
-def _source_surface_delta_base_m(
-    workspace: ContextWorkspace,
-    target: ActionTarget,
-    artifacts: ImaginationArtifacts | ActionReviewArtifacts | None,
-) -> tuple[float, float, float] | None:
-    """BASE vector from target contact TCP to its nearest observed source point.
-
-    This is derived only from the current revision's segmented RGB-D points.
-    It is not a collision/contact oracle; unlike a scalar gap, it makes the
-    local correction direction explicit without exposing raw point clouds.
-    """
-
-    if target.pose is None or artifacts is None or artifacts.planning_context is None:
-        return None
-    region_id = artifacts.planning_context.region_id
-    if region_id is None:
-        return None
-    geometry = workspace._private.region_geometry.get(region_id)
-    if geometry is None:
-        return None
-    points = np.asarray(geometry.filtered_object_points_base, dtype=np.float64)
-    if points.ndim != 2 or points.shape[1] < 3 or len(points) == 0:
-        points = np.asarray(geometry.object_points_base, dtype=np.float64)
-    if points.ndim != 2 or points.shape[1] < 3 or len(points) == 0:
-        return None
-    points = points[:, :3]
-    points = points[np.isfinite(points).all(axis=1)]
-    if len(points) == 0:
-        return None
-    target_xyz = np.asarray(target.pose.position_xyz, dtype=np.float64)
-    deltas = points - target_xyz
-    nearest_index = int(np.argmin(np.linalg.norm(deltas, axis=1)))
-    return tuple(float(value) for value in deltas[nearest_index])
-
-
 def _grounding_references(
     state: ContextState,
     region_id: Any,
@@ -1454,71 +1321,6 @@ def _proposal_raster(
         width=3,
     )
     return np.asarray(focus, dtype=np.uint8)
-
-
-def _observed_source_ref(
-    artifacts: ImaginationArtifacts | ActionReviewArtifacts | None,
-) -> str | None:
-    if artifacts is None or artifacts.planning_context is None:
-        return None
-    context = artifacts.planning_context
-    # A grasp seed's source_ref identifies the virtual seed itself; region_id
-    # identifies the observed object that seed is supposed to manipulate.
-    # Prefer observed evidence so a bad seed remains visibly inconsistent.
-    return context.region_id or context.source_ref
-
-
-def _artifact_plan(
-    artifacts: ImaginationArtifacts | ActionReviewArtifacts | None,
-):
-    if isinstance(artifacts, ImaginationArtifacts):
-        return artifacts.preview_plan
-    if isinstance(artifacts, ActionReviewArtifacts):
-        return artifacts.motion_plan
-    return None
-
-
-def _near_field_preview(
-    state: ContextState,
-    target: ActionTarget,
-    artifacts: ImaginationArtifacts | ActionReviewArtifacts | None,
-) -> NearFieldPreview | None:
-    """Compile the active virtual target for the observed near-field cloud.
-
-    Point samples always come from the current sensor revision.  Only the
-    robot geometry is virtual, so this preview cannot imply object motion or
-    contact success.
-    """
-
-    robot = state.robot
-    if robot is None or robot.gripper_opening is None:
-        return None
-    plan = _artifact_plan(artifacts)
-    joints = (
-        plan.prediction.joint_positions_rad
-        if plan is not None and plan.prediction.solve_ik == "returned"
-        else None
-    )
-    if target.pose is None:
-        joints = robot.joint_positions_rad
-    opening = (
-        1.0
-        if target.gripper == "open"
-        else 0.0
-        if target.gripper == "closed"
-        else robot.gripper_opening
-    )
-    visual_edit = (
-        artifacts.latest_visual_edit
-        if isinstance(artifacts, ImaginationArtifacts)
-        else None
-    )
-    return NearFieldPreview(
-        target_pose=target.pose,
-        joint_positions_rad=joints,
-        gripper_opening=opening,
-        visual_edit=visual_edit,
-    )
 
 
 def _agentview_with_base_axes(

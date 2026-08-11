@@ -231,7 +231,7 @@ class FailedMotionBackend:
 
 
 def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
-    assert len(FUNCTION_NAMES) == 12
+    assert len(FUNCTION_NAMES) == 16
     assert FUNCTION_NAMES[0] == "detection_and_sam"
     assert FUNCTION_NAMES[1:3] == ("propose_grasps", "locate_point")
     assert "inspect" not in FUNCTION_NAMES
@@ -240,6 +240,7 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
         "rotate",
         "open_gripper",
         "close_gripper",
+        "show_rotation_gizmo",
         "finish_imagination",
     )
     main = function_definitions()
@@ -258,8 +259,17 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
     )
     assert "commit" not in STANDARD_MAIN_FUNCTION_NAMES
     assert "reject_action" not in STANDARD_MAIN_FUNCTION_NAMES
+    assert "delta_move" not in STANDARD_MAIN_FUNCTION_NAMES
+    assert "rotate" not in STANDARD_MAIN_FUNCTION_NAMES
+    assert "open_gripper" not in STANDARD_MAIN_FUNCTION_NAMES
+    assert "close_gripper" not in STANDARD_MAIN_FUNCTION_NAMES
+    assert "start_imagination" in STANDARD_MAIN_FUNCTION_NAMES
     assert "detection_and_sam" not in REVIEW_FUNCTION_NAMES
     assert REVIEW_FUNCTION_NAMES[:2] == ("commit", "reject_action")
+    assert "revise_action" in REVIEW_FUNCTION_NAMES
+    assert not set(IMAGINATION_FUNCTION_NAMES[:-1]).intersection(
+        STANDARD_MAIN_FUNCTION_NAMES
+    )
     encoded = json.dumps(main + imagination).lower()
     assert "history" not in encoded and "receipt" not in encoded and "obb" not in encoded
     detection = main[0]["function"]
@@ -269,10 +279,16 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
     assert "motion planning 失败" in detection["description"]
     assert "commit 后应重新观察真实画面" not in SYSTEM_PROMPT
     for name in ("delta_move", "rotate"):
-        definition = next(x["function"] for x in main if x["function"]["name"] == name)
+        definition = next(
+            x["function"] for x in imagination if x["function"]["name"] == name
+        )
         assert "frame" in definition["parameters"]["required"]
-        assert "refinement_goal" in definition["parameters"]["required"]
-    delta = next(x["function"] for x in main if x["function"]["name"] == "delta_move")
+        assert "refinement_goal" not in definition["parameters"]["required"]
+    delta = next(
+        x["function"]
+        for x in imagination
+        if x["function"]["name"] == "delta_move"
+    )
     pose = next(x["function"] for x in main if x["function"]["name"] == "propose_pose")
     grasps = next(
         x["function"] for x in main if x["function"]["name"] == "propose_grasps"
@@ -282,12 +298,14 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
     assert "最终抓取接触/闭合位姿" in grasps["description"]
     assert "不生成抓取方向" in point["description"]
     assert "应先使用 propose_grasps" in pose["description"]
-    assert "当前真实 TCP" in delta["description"]
-    assert "厘米级局部修正" in delta["description"]
+    assert "当前想象目标" in delta["description"]
+    assert "厘米级局部" in delta["description"]
     frame_description = delta["parameters"]["properties"]["frame"]["description"]
     assert "base" in frame_description and "+Z 恒为竖直上抬" in frame_description
     assert "tool +Z" in frame_description and "可能朝向支撑面" in frame_description
-    rotate = next(x["function"] for x in main if x["function"]["name"] == "rotate")
+    rotate = next(
+        x["function"] for x in imagination if x["function"]["name"] == "rotate"
+    )
     assert "右手定则" in rotate["description"]
     assert "5–15°" in rotate["description"]
     assert "±90° 猜测" in rotate["description"]
@@ -316,7 +334,7 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
     assert "非物理 Function 不刷新真实 observation" in SYSTEM_PROMPT
     assert "不得仅因下层切换" in SYSTEM_PROMPT
     assert "within_region_id" in SYSTEM_PROMPT
-    for name in ("select", "propose_pose", "open_gripper", "close_gripper"):
+    for name in ("select", "propose_pose", "start_imagination"):
         definition = next(x["function"] for x in main if x["function"]["name"] == name)
         assert "refinement_goal" in definition["parameters"]["required"]
     for definition in imagination:
@@ -730,6 +748,8 @@ def test_main_revision_continues_from_reviewed_target() -> None:
     reviewed = workspace.state.action_review.target
 
     workspace.set_refinement_goal("继续把已审查目标向 base +Y 微调")
+    resumed = workspace.execute("revise_action", action_id=first_action)
+    assert resumed.ok and workspace.state.owner == "imagination"
     workspace.execute("delta_move", delta_xyz_m=[0.0, 0.01, 0.0], frame="base")
 
     revised = workspace.state.imagination.target
@@ -743,3 +763,25 @@ def test_main_revision_continues_from_reviewed_target() -> None:
         "action_id"
     ]
     assert second_action != first_action
+
+
+def test_explicit_current_handoff_keeps_local_editing_imagination_only() -> None:
+    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
+    revision = workspace.state.observation_revision
+    workspace.set_refinement_goal("先仅张开真实夹爪")
+
+    started = workspace.execute("start_imagination")
+    assert started.ok and workspace.state.owner == "imagination"
+    assert workspace.state.imagination.target.pose == workspace.state.robot.tcp_pose
+
+    gizmo = workspace.execute("show_rotation_gizmo", frame="tool")
+    assert gizmo.result == {"preview": "updated", "rotation_gizmo": "tool"}
+    assert workspace._private.imagination_artifacts.rotation_gizmo_frame == "tool"
+
+    opened = workspace.execute("open_gripper")
+    assert opened.ok
+    # A first gripper-only edit drops the neutral TCP baseline, preventing a
+    # redundant arm execution before the gripper command.
+    assert workspace.state.imagination.target.pose is None
+    assert workspace.state.imagination.target.gripper == "open"
+    assert workspace.state.observation_revision == revision

@@ -11,10 +11,14 @@ FUNCTION_NAMES = (
     "locate_point",
     "propose_pose",
     "select",
+    "start_imagination",
     "delta_move",
     "rotate",
     "open_gripper",
     "close_gripper",
+    "show_rotation_gizmo",
+    "finish_imagination",
+    "revise_action",
     "reject_action",
     "commit",
     "done",
@@ -26,20 +30,14 @@ STANDARD_MAIN_FUNCTION_NAMES = (
     "locate_point",
     "propose_pose",
     "select",
-    "delta_move",
-    "rotate",
-    "open_gripper",
-    "close_gripper",
+    "start_imagination",
     "done",
 )
 
 REVIEW_FUNCTION_NAMES = (
     "commit",
     "reject_action",
-    "delta_move",
-    "rotate",
-    "open_gripper",
-    "close_gripper",
+    "revise_action",
     "select",
     "propose_pose",
     "done",
@@ -50,6 +48,7 @@ IMAGINATION_FUNCTION_NAMES = (
     "rotate",
     "open_gripper",
     "close_gripper",
+    "show_rotation_gizmo",
     "finish_imagination",
 )
 
@@ -61,16 +60,24 @@ Canvas 上层 OBSERVED NOW 是唯一真实视觉：左侧为当前 agentview，�
 未执行目标。CONTACT FOCUS 是同一当前 RGB-D 的正交 jaw-plane，用于判断目标是否真正进入
 两指通道。规划与紫色几何都不是物理事实。
 
+【高优先级夹爪因果前提】
+- 新抓取的接近运动开始前，当前真实 GRIP 必须已经足够张开；若真实夹爪闭合，先创建并执行
+  gripper-only open，再规划接近。ARM→GRIPPER 的组合 target 不能表达“先张开再移动”。
+- 抓取位置/方向尚在校准时保持夹爪张开；到达后依据新的真实 JAW PLANE 再创建 close-only target。
+- 运输疑似或已验证抓取物时保持闭合；只有当前真实目标区域支持释放条件时才 open。
+
 你负责理解任务、调用感知、选择动作起点，并审查 Imagination 最终交回的 ActionReview。
-select、propose_pose、delta_move、rotate、open_gripper、close_gripper 会把控制权交给独立的
-Imagination Agent；它会连续微调并交回 review_required 或 failed。review_required 只表示轮到你审查，
+select、propose_pose 或 start_imagination 会把控制权交给独立的 Imagination Agent；所有局部
+delta_move、rotate、open_gripper、close_gripper 都只由它操作。它会连续微调并交回
+review_required 或 failed。review_required 只表示轮到你审查，
 不是批准：你必须查看最终 Preview，只有自己判断几何合理时才 commit；否则换 seed 或重新进入
 Imagination。
 ActionReview 是一次决策的 offer：交回后你的下一次成功 Function 若不是 commit，就表示明确放弃
 该 review，旧 action_id 随即失效。不要先用感知 Function 表达“拒绝”，下一轮又 commit 旧动作。
 若 Latest Imagination Handoff 为 failed 且含 source_ref，该引用就是刚被否决的动作起点；没有
 新视觉证据或明确不同的修正策略时，不要立刻重复选择同一 source_ref。
-不要替它执行局部微调。
+不要替它执行局部微调；需要从当前真实 TCP 开始构造相对动作时，调用 start_imagination，并把
+几何目的写入 refinement_goal。
 审查 ActionReview 时，必须把 refinement goal 与最终 Target XYZ、当前真实 TCP XYZ 和累计
 BASE 位移逐轴比较。若目标要求沿某个 base 轴增加/减少，而最终 target 却沿反方向变化，几何
 意图已经矛盾，不得 commit；应重新进入 Imagination 修正。
@@ -125,8 +132,8 @@ Imagination/ActionReview 已形成，旧的失败回执由当前 Preview 取代�
 open/closed 命令，不证明抓住或释放物体。`requested_arm_delta_base_m` 是从执行前真实 TCP 到
 请求 target 的 BASE 位移，不是物体位移或任务效果；如果上一动作没有请求 base +Z，就不能把
 “物体尚未离开支撑面”解释为抬升验证失败，应先保持夹爪状态执行小幅上抬。
-需要从当前真实 TCP 做相对抬升、下降或平移时，直接调用 delta_move；没有 active target 时它会
-以当前真实 TCP 为起点。propose_pose 只能引用 locate_point 实际返回且仍在 valid_point_ids 中的
+需要从当前真实 TCP 做相对抬升、下降、平移或纯夹爪动作时，调用 start_imagination；随后由
+Imagination Agent 从当前 TCP/GRIP 编辑 Preview。propose_pose 只能引用 locate_point 实际返回且仍在 valid_point_ids 中的
 point_id，绝不能虚构 `current_tcp` 等 ID。
 delta_move 是每轴不超过 3cm 的局部修正，不是长距离语义导航。若目标是画面中另一个物体、
 容器或远处位置，应先 detection_and_sam 定位目标，再以该 region 作为 within_region_id 调用
@@ -144,6 +151,9 @@ ACTION_REVIEW_SYSTEM_PROMPT = """\
 
 Canvas 上层 OBSERVED NOW 是当前真实世界；下层紫色 IMAGINATION 是若 commit 才会执行的虚拟
 目标。对照 refinement goal、当前真实 TCP/GRIP、最终 target、累计 BASE edit 和局部接触几何。
+高优先级夹爪前提：新抓取接近前真实夹爪必须已张开；若闭合，先批准纯 open target。位置/方向
+校准期间保持 open，到达后再用新的真实 JAW PLANE 审查 close-only target。运输时保持 closed；
+没有当前真实释放几何时不得 open。组合动作顺序 ARM→GRIPPER，不能把组合 open 当作预先张开。
 审查对象是一个局部、可执行的下一步，不是整项 User Task。应先判断它是否正确完成
 `refinement_goal`、是否为后续动作建立必要条件；不要仅因为它还没到最终目的地而否决。比如真实
 夹爪闭合且下一次接近需要张开时，gripper-only open 是有用且必要的动作，即使它本身不抓取、
@@ -156,7 +166,8 @@ TARGET ROLE 为 GRASP CONTACT 时，它是最终接触/闭合位姿而非 pre-gr
 
 本轮必须明确选择且只调用一个提供的 Review Function：
 - 几何与目标一致：commit(action_id)；
-- 需要局部修正或换已有 seed/point：调用对应 editor，交回 Imagination；
+- 需要继续局部修正当前 target：revise_action(action_id, refinement_goal)，交回 Imagination；
+- 需要换已有 seed/point：调用 select/propose_pose，创建新的 Imagination；
 - 当前 target 不应执行，或需要回到普通感知/规划：reject_action(action_id)；
 - 只有当前真实视觉已经满足 User Task 时才 done(success=true)。
 
@@ -183,6 +194,12 @@ Canvas 上层 OBSERVED NOW 是真实世界；下层 IMAGINATION 是在同一当�
 CONTACT FOCUS 的 jaw-plane、refinement goal 和 Edit Summary 审查当前 target；接触敏感判断
 优先确认物体是否位于两指之间、是否有足够闭合通道，而不是只看单一相机投影。
 
+【高优先级夹爪因果前提】
+- 新抓取接近时真实 GRIP 必须已经张开；若当前闭合，不得构造“arm pose + open”的组合 target，
+  因为真实顺序是 ARM→GRIPPER。应交回纯 open target，或 failed 让 Main 先执行张开。
+- 调整抓取 pose 时保持 open；只有当前真实 JAW PLANE 支持两指通道时才形成 close-only target。
+- 抬升/运输验证保持 closed；释放只在当前真实目标区域几何支持时设置 open。
+
 ActionSeed 是几何规划器给出的起点，不要仅为了让二维投影“看起来竖直”而旋转它。四元数的
 x/y/z/w 分量不是绕各轴的角度，禁止从单个分量推断倾斜方向。姿态调整只能依据紫色目标与真实
 表面之间一个具体、可见的接触/碰撞缺陷；若目标只是平移已经形成的姿态（例如抬升或运输），
@@ -195,7 +212,8 @@ x/y/z/w 分量不是绕各轴的角度，禁止从单个分量推断倾斜方向
 几何为准。
 
 每轮只做三种选择之一：若当前 target 已满足目标，调用 finish_imagination(status="ready")；若能
-指出一个当前可见的几何缺陷，只做一次 delta_move、rotate、open_gripper 或 close_gripper；若该
+指出一个当前可见的几何缺陷，只做一次 delta_move、rotate、open_gripper 或 close_gripper；若旋转
+方向难以从投影判断，可先调用 show_rotation_gizmo(frame) 显示 VIA 风格旋转环；若该
 target 无法可靠修复，调用 status="failed"。不要为了用满轮数而编辑。
 
 先判断空间姿态，再设置最终 gripper target；open/close 只改变虚拟目标，不能模拟接触结果。
@@ -250,7 +268,7 @@ def _refinement_goal() -> dict[str, Any]:
     }
 
 
-def _edit_definitions(*, main: bool) -> dict[str, dict[str, Any]]:
+def _edit_definitions() -> dict[str, dict[str, Any]]:
     frame = {
         "type": "string",
         "enum": ["base", "tool"],
@@ -260,19 +278,10 @@ def _edit_definitions(*, main: bool) -> dict[str, dict[str, Any]]:
             "top-down 时可能朝向支撑面"
         ),
     }
-    extra = {"refinement_goal": _refinement_goal()} if main else {}
-    extra_required = ("refinement_goal",) if main else ()
-    delta_description = (
-        "编辑想象目标的位置；只更新 preview，不执行。没有 active target 时从当前真实 TCP "
-        "开始，因此当前 TCP 的相对抬升/下降无需 point_id。它只用于厘米级局部修正；远处语义"
-        "目标应先 locate_point 再 propose_pose。可连续调用。"
-        if main
-        else "编辑当前想象目标的位置；只更新 preview，不执行。可连续调用。"
-    )
     return {
         "delta_move": _function(
             "delta_move",
-            delta_description,
+            "对当前想象目标做厘米级局部位置修正；只更新 Preview，不执行。可连续调用。",
             {
                 "delta_xyz_m": {
                     "type": "array",
@@ -289,9 +298,8 @@ def _edit_definitions(*, main: bool) -> dict[str, dict[str, Any]]:
                     ),
                 },
                 "frame": frame,
-                **extra,
             },
-            ("delta_xyz_m", "frame", *extra_required),
+            ("delta_xyz_m", "frame"),
         ),
         "rotate": _function(
             "rotate",
@@ -312,27 +320,31 @@ def _edit_definitions(*, main: bool) -> dict[str, dict[str, Any]]:
                     ),
                 },
                 "frame": frame,
-                **extra,
             },
-            ("axis", "angle_deg", "frame", *extra_required),
+            ("axis", "angle_deg", "frame"),
         ),
         "open_gripper": _function(
             "open_gripper",
             "把想象目标的夹爪状态设为 open；不会打开真实夹爪。",
-            extra,
-            extra_required,
         ),
         "close_gripper": _function(
             "close_gripper",
             "把想象目标的夹爪状态设为 closed；不会闭合真实夹爪，也不保证抓住物体。",
-            extra,
-            extra_required,
+        ),
+        "show_rotation_gizmo": _function(
+            "show_rotation_gizmo",
+            (
+                "在当前 Preview 上显示所选 frame 的 VIA 风格 X/Y/Z 旋转环，帮助判断 rotate 的"
+                "轴与正方向；不修改 target、不规划、不执行。"
+            ),
+            {"frame": frame},
+            ("frame",),
         ),
     }
 
 
 def function_definitions() -> list[dict[str, Any]]:
-    edits = _edit_definitions(main=True)
+    edits = _edit_definitions()
     within = {"type": "string", "description": "可选的当前 region 搜索范围"}
     common = [
         _function(
@@ -358,7 +370,7 @@ def function_definitions() -> list[dict[str, Any]]:
             (
                 "从 locate_point 返回且仍在 valid_point_ids 中的 point_id 与 offset 创建空间目标；"
                 "不得虚构 current_tcp 等 ID。只预览并默认继承当前真实夹爪开度。当前 TCP 的"
-                "相对移动应使用 delta_move。若移动前必须先改变开度，应先单独 commit "
+                "相对移动应使用 start_imagination 交给 Imagination Agent。若移动前必须先改变开度，应先单独 commit "
                 "gripper-only 目标。它不自动生成抓取方向；抓取已有 region 的物体时，应先使用 "
                 "propose_grasps，而不是凭空手写 quaternion。省略 quaternion 时继承当前真实方向。"
             ),
@@ -384,10 +396,38 @@ def function_definitions() -> list[dict[str, Any]]:
             },
             ("seed_id", "refinement_goal"),
         ),
+        _function(
+            "start_imagination",
+            (
+                "从当前真实 TCP/GRIP 启动一个独立 Imagination session。用于相对抬升、下降、"
+                "局部平移、旋转或纯夹爪目标；本调用不编辑 target，也不执行物理动作。"
+            ),
+            {"refinement_goal": _refinement_goal()},
+            ("refinement_goal",),
+        ),
         edits["delta_move"],
         edits["rotate"],
         edits["open_gripper"],
         edits["close_gripper"],
+        edits["show_rotation_gizmo"],
+        _function(
+            "finish_imagination",
+            "结束本次想象审查。ready 请求 Main 审查最终 Preview；failed 放弃该 target。",
+            {"status": {"type": "string", "enum": ["ready", "failed"]}},
+            ("status",),
+        ),
+        _function(
+            "revise_action",
+            (
+                "否决当前 ActionReview 的立即执行，并把同一 target 重新交给 Imagination Agent"
+                "继续局部修改；不执行、不刷新 observation。"
+            ),
+            {
+                "action_id": {"type": "string"},
+                "refinement_goal": _refinement_goal(),
+            },
+            ("action_id", "refinement_goal"),
+        ),
         _function(
             "reject_action",
             (
@@ -436,17 +476,17 @@ def review_function_definitions() -> list[dict[str, Any]]:
 
 
 def imagination_function_definitions() -> list[dict[str, Any]]:
-    edits = _edit_definitions(main=False)
+    edits = _edit_definitions()
     return [
         edits["delta_move"],
         edits["rotate"],
         edits["open_gripper"],
         edits["close_gripper"],
-        _function(
-            "finish_imagination",
-            "结束本次想象审查。ready 请求 Main 审查最终 Preview；failed 放弃该 target。",
-            {"status": {"type": "string", "enum": ["ready", "failed"]}},
-            ("status",),
+        edits["show_rotation_gizmo"],
+        next(
+            item
+            for item in function_definitions()
+            if item["function"]["name"] == "finish_imagination"
         ),
     ]
 

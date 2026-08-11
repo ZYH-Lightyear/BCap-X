@@ -8,8 +8,8 @@ export interface VisualEditSummary {
 }
 
 export interface ContextSnapshot {
-  schemaVersion: 24
-  schema: 'vaw-context-v23-source-vector'
+  schemaVersion: 25
+  schema: 'vaw-context-v24-imagination-agent'
   renderId: string
   revision: number
   viewport: { width: 1920; height: 1080 }
@@ -64,6 +64,7 @@ export interface ContextSnapshot {
         detail?: string
       }
       latest_edit?: VisualEditSummary
+      rotation_gizmo_frame?: 'base' | 'tool'
       edit_summary?: {
         initial_target: { position_xyz?: number[]; gripper_target?: 'open' | 'closed' }
         current_target: { position_xyz?: number[]; gripper_target?: 'open' | 'closed' }
