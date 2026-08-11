@@ -495,6 +495,21 @@ RGB 属于同一 revision，不是旧图或历史截图；进入新 Imagination/
 面板切换或 GRIP 数值反转刚从当前 RGB 得出的随动结论。版本更新为 Web schema 19 /
 `vaw-context-v18-physical-continuity` / renderer `context-web-v18-physical-continuity`。
 
+真实 Agent trace `m154s_qwen35plus_physical_continuity_t0_s0` 证明 v18 已能在 grounding 后保留
+“抓取失败并重试”的因果状态，也完成了从目标检测、grasp seed、抬升、basket point 到 release 的
+完整自主决策链；但环境最终仍为失败。审计发现两个确定性 Context Builder 问题：第一，保留的
+`post_commit` 页面优先级高于新 `ActionReview`，导致 Main 在审查后续动作时实际看见旧回执而不是
+将要 commit 的紫色目标；第二，抬升核验只围绕 TCP 裁剪，遮挡下无法明确判断同一目标是否仍留在
+原支撑位置。Main 因此把未随动的罐头误判为已抓住，并把这个错误 belief 一致带到 basket。
+
+v19 修订不加入 object tracker 或任务 phase。`ActionReview` 现在始终优先占据审查画面；episode
+私有状态只保留最近 grasp source 的 query 与固定 agentview bbox。每次后续 commit 编译三块真实
+视觉：`SOURCE BEFORE`、`SAME SOURCE LOCATION NOW` 和 `CURRENT ACTION AREA`。固定 source
+位置仍出现对象是“未随动”的直接反证；原位置变空只支持“离开原处”，仍需结合当前动作区域和
+全局 RGB 判断是否附着。该 artifact 在新 grasp source 出现时覆盖，不产生公共 object ID、不做
+跨相机 tracking，也不注入环境真值。版本更新为 Web schema 20 /
+`vaw-context-v19-causal-verification` / renderer `context-web-v19-causal-verification`。
+
 验收：主任务 seeds `0,1,2` 至少 `2/3` env success。
 
 ### M1.5.5 — Basic Generalization and Freeze
@@ -543,7 +558,8 @@ RGB 属于同一 revision，不是旧图或历史截图；进入新 Imagination/
 | M1.5.4-m | gripper-only Preview 之后的空间编辑必须以启动时真实 TCP 为累计位移基线 | in progress | private baseline / cumulative EditSummary regression | `m154p_qwen35plus_local_review_t0_s0` | Imagination 实际累计 base Z `-9.5 cm`，但 Review 只看到最后一步 `-2 cm` 后错误 commit；根因是 gripper-only target 无 pose 时私有 baseline 缺失，修复不改变公共 target 的 gripper-only 语义 |
 | M1.5.4-n | grasp seed 必须被解释为最终接触目标，并提供当前 source surface 的可视距离证据 | in progress | 64 full VAW tests + Ruff + Web build；同任务无物理 contact probe：`TCP→SOURCE=1.6 mm` 后不再自动上抬 | `m154q_qwen35plus_cumulative_review_t0_s0` | 旧图仅换 Prompt 仍上抬 2.5 cm；v17 probe 改为一次姿态微调，证明 contact metric 有效但尚未证明真实闭环成功，进入 frozen seed 复测 |
 | M1.5.4-o | 非物理 grounding 不得抹去同一 observation 中刚验证的物理因果视觉 | in progress | revision-local post-commit raster persistence / grounding precedence / Web regression | `m154r_qwen35plus_contact_semantics_t0_s0` | 首次真实抓持与 +3cm 随动成功；basket detection 后核验画面消失，Main 在同一 RGB 上反转结论并重抓手中物体。新增紧凑 current-observed continuity inset，待 frozen seed 复测 |
-| M1.5.4 | 完整闭环可达到基本 pick-place 成功 | in progress | 63 full VAW tests + Ruff + Web build | pending frozen seeds 0/1/2 | 尚未达到 `2/3 env_success`，不得宣称完成 |
+| M1.5.4-p | Main 必须看见当前 ActionReview；抓持核验必须显式比较同一 source 原位置 | in progress | 65 full VAW tests + Ruff + Web build；review-priority、causal-source persistence、固定 ROI 与 `1920×1080` fixture | `m154s_qwen35plus_physical_continuity_t0_s0` | v18 自主走完整条 pick/place 决策链但把未随动对象误判为已抓持；v19 以固定 source 前后对照提供直接反证，待 frozen seed 复测 |
+| M1.5.4 | 完整闭环可达到基本 pick-place 成功 | in progress | 65 full VAW tests + Ruff + Web build | pending frozen seeds 0/1/2 | 尚未达到 `2/3 env_success`，不得宣称完成 |
 
 ## 11. 非目标
 

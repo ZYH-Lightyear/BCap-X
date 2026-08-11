@@ -92,8 +92,23 @@ class ActionReviewArtifacts:
 
 
 @dataclass(frozen=True)
+class CausalSubjectArtifact:
+    """One fixed image-space subject anchor for post-commit verification.
+
+    This is not an object tracker.  It remembers only the most recent grasp
+    source crop so a later lift or transport can show whether that same image
+    location became empty in the current observation.
+    """
+
+    query: str
+    bbox_xyxy_px: tuple[float, float, float, float]
+    source_revision: int
+
+
+@dataclass(frozen=True)
 class LastPhysicalArtifacts:
     focus_pose: Pose | None = None
+    causal_subject: CausalSubjectArtifact | None = None
 
 
 @dataclass(frozen=True)

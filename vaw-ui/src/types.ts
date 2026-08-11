@@ -1,6 +1,6 @@
 export interface ContextSnapshot {
-  schemaVersion: 19
-  schema: 'vaw-context-v18-physical-continuity'
+  schemaVersion: 20
+  schema: 'vaw-context-v19-causal-verification'
   renderId: string
   revision: number
   viewport: { width: 1920; height: 1080 }
@@ -23,6 +23,9 @@ export interface ContextSnapshot {
     } | null
     postCommitBeforeRasterId: string | null
     postCommitCurrentRasterId: string | null
+    causalSourceBeforeRasterId: string | null
+    causalSourceCurrentRasterId: string | null
+    causalSourceLabel: string | null
     robot: {
       ee_pose?: { position_xyz: number[]; quaternion_xyzw: number[] }
       tcp_pose?: { position_xyz: number[]; quaternion_xyzw: number[] }

@@ -94,8 +94,8 @@ Main 自己的一句依据，用于在感知调用后保留“抓取失败，正
 
 ## Canvas
 
-Web schema 19 / `vaw-context-v18-physical-continuity` / renderer
-`context-web-v18-physical-continuity`：
+Web schema 20 / `vaw-context-v19-causal-verification` / renderer
+`context-web-v19-causal-verification`：
 
 - 上层 `OBSERVED NOW · REAL WORLD`：干净 agentview、与 agentview 标定透视一致的稠密
   RGB-D surface 和四行本体状态；
@@ -106,8 +106,12 @@ Web schema 19 / `vaw-context-v18-physical-continuity` / renderer
   物体是否真正位于两指通道，紫色 target 始终表示未执行；
 - 没有 active target 时，下层明确标成 `CURRENT EVIDENCE · OBSERVED` 或
   `CURRENT GEOMETRY · OBSERVED`，不再把当前蓝色机器人误标成未执行想象；
-- commit 后下层短暂切换为同一 Canvas 内的 `BEFORE COMMIT → CURRENT OBSERVED` 目标区
-  对照；大图只显示一次，后续非物理 grounding 在同一 observation 内保留一个紧凑的
+- Main 审查 Imagination 交回的 ActionReview 时，当前紫色 Preview 始终优先于旧的
+  post-commit 页面，确保 commit 审查的是将要执行的 target；
+- commit 后下层切换为同一 Canvas 内的真实因果对照；若存在最近 grasp source，同时显示
+  `SOURCE BEFORE → SAME SOURCE LOCATION NOW` 与 `CURRENT ACTION AREA`。前两张图使用固定
+  像素区域而非 tracking，用于直接判断对象是否仍留在原处；大图只显示一次，后续非物理
+  grounding 在同一 observation 内保留一个紧凑的
   `LAST COMMIT · CURRENT OBSERVED` 当前画面锚点，并与新 evidence 并列；它在进入新
   Imagination/Review 时隐藏，在下一次 commit 时替换，不声明任务效果；
 - BASE/WORLD 坐标提示由 robot-base 几何投影产生，并固定在角落以避免遮挡 target；

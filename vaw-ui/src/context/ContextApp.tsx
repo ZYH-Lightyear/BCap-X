@@ -254,27 +254,53 @@ function ImaginationLayer({ snapshot }: { snapshot: ContextSnapshot }) {
 
 function PostCommitLayer({ snapshot }: { snapshot: ContextSnapshot }) {
   const action = snapshot.world.lastPhysicalAction
+  const sourceBefore = snapshot.world.causalSourceBeforeRasterId
+  const sourceCurrent = snapshot.world.causalSourceCurrentRasterId
+  const hasCausalSource = sourceBefore !== null && sourceCurrent !== null
+  const sourceLabel = snapshot.world.causalSourceLabel?.toUpperCase() ?? 'LAST GRASP SOURCE'
   return (
     <section className="via-post-commit">
       <header><h1>POST-COMMIT VERIFY · REAL OBSERVATIONS</h1></header>
-      <div className="via-post-commit-grid">
-        <article className="via-compare-card via-compare-before">
-          <Raster
-            snapshot={snapshot}
-            id={snapshot.world.postCommitBeforeRasterId}
-            alt="执行前目标附近真实画面"
-          />
-          <strong>BEFORE COMMIT</strong>
-        </article>
-        <div className="via-causal-arrow" aria-hidden="true">→</div>
-        <article className="via-compare-card via-compare-current">
-          <Raster
-            snapshot={snapshot}
-            id={snapshot.world.postCommitCurrentRasterId}
-            alt="执行后目标附近当前真实画面"
-          />
-          <strong>CURRENT OBSERVED</strong>
-        </article>
+      <div className={`via-post-commit-grid${hasCausalSource ? ' via-post-commit-grid-source' : ''}`}>
+        {hasCausalSource
+          ? <>
+              <article className="via-compare-card via-compare-before">
+                <Raster snapshot={snapshot} id={sourceBefore} alt="最近抓取对象原位置的执行前真实画面" />
+                <strong>SOURCE BEFORE · {sourceLabel}</strong>
+              </article>
+              <div className="via-causal-arrow" aria-hidden="true">→</div>
+              <article className="via-compare-card via-compare-current">
+                <Raster snapshot={snapshot} id={sourceCurrent} alt="同一固定图像位置的当前真实画面" />
+                <strong>SAME SOURCE LOCATION · NOW</strong>
+              </article>
+              <article className="via-compare-card via-action-area-current">
+                <Raster
+                  snapshot={snapshot}
+                  id={snapshot.world.postCommitCurrentRasterId}
+                  alt="执行后动作目标附近当前真实画面"
+                />
+                <strong>CURRENT ACTION AREA</strong>
+              </article>
+            </>
+          : <>
+              <article className="via-compare-card via-compare-before">
+                <Raster
+                  snapshot={snapshot}
+                  id={snapshot.world.postCommitBeforeRasterId}
+                  alt="执行前目标附近真实画面"
+                />
+                <strong>BEFORE COMMIT</strong>
+              </article>
+              <div className="via-causal-arrow" aria-hidden="true">→</div>
+              <article className="via-compare-card via-compare-current">
+                <Raster
+                  snapshot={snapshot}
+                  id={snapshot.world.postCommitCurrentRasterId}
+                  alt="执行后目标附近当前真实画面"
+                />
+                <strong>CURRENT OBSERVED</strong>
+              </article>
+            </>}
         <aside className="via-post-commit-facts">
           <h2>LAST PHYSICAL ACTION</h2>
           <FactRow label="REQUESTED">{action?.intent ?? 'N/A'}</FactRow>

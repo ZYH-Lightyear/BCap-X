@@ -419,6 +419,19 @@ img { display: block; }
   gap: 12px;
 }
 
+.via-post-commit-grid-source {
+  grid-template-columns:
+    minmax(0, 1fr) 34px minmax(0, 1fr) minmax(0, 1fr) 360px;
+  gap: 9px;
+}
+
+.via-post-commit-grid-source .via-compare-card strong {
+  right: 12px;
+  max-width: calc(100% - 24px);
+  font-size: 13px;
+  line-height: 1.25;
+}
+
 .via-compare-card {
   position: relative;
   min-width: 0;
@@ -449,6 +462,8 @@ img { display: block; }
 
 .via-compare-current { border-color: #2563eb; }
 .via-compare-current strong { background: rgba(37, 99, 235, .92); }
+.via-action-area-current { border-color: #0f766e; }
+.via-action-area-current strong { background: rgba(15, 118, 110, .92); }
 
 .via-causal-arrow {
   display: grid;

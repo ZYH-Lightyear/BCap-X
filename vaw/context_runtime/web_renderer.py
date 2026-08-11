@@ -15,7 +15,7 @@ from vaw.context_runtime.packet import (
 
 
 class ContextWebRenderer:
-    name = "context-web-v18-physical-continuity"
+    name = "context-web-v19-causal-verification"
     width = CONTEXT_WIDTH
     height = CONTEXT_HEIGHT
 

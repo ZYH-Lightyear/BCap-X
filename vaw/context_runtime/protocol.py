@@ -111,6 +111,9 @@ GRIP 接近 0，就先完成 gripper-only open；闭合夹爪不能形成新的�
 若 Canvas 下层显示 POST-COMMIT VERIFY，BEFORE 与 CURRENT 都是真实 observation；
 Last Physical Action 只说明刚执行的意图、阶段和控制结果，不声称物体已被抓住、移动或释放。
 用 CURRENT 中的可见变化判断该动作是否产生了任务相关效果，并据此选择下一步。
+若同时显示 SOURCE BEFORE 与 SAME SOURCE LOCATION NOW，它们是最近抓取对象在固定像素位置的
+前后对照，不是 tracking：对象仍留在 SAME SOURCE LOCATION 表明它没有随动；原位置变空只支持
+“对象离开原处”，还必须结合 CURRENT ACTION AREA 与上层真实场景判断它是否随夹爪移动。
 紧凑的 Last Physical Action 会在同一真实 observation revision 内持续存在，直到下一次 commit
 覆盖；感知调用不会把它清空。它用于维持因果连续性，不是要求重复上一动作。一旦新的
 Imagination/ActionReview 已形成，旧的失败回执由当前 Preview 取代；已完成的最近物理动作仍作为

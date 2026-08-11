@@ -234,8 +234,8 @@ def test_packet_is_deterministic_and_does_not_leak_private_state() -> None:
     assert forbidden.isdisjoint(set(_walk_keys(snapshot)))
     encoded = json.dumps(snapshot).lower()
     assert "functionrecord" not in encoded and "waypointdraft" not in encoded
-    assert snapshot["schemaVersion"] == 19
-    assert snapshot["schema"] == "vaw-context-v18-physical-continuity"
+    assert snapshot["schemaVersion"] == 20
+    assert snapshot["schema"] == "vaw-context-v19-causal-verification"
     assert snapshot["viewport"] == {"width": CONTEXT_WIDTH, "height": CONTEXT_HEIGHT}
 
 
@@ -291,6 +291,9 @@ def test_commit_comparison_persists_across_nonphysical_grounding() -> None:
     assert workspace.state.last_physical_action is not None
     assert reviewed.world.last_physical_action is not None
     assert reviewed.world.last_physical_action.target_gripper == "open"
+    assert reviewed.decision.mode == "reviewed"
+    assert reviewed.world.action is not None
+    assert reviewed.world.action["action_id"] == action_id
 
     workspace.state.last_physical_action = LastPhysicalAction(
         intent="old failed move",
@@ -298,3 +301,43 @@ def test_commit_comparison_persists_across_nonphysical_grounding() -> None:
         outcome="arm_failed",
     )
     assert ContextCompiler().compile(workspace).world.last_physical_action is None
+
+
+def test_grasp_source_location_persists_for_lift_causal_verification() -> None:
+    workspace = _workspace()
+    region_id = workspace.execute("detection_and_sam", query="can").result[
+        "region_id"
+    ]
+    seed_id = workspace.execute("propose_grasps", region_id=region_id).result[
+        "seed_ids"
+    ][0]
+    workspace.set_refinement_goal("contact the can")
+    workspace.execute("select", seed_id=seed_id)
+    workspace.execute("close_gripper")
+    action_id = workspace.execute("finish_imagination", status="ready").result[
+        "action_id"
+    ]
+    workspace.execute("commit", action_id=action_id)
+
+    first = ContextCompiler().compile(workspace)
+    assert first.world.causal_source_label == "can"
+    assert first.world.causal_source_before_raster_id == "causal_source:before"
+    assert first.world.causal_source_current_raster_id == "causal_source:current"
+
+    workspace.set_refinement_goal("lift to verify following")
+    workspace.execute(
+        "delta_move", delta_xyz_m=[0.0, 0.0, 0.03], frame="base"
+    )
+    lift_id = workspace.execute("finish_imagination", status="ready").result[
+        "action_id"
+    ]
+    reviewed = ContextCompiler().compile(workspace)
+    assert reviewed.decision.mode == "reviewed"
+    workspace.execute("commit", action_id=lift_id)
+
+    lifted = ContextCompiler().compile(workspace)
+    assert lifted.decision.mode == "post_commit"
+    assert lifted.world.causal_source_label == "can"
+    for raster_id in ("causal_source:before", "causal_source:current"):
+        assert raster_id in lifted.rasters
+        assert lifted.rasters[raster_id].shape == (390, 520, 3)

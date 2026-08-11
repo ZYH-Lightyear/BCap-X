@@ -36,8 +36,8 @@ from vaw.context_runtime.private import (
 from vaw.context_runtime.scene_view import render_scene_view
 from vaw.context_runtime.workspace import ContextWorkspace
 
-CONTEXT_SCHEMA = "vaw-context-v18-physical-continuity"
-CONTEXT_WEB_SCHEMA_VERSION = 19
+CONTEXT_SCHEMA = "vaw-context-v19-causal-verification"
+CONTEXT_WEB_SCHEMA_VERSION = 20
 CONTEXT_WIDTH = 1920
 CONTEXT_HEIGHT = 1080
 
@@ -151,6 +151,9 @@ class WorldContextSpec:
     last_physical_action: LastPhysicalAction | None = None
     post_commit_before_raster_id: str | None = None
     post_commit_current_raster_id: str | None = None
+    causal_source_before_raster_id: str | None = None
+    causal_source_current_raster_id: str | None = None
+    causal_source_label: str | None = None
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -170,6 +173,9 @@ class WorldContextSpec:
             ),
             "postCommitBeforeRasterId": self.post_commit_before_raster_id,
             "postCommitCurrentRasterId": self.post_commit_current_raster_id,
+            "causalSourceBeforeRasterId": self.causal_source_before_raster_id,
+            "causalSourceCurrentRasterId": self.causal_source_current_raster_id,
+            "causalSourceLabel": self.causal_source_label,
         }
 
 
@@ -311,7 +317,12 @@ class ContextCompiler:
         if contact_focus is not None:
             contact_focus_id = "contact_focus"
             rasters[contact_focus_id] = contact_focus
-        post_before_id, post_current_id = _compile_post_commit_rasters(
+        (
+            post_before_id,
+            post_current_id,
+            causal_before_id,
+            causal_current_id,
+        ) = _compile_post_commit_rasters(
             workspace,
             camera,
             rasters,
@@ -348,6 +359,14 @@ class ContextCompiler:
                 last_physical_action=_visible_last_physical_action(state),
                 post_commit_before_raster_id=post_before_id,
                 post_commit_current_raster_id=post_current_id,
+                causal_source_before_raster_id=causal_before_id,
+                causal_source_current_raster_id=causal_current_id,
+                causal_source_label=(
+                    private.last_physical_artifacts.causal_subject.query
+                    if private.last_physical_artifacts is not None
+                    and private.last_physical_artifacts.causal_subject is not None
+                    else None
+                ),
             ),
             catalog=EvidenceCatalogSpec(
                 regions=tuple(region_specs),
@@ -570,18 +589,21 @@ def _decision_spec(workspace: ContextWorkspace) -> DecisionWorkspaceSpec:
                 primary_raster_id=primary,
             )
 
-    if (
-        state.last_physical_action is not None
-        and workspace._private.last_physical_artifacts is not None
-    ):
-        return DecisionWorkspaceSpec(mode="post_commit")
-
     if state.action_review is not None:
         return DecisionWorkspaceSpec(
             mode="reviewed",
             seed_ids=tuple(state.seeds)[:5],
             action_id=state.action_review.action_id,
         )
+
+    # A newly returned ActionReview is the decision Main must make now.  The
+    # previous physical comparison remains available in the packet as causal
+    # context, but must not replace the virtual target being reviewed.
+    if (
+        state.last_physical_action is not None
+        and workspace._private.last_physical_artifacts is not None
+    ):
+        return DecisionWorkspaceSpec(mode="post_commit")
     if (
         state.last_handoff is not None
         and state.last_handoff.status == "failed"
@@ -599,7 +621,7 @@ def _compile_post_commit_rasters(
     workspace: ContextWorkspace,
     current_camera: dict[str, Any],
     rasters: dict[str, np.ndarray],
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, str | None, str | None]:
     """Compile one policy-visible before/current comparison around the target.
 
     Sensor calibration remains private: it is used only to project the last
@@ -611,7 +633,7 @@ def _compile_post_commit_rasters(
         workspace.state.last_physical_action is None
         or workspace._private.last_physical_artifacts is None
     ):
-        return None, None
+        return None, None, None, None
     artifacts = workspace._private.last_physical_artifacts
     try:
         previous_camera = workspace._private.camera(
@@ -625,7 +647,61 @@ def _compile_post_commit_rasters(
     current_id = "post_commit:current"
     rasters[before_id] = _metric_focus_crop(previous_camera, focus_pose)
     rasters[current_id] = _metric_focus_crop(current_camera, focus_pose)
-    return before_id, current_id
+    causal_before_id = None
+    causal_current_id = None
+    subject = artifacts.causal_subject
+    if subject is not None:
+        causal_before_id = "causal_source:before"
+        causal_current_id = "causal_source:current"
+        rasters[causal_before_id] = _fixed_source_crop(
+            previous_camera,
+            subject.bbox_xyxy_px,
+        )
+        rasters[causal_current_id] = _fixed_source_crop(
+            current_camera,
+            subject.bbox_xyxy_px,
+        )
+    return before_id, current_id, causal_before_id, causal_current_id
+
+
+def _fixed_source_crop(
+    camera: dict[str, Any],
+    bbox_xyxy_px: tuple[float, float, float, float],
+    *,
+    output_size: tuple[int, int] = (520, 390),
+) -> np.ndarray:
+    """Crop the same image-space neighborhood before and after a commit.
+
+    The box is deliberately fixed rather than tracked.  If a grasped object
+    moves with the robot, its original location should become empty; if it
+    remains there, the current crop exposes the failed causal effect.
+    """
+
+    rgb = _rgb(camera)
+    x1, y1, x2, y2 = (float(value) for value in bbox_xyxy_px)
+    width = max(x2 - x1, 1.0)
+    height = max(y2 - y1, 1.0)
+    expanded = _fit_box_aspect(
+        (
+            x1 - 2.0 * width,
+            y1 - 2.0 * height,
+            x2 + 2.0 * width,
+            y2 + 2.0 * height,
+        ),
+        target_aspect=output_size[0] / output_size[1],
+    )
+    left, top, right, bottom = _expanded_bounds(
+        expanded,
+        rgb.shape[1],
+        rgb.shape[0],
+        ratio=0.0,
+    )
+    crop = rgb[top:bottom, left:right]
+    if crop.size == 0:
+        crop = rgb
+    image = Image.fromarray(crop).convert("RGB")
+    image = image.resize(output_size, Image.Resampling.LANCZOS)
+    return np.asarray(image, dtype=np.uint8)
 
 
 def _metric_focus_crop(

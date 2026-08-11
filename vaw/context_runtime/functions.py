@@ -33,6 +33,7 @@ from vaw.context_runtime.model import (
 from vaw.context_runtime.motion import MotionBackendError, MotionPlan
 from vaw.context_runtime.private import (
     ActionReviewArtifacts,
+    CausalSubjectArtifact,
     ImaginationArtifacts,
     LastPhysicalArtifacts,
     PlanningContext,
@@ -806,8 +807,29 @@ class ContextFunctions:
             action.target.pose
             or (self.ws.state.robot.tcp_pose if self.ws.state.robot is not None else None)
         )
+        artifacts = self.ws._private.review_artifacts.get(action_id)
+        previous_physical = self.ws._private.last_physical_artifacts
+        causal_subject = (
+            previous_physical.causal_subject
+            if previous_physical is not None
+            else None
+        )
+        planning_context = (
+            artifacts.planning_context if artifacts is not None else None
+        )
+        if (
+            planning_context is not None
+            and planning_context.source_kind == "grasp"
+            and planning_context.region_id is not None
+        ):
+            source = self.ws.state.regions.get(planning_context.region_id)
+            if source is not None:
+                causal_subject = CausalSubjectArtifact(
+                    query=source.query,
+                    bbox_xyxy_px=source.bbox_xyxy_px,
+                    source_revision=source.source_revision,
+                )
         try:
-            artifacts = self.ws._private.review_artifacts.get(action_id)
             if artifacts is None:
                 raise ContextFunctionError(
                     f"active action '{action_id}' has no private artifacts"
@@ -859,7 +881,8 @@ class ContextFunctions:
             requested_arm_delta_base_m=requested_arm_delta,
         )
         self.ws._private.last_physical_artifacts = LastPhysicalArtifacts(
-            focus_pose=focus_pose
+            focus_pose=focus_pose,
+            causal_subject=causal_subject,
         )
 
         self.ws._private.trace_diagnostics["waypoint_commit"] = {
