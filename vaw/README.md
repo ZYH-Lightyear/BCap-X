@@ -95,8 +95,8 @@ Main 自己的一句依据，用于在感知调用后保留“抓取失败，正
 
 ## Canvas
 
-Web schema 21 / `vaw-context-v20-physical-verification` / renderer
-`context-web-v20-physical-verification`：
+Web schema 22 / `vaw-context-v21-rotate-guide` / renderer
+`context-web-v21-rotate-guide`：
 
 - 上层 `OBSERVED NOW · REAL WORLD`：干净 agentview、与 agentview 标定透视一致的稠密
   RGB-D surface 和四行本体状态；
@@ -105,6 +105,9 @@ Web schema 21 / `vaw-context-v20-physical-verification` / renderer
   camera-aligned 全局 Preview，
   以及由当前 agentview+wrist RGB-D 编译的正交 `JAW PLANE` Contact Focus；后者用于观察目标
   物体是否真正位于两指通道，紫色 target 始终表示未执行；
+- near-field 的 `LOCAL 3/4` 角落固定显示 `BASE / WORLD` +轴，`JAW PLANE` 角落显示随当前
+  紫色目标旋转的 `TARGET TOOL` +轴。`rotate` 使用所选 +轴的右手定则；Prompt 要求符号或幅度
+  不确定时先用 5–15° Preview，不能用 ±90° 猜方向；
 - 没有 active target 时，下层明确标成 `CURRENT EVIDENCE · OBSERVED` 或
   `CURRENT GEOMETRY · OBSERVED`，不再把当前蓝色机器人误标成未执行想象；
 - Main 审查 Imagination 交回的 ActionReview 时，当前紫色 Preview 始终优先于旧的

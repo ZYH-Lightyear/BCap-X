@@ -31,8 +31,8 @@ function Root() {
   useEffect(() => {
     window.__VAW_RENDER__ = async (next) => {
       if (
-        next.schemaVersion !== 21
-        || next.schema !== 'vaw-context-v20-physical-verification'
+        next.schemaVersion !== 22
+        || next.schema !== 'vaw-context-v21-rotate-guide'
         || next.viewport.width !== 1920
         || next.viewport.height !== 1080
       ) {

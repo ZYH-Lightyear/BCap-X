@@ -1,6 +1,15 @@
+export interface VisualEditSummary {
+  kind: 'delta_move' | 'rotate' | 'gripper'
+  frame: 'base' | 'tool'
+  delta_xyz_m?: number[]
+  axis?: 'x' | 'y' | 'z'
+  angle_deg?: number
+  gripper_target?: 'open' | 'closed'
+}
+
 export interface ContextSnapshot {
-  schemaVersion: 21
-  schema: 'vaw-context-v20-physical-verification'
+  schemaVersion: 22
+  schema: 'vaw-context-v21-rotate-guide'
   renderId: string
   revision: number
   viewport: { width: 1920; height: 1080 }
@@ -54,20 +63,15 @@ export interface ContextSnapshot {
         collision_checked: boolean
         detail?: string
       }
-      latest_edit?: {
-        kind: 'delta_move' | 'rotate' | 'gripper'
-        frame: 'base' | 'tool'
-        delta_xyz_m?: number[]
-        axis?: 'x' | 'y' | 'z'
-        angle_deg?: number
-        gripper_target?: 'open' | 'closed'
-      }
+      latest_edit?: VisualEditSummary
       edit_summary?: {
         initial_target: { position_xyz?: number[]; gripper_target?: 'open' | 'closed' }
         current_target: { position_xyz?: number[]; gripper_target?: 'open' | 'closed' }
         total_translation_base_m?: number[]
         total_rotation_axis_base?: number[]
         total_rotation_deg?: number
+        previous_edit?: VisualEditSummary
+        last_edit?: VisualEditSummary
       }
     } | null
   }

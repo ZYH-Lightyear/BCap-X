@@ -15,7 +15,7 @@ from vaw.context_runtime.packet import (
 
 
 class ContextWebRenderer:
-    name = "context-web-v20-physical-verification"
+    name = "context-web-v21-rotate-guide"
     width = CONTEXT_WIDTH
     height = CONTEXT_HEIGHT
 

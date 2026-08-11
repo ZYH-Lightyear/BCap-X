@@ -525,6 +525,17 @@ close/open/arm commit 分别编译为 `closure/release/arm_motion · UNVERIFIED`
 当前 observation 上共享一致的证据语义。版本更新为 Web schema 21 /
 `vaw-context-v20-physical-verification` / renderer `context-web-v20-physical-verification`。
 
+冻结 seed 0 的 v20 trace `m154u_qwen35plus_physical_verification_t0_s0` 证明该语义修正确实改变了
+决策：一次 close 后 `GRIP=0.388` 时，Main 不再把中间开度直接解释成成功或失败，而是创建并
+commit `base +Z 3 cm` 的可逆随动核验；新 RGB 证明罐头未随动后才恢复。与此同时，该 trace
+暴露了剩余的通用控制缺口：Imagination 在调用 rotate 前只能看到固定 BASE 轴，TARGET TOOL 轴
+和正角方向只有编辑后才部分可见，Function 描述又允许 ±90°，导致一次无证据的 `base-X -90°`
+猜测并破坏原本可规划的 grasp seed。v21 因此不改变 Function 或控制语义，只把 `LOCAL 3/4` 的
+固定 `BASE / WORLD` +轴和 `JAW PLANE` 的随目标旋转 `TARGET TOOL` +轴同时放入角落，并规定
+rotate 为所选 +轴的右手定则；不确定时先用 5–15° Preview，超过 30° 必须有明确的大姿态差异。
+版本更新为 Web schema 22 / `vaw-context-v21-rotate-guide` / renderer
+`context-web-v21-rotate-guide`。
+
 验收：主任务 seeds `0,1,2` 至少 `2/3` env success。
 
 ### M1.5.5 — Basic Generalization and Freeze
@@ -575,6 +586,7 @@ close/open/arm commit 分别编译为 `closure/release/arm_motion · UNVERIFIED`
 | M1.5.4-o | 非物理 grounding 不得抹去同一 observation 中刚验证的物理因果视觉 | in progress | revision-local post-commit raster persistence / grounding precedence / Web regression | `m154r_qwen35plus_contact_semantics_t0_s0` | 首次真实抓持与 +3cm 随动成功；basket detection 后核验画面消失，Main 在同一 RGB 上反转结论并重抓手中物体。新增紧凑 current-observed continuity inset，待 frozen seed 复测 |
 | M1.5.4-p | Main 必须看见当前 ActionReview；抓持核验必须显式比较同一 source 原位置 | in progress | 65 full VAW tests + Ruff + Web build；review-priority、causal-source persistence、固定 ROI 与 `1920×1080` fixture | `m154s_qwen35plus_physical_continuity_t0_s0`, `m154t_qwen35plus_causal_verification_t0_s0` | v19 能走到 release，但 Action Review 丢失 Main 短意图、固定 crop 受遮挡、部分开度解释反转，最终 `env_success=false` |
 | M1.5.4-q | 物理命令效果必须以一致的 UNVERIFIED 状态跨 Main/Review 所有权传播 | in progress | 65 full VAW tests + Ruff + Web build；closure/release/arm-motion cue、Review focus 与 `1920×1080` fixture | pending v20 frozen seeds | 不加入真值或 phase；待证明 arm+close 后不会因开度歧义跳过随动测试 |
+| M1.5.4-r | rotate 必须在调用前具有可读的 BASE/TOOL frame、轴与符号依据 | in progress | pending v21 unit/snapshot/static diagnostics | `m154u_qwen35plus_physical_verification_t0_s0` | v20 已产生正确随动核验，但一次无证据 `base-X -90°` 破坏 grasp；v21 只增加坐标指南和小角度探索语义，不加入任务分支或角度 clamp |
 | M1.5.4 | 完整闭环可达到基本 pick-place 成功 | in progress | 65 full VAW tests + Ruff + Web build | pending frozen seeds 0/1/2 | 尚未达到 `2/3 env_success`，不得宣称完成 |
 
 ## 11. 非目标

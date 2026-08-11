@@ -197,6 +197,43 @@ def test_near_field_rotate_preview_changes_visual_cue_deterministically(monkeypa
     )
 
 
+def test_near_field_keeps_base_axes_fixed_but_rotates_target_tool_guide(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(near_field_module, "load_panda_urdf_fk", lambda: None)
+    identity = NearFieldPreview(
+        target_pose=Pose((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)),
+        joint_positions_rad=None,
+        gripper_opening=0.5,
+    )
+    rotated = NearFieldPreview(
+        target_pose=Pose(
+            (0.0, 0.0, 0.0),
+            tuple(Rotation.from_euler("y", 90.0, degrees=True).as_quat()),
+        ),
+        joint_positions_rad=None,
+        gripper_opening=0.5,
+    )
+
+    identity_raster = render_near_field(
+        _camera((180, 180, 180)), None, _robot(), identity
+    )
+    rotated_raster = render_near_field(
+        _camera((180, 180, 180)), None, _robot(), rotated
+    )
+
+    assert identity_raster is not None and rotated_raster is not None
+    split = near_field_module._PANEL_HEIGHT
+    # LOCAL 3/4 carries the fixed BASE/WORLD guide, independent of target pose.
+    assert np.array_equal(identity_raster[:split], rotated_raster[:split])
+    # JAW PLANE carries TARGET TOOL axes and must rotate with the virtual target.
+    jaw_top = split + near_field_module._PANEL_GAP
+    assert not np.array_equal(
+        identity_raster[jaw_top:],
+        rotated_raster[jaw_top:],
+    )
+
+
 def test_gripper_only_edit_with_spatial_target_needs_no_reference_pose(monkeypatch) -> None:
     monkeypatch.setattr(near_field_module, "load_panda_urdf_fk", lambda: None)
     preview = NearFieldPreview(

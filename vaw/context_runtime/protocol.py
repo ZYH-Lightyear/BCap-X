@@ -200,6 +200,10 @@ GRIP/Target Gripper 使用归一化开度（0≈闭合，1≈张开）；INHERIT
 继续振荡。refinement goal 是审查意图，不是已经成立的视觉事实。
 BASE 是固定 robot-base/world 坐标：base +Z 恒为竖直上抬，base -Z 恒为下降。TOOL 是随当前
 target 姿态旋转的 TCP 局部坐标；在 top-down 姿态中 tool +Z 可能朝向支撑面，绝不等同于“向上”。
+Canvas 的 LOCAL 3/4 右上角显示固定 BASE/WORLD +轴，JAW PLANE 右上角显示当前紫色目标的
+TARGET TOOL +轴。rotate 的正角遵循绕所选 +轴的右手定则。若旋转符号或幅度不确定，先用
+5–15° 做一次 Preview 并观察紫色目标如何变化；不得用 ±90° 猜方向。只有当前与期望姿态存在
+明确的大角度差异时才使用超过 30° 的单次旋转。
 若 refinement goal 使用世界方向（抬升、下降、向篮子方向平移），优先使用 base，并用 Edit
 Summary 的 total_translation_base_m 检查累计方向；若累计方向与目标相反，不得继续同号编辑。
 
@@ -283,14 +287,21 @@ def _edit_definitions(*, main: bool) -> dict[str, dict[str, Any]]:
         ),
         "rotate": _function(
             "rotate",
-            "编辑想象目标的方向；只更新 preview，不执行。可连续调用。",
+            (
+                "绕 Canvas 角落所示 BASE/WORLD 或 TARGET TOOL 的 +axis，按右手定则编辑"
+                "想象目标方向；只更新 preview，不执行。方向不确定时先用 5–15° 观察，"
+                "不要用 ±90° 猜测。可连续调用。"
+            ),
             {
                 "axis": {"type": "string", "enum": ["x", "y", "z"]},
                 "angle_deg": {
                     "type": "number",
                     "minimum": -90.0,
                     "maximum": 90.0,
-                    "description": "非零角度，绝对值不超过 90°",
+                    "description": (
+                        "按右手定则绕所选 +axis 的非零角度，绝对值不超过 90°；"
+                        "局部探索优先 5–15°，超过 30° 需要明确的大姿态差异"
+                    ),
                 },
                 "frame": frame,
                 **extra,

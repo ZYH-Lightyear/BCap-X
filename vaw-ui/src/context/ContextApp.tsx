@@ -95,6 +95,7 @@ function GroundingOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
 function EditOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
   const edit = snapshot.world.action?.latest_edit
   const summary = snapshot.world.action?.edit_summary
+  const lastEdit = edit ?? summary?.last_edit
   const target = snapshot.world.action?.target
   const cumulativeMove = summary?.total_translation_base_m
   const cumulativeRotation = summary?.total_rotation_deg
@@ -111,9 +112,13 @@ function EditOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
     : edit?.kind === 'rotate'
       ? `${edit.frame.toUpperCase()}-${edit.axis?.toUpperCase()}  ${edit.angle_deg?.toFixed(1)}°`
       : 'NONE'
+  const lastRotate = lastEdit?.kind === 'rotate'
+    ? `${lastEdit.frame.toUpperCase()}-${lastEdit.axis?.toUpperCase()}  ${lastEdit.angle_deg?.toFixed(1)}°`
+    : '—'
   return (
     <div className="via-edit-overlay">
       <FactRow label="MOVE TOTAL">{move}</FactRow>
+      <FactRow label="ROTATE LAST">{lastRotate}</FactRow>
       <FactRow label="ROTATE TOTAL">{rotate}</FactRow>
       {target?.pose && <FactRow label="TARGET XYZ">{fmt(target.pose.position_xyz)}</FactRow>}
     </div>

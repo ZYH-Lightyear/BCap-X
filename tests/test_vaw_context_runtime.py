@@ -287,6 +287,12 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
     frame_description = delta["parameters"]["properties"]["frame"]["description"]
     assert "base" in frame_description and "+Z 恒为竖直上抬" in frame_description
     assert "tool +Z" in frame_description and "可能朝向支撑面" in frame_description
+    rotate = next(x["function"] for x in main if x["function"]["name"] == "rotate")
+    assert "右手定则" in rotate["description"]
+    assert "5–15°" in rotate["description"]
+    assert "±90° 猜测" in rotate["description"]
+    assert "TARGET TOOL +轴" in IMAGINATION_SYSTEM_PROMPT
+    assert "超过 30°" in IMAGINATION_SYSTEM_PROMPT
     assert "total_translation_base_m" in IMAGINATION_SYSTEM_PROMPT
     assert "不得 commit" in SYSTEM_PROMPT
     assert "current_tcp" in pose["description"]

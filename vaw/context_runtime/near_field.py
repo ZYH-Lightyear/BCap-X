@@ -8,6 +8,7 @@ matrices and point arrays remain inside the trusted presenter.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -243,8 +244,9 @@ def _render_geometry_pair(
             current_tcp_rotation=tcp_rotation,
             preview=preview,
             preview_is_target_ghost=preview_is_target_ghost,
+            axes_kind="base" if index == 0 else "tool",
         )
-        for view in views
+        for index, view in enumerate(views)
     ]
     canvas = np.full(
         (NEAR_FIELD_HEIGHT, NEAR_FIELD_WIDTH, 3), _BACKGROUND, dtype=np.uint8
@@ -385,6 +387,7 @@ def _render_view(
     current_tcp_rotation: np.ndarray,
     preview: NearFieldPreview | None,
     preview_is_target_ghost: bool,
+    axes_kind: Literal["base", "tool"],
 ) -> np.ndarray:
     height, width = _PANEL_HEIGHT, NEAR_FIELD_WIDTH
     image = np.full((height, width, 3), _BACKGROUND, dtype=np.uint8)
@@ -439,13 +442,25 @@ def _render_view(
         width=1,
     )
     draw.text((15, 12), view.label, fill=(30, 41, 59, 255), font=font)
+    axes_rotation_local = current_tcp_rotation.T
+    axes_label = "BASE / WORLD"
+    if axes_kind == "tool":
+        axes_rotation_local = np.eye(3, dtype=np.float64)
+        axes_label = "CURRENT TOOL"
+        if preview is not None and preview.target_pose is not None:
+            _, axes_rotation_local = _pose_in_current_tcp(
+                preview.target_pose,
+                current_tcp_position,
+                current_tcp_rotation,
+            )
+            axes_label = "TARGET TOOL"
     _draw_corner_axes(
         draw,
         view,
-        current_tcp_rotation.T,
+        axes_rotation_local,
         width,
-        label="BASE +AXES",
-        origin=(width - 72.0, 88.0),
+        label=axes_label,
+        origin=(width - 100.0, 112.0),
     )
     if preview is not None and preview.target_pose is not None:
         _draw_adjustment(
@@ -608,11 +623,13 @@ def _draw_corner_axes(
     title_font = _label_font()
     title_box = draw.textbbox((0, 0), title, font=title_font)
     title_width = title_box[2] - title_box[0]
-    plate_left = origin[0] - 68
-    # Keep the title in its own band; projected axes may point upward.
-    plate_top = origin[1] - 62
-    plate_right = max(origin[0] + 52, plate_left + title_width + 14)
-    plate_bottom = origin[1] + 45
+    plate_left = origin[0] - 86
+    # Reserve a real title band above every projected +axis label.  Axis
+    # labels may extend about 70 px from the origin; the earlier 62 px margin
+    # let +X overlap TARGET TOOL for near-vertical poses.
+    plate_top = origin[1] - 95
+    plate_right = max(origin[0] + 86, plate_left + title_width + 14)
+    plate_bottom = origin[1] + 52
     draw.rounded_rectangle(
         (plate_left, plate_top, plate_right, plate_bottom),
         radius=6,
