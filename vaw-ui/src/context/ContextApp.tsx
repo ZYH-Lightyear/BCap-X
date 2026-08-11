@@ -56,7 +56,10 @@ function ObservedLayer({ snapshot }: { snapshot: ContextSnapshot }) {
 function SeedCard({ snapshot, seed }: { snapshot: ContextSnapshot; seed: Seed }) {
   return (
     <article className="via-seed-card">
-      <strong>{seed.id}</strong>
+      <strong>
+        <span>{seed.id}</span>
+        <code>APPROACH BASE {fmt(seed.approachVector ?? undefined, 2)}</code>
+      </strong>
       <Raster snapshot={snapshot} id={seed.rasterId} alt={`Action Seed ${seed.id}`} />
     </article>
   )

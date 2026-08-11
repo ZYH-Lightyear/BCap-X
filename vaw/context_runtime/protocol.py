@@ -92,8 +92,10 @@ detection_and_sam 的 region 是当前观测中目标身份与二维位置的权
 evidence crop 或 GRIP 数值就反转结论。只有当前 RGB 中出现明确矛盾，才能改写该判断。
 选择动作起点时按工具实际能力区分，而不是让语言模型手写本应由几何模块求出的量：
 - 要抓取一个已有 region 的物体时，`propose_grasps(region_id)` 是默认几何生成器；它产生包含
-  位置与方向的多个 seed，之后由 select/Imagination 审查。grasp seed 是规划器建议的最终
-  接触/闭合位姿，不是需要自动上抬的 pre-grasp 或 clearance waypoint。
+  位置与方向的多个 seed，之后由 select/Imagination 审查。每张 seed 卡的 `APPROACH BASE`
+  是从手掌侧指向 contact TCP 的 BASE 向量；描述 side/top-down 等方向时必须与这个向量及图中
+  几何一致，不得只凭二维外观命名。grasp seed 是规划器建议的最终接触/闭合位姿，不是需要
+  自动上抬的 pre-grasp 或 clearance waypoint。
 - `locate_point` 只给一个语义点的 XYZ，不提供抓取方向；`propose_pose` 适合放置点、表面点或
   已有明确姿态约束的直接位姿。不要在尚未尝试 grasp seeds 时，凭空手写 quaternion 来替代它们。
 - 只有 `propose_grasps` 实际返回无 seed，或所有不同 seed 均失败，才把 point-derived pose 作为
@@ -108,6 +110,8 @@ GRIP 接近 0，就先完成 gripper-only open；闭合夹爪不能形成新的�
 闭合命令后 GRIP 仍大于 0 可能是物体阻挡手指，并不等于“仍然打开”或抓取失败；物体在首次
 抬升前仍接触原支撑面也属正常。抓持关系不确定时，应保持夹爪状态做一次小幅可逆抬升，并从
 新真实画面判断物体是否随动，而不是仅凭 GRIP 数值重复 close 或重新抓取。
+仅执行 arm approach、且此前没有真实 closed gripper 时，物体留在原处是预期结果，不能称为
+“抓取失败”；只有闭合后执行了明确的随动验证，才可用物体是否随 arm 移动判断抓持效果。
 若 Canvas 下层显示 POST-COMMIT VERIFY，BEFORE 与 CURRENT 都是真实 observation；
 Last Physical Action 只说明刚执行的意图、阶段和控制结果，不声称物体已被抓住、移动或释放。
 用 CURRENT 中的可见变化判断该动作是否产生了任务相关效果，并据此选择下一步。

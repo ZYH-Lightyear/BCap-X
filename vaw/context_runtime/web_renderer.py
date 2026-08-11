@@ -15,7 +15,7 @@ from vaw.context_runtime.packet import (
 
 
 class ContextWebRenderer:
-    name = "context-web-v21-rotate-guide"
+    name = "context-web-v22-seed-approach"
     width = CONTEXT_WIDTH
     height = CONTEXT_HEIGHT
 

@@ -295,7 +295,7 @@ img { display: block; }
 .via-seed-card {
   min-width: 0;
   display: grid;
-  grid-template-rows: 42px minmax(0, 1fr);
+  grid-template-rows: 48px minmax(0, 1fr);
   overflow: hidden;
   border: 2px solid #7c3aed;
   border-radius: 9px;
@@ -305,10 +305,19 @@ img { display: block; }
 .via-seed-card strong {
   display: flex;
   align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   padding: 0 14px;
   color: #ede9fe;
   border-bottom: 1px solid #6d4bc1;
   font: 900 20px "DejaVu Sans Mono", monospace;
+}
+.via-seed-card strong code {
+  overflow: hidden;
+  color: #c4b5fd;
+  font: 800 12px "DejaVu Sans Mono", monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .via-seed-card img {
   width: 100%;

@@ -36,8 +36,8 @@ from vaw.context_runtime.private import (
 from vaw.context_runtime.scene_view import render_scene_view
 from vaw.context_runtime.workspace import ContextWorkspace
 
-CONTEXT_SCHEMA = "vaw-context-v21-rotate-guide"
-CONTEXT_WEB_SCHEMA_VERSION = 22
+CONTEXT_SCHEMA = "vaw-context-v22-seed-approach"
+CONTEXT_WEB_SCHEMA_VERSION = 23
 CONTEXT_WIDTH = 1920
 CONTEXT_HEIGHT = 1080
 

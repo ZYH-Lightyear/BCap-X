@@ -31,8 +31,8 @@ function Root() {
   useEffect(() => {
     window.__VAW_RENDER__ = async (next) => {
       if (
-        next.schemaVersion !== 22
-        || next.schema !== 'vaw-context-v21-rotate-guide'
+        next.schemaVersion !== 23
+        || next.schema !== 'vaw-context-v22-seed-approach'
         || next.viewport.width !== 1920
         || next.viewport.height !== 1080
       ) {

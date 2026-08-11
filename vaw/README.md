@@ -95,12 +95,13 @@ Main 自己的一句依据，用于在感知调用后保留“抓取失败，正
 
 ## Canvas
 
-Web schema 22 / `vaw-context-v21-rotate-guide` / renderer
-`context-web-v21-rotate-guide`：
+Web schema 23 / `vaw-context-v22-seed-approach` / renderer
+`context-web-v22-seed-approach`：
 
 - 上层 `OBSERVED NOW · REAL WORLD`：干净 agentview、与 agentview 标定透视一致的稠密
   RGB-D surface 和四行本体状态；
-- `ACTION SEEDS`：最多五个候选以固定五列占满下层，统一尺度并完整显示；
+- `ACTION SEEDS`：最多五个候选以固定五列占满下层，统一尺度并完整显示；每张卡直接标出
+  精确 `APPROACH BASE [x,y,z]`，使 Main 不必从二维投影猜 side/top-down；
 - active target 时下层为 `IMAGINATION · NOT EXECUTED`：同一当前 RGB-D surface 的
   camera-aligned 全局 Preview，
   以及由当前 agentview+wrist RGB-D 编译的正交 `JAW PLANE` Contact Focus；后者用于观察目标

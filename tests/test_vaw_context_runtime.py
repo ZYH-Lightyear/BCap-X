@@ -293,6 +293,8 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
     assert "±90° 猜测" in rotate["description"]
     assert "TARGET TOOL +轴" in IMAGINATION_SYSTEM_PROMPT
     assert "超过 30°" in IMAGINATION_SYSTEM_PROMPT
+    assert "APPROACH BASE" in SYSTEM_PROMPT
+    assert "此前没有真实 closed gripper" in SYSTEM_PROMPT
     assert "total_translation_base_m" in IMAGINATION_SYSTEM_PROMPT
     assert "不得 commit" in SYSTEM_PROMPT
     assert "current_tcp" in pose["description"]

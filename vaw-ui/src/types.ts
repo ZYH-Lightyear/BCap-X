@@ -8,8 +8,8 @@ export interface VisualEditSummary {
 }
 
 export interface ContextSnapshot {
-  schemaVersion: 22
-  schema: 'vaw-context-v21-rotate-guide'
+  schemaVersion: 23
+  schema: 'vaw-context-v22-seed-approach'
   renderId: string
   revision: number
   viewport: { width: 1920; height: 1080 }
