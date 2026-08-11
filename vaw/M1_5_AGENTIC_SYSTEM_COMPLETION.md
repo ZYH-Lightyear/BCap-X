@@ -544,6 +544,13 @@ v21 frozen seed 0 `m154r_v21_rotate_guide_qwen35plus_t0_s0` 中，Imagination �
 为 Web schema 23 / `vaw-context-v22-seed-approach` / renderer
 `context-web-v22-seed-approach`。
 
+v22 seed 1 的前 14 turns 证明 approach 标签生效：Main 正确把 `approach_z≈-1` 的 s3 解释为
+top-down；但 scalar `TCP→SOURCE` 从 3 mm 增至 18/27 mm 时，Main 与 Imagination 仍凭相机
+“上下”连续执行 base -Z，直至 collision error。v23 删除这个无方向标量，Packet 只携带从 target
+TCP 指向最近当前 source surface 的 `TCP→SOURCE BASE [dx,dy,dz]`；Canvas 由该向量派生距离，
+Prompt 要求沿同号 BASE 分量小步试探，并逐轮确认向量范数缩小。版本更新为 Web schema 24 /
+`vaw-context-v23-source-vector` / renderer `context-web-v23-source-vector`。
+
 验收：主任务 seeds `0,1,2` 至少 `2/3` env success。
 
 ### M1.5.5 — Basic Generalization and Freeze
@@ -596,6 +603,7 @@ v21 frozen seed 0 `m154r_v21_rotate_guide_qwen35plus_t0_s0` 中，Imagination �
 | M1.5.4-q | 物理命令效果必须以一致的 UNVERIFIED 状态跨 Main/Review 所有权传播 | in progress | 65 full VAW tests + Ruff + Web build；closure/release/arm-motion cue、Review focus 与 `1920×1080` fixture | pending v20 frozen seeds | 不加入真值或 phase；待证明 arm+close 后不会因开度歧义跳过随动测试 |
 | M1.5.4-r | rotate 必须在调用前具有可读的 BASE/TOOL frame、轴与符号依据 | in progress | pending v21 unit/snapshot/static diagnostics | `m154u_qwen35plus_physical_verification_t0_s0` | v20 已产生正确随动核验，但一次无证据 `base-X -90°` 破坏 grasp；v21 只增加坐标指南和小角度探索语义，不加入任务分支或角度 clamp |
 | M1.5.4-s | Main 必须从精确 BASE approach 解释 seed，且不能把纯 arm approach 叙述为抓取失败 | in progress | pending v22 unit/Web/frozen seed diagnostics | `m154r_v21_rotate_guide_qwen35plus_t0_s0` | v21 首次 rotate 收敛为 15°，但 Main 将 approach_z≈-1 的 seed 误称 side grasp；point-pose approach 后又在未闭合时错误宣称抓取失败，主任务仍为 `env_success=false` |
+| M1.5.4-t | 接触微调必须获得带 BASE 方向的 source surface correction，而非孤立距离 | in progress | 67 full VAW tests + Ruff + Web build + deterministic direction fixture | pending v23 seed-1 control probe | v22 正确识别 top-down seed，但 `TCP→SOURCE` 从 3→18→27 mm 时仍连续 base -Z 并撞入 collision；v23 用唯一 BASE delta 向量替换标量，不加入任务分支 |
 | M1.5.4 | 完整闭环可达到基本 pick-place 成功 | in progress | 65 full VAW tests + Ruff + Web build | pending frozen seeds 0/1/2 | 尚未达到 `2/3 env_success`，不得宣称完成 |
 
 ## 11. 非目标

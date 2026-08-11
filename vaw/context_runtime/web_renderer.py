@@ -15,7 +15,7 @@ from vaw.context_runtime.packet import (
 
 
 class ContextWebRenderer:
-    name = "context-web-v22-seed-approach"
+    name = "context-web-v23-source-vector"
     width = CONTEXT_WIDTH
     height = CONTEXT_HEIGHT
 

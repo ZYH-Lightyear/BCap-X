@@ -199,17 +199,20 @@ function WaypointPanel({ snapshot }: { snapshot: ContextSnapshot }) {
   const targetRole = action?.target_role
     ?.replaceAll('_', ' ')
     .toUpperCase() ?? 'NONE'
-  const sourceGap = action?.source_surface_distance_m
-  const sourceGapText = sourceGap === undefined
-    ? null
-    : `${(sourceGap * 1000).toFixed(0)} mm`
+  const sourceDelta = action?.source_surface_delta_base_m
+  const sourceDistance = sourceDelta
+    ? Math.sqrt(sourceDelta.reduce((sum, value) => sum + value * value, 0))
+    : null
+  const sourceDeltaText = sourceDelta && sourceDistance !== null
+    ? `${fmt(sourceDelta, 3)} m · ${(sourceDistance * 1000).toFixed(0)} mm`
+    : null
   const verification = snapshot.world.physicalVerification
   return (
     <aside className="via-waypoint-panel">
       <h2>WAYPOINT</h2>
       {lastReal && <FactRow label="LAST REAL">{lastReal}</FactRow>}
       <FactRow label="TARGET ROLE">{targetRole}</FactRow>
-      {sourceGapText && <FactRow label="TCP→SOURCE">{sourceGapText}</FactRow>}
+      {sourceDeltaText && <FactRow label="TCP→SOURCE BASE">{sourceDeltaText}</FactRow>}
       <FactRow label="ARM">{action ? (planned ? 'PLANNED' : prediction?.solve_ik?.toUpperCase() ?? 'TARGET ONLY') : 'NONE'}</FactRow>
       <FactRow label="GRIP TARGET">{grip}</FactRow>
       {verification && (

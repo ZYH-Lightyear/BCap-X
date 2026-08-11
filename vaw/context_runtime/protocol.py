@@ -149,8 +149,10 @@ Canvas 上层 OBSERVED NOW 是当前真实世界；下层紫色 IMAGINATION 是�
 夹爪闭合且下一次接近需要张开时，gripper-only open 是有用且必要的动作，即使它本身不抓取、
 运输或放置物体；同理，明确用于 grasp approach 的 target 不应因为它尚未移动到容器而被否决。
 TARGET ROLE 为 GRASP CONTACT 时，它是最终接触/闭合位姿而非 pre-grasp：若 jaw-plane 仍显示
-物体与两指通道分离，或 TCP→SOURCE 有明显自由空间间隙，不得把“在物体上方”当作可执行接触；
-应继续局部修正或 reject。TCP→SOURCE 只是当前 RGB-D 的最近表面距离，不是接触成功真值。
+物体与两指通道分离，或 `TCP→SOURCE BASE` 仍显示明显自由空间间隙，不得把“在物体上方”
+当作可执行接触；应继续局部修正或 reject。该向量从 target TCP 指向当前 RGB-D 中最近的 source
+表面点；若需要缩小局部间隙，应沿同号 BASE 分量小步 Preview，并确认新向量确实缩短。它不是
+接触成功真值，若与 jaw-plane 可见通道矛盾，以完整几何为准。
 
 本轮必须明确选择且只调用一个提供的 Review Function：
 - 几何与目标一致：commit(action_id)；
@@ -186,9 +188,11 @@ x/y/z/w 分量不是绕各轴的角度，禁止从单个分量推断倾斜方向
 表面之间一个具体、可见的接触/碰撞缺陷；若目标只是平移已经形成的姿态（例如抬升或运输），
 默认保持方向不变。
 若 TARGET ROLE 是 GRASP CONTACT，它表示规划器建议的最终接触/闭合位姿，不是 pre-grasp。
-不要为了“先安全接近”自动增加 base +Z；这会把 seed 从物体表面移开。TCP→SOURCE 是 contact
-TCP 到当前分割物体最近观测表面的距离，只是几何间隙提示，不是接触真值；该距离明显增大或
-jaw-plane 中物体与两指通道分离时，不能宣称抓取接触已经合理。
+不要为了“先安全接近”自动增加 base +Z；这会把 seed 从物体表面移开。`TCP→SOURCE BASE`
+从 target contact TCP 指向当前分割物体最近观测表面；需要缩小局部间隙时沿它的同号 BASE
+分量小步 Preview，而不是凭相机上下猜 base ±Z。每次编辑后必须确认向量范数确实缩小；若增大，
+说明方向错误，应撤回。它只是几何提示，不是接触真值；若与 jaw-plane 可见通道矛盾，以完整
+几何为准。
 
 每轮只做三种选择之一：若当前 target 已满足目标，调用 finish_imagination(status="ready")；若能
 指出一个当前可见的几何缺陷，只做一次 delta_move、rotate、open_gripper 或 close_gripper；若该

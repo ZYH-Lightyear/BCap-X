@@ -95,8 +95,8 @@ Main 自己的一句依据，用于在感知调用后保留“抓取失败，正
 
 ## Canvas
 
-Web schema 23 / `vaw-context-v22-seed-approach` / renderer
-`context-web-v22-seed-approach`：
+Web schema 24 / `vaw-context-v23-source-vector` / renderer
+`context-web-v23-source-vector`：
 
 - 上层 `OBSERVED NOW · REAL WORLD`：干净 agentview、与 agentview 标定透视一致的稠密
   RGB-D surface 和四行本体状态；
@@ -109,6 +109,8 @@ Web schema 23 / `vaw-context-v22-seed-approach` / renderer
 - near-field 的 `LOCAL 3/4` 角落固定显示 `BASE / WORLD` +轴，`JAW PLANE` 角落显示随当前
   紫色目标旋转的 `TARGET TOOL` +轴。`rotate` 使用所选 +轴的右手定则；Prompt 要求符号或幅度
   不确定时先用 5–15° Preview，不能用 ±90° 猜方向；
+- Waypoint 卡使用 `TCP→SOURCE BASE [dx,dy,dz]` 表示从 target TCP 指向最近当前 source surface
+  的 BASE 向量；距离只由该向量派生显示，不再暴露一个缺少修正方向的孤立标量；
 - 没有 active target 时，下层明确标成 `CURRENT EVIDENCE · OBSERVED` 或
   `CURRENT GEOMETRY · OBSERVED`，不再把当前蓝色机器人误标成未执行想象；
 - Main 审查 Imagination 交回的 ActionReview 时，当前紫色 Preview 始终优先于旧的

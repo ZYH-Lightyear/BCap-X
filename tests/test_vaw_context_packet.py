@@ -58,7 +58,9 @@ def test_packet_modes_follow_owner_and_evidence_not_history() -> None:
     assert packet.world.owner == "imagination"
     assert packet.world.action["status"] == "editing"
     assert packet.world.action["target_role"] == "grasp_contact"
-    assert packet.world.action["source_surface_distance_m"] >= 0.0
+    source_delta = packet.world.action["source_surface_delta_base_m"]
+    assert len(source_delta) == 3
+    assert all(np.isfinite(source_delta))
     assert packet.world.imagination_scene_raster_id == "imagination_scene"
 
     action_id = workspace.execute("finish_imagination", status="ready").result[
@@ -71,6 +73,32 @@ def test_packet_modes_follow_owner_and_evidence_not_history() -> None:
     assert packet.manifest()["review_action_id"] == action_id
     assert packet.world.action["status"] == "review"
     assert "handoff_reason" not in packet.world.action
+
+
+def test_source_surface_delta_points_toward_observed_geometry() -> None:
+    workspace = _workspace()
+    compiler = ContextCompiler()
+    region_id = workspace.execute("detection_and_sam", query="can").result[
+        "region_id"
+    ]
+    seed_id = workspace.execute("propose_grasps", region_id=region_id).result[
+        "seed_ids"
+    ][0]
+    workspace.set_refinement_goal("approach the current source surface")
+    workspace.execute("select", seed_id=seed_id)
+
+    before = np.asarray(
+        compiler.compile(workspace).world.action["source_surface_delta_base_m"]
+    )
+    step = np.clip(before, -0.02, 0.02)
+    workspace.execute("delta_move", delta_xyz_m=step.tolist(), frame="base")
+    after = np.asarray(
+        compiler.compile(workspace).world.action["source_surface_delta_base_m"]
+    )
+
+    assert np.linalg.norm(step) > 0.0
+    assert float(before @ step) > 0.0
+    assert np.linalg.norm(after) < np.linalg.norm(before)
 
 
 def test_action_review_preserves_cumulative_imagination_edit() -> None:
@@ -234,8 +262,8 @@ def test_packet_is_deterministic_and_does_not_leak_private_state() -> None:
     assert forbidden.isdisjoint(set(_walk_keys(snapshot)))
     encoded = json.dumps(snapshot).lower()
     assert "functionrecord" not in encoded and "waypointdraft" not in encoded
-    assert snapshot["schemaVersion"] == 23
-    assert snapshot["schema"] == "vaw-context-v22-seed-approach"
+    assert snapshot["schemaVersion"] == 24
+    assert snapshot["schema"] == "vaw-context-v23-source-vector"
     assert snapshot["viewport"] == {"width": CONTEXT_WIDTH, "height": CONTEXT_HEIGHT}
 
 

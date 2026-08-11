@@ -36,8 +36,8 @@ from vaw.context_runtime.private import (
 from vaw.context_runtime.scene_view import render_scene_view
 from vaw.context_runtime.workspace import ContextWorkspace
 
-CONTEXT_SCHEMA = "vaw-context-v22-seed-approach"
-CONTEXT_WEB_SCHEMA_VERSION = 23
+CONTEXT_SCHEMA = "vaw-context-v23-source-vector"
+CONTEXT_WEB_SCHEMA_VERSION = 24
 CONTEXT_WIDTH = 1920
 CONTEXT_HEIGHT = 1080
 
@@ -859,7 +859,7 @@ def _active_presentation(
                 status="editing",
                 action_id=None,
                 target_role=_target_role(state.imagination.target, artifacts),
-                source_surface_distance_m=_source_surface_distance_m(
+                source_surface_delta_base_m=_source_surface_delta_base_m(
                     workspace,
                     state.imagination.target,
                     artifacts,
@@ -880,7 +880,7 @@ def _active_presentation(
                 action_id=state.action_review.action_id,
                 intent=state.action_review.intent,
                 target_role=_target_role(state.action_review.target, artifacts),
-                source_surface_distance_m=_source_surface_distance_m(
+                source_surface_delta_base_m=_source_surface_delta_base_m(
                     workspace,
                     state.action_review.target,
                     artifacts,
@@ -897,7 +897,7 @@ def _target_presentation(
     status: str,
     action_id: str | None,
     target_role: str,
-    source_surface_distance_m: float | None,
+    source_surface_delta_base_m: tuple[float, float, float] | None,
     intent: str | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
@@ -905,9 +905,9 @@ def _target_presentation(
         "target": target.summary(),
         "target_role": target_role,
     }
-    if source_surface_distance_m is not None:
-        result["source_surface_distance_m"] = round(
-            float(source_surface_distance_m),
+    if source_surface_delta_base_m is not None:
+        result["source_surface_delta_base_m"] = _rounded(
+            source_surface_delta_base_m,
             4,
         )
     if action_id is not None:
@@ -949,16 +949,16 @@ def _target_role(
     return "relative_pose"
 
 
-def _source_surface_distance_m(
+def _source_surface_delta_base_m(
     workspace: ContextWorkspace,
     target: ActionTarget,
     artifacts: ImaginationArtifacts | ActionReviewArtifacts | None,
-) -> float | None:
-    """Nearest observed source surface to the contact TCP, as a compact cue.
+) -> tuple[float, float, float] | None:
+    """BASE vector from target contact TCP to its nearest observed source point.
 
     This is derived only from the current revision's segmented RGB-D points.
-    It is not a collision/contact oracle; it makes a visible free-space gap
-    explicit without exposing masks or point clouds in the packet.
+    It is not a collision/contact oracle; unlike a scalar gap, it makes the
+    local correction direction explicit without exposing raw point clouds.
     """
 
     if target.pose is None or artifacts is None or artifacts.planning_context is None:
@@ -979,7 +979,9 @@ def _source_surface_distance_m(
     if len(points) == 0:
         return None
     target_xyz = np.asarray(target.pose.position_xyz, dtype=np.float64)
-    return float(np.min(np.linalg.norm(points - target_xyz, axis=1)))
+    deltas = points - target_xyz
+    nearest_index = int(np.argmin(np.linalg.norm(deltas, axis=1)))
+    return tuple(float(value) for value in deltas[nearest_index])
 
 
 def _grounding_references(

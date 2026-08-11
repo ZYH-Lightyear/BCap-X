@@ -310,7 +310,8 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
     assert "中间值具有歧义" in ACTION_REVIEW_SYSTEM_PROMPT
     assert "固定 source" in ACTION_REVIEW_SYSTEM_PROMPT
     assert "不是 pre-grasp" in IMAGINATION_SYSTEM_PROMPT
-    assert "TCP→SOURCE" in IMAGINATION_SYSTEM_PROMPT
+    assert "TCP→SOURCE BASE" in IMAGINATION_SYSTEM_PROMPT
+    assert "同号 BASE" in IMAGINATION_SYSTEM_PROMPT
     assert "继续随机" in IMAGINATION_SYSTEM_PROMPT
     assert "非物理 Function 不刷新真实 observation" in SYSTEM_PROMPT
     assert "不得仅因下层切换" in SYSTEM_PROMPT

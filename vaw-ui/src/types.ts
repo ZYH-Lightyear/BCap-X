@@ -8,8 +8,8 @@ export interface VisualEditSummary {
 }
 
 export interface ContextSnapshot {
-  schemaVersion: 23
-  schema: 'vaw-context-v22-seed-approach'
+  schemaVersion: 24
+  schema: 'vaw-context-v23-source-vector'
   renderId: string
   revision: number
   viewport: { width: 1920; height: 1080 }
@@ -52,7 +52,7 @@ export interface ContextSnapshot {
       action_id?: string
       intent?: string
       target_role: 'grasp_contact' | 'point_pose' | 'relative_pose' | 'gripper_only'
-      source_surface_distance_m?: number
+      source_surface_delta_base_m?: number[]
       target: {
         pose?: { position_xyz: number[]; quaternion_xyzw: number[] }
         gripper?: 'open' | 'closed'
