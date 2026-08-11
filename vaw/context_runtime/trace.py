@@ -44,6 +44,7 @@ class ContextTraceLogger:
         raw_response_text: str = "",
         provider_reasoning: str = "",
         state_summary: dict[str, Any] | None = None,
+        main_working_focus: str | None = None,
     ) -> pathlib.Path:
         name = f"context_{self.index:04d}.png"
         path = self.dir / name
@@ -74,6 +75,9 @@ class ContextTraceLogger:
             "thought": thought,
             "raw_response_text": raw_response_text,
             "provider_reasoning": provider_reasoning,
+            # Exact bounded belief visible to Main before this decision.  It
+            # is absent for Imagination and ActionReview requests.
+            "main_working_focus": main_working_focus,
             "state_summary": state_summary,
             "env_reward": 1.0 if env_success else 0.0,
             "env_success": env_success,

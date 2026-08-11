@@ -15,7 +15,7 @@ from vaw.context_runtime.packet import (
 
 
 class ContextWebRenderer:
-    name = "context-web-v14-contact-focus"
+    name = "context-web-v16-review-contract"
     width = CONTEXT_WIDTH
     height = CONTEXT_HEIGHT
 

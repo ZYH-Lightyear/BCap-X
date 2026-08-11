@@ -39,6 +39,7 @@ from vaw.context_runtime.private import (
     RegionGeometryArtifact,
     SeedArtifacts,
     VisualEdit,
+    build_edit_summary,
 )
 from vaw.context_runtime.semantic_grounding import (
     candidate_prompt,
@@ -82,6 +83,7 @@ class ContextFunctions:
             "open_gripper": self.open_gripper,
             "close_gripper": self.close_gripper,
             "finish_imagination": self.finish_imagination,
+            "reject_action": self.reject_action,
             "done": self.done,
         }
 
@@ -609,13 +611,35 @@ class ContextFunctions:
             return reference, self.ws._private.imagination_artifacts or ImaginationArtifacts()
 
         review = self.ws.state.action_review
-        if review is not None and review.target.pose is not None:
-            reference_rotation = _pose_rotation(review.target.pose)
-            reference = Pose(
-                review.target.pose.position_xyz,
-                tuple(float(value) for value in reference_rotation.as_quat()),
-            )
+        if review is not None:
             review_artifacts = self.ws._private.review_artifacts.get(review.action_id)
+            if review.target.pose is not None:
+                reference_rotation = _pose_rotation(review.target.pose)
+                reference = Pose(
+                    review.target.pose.position_xyz,
+                    tuple(float(value) for value in reference_rotation.as_quat()),
+                )
+                initial_target = review.target
+            else:
+                robot = self.ws.state.robot
+                if robot is None or robot.tcp_pose is None:
+                    raise ContextFunctionError("current TCP pose is unavailable")
+                try:
+                    reference_rotation = _pose_rotation(robot.tcp_pose)
+                except ValueError as exc:
+                    raise ContextFunctionError(
+                        f"current TCP pose is invalid: {exc}"
+                    ) from exc
+                reference = Pose(
+                    robot.tcp_pose.position_xyz,
+                    tuple(float(value) for value in reference_rotation.as_quat()),
+                )
+                # A spatial edit of a gripper-only review adds a pose; it must
+                # not silently erase the reviewed gripper command.
+                initial_target = ActionTarget(
+                    pose=reference,
+                    gripper=review.target.gripper,
+                )
             return (
                 reference,
                 ImaginationArtifacts(
@@ -629,7 +653,7 @@ class ContextFunctions:
                         if review_artifacts is not None
                         else None
                     ),
-                    initial_target=review.target,
+                    initial_target=initial_target,
                 ),
             )
 
@@ -757,6 +781,22 @@ class ContextFunctions:
         action = self.ws.state.action_review
         if action is None or action.action_id != action_id:
             raise ContextFunctionError(f"unknown or expired action_id '{action_id}'")
+        start_tcp = (
+            self.ws.state.robot.tcp_pose
+            if self.ws.state.robot is not None
+            else None
+        )
+        requested_arm_delta = (
+            tuple(
+                float(value)
+                for value in (
+                    np.asarray(action.target.pose.position_xyz, dtype=np.float64)
+                    - np.asarray(start_tcp.position_xyz, dtype=np.float64)
+                )
+            )
+            if action.target.pose is not None and start_tcp is not None
+            else None
+        )
         execution_error: ContextFunctionError | None = None
         failed_stage: str | None = (
             "arm" if action.target.pose is not None else "gripper"
@@ -815,6 +855,8 @@ class ContextFunctions:
             intent=action.intent,
             executed_stages=stage_summary,
             outcome=outcome,
+            target_gripper=action.target.gripper,
+            requested_arm_delta_base_m=requested_arm_delta,
         )
         self.ws._private.last_physical_artifacts = LastPhysicalArtifacts(
             focus_pose=focus_pose
@@ -916,6 +958,15 @@ class ContextFunctions:
             return self.ws.state.last_handoff.summary()
         return self._handoff_review("agent_ready")
 
+    def reject_action(self, action_id: str) -> dict[str, Any]:
+        """Decline a reviewed virtual target without changing the world."""
+
+        action = self.ws.state.action_review
+        if action is None or action.action_id != action_id:
+            raise ContextFunctionError(f"unknown or expired action_id '{action_id}'")
+        self.ws.discard_action_review()
+        return {}
+
     def limit_imagination(self) -> dict[str, Any]:
         """Return the final preview to Main without marking it as approved."""
 
@@ -959,6 +1010,7 @@ class ContextFunctions:
                 motion_plan=plan,
                 planning_context=artifacts.planning_context,
                 termination_reason=termination_reason,
+                edit_summary=build_edit_summary(imagination.target, artifacts),
             )
         }
         self.ws.state.imagination = None

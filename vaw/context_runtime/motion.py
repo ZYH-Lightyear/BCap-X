@@ -263,8 +263,8 @@ class CuroboMotionBackend:
         if isinstance(status, dict) and status.get("all_converged") is False:
             raise MotionBackendError("execute_joint_trajectory did not converge")
 
-        residual = self._final_joint_residual(trajectory[-1])
-        if residual > self.final_joint_tolerance_rad and status is None:
+        max_joint_error = self._final_joint_max_error(trajectory[-1])
+        if max_joint_error > self.final_joint_tolerance_rad and status is None:
             # FrankaLiberoApiReduced does not expose the per-waypoint controller
             # status.  Track dense trajectory waypoints with the same bounded
             # budget used by CaP-X's low-level trajectory helper, then make one
@@ -280,15 +280,15 @@ class CuroboMotionBackend:
                 tolerance=self.waypoint_tolerance_rad,
                 max_steps=self.final_settle_max_steps,
             )
-            residual = self._final_joint_residual(trajectory[-1])
-        if residual > self.final_joint_tolerance_rad:
+            max_joint_error = self._final_joint_max_error(trajectory[-1])
+        if max_joint_error > self.final_joint_tolerance_rad:
             raise MotionBackendError(
                 "CuRobo trajectory execution did not converge: "
-                f"joint residual {residual:.6f} rad exceeds "
+                f"max joint error {max_joint_error:.6f} rad exceeds "
                 f"{self.final_joint_tolerance_rad:.6f} rad"
             )
 
-    def _final_joint_residual(self, target_joints: np.ndarray) -> float:
+    def _final_joint_max_error(self, target_joints: np.ndarray) -> float:
         observation = _call(self.api, "get_observation")
         if not isinstance(observation, dict):
             raise MotionBackendError("get_observation returned no joint state")
@@ -297,7 +297,14 @@ class CuroboMotionBackend:
             minimum_length=7,
             label="observed robot joints",
         )[:7]
-        return float(np.linalg.norm(achieved - target_joints))
+        # Use a dimension-independent endpoint diagnostic here.  CaP-X's
+        # controller internally stops on an L2 norm, but applying that same
+        # scalar threshold a second time after execution makes acceptance
+        # tighten merely because the arm has seven joints.  The maximum
+        # component still rejects a materially missed endpoint while avoiding
+        # false failures such as seven harmless ~0.01 rad residuals.  The
+        # public commit result separately reports the achieved TCP error.
+        return float(np.max(np.abs(achieved - target_joints)))
 
 
 def create_motion_backend(name: str, api: Any) -> MotionBackend:

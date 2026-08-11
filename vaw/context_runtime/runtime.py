@@ -1,4 +1,4 @@
-"""History-free Main/Imagination orchestration for the VAW Context Runtime."""
+"""Bounded-state Main/Imagination orchestration for the VAW Context Runtime."""
 
 from __future__ import annotations
 
@@ -27,13 +27,16 @@ from vaw.context_runtime.packet import (
 )
 from vaw.context_runtime.private import build_edit_summary
 from vaw.context_runtime.protocol import (
-    FUNCTION_NAMES,
+    ACTION_REVIEW_SYSTEM_PROMPT,
     IMAGINATION_FUNCTION_NAMES,
     IMAGINATION_SYSTEM_PROMPT,
+    REVIEW_FUNCTION_NAMES,
+    STANDARD_MAIN_FUNCTION_NAMES,
     SYSTEM_PROMPT,
-    function_definitions,
     imagination_function_definitions,
+    main_function_definitions,
     parse_action,
+    review_function_definitions,
 )
 from vaw.context_runtime.trace import ContextTraceLogger
 from vaw.context_runtime.workspace import ContextStepResult, ContextWorkspace
@@ -87,7 +90,8 @@ class ContextRuntime:
         self.trace = trace
         self.env_check = env_check
         self.env_terminal_check = env_terminal_check
-        self.main_tools = function_definitions()
+        self.main_tools = main_function_definitions()
+        self.review_tools = review_function_definitions()
         self.imagination_tools = imagination_function_definitions()
         self.usage: dict[str, int] = {}
         self.env_success: bool | None = None
@@ -95,13 +99,17 @@ class ContextRuntime:
         self.main_turns = 0
         self.imagination_turns = 0
         self._feedback: dict[str, str | None] = {"main": None, "imagination": None}
+        # One overwrite-only Main belief bridges adjacent semantic decisions.
+        # This is intentionally not a transcript: no old images, tool payloads
+        # or Imagination rationale are replayed.
+        self._main_working_focus: str | None = None
         if self.trace is not None:
             self.trace.log_meta(
                 {
                     "context_schema": CONTEXT_SCHEMA,
                     "renderer": renderer.name,
                     "task_prompt": workspace.state.task_prompt,
-                    "orchestration": "main-imagination-no-history",
+                    "orchestration": "main-imagination-single-working-focus",
                     "max_imagination_turns": self.config.max_imagination_turns,
                     "motion_backend": workspace.motion_backend_name,
                 }
@@ -135,11 +143,18 @@ class ContextRuntime:
             owner = self.workspace.state.owner
             packet = self.compiler.compile(self.workspace)
             image = self.renderer.render(packet)
+            visible_main_focus = self._visible_main_working_focus(owner)
             messages = self._messages(owner, packet, image)
             provider = (
                 self.imagination_provider if owner == "imagination" else self.main_provider
             )
-            tools = self.imagination_tools if owner == "imagination" else self.main_tools
+            tools = (
+                self.imagination_tools
+                if owner == "imagination"
+                else self.review_tools
+                if self.workspace.state.action_review is not None
+                else self.main_tools
+            )
             turn += 1
             if owner == "main":
                 self.main_turns += 1
@@ -159,7 +174,16 @@ class ContextRuntime:
             call, protocol_error = self._single_call(response)
             if protocol_error is not None:
                 self._feedback[owner] = protocol_error
-                self._log(turn, owner, image, packet, None, None, response)
+                self._log(
+                    turn,
+                    owner,
+                    image,
+                    packet,
+                    None,
+                    None,
+                    response,
+                    main_working_focus=visible_main_focus,
+                )
                 continue
 
             assert call is not None
@@ -181,7 +205,18 @@ class ContextRuntime:
 
             record = _step_record(turn, owner, step, response.text, physical=physical)
             steps.append(record)
-            self._log(turn, owner, image, packet, _call_summary(call), step, response)
+            self._log(
+                turn,
+                owner,
+                image,
+                packet,
+                _call_summary(call),
+                step,
+                response,
+                main_working_focus=visible_main_focus,
+            )
+            if owner == "main":
+                self._update_main_working_focus(response.text)
             self._notify(turn, record)
 
             if physical and self._environment_terminated():
@@ -261,23 +296,63 @@ class ContextRuntime:
             "Current Policy State："
             + json.dumps(packet.manifest(), ensure_ascii=False, separators=(",", ":"))
         )
+        visible_focus = self._visible_main_working_focus(owner)
+        if visible_focus is not None:
+            text += (
+                "\nMain Working Focus（上一轮 Main 的可覆盖 belief，不是真值）："
+                + visible_focus
+            )
         handoff = self.workspace.state.last_handoff
         if handoff is not None:
             text += "\nLatest Imagination Handoff：" + json.dumps(
                 handoff.summary(), ensure_ascii=False, separators=(",", ":")
             )
+        review = self.workspace.state.action_review
+        if review is not None:
+            review_artifacts = self.workspace._private.review_artifacts.get(
+                review.action_id
+            )
+            if (
+                review_artifacts is not None
+                and review_artifacts.edit_summary is not None
+            ):
+                text += "\nAction Review Edit Summary：" + json.dumps(
+                    review_artifacts.edit_summary.summary(),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
         last_physical = self.workspace.state.last_physical_action
         if (
             last_physical is not None
-            and self.workspace.state.imagination is None
-            and self.workspace.state.action_review is None
+            and (
+                (
+                    self.workspace.state.imagination is None
+                    and self.workspace.state.action_review is None
+                )
+                or last_physical.outcome == "completed"
+            )
         ):
             text += "\nLast Physical Action：" + json.dumps(
                 last_physical.summary(), ensure_ascii=False, separators=(",", ":")
             )
         if feedback:
             text += f"\n上轮协议错误：{feedback}"
-        return _image_messages(SYSTEM_PROMPT, text, context_image)
+        system_prompt = (
+            ACTION_REVIEW_SYSTEM_PROMPT
+            if self.workspace.state.action_review is not None
+            else SYSTEM_PROMPT
+        )
+        return _image_messages(system_prompt, text, context_image)
+
+    def _visible_main_working_focus(self, owner: str) -> str | None:
+        if owner != "main" or self.workspace.state.action_review is not None:
+            return None
+        return self._main_working_focus
+
+    def _update_main_working_focus(self, text: str) -> None:
+        normalized = " ".join(str(text).split())
+        if normalized:
+            self._main_working_focus = normalized
 
     def _single_call(
         self, response: ModelResponse
@@ -291,7 +366,13 @@ class ContextRuntime:
     def _dispatch(self, owner: str, call: ToolCall) -> ContextStepResult:
         if call.parse_error:
             return self.workspace.reject(call.name, call.args, call.parse_error)
-        allowed = IMAGINATION_FUNCTION_NAMES if owner == "imagination" else FUNCTION_NAMES
+        allowed = (
+            IMAGINATION_FUNCTION_NAMES
+            if owner == "imagination"
+            else REVIEW_FUNCTION_NAMES
+            if self.workspace.state.action_review is not None
+            else STANDARD_MAIN_FUNCTION_NAMES
+        )
         arguments = dict(call.args)
         if owner == "main" and call.name in IMAGINATION_STARTERS:
             raw_goal = arguments.pop("refinement_goal", None)
@@ -396,6 +477,8 @@ class ContextRuntime:
         call: dict[str, Any] | None,
         step: ContextStepResult | None,
         response: ModelResponse,
+        *,
+        main_working_focus: str | None,
     ) -> None:
         if self.trace is None:
             return
@@ -412,6 +495,7 @@ class ContextRuntime:
             raw_response_text=response.raw_response_text or response.text,
             provider_reasoning=response.provider_reasoning,
             state_summary=self.workspace.state.trace_summary(),
+            main_working_focus=main_working_focus,
         )
 
     def _notify(self, turn: int, record: StepRecord) -> None:

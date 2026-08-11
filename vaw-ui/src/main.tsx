@@ -31,8 +31,8 @@ function Root() {
   useEffect(() => {
     window.__VAW_RENDER__ = async (next) => {
       if (
-        next.schemaVersion !== 15
-        || next.schema !== 'vaw-context-v14-contact-focus'
+        next.schemaVersion !== 17
+        || next.schema !== 'vaw-context-v16-review-contract'
         || next.viewport.width !== 1920
         || next.viewport.height !== 1080
       ) {

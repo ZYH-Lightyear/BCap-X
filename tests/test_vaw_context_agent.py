@@ -8,6 +8,10 @@ import numpy as np
 from tests.test_vaw_context_runtime import FakeContextApi
 from vaw.agents.contracts import ModelResponse, ToolCall
 from vaw.context_runtime.runtime import ContextRunConfig, ContextRuntime
+from vaw.context_runtime.protocol import (
+    REVIEW_FUNCTION_NAMES,
+    STANDARD_MAIN_FUNCTION_NAMES,
+)
 from vaw.context_runtime.trace import ContextTraceLogger
 from vaw.context_runtime.workspace import ContextWorkspace
 
@@ -91,6 +95,8 @@ def test_dual_agent_runtime_rebuilds_every_request_without_history(tmp_path: Pat
     post_commit_text = _user_text(main.messages[2])
     assert "Last Physical Action" in post_commit_text
     assert "设置闭合目标并检查两指通道" in post_commit_text
+    assert "Main Working Focus" in post_commit_text
+    assert "reason 3" in post_commit_text
     assert "Refinement Goal：设置闭合目标并检查两指通道" in json.dumps(
         imagination.messages[0], ensure_ascii=False
     )
@@ -107,6 +113,51 @@ def test_dual_agent_runtime_rebuilds_every_request_without_history(tmp_path: Pat
     ]
     assert all("visible_recent_calls" not in row for row in rows)
     assert all("execution_receipt" not in row for row in rows)
+    assert rows[0]["main_working_focus"] is None
+    assert rows[2]["main_working_focus"] is None
+    assert rows[3]["main_working_focus"] == "reason 3"
+
+
+def test_main_keeps_only_one_overwrite_only_working_focus() -> None:
+    main = RecordingProvider(
+        [
+            ModelResponse(
+                text="当前抬升核验显示目标没有随动；重新定位目标以重抓。",
+                tool_calls=(
+                    ToolCall(
+                        id="call-1",
+                        name="detection_and_sam",
+                        args={"query": "can"},
+                    ),
+                ),
+            ),
+            ModelResponse(
+                text="region 已确认；生成不同抓取起点。",
+                tool_calls=(
+                    ToolCall(
+                        id="call-2",
+                        name="propose_grasps",
+                        args={"region_id": "region1"},
+                    ),
+                ),
+            ),
+            _response(3, "done", success=False),
+        ]
+    )
+    runtime = ContextRuntime(
+        main,
+        ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki"),
+        SolidRenderer(),
+    )
+
+    runtime.run()
+
+    second = _user_text(main.messages[1])
+    third = _user_text(main.messages[2])
+    assert "目标没有随动；重新定位目标以重抓" in second
+    assert "region 已确认；生成不同抓取起点" in third
+    assert "目标没有随动；重新定位目标以重抓" not in third
+    assert "function_result" not in third and "call-2" not in third
 
 
 def test_runtime_stops_after_environment_terminates_during_commit() -> None:
@@ -196,7 +247,42 @@ def test_last_physical_action_persists_across_main_perception_calls() -> None:
     assert all(_image_count(messages) == 1 for messages in main.messages)
 
 
-def test_noncommit_main_decision_discards_review_offer() -> None:
+def test_completed_gripper_action_remains_visible_during_lift_review() -> None:
+    main = RecordingProvider(
+        [
+            _response(1, "close_gripper", refinement_goal="闭合真实夹爪"),
+            _response(3, "commit", action_id="a1"),
+            _response(
+                4,
+                "delta_move",
+                delta_xyz_m=[0.0, 0.0, 0.03],
+                frame="base",
+                refinement_goal="保持闭合并上抬 3cm 核验随动",
+            ),
+            _response(6, "done", success=False),
+        ]
+    )
+    imagination = RecordingProvider(
+        [
+            _response(2, "finish_imagination", status="ready"),
+            _response(5, "finish_imagination", status="ready"),
+        ]
+    )
+    ContextRuntime(
+        main,
+        ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki"),
+        SolidRenderer(),
+        imagination_provider=imagination,
+    ).run()
+
+    review_text = _user_text(main.messages[3])
+    assert "Last Physical Action" in review_text
+    assert '"target_gripper":"closed"' in review_text
+    assert '"outcome":"completed"' in review_text
+    assert '"total_translation_base_m":[0.0,0.0,0.03]' in review_text
+
+
+def test_review_tool_surface_requires_explicit_commit_revise_or_reject() -> None:
     main = RecordingProvider(
         [
             _response(
@@ -207,8 +293,9 @@ def test_noncommit_main_decision_discards_review_offer() -> None:
                 refinement_goal="检查目标位置",
             ),
             _response(3, "detection_and_sam", query="basket"),
-            _response(4, "commit", action_id="a1"),
-            _response(5, "done", success=False),
+            _response(4, "reject_action", action_id="a1"),
+            _response(5, "detection_and_sam", query="basket"),
+            _response(6, "done", success=False),
         ]
     )
     imagination = RecordingProvider(
@@ -224,11 +311,27 @@ def test_noncommit_main_decision_discards_review_offer() -> None:
 
     result = runtime.run()
 
-    commit = next(step for step in result.steps if step.op == "main:commit")
-    assert not commit.ok
-    assert json.loads(commit.result) == {
-        "error": "unknown or expired action_id 'a1'"
-    }
+    invalid_perception = result.steps[2]
+    assert invalid_perception.op == "main:detection_and_sam"
+    assert not invalid_perception.ok
+    assert "unknown function 'detection_and_sam'" in invalid_perception.result
+    assert [item["function"]["name"] for item in main.tools[0]] == list(
+        STANDARD_MAIN_FUNCTION_NAMES
+    )
+    assert [item["function"]["name"] for item in main.tools[1]] == list(
+        REVIEW_FUNCTION_NAMES
+    )
+    assert [item["function"]["name"] for item in main.tools[2]] == list(
+        REVIEW_FUNCTION_NAMES
+    )
+    assert [item["function"]["name"] for item in main.tools[3]] == list(
+        STANDARD_MAIN_FUNCTION_NAMES
+    )
+    assert "当前只负责审查一个" in main.messages[1][0]["content"]
+    assert "unknown function 'detection_and_sam'" in _user_text(main.messages[2])
+    assert any(step.op == "main:reject_action" and step.ok for step in result.steps)
+    assert any(step.op == "main:detection_and_sam" and step.ok for step in result.steps)
+    assert workspace.state.regions
     assert workspace.state.action_review is None
 
 
@@ -401,3 +504,6 @@ def test_imagination_receives_cumulative_edit_summary_not_transcript() -> None:
     assert '"total_translation_base_m":[0.01,0.02,0.0]' in second
     assert '"total_translation_base_m":[0.01,0.01,0.0]' in third
     assert "reason 2" not in second and "reason 3" not in third
+    main_review = _user_text(main.messages[1])
+    assert "Action Review Edit Summary" in main_review
+    assert '"total_translation_base_m":[0.01,0.01,0.0]' in main_review

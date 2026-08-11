@@ -1,6 +1,6 @@
 export interface ContextSnapshot {
-  schemaVersion: 15
-  schema: 'vaw-context-v14-contact-focus'
+  schemaVersion: 17
+  schema: 'vaw-context-v16-review-contract'
   renderId: string
   revision: number
   viewport: { width: 1920; height: 1080 }
@@ -18,6 +18,8 @@ export interface ContextSnapshot {
       intent: string
       executed_stages: 'arm' | 'gripper' | 'arm+gripper'
       outcome: 'completed' | 'arm_failed' | 'gripper_failed'
+      target_gripper?: 'open' | 'closed'
+      requested_arm_delta_base_m?: number[]
     } | null
     postCommitBeforeRasterId: string | null
     postCommitCurrentRasterId: string | null
@@ -48,6 +50,13 @@ export interface ContextSnapshot {
         axis?: 'x' | 'y' | 'z'
         angle_deg?: number
         gripper_target?: 'open' | 'closed'
+      }
+      edit_summary?: {
+        initial_target: { position_xyz?: number[]; gripper_target?: 'open' | 'closed' }
+        current_target: { position_xyz?: number[]; gripper_target?: 'open' | 'closed' }
+        total_translation_base_m?: number[]
+        total_rotation_axis_base?: number[]
+        total_rotation_deg?: number
       }
     } | null
   }

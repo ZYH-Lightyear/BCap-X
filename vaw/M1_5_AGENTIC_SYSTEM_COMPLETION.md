@@ -429,6 +429,37 @@ episode termination。
 check；任何 commit 导致底层 episode 结束后都立即以 `env_terminated` 停止，不能继续向死环境发出
 感知或动作。
 
+真实 Agent trace `m154g_qwen35plus_bounded_exec_t0_s1` 验证了执行预算修订：7 次 physical
+commit 共记录 328 个每 4 simulation step 采样的视频帧，环境没有触及 4000-step horizon；首个
+approach、close 与后续移动的 TCP error 均约 `9.5–12.6 mm`。因此 executor/horizon 已不再是当前
+首要失败。
+
+该 trace 把下一失败精确定位到 Imagination→Main 的控制语义断点：Main 要求“抬升”，却用
+`tool +Z` 启动编辑；top-down grasp 下该局部轴朝向支撑面。Imagination 连续编辑后最终 target
+相对初始 target 在 base Z 方向下降约 `11 cm`，但 handoff 时 `ActionReviewArtifacts` 丢弃了
+`EditSummary`，Main Canvas 显示 `MOVE ΔXYZ —`，随后把明显低于当前 TCP 的 target 误判为合理并
+commit。修订采用两个通用机制，而非任务 phase/gate：
+
+1. schema 和 Function 描述明确 `base +Z` 恒为世界上抬，tool 轴随 target 姿态旋转，世界方向动作
+   不得把 tool Z 当作高度；
+2. handoff 原子冻结 `initial target / current target / cumulative base translation/rotation`，并同时
+   编译进 Main 的 ActionReview Canvas 与最小控制文本，使 Main 能逐轴核对 refinement goal。
+
+新版本为 Web schema 16 / `vaw-context-v15-review-edit` / renderer
+`context-web-v15-review-edit`。它只传递当前命令状态，不恢复 transcript history，也不暴露 trajectory、
+相机参数或环境真值。
+
+真实 Agent trace `m154h_qwen35plus_review_edit_t0_s1` 对 frame 修订给出正向证据：所有“抬升/下降”
+编辑均显式使用 base Z；不可执行 pose 在 handoff 边界被判为 failed，没有形成可被 Main 错误 commit
+的 ActionReview。该 run 同时暴露了更早的 capability-routing 失败：Main 在准确 `region1` 已存在时
+完全跳过 `propose_grasps`，三次用同一个 point 配合手写 offset/quaternion 构造侧抓，所有规划均为
+IK error；每次失败后又调用幂等 detection，误以为能获得“fresh”几何。
+
+这不是要增加 pick phase，而是 Function affordance 描述不充分。修订保持十一项 Function 和 runtime
+调度不变，只明确工具能力边界并调整展示顺序：对象 region 的抓取默认由 `propose_grasps` 生成完整
+位置+方向 seed；`locate_point` 只提供 XYZ，`propose_pose` 用于放置/表面点或已有明确方向约束的直接
+pose；motion failure 不会让同 revision 的 perception 变旧，重复 detection 不能恢复 IK。
+
 验收：主任务 seeds `0,1,2` 至少 `2/3` env success。
 
 ### M1.5.5 — Basic Generalization and Freeze
@@ -467,8 +498,13 @@ check；任何 commit 导致底层 episode 结束后都立即以 `env_terminated
 | M1.5.4-c | 正交 Contact Focus 能收敛局部接触；revision-local cause + one-decision review 防止任务重启与 stale commit | in progress | 52 full VAW tests + Ruff + Web build | `m154_qwen35plus_contact_focus_t0_s1`, `m154c_source_guard_scripted_t0_s1`, `m154c_qwen35plus_causal_t0_s1` | 局部调整明显收敛且首次真实抓起；因果、stale review、source outlier 与 gripper-only Canvas crash 均已修复并回归 |
 | M1.5.4-d | 精确终点 settle + 幂等 grounding + local/semantic motion 分工能把闭环推进到可靠 place | in progress | 56 full VAW tests + Ruff + Web build | `m154d_qwen35plus_settle_t0_s1` | pick 与 3cm lift 真实成功；首次 place 因未 grounding basket、把 delta 当长距离导航而落在篮外；策略语义已修订，待复测 |
 | M1.5.4-e | 当前 Review 应覆盖旧物理失败，避免两个因果焦点竞争 | in progress | packet/message scope tests + Ruff | `m154e_qwen35plus_destination_t0_s1`, `m154f_qwen35plus_review_scope_t0_s1` | destination recovery 已使用 region-scoped point；隐藏旧 failure 后 Main 能审查新 point-based action。下一失败来自 executor 耗尽 LIBERO horizon |
-| M1.5.4-f | 有界 waypoint tracking + environment termination 传播能保留真实闭环预算 | in progress | safe `+3 cm Z` A/B：81 steps/8.43 mm → 43 steps/6.13 mm；terminal callback regression | pending agent rerun | 保留 0.02 rad 最终 gate，不改 CaP-X；待真实完整 episode 验证 |
-| M1.5.4 | 完整闭环可达到基本 pick-place 成功 | in progress | 56 full VAW tests + Ruff + Web build | pending frozen seeds 0/1/2 | 尚未达到 `2/3 env_success`，不得宣称完成 |
+| M1.5.4-f | 有界 waypoint tracking + environment termination 传播能保留真实闭环预算 | `6e7313d` | safe `+3 cm Z` A/B：81 steps/8.43 mm → 43 steps/6.13 mm；terminal callback regression | `m154g_qwen35plus_bounded_exec_t0_s1` | 7 次 physical commit 未耗尽 horizon，executor 修复成立；下一失败转为 tool/base 语义与 review edit 丢失 |
+| M1.5.4-g | frame 因果语义 + review command-state continuity 能阻止方向相反的 target 被批准 | in progress | 58 full VAW tests + Ruff + Web build；handoff cumulative-edit packet/message tests | `m154h_qwen35plus_review_edit_t0_s1` | base/world 方向语义生效，不可执行 target 未被交回；该 run 未产生可执行 review，累计 edit 的真实 Main 审查仍待覆盖 |
+| M1.5.4-h | 工具 capability routing 能优先使用完整 grasp seeds，并停止用幂等 perception 恢复 IK | in progress | Function order/description contract tests + targeted 37 tests + Ruff | pending agent rerun | 不增加 phase/gate；待验证 Main 使用 `region → propose_grasps` 而非未尝试 seed 就手写 quaternion |
+| M1.5.4-i | Main 只在独立 Review 决策面批准动作，普通决策不会遗留 stale review | in progress | Review tool-surface、reject、packet 与 runtime 回归 | `m154k_qwen35plus_review_contract_t0_s1` | Main 能 commit/reject/revise，未再用 detection 隐式跳过 review；发现 7-D joint L2 对小分量误差的重复放大 |
+| M1.5.4-j | overwrite-only Main Working Focus 能跨一次非物理调用维持失败结论 | in progress | 单 focus 覆盖/隔离测试；无 transcript/history | `m154l_qwen35plus_per_joint_t0_s1`, `m154m_qwen35plus_working_focus_t0_s1` | 抓持随动失败后，下一轮保留“失败并重试”而没有转向 basket；发现 gripper-only review 加空间编辑时丢失 gripper target，已修复 |
+| M1.5.4-k | Review 编辑必须保留完整 arm+gripper target，终点验收不应随关节维数人为收紧 | in progress | 63 full VAW tests + Ruff + Web build | `m154n_qwen35plus_preserve_target_t0_s1` | target 保真修复通过；真实失败 target 的 achieved TCP 仍偏差约 3.8 cm，正确拒绝并跳过 gripper。恢复随后陷入无可行 seed/手工侧抓 IK error，主任务仍未成功 |
+| M1.5.4 | 完整闭环可达到基本 pick-place 成功 | in progress | 63 full VAW tests + Ruff + Web build | pending frozen seeds 0/1/2 | 尚未达到 `2/3 env_success`，不得宣称完成 |
 
 ## 11. 非目标
 

@@ -31,12 +31,13 @@ from vaw.context_runtime.private import (
     ActionReviewArtifacts,
     ImaginationArtifacts,
     PrivateEnvContext,
+    build_edit_summary,
 )
 from vaw.context_runtime.scene_view import render_scene_view
 from vaw.context_runtime.workspace import ContextWorkspace
 
-CONTEXT_SCHEMA = "vaw-context-v14-contact-focus"
-CONTEXT_WEB_SCHEMA_VERSION = 15
+CONTEXT_SCHEMA = "vaw-context-v16-review-contract"
+CONTEXT_WEB_SCHEMA_VERSION = 17
 CONTEXT_WIDTH = 1920
 CONTEXT_HEIGHT = 1080
 
@@ -344,11 +345,7 @@ class ContextCompiler:
                     else None
                 ),
                 latest_error=event.error if event is not None else None,
-                last_physical_action=(
-                    state.last_physical_action
-                    if state.imagination is None and state.action_review is None
-                    else None
-                ),
+                last_physical_action=_visible_last_physical_action(state),
                 post_commit_before_raster_id=post_before_id,
                 post_commit_current_raster_id=post_current_id,
             ),
@@ -520,6 +517,17 @@ class ContextCompiler:
                 )
             )
         return specs
+
+
+def _visible_last_physical_action(state: ContextState) -> LastPhysicalAction | None:
+    """Keep successful causal facts, but let a new Preview supersede old failure."""
+
+    action = state.last_physical_action
+    if action is None:
+        return None
+    if state.imagination is None and state.action_review is None:
+        return action
+    return action if action.outcome == "completed" else None
 
 
 def _decision_spec(workspace: ContextWorkspace) -> DecisionWorkspaceSpec:
@@ -733,6 +741,15 @@ def _target_presentation(
         result["prediction"] = plan.prediction.summary()
     if isinstance(artifacts, ImaginationArtifacts) and artifacts.latest_visual_edit:
         result["latest_edit"] = artifacts.latest_visual_edit.summary()
+    edit_summary = (
+        build_edit_summary(target, artifacts)
+        if isinstance(artifacts, ImaginationArtifacts)
+        else artifacts.edit_summary
+        if isinstance(artifacts, ActionReviewArtifacts)
+        else None
+    )
+    if edit_summary is not None:
+        result["edit_summary"] = edit_summary.summary()
     return result
 
 

@@ -42,7 +42,7 @@ call/result/rationale。
 
 ## Function space
 
-Main Agent：
+Main Agent（普通决策面）：
 
 ```text
 detection_and_sam(query, within_region_id?)
@@ -54,9 +54,22 @@ delta_move(delta_xyz_m, frame, refinement_goal)
 rotate(axis, angle_deg, frame, refinement_goal)
 open_gripper(refinement_goal)
 close_gripper(refinement_goal)
-commit(action_id)
 done(success)
 ```
+
+Action Review 决策面只在 Imagination 交回一个待审动作时出现：
+
+```text
+commit(action_id)
+reject_action(action_id)
+delta_move / rotate / open_gripper / close_gripper
+select / propose_pose
+done(success)
+```
+
+普通 Main 看不到 `commit`；因此只有在最终 Preview 已进入 Action Review 后才可能执行。审查时
+若调用 editor，会把同一完整 target 交回 Imagination；若调用 `reject_action`，则显式销毁该
+offer，不刷新真实 observation。
 
 Imagination Agent：
 
@@ -72,15 +85,17 @@ finish_imagination(status="ready" | "failed")
 空间或夹爪 editor 时进入 Imagination；结束后产生等待 Main 判断的 `ActionReview`。
 Main 启动 Imagination 时必须显式提供一句短的 `refinement_goal`，不能把整段 rationale 当成
 局部控制目标。Imagination 每次请求只收到当前 Canvas、目标几何和累计 `EditSummary`，不收到
-Function transcript。默认最多连续想象 6 轮；主动完成或达到上限都以中性的
+Function transcript。普通 Main 只额外收到一条 overwrite-only `Main Working Focus`：上一轮
+Main 自己的一句依据，用于在感知调用后保留“抓取失败，正在重试”这类短期任务关系；它不是
+环境真值，也不会进入 Imagination 或 Action Review。默认最多连续想象 6 轮；主动完成或达到上限都以中性的
 `review_required` 交回 Main，`turn_limit` 只写 trace。只有 Main 查看最终 Preview 后调用
 `commit` 才构成批准。`ActionReview` 是一次决策的 offer：Main 的下一次成功调用若不是
 `commit`，旧 review 会被明确丢弃，不能在后续回合被误提交。
 
 ## Canvas
 
-Web schema 15 / `vaw-context-v14-contact-focus` / renderer
-`context-web-v14-contact-focus`：
+Web schema 17 / `vaw-context-v16-review-contract` / renderer
+`context-web-v16-review-contract`：
 
 - 上层 `OBSERVED NOW · REAL WORLD`：干净 agentview、与 agentview 标定透视一致的稠密
   RGB-D surface 和四行本体状态；
@@ -97,6 +112,8 @@ Web schema 15 / `vaw-context-v14-contact-focus` / renderer
 - BASE/WORLD 坐标提示由 robot-base 几何投影产生，并固定在角落以避免遮挡 target；
 - grounding、ActionSeed 与 refinement 信息只占用下层固定 overlay，不改变双层版式；
 - 紫色几何只存在于下层，并始终表示未执行的预测；
+- Imagination 交回 Main 后仍保留精确的初始/最终 target 与累计 base-frame 位移/旋转，避免
+  ActionReview 丢失局部编辑方向；
 - 无 receipt 页面、旧 Function history、Task 重复文本或 privileged state。
 
 Depth、相机参数、raw mask/cloud、planner trajectory 和环境 success 只存在于 private context

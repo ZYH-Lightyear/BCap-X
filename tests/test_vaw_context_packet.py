@@ -11,6 +11,7 @@ from vaw.context_runtime.packet import (
     ContextCompiler,
     _observed_source_ref,
 )
+from vaw.context_runtime.model import LastPhysicalAction
 from vaw.context_runtime.workspace import ContextWorkspace
 
 
@@ -68,6 +69,30 @@ def test_packet_modes_follow_owner_and_evidence_not_history() -> None:
     assert packet.manifest()["review_action_id"] == action_id
     assert packet.world.action["status"] == "review"
     assert "handoff_reason" not in packet.world.action
+
+
+def test_action_review_preserves_cumulative_imagination_edit() -> None:
+    workspace = _workspace()
+    compiler = ContextCompiler()
+    workspace.set_refinement_goal("沿 base +Z 抬升 TCP")
+    workspace.execute(
+        "delta_move", delta_xyz_m=[0.0, 0.0, 0.03], frame="base"
+    )
+    workspace.execute(
+        "delta_move", delta_xyz_m=[0.0, 0.0, -0.01], frame="base"
+    )
+
+    action_id = workspace.execute("finish_imagination", status="ready").result[
+        "action_id"
+    ]
+    packet = compiler.compile(workspace)
+
+    assert packet.world.action["action_id"] == action_id
+    summary = packet.world.action["edit_summary"]
+    assert summary["total_translation_base_m"] == [0.0, 0.0, 0.02]
+    assert summary["previous_edit"]["delta_xyz_m"] == [0.0, 0.0, 0.03]
+    assert summary["last_edit"]["delta_xyz_m"] == [0.0, 0.0, -0.01]
+    assert "latest_edit" not in packet.world.action
 
 
 def test_failed_imagination_returns_to_visible_seed_catalog() -> None:
@@ -207,8 +232,8 @@ def test_packet_is_deterministic_and_does_not_leak_private_state() -> None:
     assert forbidden.isdisjoint(set(_walk_keys(snapshot)))
     encoded = json.dumps(snapshot).lower()
     assert "functionrecord" not in encoded and "waypointdraft" not in encoded
-    assert snapshot["schemaVersion"] == 15
-    assert snapshot["schema"] == "vaw-context-v14-contact-focus"
+    assert snapshot["schemaVersion"] == 17
+    assert snapshot["schema"] == "vaw-context-v16-review-contract"
     assert snapshot["viewport"] == {"width": CONTEXT_WIDTH, "height": CONTEXT_HEIGHT}
 
 
@@ -242,11 +267,20 @@ def test_commit_compiles_one_shot_post_action_visual_comparison() -> None:
     workspace.execute("delta_move", delta_xyz_m=[0.0, 0.0, 0.01], frame="base")
     editing = ContextCompiler().compile(workspace)
     assert workspace.state.last_physical_action is not None
-    assert editing.world.last_physical_action is None
+    assert editing.world.last_physical_action is not None
+    assert editing.world.last_physical_action.target_gripper == "open"
     action_id = workspace.execute("finish_imagination", status="ready").result[
         "action_id"
     ]
     assert action_id
     reviewed = ContextCompiler().compile(workspace)
     assert workspace.state.last_physical_action is not None
-    assert reviewed.world.last_physical_action is None
+    assert reviewed.world.last_physical_action is not None
+    assert reviewed.world.last_physical_action.target_gripper == "open"
+
+    workspace.state.last_physical_action = LastPhysicalAction(
+        intent="old failed move",
+        executed_stages="arm",
+        outcome="arm_failed",
+    )
+    assert ContextCompiler().compile(workspace).world.last_physical_action is None

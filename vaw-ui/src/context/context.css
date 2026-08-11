@@ -180,7 +180,9 @@ img { display: block; }
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: 356px minmax(0, 1fr);
+  /* Reserve enough room for the complete causal Waypoint summary.  A taller
+     focus view silently clipped LAST REAL at the fixed 1080 px viewport. */
+  grid-template-rows: 320px minmax(0, 1fr);
   gap: 8px;
   padding: 8px 8px 8px 0;
 }
@@ -270,7 +272,7 @@ img { display: block; }
 .via-edit-overlay {
   left: 20px;
   bottom: 18px;
-  width: 520px;
+  width: 610px;
   padding: 11px 18px;
 }
 .via-edit-overlay .via-fact-row {

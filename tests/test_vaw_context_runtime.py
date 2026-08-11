@@ -20,9 +20,15 @@ from vaw.context_runtime.motion import (
     MotionPlan,
 )
 from vaw.context_runtime.protocol import (
+    ACTION_REVIEW_SYSTEM_PROMPT,
     IMAGINATION_FUNCTION_NAMES,
+    IMAGINATION_SYSTEM_PROMPT,
+    REVIEW_FUNCTION_NAMES,
+    STANDARD_MAIN_FUNCTION_NAMES,
     SYSTEM_PROMPT,
     imagination_function_definitions,
+    main_function_definitions,
+    review_function_definitions,
 )
 
 
@@ -146,16 +152,17 @@ class FakeCuroboContextApi(FakeContextApi):
 
 
 class SettlingCuroboApi(FakeCuroboContextApi):
-    def __init__(self, *, settle: bool) -> None:
+    def __init__(self, *, settle: bool, initial_error: float = 0.03) -> None:
         super().__init__()
         self.settle = settle
+        self.initial_error = float(initial_error)
 
     def execute_joint_trajectory(self, trajectory, **kwargs):
         values = np.asarray(trajectory).copy()
         self.curobo_execute_calls.append(values)
         self.curobo_execute_kwargs.append(dict(kwargs))
         if len(self.curobo_execute_calls) == 1:
-            self.joints = values[-1] + 0.02
+            self.joints = values[-1] + self.initial_error
         elif self.settle:
             self.joints = values[-1]
 
@@ -223,8 +230,9 @@ class FailedMotionBackend:
 
 
 def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
-    assert len(FUNCTION_NAMES) == 11
+    assert len(FUNCTION_NAMES) == 12
     assert FUNCTION_NAMES[0] == "detection_and_sam"
+    assert FUNCTION_NAMES[1:3] == ("propose_grasps", "locate_point")
     assert "inspect" not in FUNCTION_NAMES
     assert IMAGINATION_FUNCTION_NAMES == (
         "delta_move",
@@ -234,17 +242,30 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
         "finish_imagination",
     )
     main = function_definitions()
+    standard = main_function_definitions()
+    review = review_function_definitions()
     imagination = imagination_function_definitions()
     assert [item["function"]["name"] for item in main] == list(FUNCTION_NAMES)
     assert [item["function"]["name"] for item in imagination] == list(
         IMAGINATION_FUNCTION_NAMES
     )
+    assert [item["function"]["name"] for item in standard] == list(
+        STANDARD_MAIN_FUNCTION_NAMES
+    )
+    assert [item["function"]["name"] for item in review] == list(
+        REVIEW_FUNCTION_NAMES
+    )
+    assert "commit" not in STANDARD_MAIN_FUNCTION_NAMES
+    assert "reject_action" not in STANDARD_MAIN_FUNCTION_NAMES
+    assert "detection_and_sam" not in REVIEW_FUNCTION_NAMES
+    assert REVIEW_FUNCTION_NAMES[:2] == ("commit", "reject_action")
     encoded = json.dumps(main + imagination).lower()
     assert "history" not in encoded and "receipt" not in encoded and "obb" not in encoded
     detection = main[0]["function"]
     assert "bbox detection" in detection["description"]
     assert "sam" in detection["description"].lower()
     assert "不刷新 observation" in detection["description"]
+    assert "motion planning 失败" in detection["description"]
     assert "commit 后应重新观察真实画面" not in SYSTEM_PROMPT
     for name in ("delta_move", "rotate"):
         definition = next(x["function"] for x in main if x["function"]["name"] == name)
@@ -252,11 +273,25 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
         assert "refinement_goal" in definition["parameters"]["required"]
     delta = next(x["function"] for x in main if x["function"]["name"] == "delta_move")
     pose = next(x["function"] for x in main if x["function"]["name"] == "propose_pose")
+    grasps = next(
+        x["function"] for x in main if x["function"]["name"] == "propose_grasps"
+    )
+    point = next(x["function"] for x in main if x["function"]["name"] == "locate_point")
+    assert "默认几何生成器" in grasps["description"]
+    assert "不生成抓取方向" in point["description"]
+    assert "应先使用 propose_grasps" in pose["description"]
     assert "当前真实 TCP" in delta["description"]
     assert "厘米级局部修正" in delta["description"]
+    frame_description = delta["parameters"]["properties"]["frame"]["description"]
+    assert "base" in frame_description and "+Z 恒为竖直上抬" in frame_description
+    assert "tool +Z" in frame_description and "可能朝向支撑面" in frame_description
+    assert "total_translation_base_m" in IMAGINATION_SYSTEM_PROMPT
+    assert "不得 commit" in SYSTEM_PROMPT
     assert "current_tcp" in pose["description"]
     assert "绝不能虚构 `current_tcp`" in SYSTEM_PROMPT
     assert "GRIP 仍大于 0 可能是物体阻挡手指" in SYSTEM_PROMPT
+    assert "requested_arm_delta_base_m" in SYSTEM_PROMPT
+    assert "reject_action(action_id)" in ACTION_REVIEW_SYSTEM_PROMPT
     assert "within_region_id" in SYSTEM_PROMPT
     for name in ("select", "propose_pose", "open_gripper", "close_gripper"):
         definition = next(x["function"] for x in main if x["function"]["name"] == name)
@@ -297,7 +332,7 @@ def test_curobo_retries_exact_final_waypoint_when_reduced_api_is_still_settling(
     }
 
 
-def test_curobo_final_settle_does_not_relax_residual_threshold() -> None:
+def test_curobo_final_settle_does_not_relax_max_joint_threshold() -> None:
     api = SettlingCuroboApi(settle=False)
     backend = CuroboMotionBackend(api)
     target = Pose((0.4, 0.0, 0.2), (0.0, 1.0, 0.0, 0.0))
@@ -313,10 +348,34 @@ def test_curobo_final_settle_does_not_relax_residual_threshold() -> None:
         trajectory,
     )
 
-    with pytest.raises(MotionBackendError, match="joint residual"):
+    with pytest.raises(MotionBackendError, match="max joint error"):
         backend.execute(plan, target)
 
     assert len(api.curobo_execute_calls) == 2
+
+
+def test_curobo_accepts_dimension_independent_small_joint_residuals() -> None:
+    api = SettlingCuroboApi(settle=False, initial_error=0.012)
+    backend = CuroboMotionBackend(api)
+    target = Pose((0.4, 0.0, 0.2), (0.0, 1.0, 0.0, 0.0))
+    trajectory = np.stack([np.zeros(7), np.full(7, 0.5)])
+    plan = MotionPlan(
+        "curobo",
+        ActionPrediction(
+            solve_ik="returned",
+            joint_positions_rad=tuple(trajectory[-1]),
+            trajectory_checked=True,
+            collision_checked=True,
+        ),
+        trajectory,
+    )
+
+    backend.execute(plan, target)
+
+    # The seven-dimensional L2 residual is > 0.02 rad even though no single
+    # joint has a material endpoint miss.
+    assert np.linalg.norm(api.joints - trajectory[-1]) > 0.02
+    assert len(api.curobo_execute_calls) == 1
 
 
 def test_detection_is_idempotent_within_one_observation_revision() -> None:
@@ -452,6 +511,26 @@ def test_continuous_imagination_edits_one_target_then_hands_off() -> None:
     assert handoff.result == {"status": "review_required", "action_id": action_id}
 
 
+def test_spatial_edit_of_gripper_only_review_preserves_gripper_target() -> None:
+    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
+    workspace.set_refinement_goal("先张开，再调整目标")
+    workspace.execute("open_gripper")
+    workspace.execute("finish_imagination", status="ready")
+
+    edited = workspace.execute(
+        "delta_move",
+        delta_xyz_m=[0.0, 0.0, -0.01],
+        frame="base",
+    )
+
+    assert edited.ok
+    assert workspace.state.imagination.target.pose is not None
+    assert workspace.state.imagination.target.gripper == "open"
+    assert (
+        workspace._private.imagination_artifacts.initial_target.gripper == "open"
+    )
+
+
 def test_commit_is_only_physical_boundary_and_invalidates_revision_state() -> None:
     api = FakeContextApi()
     workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
@@ -471,8 +550,30 @@ def test_commit_is_only_physical_boundary_and_invalidates_revision_state() -> No
     assert workspace.state.last_physical_action.intent == "task"
     assert workspace.state.last_physical_action.executed_stages == "arm+gripper"
     assert workspace.state.last_physical_action.outcome == "completed"
+    assert workspace.state.last_physical_action.target_gripper == "closed"
+    assert workspace.state.last_physical_action.requested_arm_delta_base_m == pytest.approx(
+        (0.0, 0.0, 0.02)
+    )
     assert workspace._private.previous_observation is not None
     assert workspace._private.last_physical_artifacts.focus_pose is not None
+
+
+def test_reject_action_explicitly_discards_review_without_physics() -> None:
+    api = FakeContextApi()
+    workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
+    workspace.execute("open_gripper")
+    action_id = workspace.execute("finish_imagination", status="ready").result[
+        "action_id"
+    ]
+    revision = workspace.state.observation_revision
+
+    result = workspace.execute("reject_action", action_id=action_id)
+
+    assert result.ok and result.result == {}
+    assert workspace.state.action_review is None
+    assert workspace._private.review_artifacts == {}
+    assert workspace.state.observation_revision == revision
+    assert api.operation_log == []
 
 
 def test_commit_records_failed_stage_without_claiming_task_effect() -> None:

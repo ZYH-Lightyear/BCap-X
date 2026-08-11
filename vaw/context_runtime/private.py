@@ -85,6 +85,10 @@ class ActionReviewArtifacts:
     motion_plan: MotionPlan | None = None
     planning_context: PlanningContext | None = None
     termination_reason: str = "agent_ready"
+    # Exact command-state summary copied at the Imagination -> Main boundary.
+    # Without this, Main only sees the endpoint and loses whether refinement
+    # moved in the intended base-frame direction.
+    edit_summary: EditSummary | None = None
 
 
 @dataclass(frozen=True)

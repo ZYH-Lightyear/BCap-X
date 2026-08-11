@@ -111,13 +111,22 @@ class LastPhysicalAction:
     intent: str
     executed_stages: Literal["arm", "gripper", "arm+gripper"]
     outcome: Literal["completed", "arm_failed", "gripper_failed"]
+    target_gripper: Literal["open", "closed"] | None = None
+    requested_arm_delta_base_m: tuple[float, float, float] | None = None
 
-    def summary(self) -> dict[str, str]:
-        return {
+    def summary(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
             "intent": self.intent,
             "executed_stages": self.executed_stages,
             "outcome": self.outcome,
         }
+        if self.target_gripper is not None:
+            result["target_gripper"] = self.target_gripper
+        if self.requested_arm_delta_base_m is not None:
+            result["requested_arm_delta_base_m"] = _floats(
+                self.requested_arm_delta_base_m
+            )
+        return result
 
 
 @dataclass(frozen=True)

@@ -94,17 +94,27 @@ function GroundingOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
 
 function EditOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
   const edit = snapshot.world.action?.latest_edit
+  const summary = snapshot.world.action?.edit_summary
   const target = snapshot.world.action?.target
-  const move = edit?.kind === 'delta_move'
-    ? `${edit.frame.toUpperCase()}  ${fmt(edit.delta_xyz_m, 2)} m`
-    : '—'
-  const rotate = edit?.kind === 'rotate'
-    ? `${edit.frame.toUpperCase()}-${edit.axis?.toUpperCase()}  ${edit.angle_deg?.toFixed(1)}°`
-    : '—'
+  const cumulativeMove = summary?.total_translation_base_m
+  const cumulativeRotation = summary?.total_rotation_deg
+  const hasCumulativeMove = cumulativeMove?.some((value) => Math.abs(value) >= 0.0005)
+  const hasCumulativeRotation = cumulativeRotation !== undefined
+    && Math.abs(cumulativeRotation) >= 0.05
+  const move = hasCumulativeMove
+    ? `BASE TOTAL ${fmt(cumulativeMove, 3)} m`
+    : edit?.kind === 'delta_move'
+      ? `${edit.frame.toUpperCase()}  ${fmt(edit.delta_xyz_m, 3)} m`
+      : '—'
+  const rotate = hasCumulativeRotation
+    ? `BASE AXIS ${fmt(summary?.total_rotation_axis_base, 2)}  ${cumulativeRotation?.toFixed(1)}°`
+    : edit?.kind === 'rotate'
+      ? `${edit.frame.toUpperCase()}-${edit.axis?.toUpperCase()}  ${edit.angle_deg?.toFixed(1)}°`
+      : 'NONE'
   return (
     <div className="via-edit-overlay">
-      <FactRow label="MOVE ΔXYZ">{move}</FactRow>
-      <FactRow label="ROTATE">{rotate}</FactRow>
+      <FactRow label="MOVE TOTAL">{move}</FactRow>
+      <FactRow label="ROTATE TOTAL">{rotate}</FactRow>
       {target?.pose && <FactRow label="TARGET XYZ">{fmt(target.pose.position_xyz)}</FactRow>}
     </div>
   )
@@ -145,10 +155,21 @@ function WaypointPanel({ snapshot }: { snapshot: ContextSnapshot }) {
     ? 'N/A'
     : `${targetGrip.toFixed(3)} ${action?.target.gripper ? 'TARGET' : 'INHERITED'}`
   const goal = snapshot.world.refinementGoal ?? action?.intent
+  const lastPhysical = snapshot.world.lastPhysicalAction
+  const lastRealParts: string[] = []
+  if (lastPhysical?.requested_arm_delta_base_m) {
+    lastRealParts.push(`ARM Δ ${fmt(lastPhysical.requested_arm_delta_base_m)}`)
+  }
+  if (lastPhysical?.target_gripper) {
+    lastRealParts.push(`GRIP ${lastPhysical.target_gripper.toUpperCase()}`)
+  }
+  if (lastPhysical) lastRealParts.push(lastPhysical.outcome.toUpperCase())
+  const lastReal = lastRealParts.length > 0 ? lastRealParts.join(' · ') : null
   return (
     <aside className="via-waypoint-panel">
       <h2>WAYPOINT</h2>
       <FactRow label="OWNER">{snapshot.world.owner.toUpperCase()}</FactRow>
+      {lastReal && <FactRow label="LAST REAL">{lastReal}</FactRow>}
       <FactRow label="ARM">{action ? (planned ? 'PLANNED' : prediction?.solve_ik?.toUpperCase() ?? 'TARGET ONLY') : 'NONE'}</FactRow>
       <FactRow label="GRIP TARGET">{grip}</FactRow>
       <FactRow label="CONTACT"><em>UNKNOWN</em></FactRow>
@@ -222,6 +243,12 @@ function PostCommitLayer({ snapshot }: { snapshot: ContextSnapshot }) {
           <h2>LAST PHYSICAL ACTION</h2>
           <FactRow label="REQUESTED">{action?.intent ?? 'N/A'}</FactRow>
           <FactRow label="EXECUTED">{action?.executed_stages.toUpperCase() ?? 'N/A'}</FactRow>
+          {action?.requested_arm_delta_base_m && (
+            <FactRow label="ARM CMD Δ">{fmt(action.requested_arm_delta_base_m)} m</FactRow>
+          )}
+          {action?.target_gripper && (
+            <FactRow label="GRIP CMD">{action.target_gripper.toUpperCase()}</FactRow>
+          )}
           {action?.outcome !== 'completed' && <FactRow label="CONTROL ERROR">{action?.outcome.toUpperCase() ?? 'N/A'}</FactRow>}
           <p>TASK EFFECT · VERIFY FROM CURRENT IMAGE</p>
         </aside>
