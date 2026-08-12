@@ -53,22 +53,3 @@ python -m vaw.diagnostics.run_static_vlm \
 - `summary.md`：便于快速阅读的对照表。
 
 `--allow-image-egress` 是显式确认：这些 trace PNG 会被发送到 `--server-url` 指定的服务。
-
-## 开放式下一步动作测试
-
-`run_next_action.py` 不提供问题或选项，而是从冻结 trace 重建真实 Agent turn：当前 System Prompt、
-Function 文档、K≤8 transaction、manifest 和 Context PNG。模型必须自主输出下一条
-`<tool_call>`：
-
-```bash
-python -m vaw.diagnostics.run_next_action \
-  --models vapi/gpt-5.5 vapi/qwen3.5-plus \
-  --server-url http://127.0.0.1:8110/chat/completions \
-  --temperature 0 \
-  --max-tokens 768 \
-  --allow-image-egress
-```
-
-评分允许多个合理恢复动作，并区分 `preferred / acceptable / unsafe / invalid_call / other /
-no_call`。2026-08-10 的真实对照及人工分析见
-`docs/vaw_next_action_diagnostic_report_20260810.md`。

@@ -12,6 +12,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from scipy.spatial.transform import Rotation
 
+from vaw.context_runtime.contact_camera import ContactCameraRequest
 from vaw.context_runtime.geometry import project_world_to_pixel
 from vaw.context_runtime.gripper_mesh import (
     load_panda_urdf_fk,
@@ -26,7 +27,11 @@ from vaw.context_runtime.model import (
     Pose,
     RobotState,
 )
-from vaw.context_runtime.near_field import render_contact_focus
+from vaw.context_runtime.near_field import (
+    CONTACT_FOCUS_WIDTH,
+    CONTACT_PANEL_HEIGHT,
+    render_contact_focus,
+)
 from vaw.context_runtime.presentation import (
     artifact_plan as _artifact_plan,
 )
@@ -47,10 +52,10 @@ from vaw.context_runtime.private import (
 from vaw.context_runtime.scene_view import render_scene_view
 from vaw.context_runtime.workspace import ContextWorkspace
 
-CONTEXT_SCHEMA = "vaw-context-v24-imagination-agent"
-CONTEXT_WEB_SCHEMA_VERSION = 25
-CONTEXT_WIDTH = 1920
-CONTEXT_HEIGHT = 1080
+CONTEXT_SCHEMA = "vaw-context-v30-main-gripper-review"
+CONTEXT_WEB_SCHEMA_VERSION = 31
+CONTEXT_WIDTH = 2048
+CONTEXT_HEIGHT = 1280
 
 BLUE = (37, 99, 235)
 GREEN = (22, 163, 74)
@@ -279,9 +284,7 @@ class ContextPacket:
         return {
             "owner": self.world.owner,
             "review_action_id": (
-                self.world.action.get("action_id")
-                if self.world.action is not None
-                else None
+                self.world.action.get("action_id") if self.world.action is not None else None
             ),
             "valid_region_ids": [item.region_id for item in self.catalog.regions],
             "valid_point_ids": [item.point_id for item in self.catalog.points],
@@ -313,16 +316,25 @@ class ContextCompiler:
             wrist_camera = private.camera(workspace.wrist_camera_name)
         target, active_artifacts, action_presentation = _active_presentation(workspace)
         scene_preview = (
-            _near_field_preview(state, target, active_artifacts)
-            if target is not None
-            else None
+            _near_field_preview(state, target, active_artifacts) if target is not None else None
         )
         source_ref = _observed_source_ref(active_artifacts)
-        source_mask = (
-            private.region_masks.get(source_ref)
-            if source_ref is not None
-            else None
-        )
+        source_mask = private.region_masks.get(source_ref) if source_ref is not None else None
+        contact_cameras = None
+        if (
+            scene_preview is not None
+            and scene_preview.contact_frame_position_xyz is not None
+            and scene_preview.contact_frame_quaternion_xyzw is not None
+            and callable(private.contact_camera_provider)
+        ):
+            contact_cameras = private.contact_camera_provider(
+                ContactCameraRequest(
+                    center_base_xyz=scene_preview.contact_frame_position_xyz,
+                    frame_quaternion_xyzw=(scene_preview.contact_frame_quaternion_xyzw),
+                    width=CONTACT_FOCUS_WIDTH,
+                    panel_height=CONTACT_PANEL_HEIGHT,
+                )
+            )
         observed_scene = render_scene_view(
             camera,
             wrist_camera,
@@ -343,6 +355,7 @@ class ContextCompiler:
             state.robot,
             scene_preview,
             source_mask=source_mask,
+            contact_cameras=contact_cameras,
         )
 
         # The persistent world view is deliberately sensor-clean.  All
@@ -391,9 +404,7 @@ class ContextCompiler:
                 owner=state.owner,
                 action=action_presentation,
                 refinement_goal=(
-                    state.imagination.refinement_goal
-                    if state.imagination is not None
-                    else None
+                    state.imagination.refinement_goal if state.imagination is not None else None
                 ),
                 latest_error=event.error if event is not None else None,
                 last_physical_action=_visible_last_physical_action(state),
@@ -506,25 +517,16 @@ class ContextCompiler:
             if pose is None:
                 continue
             anchor = next(
-                (
-                    point
-                    for point in state.points.values()
-                    if point.within_region_id == region_id
-                ),
+                (point for point in state.points.values() if point.within_region_id == region_id),
                 None,
             )
-            rotation = Rotation.from_quat(
-                np.asarray(pose.quaternion_xyzw)
-            ).as_matrix()
+            rotation = Rotation.from_quat(np.asarray(pose.quaternion_xyzw)).as_matrix()
             approach = tuple(float(value) for value in rotation[:, 2])
             delta = None
             if anchor is not None:
                 delta = tuple(
                     float(value)
-                    for value in (
-                        np.asarray(pose.position_xyz)
-                        - np.asarray(anchor.position_xyz)
-                    )
+                    for value in (np.asarray(pose.position_xyz) - np.asarray(anchor.position_xyz))
                 )
             robot_mask = None
             gripper_mask = None
@@ -543,8 +545,7 @@ class ContextCompiler:
                 if preview_matches:
                     opening = (
                         state.robot.gripper_opening
-                        if state.robot is not None
-                        and state.robot.gripper_opening is not None
+                        if state.robot is not None and state.robot.gripper_opening is not None
                         else 1.0
                     )
                     robot_mask = _robot_mask(
@@ -659,9 +660,7 @@ def _decision_spec(workspace: ContextWorkspace) -> DecisionWorkspaceSpec:
         result = event.result
         seed_ids = result.get("seed_ids")
         if isinstance(seed_ids, list):
-            valid = tuple(
-                str(value) for value in seed_ids if str(value) in state.seeds
-            )[:5]
+            valid = tuple(str(value) for value in seed_ids if str(value) in state.seeds)[:5]
             return DecisionWorkspaceSpec(mode="seeds", seed_ids=valid)
         region_id = result.get("region_id")
         point_id = result.get("point_id")
@@ -694,11 +693,7 @@ def _decision_spec(workspace: ContextWorkspace) -> DecisionWorkspaceSpec:
         and workspace._private.last_physical_artifacts is not None
     ):
         return DecisionWorkspaceSpec(mode="post_commit")
-    if (
-        state.last_handoff is not None
-        and state.last_handoff.status == "failed"
-        and state.seeds
-    ):
+    if state.last_handoff is not None and state.last_handoff.status == "failed" and state.seeds:
         return DecisionWorkspaceSpec(
             mode="seeds",
             seed_ids=tuple(state.seeds)[:5],
@@ -1016,9 +1011,7 @@ def _candidate_crop(
     )
     raster = rgb[top:bottom, left:right].copy()
     local_robot = robot_mask[top:bottom, left:right] if has_robot_mask else None
-    local_gripper = (
-        gripper_mask[top:bottom, left:right] if has_gripper_mask else None
-    )
+    local_gripper = gripper_mask[top:bottom, left:right] if has_gripper_mask else None
     # The hand/object relationship is the decision evidence.  Preserve the
     # true whole-arm silhouette, but keep it subordinate to the target hand.
     raster = _overlay_mask(raster, local_robot, VIOLET, alpha=0.10)
@@ -1183,11 +1176,7 @@ def _proposal_raster(
         joints = robot.joint_positions_rad
     current_opening = robot.gripper_opening if robot is not None else None
     target_opening = (
-        1.0
-        if target.gripper == "open"
-        else 0.0
-        if target.gripper == "closed"
-        else current_opening
+        1.0 if target.gripper == "open" else 0.0 if target.gripper == "closed" else current_opening
     )
     robot_mask = None
     gripper_mask = None
@@ -1209,9 +1198,7 @@ def _proposal_raster(
 
     raster = rgb.copy()
     visual_edit = (
-        artifacts.latest_visual_edit
-        if isinstance(artifacts, ImaginationArtifacts)
-        else None
+        artifacts.latest_visual_edit if isinstance(artifacts, ImaginationArtifacts) else None
     )
     if (
         visual_edit is not None
@@ -1238,29 +1225,21 @@ def _proposal_raster(
     source_ref = _observed_source_ref(artifacts)
     source_bbox = _source_bbox(state, source_ref, camera)
     reference_pixel = None
-    target_pixel = (
-        _pose_origin_pixel(target.pose, camera)
-        if target.pose is not None
-        else None
-    )
+    target_pixel = _pose_origin_pixel(target.pose, camera) if target.pose is not None else None
     if visual_edit is not None and target.pose is not None:
         reference = visual_edit.reference_pose
         reference_pixel = _pose_origin_pixel(reference, camera)
         axes_rotation = (
             Rotation.identity()
             if visual_edit.frame == "base"
-            else Rotation.from_quat(
-                np.asarray(reference.quaternion_xyzw, dtype=np.float64)
-            )
+            else Rotation.from_quat(np.asarray(reference.quaternion_xyzw, dtype=np.float64))
         )
         if visual_edit.kind == "rotate":
             _draw_pose_axes(draw, reference.position_xyz, axes_rotation, camera, BLUE)
             _draw_pose_axes(
                 draw,
                 target.pose.position_xyz,
-                Rotation.from_quat(
-                    np.asarray(target.pose.quaternion_xyzw, dtype=np.float64)
-                ),
+                Rotation.from_quat(np.asarray(target.pose.quaternion_xyzw, dtype=np.float64)),
                 camera,
                 GREEN,
             )
@@ -1340,8 +1319,8 @@ def _agentview_with_base_axes(
     draw = ImageDraw.Draw(image, "RGBA")
     origin = np.array([90.0, float(rgb.shape[0] - 112)], dtype=np.float64)
     directions = (
-        np.array([0.0, 1.0]),   # BASE +X: image down
-        np.array([1.0, 0.0]),   # BASE +Y: image right
+        np.array([0.0, 1.0]),  # BASE +X: image down
+        np.array([1.0, 0.0]),  # BASE +Y: image right
         np.array([0.0, -1.0]),  # BASE +Z: image up / physical lift
     )
     colors = ((220, 38, 38), (22, 163, 74), (37, 99, 235))
@@ -1457,8 +1436,7 @@ def _draw_rotation_arc(
     )
     arc = np.vstack(
         [
-            center
-            + Rotation.from_rotvec(axis_base * angle).apply(radial_base * 0.05)
+            center + Rotation.from_rotvec(axis_base * angle).apply(radial_base * 0.05)
             for angle in samples
         ]
     )
@@ -1547,12 +1525,8 @@ def _candidate_fk_matches_target(
         ).as_matrix()
         expected_hand_position = np.asarray(
             target.position_xyz, dtype=np.float64
-        ) + target_rotation @ np.asarray(
-            tcp_to_hand_local_xyz, dtype=np.float64
-        ).reshape(3)
-        position_error = float(
-            np.linalg.norm(actual_hand[:3, 3] - expected_hand_position)
-        )
+        ) + target_rotation @ np.asarray(tcp_to_hand_local_xyz, dtype=np.float64).reshape(3)
+        position_error = float(np.linalg.norm(actual_hand[:3, 3] - expected_hand_position))
         rotation_error = float(
             (
                 Rotation.from_matrix(actual_hand[:3, :3]).inv()

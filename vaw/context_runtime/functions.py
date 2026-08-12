@@ -86,7 +86,6 @@ class ContextFunctions:
             "close_gripper": self.close_gripper,
             "show_rotation_gizmo": self.show_rotation_gizmo,
             "finish_imagination": self.finish_imagination,
-            "revise_action": self.revise_action,
             "reject_action": self.reject_action,
             "done": self.done,
         }
@@ -109,9 +108,7 @@ class ContextFunctions:
                 }
                 return {
                     "region_id": region.region_id,
-                    "bbox_xyxy_px": [
-                        round(float(value), 3) for value in region.bbox_xyxy_px
-                    ],
+                    "bbox_xyxy_px": [round(float(value), 3) for value in region.bbox_xyxy_px],
                 }
         camera = self.ws._camera()
         rgb = _camera_image(camera, "rgb")
@@ -123,9 +120,7 @@ class ContextFunctions:
             source_shape=semantic_crop.shape[:2],
             target_shape=crop_rgb.shape[:2],
         )
-        semantic_diagnostics = self.ws._private.trace_diagnostics.get(
-            "semantic_grounding"
-        )
+        semantic_diagnostics = self.ws._private.trace_diagnostics.get("semantic_grounding")
         if isinstance(semantic_diagnostics, dict):
             semantic_diagnostics["semantic_rgb_shape"] = list(semantic_crop.shape)
             semantic_diagnostics["observation_rgb_shape"] = list(crop_rgb.shape)
@@ -216,8 +211,7 @@ class ContextFunctions:
             "coord_space": coord_space,
             "candidate_reply": str(candidate_reply),
             "candidate_boxes": [
-                [round(float(value), 3) for value in item.box_xyxy_px]
-                for item in candidates
+                [round(float(value), 3) for value in item.box_xyxy_px] for item in candidates
             ],
         }
         self.ws._private.trace_diagnostics["semantic_grounding"] = diagnostics
@@ -237,9 +231,7 @@ class ContextFunctions:
             selected = parse_choice(str(review_reply), count=len(candidates))
         except ValueError as exc:
             raise ContextFunctionError(f"semantic candidate review failed: {exc}") from exc
-        diagnostics["selected_candidate"] = (
-            None if selected is None else int(selected + 1)
-        )
+        diagnostics["selected_candidate"] = None if selected is None else int(selected + 1)
         if selected is None:
             raise ContextFunctionError(
                 f"semantic grounding is ambiguous for '{query}'; refine the query"
@@ -306,9 +298,7 @@ class ContextFunctions:
             mask.astype(np.int64),
         )
         try:
-            base_from_camera = np.asarray(
-                camera["pose_mat"], dtype=np.float64
-            ).reshape(4, 4)
+            base_from_camera = np.asarray(camera["pose_mat"], dtype=np.float64).reshape(4, 4)
         except (KeyError, ValueError) as exc:
             raise ContextFunctionError(f"invalid camera pose: {exc}") from exc
         prepared, diagnostic = _prepare_grasps(
@@ -317,14 +307,11 @@ class ContextFunctions:
             base_from_camera=base_from_camera,
             reference_quaternion_xyzw=(
                 self.ws.state.robot.ee_pose.quaternion_xyzw
-                if self.ws.state.robot is not None
-                and self.ws.state.robot.ee_pose is not None
+                if self.ws.state.robot is not None and self.ws.state.robot.ee_pose is not None
                 else None
             ),
             object_points_base=(
-                geometry.filtered_object_points_base
-                if geometry is not None
-                else None
+                geometry.filtered_object_points_base if geometry is not None else None
             ),
         )
         self.ws._private.trace_diagnostics["grasp_candidates"] = {
@@ -463,9 +450,7 @@ class ContextFunctions:
         return self._start_imagination(
             ActionTarget(pose=target),
             ImaginationArtifacts(
-                planning_context=PlanningContext(
-                    source_kind="point", source_ref=point_id
-                ),
+                planning_context=PlanningContext(source_kind="point", source_ref=point_id),
                 preview_plan=self.ws.motion.plan_pose(target),
             ),
         )
@@ -505,34 +490,6 @@ class ContextFunctions:
             ),
         )
 
-    def revise_action(self, action_id: str) -> dict[str, Any]:
-        """Return one reviewed target to Imagination without changing it."""
-
-        review = self.ws.state.action_review
-        if review is None or review.action_id != action_id:
-            raise ContextFunctionError(f"unknown or expired action_id '{action_id}'")
-        private = self.ws._private.review_artifacts.get(action_id)
-        summary = private.edit_summary if private is not None else None
-        self.ws.state.action_review = None
-        self.ws._private.review_artifacts.clear()
-        self.ws.state.imagination = ImaginationState(
-            target=review.target,
-            refinement_goal=self.ws.refinement_goal,
-        )
-        self.ws._private.imagination_artifacts = ImaginationArtifacts(
-            planning_context=private.planning_context if private is not None else None,
-            preview_plan=private.motion_plan if private is not None else None,
-            initial_target=(summary.initial_target if summary is not None else review.target),
-            previous_visual_edit=(summary.previous_edit if summary is not None else None),
-            latest_visual_edit=(summary.last_edit if summary is not None else None),
-        )
-        self.ws._private.trace_diagnostics["imagination_handoff"] = {
-            "status": "revision_requested",
-            "replaced_action_id": action_id,
-            "refinement_goal": self.ws.refinement_goal,
-        }
-        return _preview_result(review.target, self.ws._private.imagination_artifacts)
-
     def delta_move(
         self,
         delta_xyz_m: list[float],
@@ -566,9 +523,7 @@ class ContextFunctions:
             current.target.gripper
             if current is not None
             else (
-                artifacts.initial_target.gripper
-                if artifacts.initial_target is not None
-                else None
+                artifacts.initial_target.gripper if artifacts.initial_target is not None else None
             )
         )
         return self._store_imagination(
@@ -583,6 +538,7 @@ class ContextFunctions:
                 previous_visual_edit=artifacts.previous_visual_edit,
                 latest_visual_edit=visual_edit,
                 rotation_gizmo_frame=artifacts.rotation_gizmo_frame,
+                rotation_gizmo_axis=artifacts.rotation_gizmo_axis,
                 turn_count=artifacts.turn_count,
             ),
         )
@@ -634,9 +590,7 @@ class ContextFunctions:
             current.target.gripper
             if current is not None
             else (
-                artifacts.initial_target.gripper
-                if artifacts.initial_target is not None
-                else None
+                artifacts.initial_target.gripper if artifacts.initial_target is not None else None
             )
         )
         return self._store_imagination(
@@ -651,6 +605,7 @@ class ContextFunctions:
                 previous_visual_edit=artifacts.previous_visual_edit,
                 latest_visual_edit=visual_edit,
                 rotation_gizmo_frame=artifacts.rotation_gizmo_frame,
+                rotation_gizmo_axis=artifacts.rotation_gizmo_axis,
                 turn_count=artifacts.turn_count,
             ),
         )
@@ -665,51 +620,9 @@ class ContextFunctions:
             )
             return reference, self.ws._private.imagination_artifacts or ImaginationArtifacts()
 
-        review = self.ws.state.action_review
-        if review is not None:
-            review_artifacts = self.ws._private.review_artifacts.get(review.action_id)
-            if review.target.pose is not None:
-                reference_rotation = _pose_rotation(review.target.pose)
-                reference = Pose(
-                    review.target.pose.position_xyz,
-                    tuple(float(value) for value in reference_rotation.as_quat()),
-                )
-                initial_target = review.target
-            else:
-                robot = self.ws.state.robot
-                if robot is None or robot.tcp_pose is None:
-                    raise ContextFunctionError("current TCP pose is unavailable")
-                try:
-                    reference_rotation = _pose_rotation(robot.tcp_pose)
-                except ValueError as exc:
-                    raise ContextFunctionError(
-                        f"current TCP pose is invalid: {exc}"
-                    ) from exc
-                reference = Pose(
-                    robot.tcp_pose.position_xyz,
-                    tuple(float(value) for value in reference_rotation.as_quat()),
-                )
-                # A spatial edit of a gripper-only review adds a pose; it must
-                # not silently erase the reviewed gripper command.
-                initial_target = ActionTarget(
-                    pose=reference,
-                    gripper=review.target.gripper,
-                )
-            return (
-                reference,
-                ImaginationArtifacts(
-                    planning_context=(
-                        review_artifacts.planning_context
-                        if review_artifacts is not None
-                        else None
-                    ),
-                    preview_plan=(
-                        review_artifacts.motion_plan
-                        if review_artifacts is not None
-                        else None
-                    ),
-                    initial_target=initial_target,
-                ),
+        if self.ws.state.action_review is not None:
+            raise ContextFunctionError(
+                "an ActionReview is pending; Main must commit or reject it before spatial editing"
             )
 
         robot = self.ws.state.robot
@@ -760,6 +673,7 @@ class ContextFunctions:
             previous_visual_edit=None,
             latest_visual_edit=artifacts.latest_visual_edit,
             rotation_gizmo_frame=None,
+            rotation_gizmo_axis=None,
             turn_count=0,
         )
         return self._store_imagination(target, artifacts)
@@ -794,6 +708,13 @@ class ContextFunctions:
             if previous is not None
             else None
         )
+        rotation_gizmo_axis = (
+            artifacts.rotation_gizmo_axis
+            if artifacts.rotation_gizmo_axis is not None
+            else previous.rotation_gizmo_axis
+            if previous is not None
+            else None
+        )
         self.ws.state.action_review = None
         self.ws._private.review_artifacts.clear()
         self.ws.state.imagination = ImaginationState(
@@ -807,6 +728,7 @@ class ContextFunctions:
             previous_visual_edit=previous_edit,
             latest_visual_edit=latest_edit,
             rotation_gizmo_frame=rotation_gizmo_frame,
+            rotation_gizmo_axis=rotation_gizmo_axis,
             turn_count=turn_count,
         )
         self.ws._private.trace_diagnostics["imagination_edit"] = {
@@ -845,11 +767,7 @@ class ContextFunctions:
         action = self.ws.state.action_review
         if action is None or action.action_id != action_id:
             raise ContextFunctionError(f"unknown or expired action_id '{action_id}'")
-        start_tcp = (
-            self.ws.state.robot.tcp_pose
-            if self.ws.state.robot is not None
-            else None
-        )
+        start_tcp = self.ws.state.robot.tcp_pose if self.ws.state.robot is not None else None
         requested_arm_delta = (
             tuple(
                 float(value)
@@ -862,24 +780,15 @@ class ContextFunctions:
             else None
         )
         execution_error: ContextFunctionError | None = None
-        failed_stage: str | None = (
-            "arm" if action.target.pose is not None else "gripper"
-        )
+        failed_stage: str | None = "arm" if action.target.pose is not None else "gripper"
         executed_stages: list[str] = []
-        focus_pose = (
-            action.target.pose
-            or (self.ws.state.robot.tcp_pose if self.ws.state.robot is not None else None)
+        focus_pose = action.target.pose or (
+            self.ws.state.robot.tcp_pose if self.ws.state.robot is not None else None
         )
         artifacts = self.ws._private.review_artifacts.get(action_id)
         previous_physical = self.ws._private.last_physical_artifacts
-        causal_subject = (
-            previous_physical.causal_subject
-            if previous_physical is not None
-            else None
-        )
-        planning_context = (
-            artifacts.planning_context if artifacts is not None else None
-        )
+        causal_subject = previous_physical.causal_subject if previous_physical is not None else None
+        planning_context = artifacts.planning_context if artifacts is not None else None
         if (
             planning_context is not None
             and planning_context.source_kind == "grasp"
@@ -894,9 +803,7 @@ class ContextFunctions:
                 )
         try:
             if artifacts is None:
-                raise ContextFunctionError(
-                    f"active action '{action_id}' has no private artifacts"
-                )
+                raise ContextFunctionError(f"active action '{action_id}' has no private artifacts")
             if action.target.pose is not None:
                 failed_stage = "arm"
                 executed_stages.append("arm")
@@ -905,13 +812,11 @@ class ContextFunctions:
                         f"active action '{action_id}' has no cached motion plan"
                     )
                 self.ws.motion.execute(artifacts.motion_plan, action.target.pose)
-            if action.target.gripper is not None:
+            elif action.target.gripper is not None:
                 failed_stage = "gripper"
                 executed_stages.append("gripper")
                 backend_function = (
-                    "open_gripper"
-                    if action.target.gripper == "open"
-                    else "close_gripper"
+                    "open_gripper" if action.target.gripper == "open" else "close_gripper"
                 )
                 self.ws._call_backend(backend_function)
             failed_stage = None
@@ -924,12 +829,7 @@ class ContextFunctions:
 
         if not executed_stages and failed_stage is not None:
             executed_stages.append(failed_stage)
-        if executed_stages == ["arm", "gripper"]:
-            stage_summary = "arm+gripper"
-        elif executed_stages == ["arm"]:
-            stage_summary = "arm"
-        else:
-            stage_summary = "gripper"
+        stage_summary = "arm" if executed_stages == ["arm"] else "gripper"
         if execution_error is None:
             outcome = "completed"
         elif failed_stage == "arm":
@@ -977,15 +877,18 @@ class ContextFunctions:
         return result
 
     def open_gripper(self) -> dict[str, Any]:
-        return self._preview_gripper("open")
+        return self._create_gripper_review("open")
 
     def close_gripper(self) -> dict[str, Any]:
-        return self._preview_gripper("closed")
+        return self._create_gripper_review("closed")
 
-    def show_rotation_gizmo(self, frame: str) -> dict[str, Any]:
-        """Request a presenter-only rotation aid for the active target."""
+    def show_rotation_gizmo(self, frame: str, axis: str) -> dict[str, Any]:
+        """Request a non-occluding +/- guide for one rotation axis."""
 
         normalized_frame = _frame(frame)
+        normalized_axis = str(axis).lower()
+        if normalized_axis not in {"x", "y", "z"}:
+            raise ContextFunctionError("axis must be one of 'x', 'y', or 'z'")
         imagination = self.ws.state.imagination
         if imagination is None:
             raise ContextFunctionError("there is no active imagination session")
@@ -993,74 +896,59 @@ class ContextFunctions:
         self.ws._private.imagination_artifacts = replace(
             artifacts,
             rotation_gizmo_frame=normalized_frame,
+            rotation_gizmo_axis=normalized_axis,
         )
         self.ws._private.trace_diagnostics["rotation_gizmo"] = {
             "frame": normalized_frame,
+            "axis": normalized_axis,
             "target": imagination.target.summary(),
         }
-        return {"preview": "updated", "rotation_gizmo": normalized_frame}
+        return {
+            "preview": "updated",
+            "rotation_guide": {
+                "frame": normalized_frame,
+                "axis": normalized_axis,
+            },
+        }
 
-    def _preview_gripper(self, target: str) -> dict[str, Any]:
-        imagination = self.ws.state.imagination
-        if imagination is not None:
-            artifacts = self.ws._private.imagination_artifacts or ImaginationArtifacts()
-            pose = imagination.target.pose
-            # ``start_imagination`` uses the observed TCP as a neutral spatial
-            # baseline.  If the first actual edit is gripper-only, drop that
-            # unchanged pose so commit does not execute a redundant arm plan.
-            if (
-                artifacts.planning_context is not None
-                and artifacts.planning_context.source_kind == "current"
-                and artifacts.preview_plan is None
-                and artifacts.previous_visual_edit is None
-                and artifacts.latest_visual_edit is None
-            ):
-                pose = None
-        elif self.ws.state.action_review is not None:
-            review = self.ws.state.action_review
-            review_artifacts = self.ws._private.review_artifacts.get(review.action_id)
-            artifacts = ImaginationArtifacts(
-                planning_context=(
-                    review_artifacts.planning_context
-                    if review_artifacts is not None
-                    else None
-                ),
-                preview_plan=(
-                    review_artifacts.motion_plan
-                    if review_artifacts is not None
-                    else None
-                ),
-                initial_target=review.target,
+    def _create_gripper_review(self, target: str) -> dict[str, Any]:
+        """Create a Main-owned gripper-only review without entering Imagination."""
+
+        if self.ws.state.imagination is not None:
+            raise ContextFunctionError(
+                "open_gripper/close_gripper are Main-only; finish or fail Imagination first"
             )
-            pose = review.target.pose
-        else:
-            robot = self.ws.state.robot
-            if robot is None or robot.tcp_pose is None:
-                raise ContextFunctionError("current TCP pose is unavailable")
-            # Keep a private spatial baseline even though the public target is
-            # deliberately gripper-only.  If Imagination later adds pose edits,
-            # EditSummary can then report their true cumulative displacement
-            # from the observed TCP instead of showing only the last edit.
-            artifacts = ImaginationArtifacts(
-                initial_target=ActionTarget(
-                    pose=robot.tcp_pose,
-                    gripper=_gripper_target(target),
-                )
+        if self.ws.state.action_review is not None:
+            raise ContextFunctionError(
+                "an ActionReview is already pending; commit or reject it first"
             )
-            pose = None
-        edit = VisualEdit(kind="gripper", gripper_target=target)
-        return self._store_imagination(
-            ActionTarget(pose=pose, gripper=_gripper_target(target)),
-            ImaginationArtifacts(
-                planning_context=artifacts.planning_context,
-                preview_plan=artifacts.preview_plan,
-                initial_target=artifacts.initial_target,
-                previous_visual_edit=artifacts.previous_visual_edit,
-                latest_visual_edit=edit,
-                rotation_gizmo_frame=artifacts.rotation_gizmo_frame,
-                turn_count=artifacts.turn_count,
-            ),
+        normalized_target = _gripper_target(target)
+        action_target = ActionTarget(gripper=normalized_target)
+        action_id = self.ws.state.next_id("a")
+        intent = f"set gripper {normalized_target}"
+        summary_artifacts = ImaginationArtifacts(
+            initial_target=action_target,
         )
+        review = ActionReview(
+            action_id=action_id,
+            target=action_target,
+            intent=intent,
+        )
+        self.ws.state.action_review = review
+        self.ws.state.last_handoff = None
+        self.ws._private.review_artifacts = {
+            action_id: ActionReviewArtifacts(
+                termination_reason="main_gripper_preview",
+                edit_summary=build_edit_summary(action_target, summary_artifacts),
+            )
+        }
+        self.ws._private.imagination_artifacts = None
+        self.ws._private.trace_diagnostics["main_gripper_review"] = {
+            "action_id": action_id,
+            "target_gripper": normalized_target,
+            "physical_effect": False,
+        }
+        return {"action_id": action_id}
 
     def finish_imagination(self, status: str) -> dict[str, Any]:
         if status not in {"ready", "failed"}:
@@ -1069,21 +957,7 @@ class ContextFunctions:
         if imagination is None:
             raise ContextFunctionError("there is no active imagination session")
         if status == "failed":
-            source_ref = _planning_source_ref(
-                self.ws._private.imagination_artifacts
-            )
-            self.ws.state.imagination = None
-            self.ws._private.imagination_artifacts = None
-            self.ws.state.last_handoff = ImaginationHandoff(
-                status="failed", source_ref=source_ref
-            )
-            self.ws._private.trace_diagnostics["imagination_handoff"] = {
-                "status": "failed",
-                "termination_reason": "agent_failed",
-                "target": imagination.target.summary(),
-                "source_ref": source_ref,
-            }
-            return self.ws.state.last_handoff.summary()
+            return self._fail_imagination("agent_failed")
         return self._handoff_review("agent_ready")
 
     def reject_action(self, action_id: str) -> dict[str, Any]:
@@ -1096,12 +970,25 @@ class ContextFunctions:
         return {}
 
     def limit_imagination(self) -> dict[str, Any]:
-        """Return the final preview to Main without marking it as approved."""
+        """Fail a refinement session that did not converge within its budget."""
 
+        return self._fail_imagination("turn_limit")
+
+    def _fail_imagination(self, termination_reason: str) -> dict[str, Any]:
         imagination = self.ws.state.imagination
         if imagination is None:
             raise ContextFunctionError("there is no active imagination session")
-        return self._handoff_review("turn_limit")
+        source_ref = _planning_source_ref(self.ws._private.imagination_artifacts)
+        self.ws.state.imagination = None
+        self.ws._private.imagination_artifacts = None
+        self.ws.state.last_handoff = ImaginationHandoff(status="failed", source_ref=source_ref)
+        self.ws._private.trace_diagnostics["imagination_handoff"] = {
+            "status": "failed",
+            "termination_reason": termination_reason,
+            "target": imagination.target.summary(),
+            "source_ref": source_ref,
+        }
+        return self.ws.state.last_handoff.summary()
 
     def _handoff_review(self, termination_reason: str) -> dict[str, Any]:
         imagination = self.ws.state.imagination
@@ -1115,9 +1002,7 @@ class ContextFunctions:
             source_ref = _planning_source_ref(artifacts)
             self.ws.state.imagination = None
             self.ws._private.imagination_artifacts = None
-            self.ws.state.last_handoff = ImaginationHandoff(
-                "failed", source_ref=source_ref
-            )
+            self.ws.state.last_handoff = ImaginationHandoff("failed", source_ref=source_ref)
             self.ws._private.trace_diagnostics["imagination_handoff"] = {
                 "status": "failed",
                 "termination_reason": f"{termination_reason}_without_executable_plan",
@@ -1382,9 +1267,7 @@ def _prepare_grasps(
         source_radius_m = max(0.04, float(np.linalg.norm(upper - lower)))
     prepared: list[_PreparedGrasp] = []
     rejected: list[dict[str, Any]] = []
-    for index, (pose, score) in enumerate(
-        zip(poses_array, scores_array, strict=True)
-    ):
+    for index, (pose, score) in enumerate(zip(poses_array, scores_array, strict=True)):
         reasons: list[str] = []
         if not np.isfinite(score):
             reasons.append("non_finite_score")
@@ -1402,9 +1285,7 @@ def _prepare_grasps(
             rejected.append({"index": index, "reasons": reasons})
             continue
 
-        base_from_graspnet = (
-            pose if poses_are_base_frame else np.asarray(base_from_camera) @ pose
-        )
+        base_from_graspnet = pose if poses_are_base_frame else np.asarray(base_from_camera) @ pose
         base_from_hand = graspnet_pose_to_panda_hand(
             base_from_graspnet,
             reference_quaternion_xyzw=reference_quaternion_xyzw,
@@ -1422,9 +1303,7 @@ def _prepare_grasps(
                 np.min(np.linalg.norm(object_points - contact[None, :], axis=1))
             )
         source_center_distance_m = (
-            float(np.linalg.norm(contact - source_center))
-            if source_center is not None
-            else None
+            float(np.linalg.norm(contact - source_center)) if source_center is not None else None
         )
         if approach_z > 0.0:
             rejected.append(
@@ -1449,9 +1328,7 @@ def _prepare_grasps(
                     "approach_z": round(approach_z, 6),
                     "target_xyz": _rounded_vector(contact),
                     "nearest_object_m": _rounded_scalar(nearest_object_m),
-                    "source_center_distance_m": _rounded_scalar(
-                        source_center_distance_m
-                    ),
+                    "source_center_distance_m": _rounded_scalar(source_center_distance_m),
                     "source_radius_m": _rounded_scalar(source_radius_m),
                 }
             )
@@ -1477,8 +1354,7 @@ def _prepare_grasps(
                 float(
                     np.min(
                         np.linalg.norm(
-                            object_points
-                            - np.asarray(item.target.position_xyz)[None, :],
+                            object_points - np.asarray(item.target.position_xyz)[None, :],
                             axis=1,
                         )
                     )
@@ -1487,11 +1363,7 @@ def _prepare_grasps(
                 else None
             ),
             "source_center_distance_m": _rounded_scalar(
-                float(
-                    np.linalg.norm(
-                        np.asarray(item.target.position_xyz) - source_center
-                    )
-                )
+                float(np.linalg.norm(np.asarray(item.target.position_xyz) - source_center))
                 if source_center is not None
                 else None
             ),

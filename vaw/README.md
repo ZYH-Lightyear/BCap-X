@@ -1,7 +1,7 @@
 # VAW — Visual Action Workspace
 
 `vaw` 是面向 LIBERO-PRO 的双 Agent Visual Context Runtime。它把当前真实观测与动作想象
-编译为固定 `1920×1080` Canvas，但模型不点击页面：动作通道始终是 structured Function
+编译为固定 `2048×1280` Canvas，但模型不点击页面：动作通道始终是 structured Function
 call。
 
 当前架构不再回放 Function history，也不维护 Persistent Waypoint。Main Agent 负责语义决策
@@ -21,8 +21,10 @@ CURRENT OBSERVED
       │
       ▼
 Main Agent ── perception / ActionSeed ──► Imagination Agent
+   │                 │                    │
+   │                 └─ open / close ──► gripper-only ActionReview
    ▲                                      │
-   │                  delta / rotate / gripper preview
+   │                         delta / rotate
    │                                      │
    └──────── ActionReview / failed ────────────────┘
    │
@@ -51,6 +53,8 @@ propose_grasps(region_id) -> seed_ids
 propose_pose(point_id, offset_xyz, refinement_goal, quaternion_xyzw?)
 select(seed_id, refinement_goal)
 start_imagination(refinement_goal)
+open_gripper() -> action_id
+close_gripper() -> action_id
 done(success)
 ```
 
@@ -59,65 +63,71 @@ Action Review 决策面只在 Imagination 交回一个待审动作时出现：
 ```text
 commit(action_id)
 reject_action(action_id)
-revise_action(action_id, refinement_goal)
 select / propose_pose
 done(success)
 ```
 
 普通 Main 看不到 `commit`；因此只有在最终 Preview 已进入 Action Review 后才可能执行。审查时
-若调用 `revise_action`，会把同一完整 target 交回 Imagination；若调用 `reject_action`，则显式销毁该
-offer，不刷新真实 observation。
+Main 不再二次裁决毫米级位置、方向、两指通道或接触间隙，也不能把同一 target 交回继续微调；
+这些局部几何只由 Imagination Agent 判断。Main 只检查任务/动作意图、真实执行前提、planner
+可执行性，以及它是否是合理的下一次物理动作。`reject_action` 显式销毁 offer，不刷新真实
+observation；`select/propose_pose` 则从不同起点创建新的 Imagination。
 
 Imagination Agent：
 
 ```text
 delta_move(delta_xyz_m, frame)
 rotate(axis, angle_deg, frame)
-open_gripper()
-close_gripper()
-show_rotation_gizmo(frame)
+show_rotation_gizmo(frame, axis)
 finish_imagination(status="ready" | "failed")
 ```
 
 除 `commit` 外，所有 Function 都不会改变真实世界。`select/propose_pose/start_imagination`
-创建 Imagination；Main 和 Review 均不再直接拥有空间或夹爪 editor。`revise_action` 把现有
-Review 原样交回 Imagination；结束后产生等待 Main 判断的 `ActionReview`。
+创建空间 Imagination；Main 不直接拥有空间 editor。`open_gripper/close_gripper` 是 Main-only，
+直接创建纯夹爪 `ActionReview`，不进入 Imagination，也不触发 controller。两类 Review 都必须由
+Main 在下一轮显式 `commit(action_id)` 才会产生物理效果；空间与夹爪目标不在同一次 Review 中
+隐式组合。只有 Imagination 主动调用 `finish_imagination(status="ready")` 才会产生空间
+`ActionReview`。
 Main 启动 Imagination 时必须显式提供一句短的 `refinement_goal`，不能把整段 rationale 当成
 局部控制目标。Imagination 每次请求只收到当前 Canvas、目标几何和累计 `EditSummary`，不收到
 Function transcript。普通 Main 只额外收到一条 overwrite-only `Main Working Focus`：上一轮
 Main 自己的一句依据，用于在感知调用后保留“抓取失败，正在重试”这类短期任务关系；它不是
-环境真值，也不会进入 Imagination；Action Review 会继续看到发起本次 Preview 的这条短意图，
-避免所有权交接后失去动作目的。默认最多连续想象 6 轮；主动完成或达到上限都以中性的
-`review_required` 交回 Main，`turn_limit` 只写 trace。只有 Main 查看最终 Preview 后调用
-`commit` 才构成批准。`ActionReview` 是一次决策的 offer：Main 的下一次成功调用若不是
+环境真值，也不会进入 Imagination；Action Review 不重新注入旧 Main Working Focus，避免旧的
+局部几何判断形成自我强化。默认最多连续想象 6 轮；主动 ready 才产生 `review_required`，达到
+上限直接产生 `failed`，不创建 action ID，`turn_limit` 只写 trace。只有 Main 审查宏观条件后
+调用 `commit` 才构成批准。`ActionReview` 是一次决策的 offer：Main 的下一次成功调用若不是
 `commit`，旧 review 会被明确丢弃，不能在后续回合被误提交。
 
 ## Canvas
 
-Web schema 25 / `vaw-context-v24-imagination-agent` / renderer
-`context-web-v24-imagination-agent`：
+Web schema 31 / `vaw-context-v30-main-gripper-review` / renderer
+`context-web-v30-main-gripper-review`：
 
 - 上层 `OBSERVED NOW · REAL WORLD`：干净 agentview、与 agentview 标定透视一致的稠密
   RGB-D surface 和四行本体状态；
 - `ACTION SEEDS`：最多五个候选以固定五列占满下层，统一尺度并完整显示；每张卡直接标出
   精确 `APPROACH BASE [x,y,z]`，使 Main 不必从二维投影猜 side/top-down；
-- active target 时下层为 `IMAGINATION · NOT EXECUTED`：同一当前 RGB-D surface 的
-  camera-aligned 全局 Preview，
-  以及由当前 agentview+wrist RGB-D 编译的正交 `JAW PLANE` Contact Focus；后者用于观察目标
-  物体是否真正位于两指通道，紫色 target 始终表示未执行；
-- near-field 的 `LOCAL 3/4` 角落固定显示 `BASE / WORLD` +轴，`JAW PLANE` 角落显示随当前
-  紫色目标旋转的 `TARGET TOOL` +轴。`rotate` 使用所选 +轴的右手定则；Prompt 要求符号或幅度
-  不确定时先用 5–15° Preview，不能用 ±90° 猜方向；
+- active target 时下层为 `IMAGINATION · NOT EXECUTED`：左侧保留同一当前 RGB-D surface 的
+  camera-aligned 全局 Preview；右侧同时显示与目标夹爪对齐的 `CONTACT FRONT · TOOL Y-Z`
+  和 `CONTACT SIDE · TOOL X-Z`。前者展示两指闭合通道，后者暴露单一正投影隐藏的前后/高度
+  偏差；紫色 target 始终表示未执行；
+- 真实 LIBERO-PRO 的 Contact View 不再从 agentview/wrist RGB-D 重投影 novel view，而是由
+  两张 episode-private、重力稳定且 session 锁定的 MuJoCo Contact Camera 直接光栅化；因此
+  背景、物体表面、机器人与遮挡边界具有与 agentview 相同的稠密图像质量，不再产生重投影孔洞。
+  这是 simulation-only active sensor，实验中必须与仅重排原观测的 Canvas 版本区分；
+- `rotate` 仍使用所选 +轴的右手定则；`show_rotation_gizmo(frame, axis)` 不再把三轴旋转环覆盖
+  在物体中心，而是在每张 Contact View 的独立右侧栏显示该单轴 `−10° / +10°` 两张真实夹爪
+  姿态对照。它只解释符号，不修改 target、不规划、不执行；
 - 每次空间编辑后，Contact Focus 同时显示青色 `PREVIOUS PREVIEW` 和紫色 `CURRENT PREVIEW`，
-  让 history-free Agent 在一张当前图里比较编辑前后；`show_rotation_gizmo(frame)` 可按需在目标
-  周围显示 VIA 风格三轴旋转环，默认不占据画面；
-- Waypoint 卡使用 `TCP→SOURCE BASE [dx,dy,dz]` 表示从 target TCP 指向最近当前 source surface
-  的 BASE 向量；距离只由该向量派生显示，不再暴露一个缺少修正方向的孤立标量；
+  让 history-free Agent 在一张当前图里比较编辑前后；
+- Canvas 不再绘制 Waypoint 文字卡；下层空间全部用于当前点云、紫色 target 与 Contact Focus，
+  避免把待验证的 intent、target 或 source metric 误读为已经成立的世界状态；
 - 没有 active target 时，下层明确标成 `CURRENT EVIDENCE · OBSERVED` 或
-  `CURRENT GEOMETRY · OBSERVED`，不再把当前蓝色机器人误标成未执行想象；
+  `CURRENT GEOMETRY · OBSERVED`；当前真实机器人仅以白色轮廓标记，不再使用蓝色实体 mask，
+  也不会被误标成未执行想象；
 - Main 审查 Imagination 交回的 ActionReview 时，当前紫色 Preview 始终优先于旧的
-  post-commit 页面，确保 commit 审查的是将要执行的 target；右侧 Waypoint 事实栏同时保留
-  最近物理命令的 `UNVERIFIED` 效果与仍缺少的证据，不遮挡 Preview；
+  post-commit 页面，确保 commit 审查的是将要执行的 target；最近物理命令与仍缺少的证据继续
+  保留在文本 Context，不再占用 Preview 画面；
 - commit 后下层切换为同一 Canvas 内的真实因果对照；若存在最近 grasp source，同时显示
   `SOURCE BEFORE → FIXED SOURCE CROP NOW` 与 `CURRENT ACTION AREA`。前两张图使用固定
   像素区域而非 tracking，明确标注机器人遮挡也可能造成变化；大图只显示一次，后续非物理
@@ -129,6 +139,8 @@ Web schema 25 / `vaw-context-v24-imagination-agent` / renderer
   不注入抓取/放置成功结论；
 - BASE/WORLD 坐标提示由 robot-base 几何投影产生，并固定在角落以避免遮挡 target；
 - grounding、ActionSeed 与 refinement 信息只占用下层固定 overlay，不改变双层版式；
+- 外层 padding、上下层 gap、视觉卡片 gap 与主要 border 统一压缩为 `1–4px`；新增分辨率完全
+  分配给真实 RGB-D、Preview 和 Contact View，不增加装饰性留白；
 - 紫色几何只存在于下层，并始终表示未执行的预测；
 - Imagination 交回 Main 后仍保留精确的初始/最终 target 与累计 base-frame 位移/旋转，避免
   ActionReview 丢失局部编辑方向；
@@ -188,7 +200,9 @@ python -m pytest -q \
   tests/test_vaw_context_agent.py \
   tests/test_vaw_context_packet.py \
   tests/test_vaw_near_field.py \
-  tests/test_vaw_gripper_fk.py
+  tests/test_vaw_gripper_fk.py \
+  tests/test_vaw_contact_camera.py \
+  tests/test_vaw_semantic_grounding.py
 ```
 
 当前实现不修改 CaP-X、RoboMEx、`capx_skill_rl` 或已有输出 trace。

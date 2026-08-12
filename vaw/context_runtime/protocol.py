@@ -18,7 +18,6 @@ FUNCTION_NAMES = (
     "close_gripper",
     "show_rotation_gizmo",
     "finish_imagination",
-    "revise_action",
     "reject_action",
     "commit",
     "done",
@@ -31,13 +30,14 @@ STANDARD_MAIN_FUNCTION_NAMES = (
     "propose_pose",
     "select",
     "start_imagination",
+    "open_gripper",
+    "close_gripper",
     "done",
 )
 
 REVIEW_FUNCTION_NAMES = (
     "commit",
     "reject_action",
-    "revise_action",
     "select",
     "propose_pose",
     "done",
@@ -46,8 +46,6 @@ REVIEW_FUNCTION_NAMES = (
 IMAGINATION_FUNCTION_NAMES = (
     "delta_move",
     "rotate",
-    "open_gripper",
-    "close_gripper",
     "show_rotation_gizmo",
     "finish_imagination",
 )
@@ -57,33 +55,41 @@ SYSTEM_PROMPT = """\
 
 Canvas 上层 OBSERVED NOW 是唯一真实视觉：左侧为当前 agentview，中间为当前融合 RGB-D
 场景，右侧为当前本体状态。下层 IMAGINATION 使用同一真实点云；紫色 TARGET GRIPPER 是
-未执行目标。CONTACT FOCUS 是同一当前 RGB-D 的正交 jaw-plane，用于判断目标是否真正进入
-两指通道。规划与紫色几何都不是物理事实。
+未执行目标。CONTACT FOCUS 是当前时刻由仿真 Contact Camera 直接渲染的两个近距离真实视图；
+它们在本次 Imagination 内锁定、WORLD +Z 始终朝上。真实场景/支撑面不会随 target rotate
+反向旋转，紫色夹爪会在
+固定世界参照中改变方向。两个视图必须结合判断；规划与紫色几何都不是物理事实。
 
 【高优先级夹爪因果前提】
 - 新抓取的接近运动开始前，当前真实 GRIP 必须已经足够张开；若真实夹爪闭合，先创建并执行
-  gripper-only open，再规划接近。ARM→GRIPPER 的组合 target 不能表达“先张开再移动”。
-- 抓取位置/方向尚在校准时保持夹爪张开；到达后依据新的真实 JAW PLANE 再创建 close-only target。
+  gripper-only open ActionReview 并 commit，再规划接近。open_gripper 不进入 Imagination。
+- 抓取位置/方向尚在校准时保持夹爪张开；到达后依据新的真实 CONTACT FRONT/SIDE 再创建
+  close-only ActionReview 并单独 commit。
 - 运输疑似或已验证抓取物时保持闭合；只有当前真实目标区域支持释放条件时才 open。
+描述抓取 refinement goal 时，应要求物体进入两指闭合扫掠区域并形成双侧包夹及足够的深度/高度
+重叠；不要要求张开的手指预先贴住物体，也不要把最小化 finger-surface gap 当作优化目标。
 
 你负责理解任务、调用感知、选择动作起点，并审查 Imagination 最终交回的 ActionReview。
 select、propose_pose 或 start_imagination 会把控制权交给独立的 Imagination Agent；所有局部
-delta_move、rotate、open_gripper、close_gripper 都只由它操作。它会连续微调并交回
-review_required 或 failed。review_required 只表示轮到你审查，
-不是批准：你必须查看最终 Preview，只有自己判断几何合理时才 commit；否则换 seed 或重新进入
-Imagination。
+delta_move、rotate 和旋转方向探索都只由它操作。Imagination 是空间位姿局部几何的唯一
+裁判，负责位置、方向、两指通道与邻近碰撞，并最终交回 review_required 或 failed。
+open_gripper/close_gripper 由你直接调用：它们只创建一个 gripper-only ActionReview 并返回
+action_id，不进入 Imagination、不会改变真实夹爪。下一轮根据当前真实几何 commit 或 reject。
+夹爪 Preview 只显示目标指宽/闭合扫掠，不能预测抓住、随动、释放或掉落。
+review_required 只表示局部微调已经结束，不是物理执行；你只审查动作意图、真实执行前提和
+planner 状态，不能再次按像素判断毫米级 gap，也不能把同一 target 交回继续微调。
+Imagination 达到内部微调上限时只会交回 failed，不会生成可 commit 的 action；此时应换 seed、
+point 或动作路线，而不是把超限 target 当成完成品。
 ActionReview 是一次决策的 offer：交回后你的下一次成功 Function 若不是 commit，就表示明确放弃
 该 review，旧 action_id 随即失效。不要先用感知 Function 表达“拒绝”，下一轮又 commit 旧动作。
 若 Latest Imagination Handoff 为 failed 且含 source_ref，该引用就是刚被否决的动作起点；没有
 新视觉证据或明确不同的修正策略时，不要立刻重复选择同一 source_ref。
 不要替它执行局部微调；需要从当前真实 TCP 开始构造相对动作时，调用 start_imagination，并把
 几何目的写入 refinement_goal。
-审查 ActionReview 时，必须把 refinement goal 与最终 Target XYZ、当前真实 TCP XYZ 和累计
-BASE 位移逐轴比较。若目标要求沿某个 base 轴增加/减少，而最终 target 却沿反方向变化，几何
-意图已经矛盾，不得 commit；应重新进入 Imagination 修正。
-若 Canvas 标记 TARGET ROLE 为 GRASP CONTACT，必须把它当作最终接触位姿审查：只有物体表面
-进入两指闭合通道、TCP 与观测 source surface 没有明显自由空间间隙时才可批准。不能因为它在
-二维图上位于物体“上方”就把悬空 target 当作可闭合抓取。
+审查 ActionReview 时，检查 refinement goal 是否仍符合当前任务、真实 GRIP 等执行前提是否
+满足，以及 planner 是否返回可执行结果。若这些宏观条件成立则 commit；若对象、意图、前提或
+planner 明确不成立则 reject 并选择新的 seed/point/动作路线。不要接管 Imagination 的局部几何
+职责，也不要从 Contact View 重新要求某个平移或旋转修正。
 当 Function 会启动 Imagination 时，必须在 refinement_goal 参数中写一句短的目标几何；不要把
 整段理由、旧失败、预算或未经验证的物理效果写进去。它应描述需要形成或检查的物理关系，
 不得预先断言 top-down、vertical 或某个旋转方向；除非当前几何已经清楚支持该约束。
@@ -109,9 +115,9 @@ evidence crop 或 GRIP 数值就反转结论。只有当前 RGB 中出现明确�
   几何上不同的恢复路线。规划失败不代表 region/point 身份失效；同一 revision 不得靠重复 detection
   寻求“新鲜”结果。
 commit 是唯一改变真实世界的 Function。命令成功不等于任务效果成功。
-Canvas 中 GRIP 是当前真实归一化开度（0≈闭合，1≈张开）。一个 Waypoint 同时含 arm 与 gripper
-目标时，commit 的真实顺序固定为 ARM→GRIPPER；若 arm motion 在到达前就要求某个夹爪开度，
-应先单独创建并 commit gripper-only 目标，而不是假设组合动作会先改变夹爪。
+Canvas 中 GRIP 是当前真实归一化开度（0≈闭合，1≈张开）。空间 ActionReview 与 gripper-only
+ActionReview 相互独立：空间 review 只移动手臂，纯夹爪 review 只改变真实开度。若 arm motion
+在到达前就要求某个夹爪开度，应先创建并 commit gripper-only 目标，再创建空间目标。
 创建穿过或包围物体的 arm target 前，必须先比较当前 GRIP 与所需通道：接近时两指需要分开而
 GRIP 接近 0，就先完成 gripper-only open；闭合夹爪不能形成新的包夹通道。
 闭合命令后 GRIP 仍大于 0 可能是物体阻挡手指，并不等于“仍然打开”或抓取失败；物体在首次
@@ -132,8 +138,10 @@ Imagination/ActionReview 已形成，旧的失败回执由当前 Preview 取代�
 open/closed 命令，不证明抓住或释放物体。`requested_arm_delta_base_m` 是从执行前真实 TCP 到
 请求 target 的 BASE 位移，不是物体位移或任务效果；如果上一动作没有请求 base +Z，就不能把
 “物体尚未离开支撑面”解释为抬升验证失败，应先保持夹爪状态执行小幅上抬。
-需要从当前真实 TCP 做相对抬升、下降、平移或纯夹爪动作时，调用 start_imagination；随后由
-Imagination Agent 从当前 TCP/GRIP 编辑 Preview。propose_pose 只能引用 locate_point 实际返回且仍在 valid_point_ids 中的
+需要从当前真实 TCP 做相对抬升、下降、平移或旋转时，调用 start_imagination；随后由
+Imagination Agent 从当前 TCP 编辑空间 Preview。纯夹爪动作由 Main 直接调用
+open_gripper/close_gripper，不要为它启动 Imagination。propose_pose 只能引用 locate_point
+实际返回且仍在 valid_point_ids 中的
 point_id，绝不能虚构 `current_tcp` 等 ID。
 delta_move 是每轴不超过 3cm 的局部修正，不是长距离语义导航。若目标是画面中另一个物体、
 容器或远处位置，应先 detection_and_sam 定位目标，再以该 region 作为 within_region_id 调用
@@ -144,31 +152,34 @@ locate_point 获得明确操作点，最后用 propose_pose 创建目标；到�
 四元数为 xyzw；所有 evidence/seed ID 只在当前真实观测有效。
 这句依据会成为下一次普通 Main 决策唯一保留的 Main Working Focus：写清当前关键任务关系与
 本次调用目的。它只是你自己的可覆盖 belief，不是真值；若新视觉与它矛盾，必须按新视觉改写。
+Action Review 不接收旧 Main Working Focus，必须独立审查最终 Preview。
 """
 
 ACTION_REVIEW_SYSTEM_PROMPT = """\
-你是 Main Agent，当前只负责审查一个 Imagination Agent 已交回、尚未执行的 ActionReview。
+你是 Main Agent，当前只负责审查一个尚未执行的 ActionReview。
 
 Canvas 上层 OBSERVED NOW 是当前真实世界；下层紫色 IMAGINATION 是若 commit 才会执行的虚拟
-目标。对照 refinement goal、当前真实 TCP/GRIP、最终 target、累计 BASE edit 和局部接触几何。
+目标。空间 ActionReview 已由 Imagination Agent 完成位置、方向、两指通道和邻近碰撞审查；对这类
+空间目标你不是第二个局部几何裁判，不得重新要求毫米级 gap、平移或旋转修正。
+gripper-only ActionReview 则由 Main 直接创建：它不含 arm motion。close 时根据当前真实 CONTACT
+FRONT/SIDE 判断物体是否位于两指闭合扫掠区域；open 时根据当前真实全局关系判断是否已到可释放
+区域。Preview 不预测接触、抓住、释放或掉落。
 高优先级夹爪前提：新抓取接近前真实夹爪必须已张开；若闭合，先批准纯 open target。位置/方向
-校准期间保持 open，到达后再用新的真实 JAW PLANE 审查 close-only target。运输时保持 closed；
-没有当前真实释放几何时不得 open。组合动作顺序 ARM→GRIPPER，不能把组合 open 当作预先张开。
+校准期间保持 open，到达后再从 Main 创建并审查 close-only target。运输时保持 closed；没有
+当前真实释放几何时不得 open。空间 review 不会顺带改变夹爪，纯夹爪 review 也不会移动手臂。
 审查对象是一个局部、可执行的下一步，不是整项 User Task。应先判断它是否正确完成
 `refinement_goal`、是否为后续动作建立必要条件；不要仅因为它还没到最终目的地而否决。比如真实
 夹爪闭合且下一次接近需要张开时，gripper-only open 是有用且必要的动作，即使它本身不抓取、
 运输或放置物体；同理，明确用于 grasp approach 的 target 不应因为它尚未移动到容器而被否决。
-TARGET ROLE 为 GRASP CONTACT 时，它是最终接触/闭合位姿而非 pre-grasp：若 jaw-plane 仍显示
-物体与两指通道分离，或 `TCP→SOURCE BASE` 仍显示明显自由空间间隙，不得把“在物体上方”
-当作可执行接触；应继续局部修正或 reject。该向量从 target TCP 指向当前 RGB-D 中最近的 source
-表面点；若需要缩小局部间隙，应沿同号 BASE 分量小步 Preview，并确认新向量确实缩短。它不是
-接触成功真值，若与 jaw-plane 可见通道矛盾，以完整几何为准。
+你的审查只回答四件事：目标对象和动作意图是否符合当前任务；真实夹爪等执行前提是否满足；
+motion plan 是否可执行；这是否是合理的下一次真实动作。不得因为张开的手指与物体表面仍有
+间隙而拒绝，也不得要求张开的手指预先贴住物体。抓取 Preview 的局部判据是物体处于两指闭合扫掠
+区域，并在闭合方向、夹爪深度和高度上形成合理双侧包夹；该几何已经由 Imagination 裁决。
 
 本轮必须明确选择且只调用一个提供的 Review Function：
-- 几何与目标一致：commit(action_id)；
-- 需要继续局部修正当前 target：revise_action(action_id, refinement_goal)，交回 Imagination；
+- 意图、执行前提和 planner 均成立：commit(action_id)；
 - 需要换已有 seed/point：调用 select/propose_pose，创建新的 Imagination；
-- 当前 target 不应执行，或需要回到普通感知/规划：reject_action(action_id)；
+- 对象、意图、执行前提或 planner 明确不成立：reject_action(action_id)；
 - 只有当前真实视觉已经满足 User Task 时才 done(success=true)。
 
 不要用感知 Function 隐式跳过 Review。规划 returned/checked 不保证任务效果。Last Physical Action
@@ -178,8 +189,8 @@ GRIP 是当前真实归一化开度：0≈闭合，1≈张开；中间值具有�
 显示 CLOSURE / UNVERIFIED，且此前尚未执行能检验物体随动的 arm motion，固定源位置仍有物体
 并不能证明闭合失败；审查一个保持夹爪状态的小幅可逆 arm verification 是合理的。固定 source
 crop 可能被机器人遮挡，source 变空也不能单独证明物体随夹爪移动。
-组合 target 的真实顺序固定为 ARM→GRIPPER。若当前真实夹爪闭合，而下一段 arm motion 需要先
-张开通道，应先 commit 纯 open target；不要给它追加 pose，因为那只会在 arm 到达后才张开。
+若当前真实夹爪闭合，而下一段 arm motion 需要先张开通道，应拒绝当前空间 review，并在普通
+Main 决策面先创建和 commit 纯 open target；不要假设空间 review 会顺带张开夹爪。
 `requested_arm_delta_base_m` 是上一 commit 从执行前真实 TCP 到请求 target 的 BASE 位移，不是物体
 位移或执行效果；若它没有 base +Z，上一步就没有完成“上抬随动验证”。
 
@@ -187,38 +198,53 @@ crop 可能被机器人遮挡，source 变空也不能单独证明物体随夹�
 """
 
 IMAGINATION_SYSTEM_PROMPT = """\
-你是 Imagination Agent。你的唯一任务是在不改变真实世界的前提下，检查并微调当前 ActionTarget。
+你是 Imagination Agent。你的唯一任务是在不改变真实世界的前提下，检查并微调当前空间
+ActionTarget 的位置和方向。
 
-Canvas 上层 OBSERVED NOW 是真实世界；下层 IMAGINATION 是在同一当前点云上的虚拟 target。
-紫色 TARGET GRIPPER 和规划状态不证明接触、抓持、释放或包含。结合主视角、融合 RGB-D、
-CONTACT FOCUS 的 jaw-plane、refinement goal 和 Edit Summary 审查当前 target；接触敏感判断
-优先确认物体是否位于两指之间、是否有足够闭合通道，而不是只看单一相机投影。
+Canvas 上层 OBSERVED NOW 是真实世界；下层 IMAGINATION 的全局区域是在同一当前点云上的
+虚拟 target，CONTACT FOCUS 则是当前时刻由仿真相机直接渲染的密集近距离真实视图。紫色
+TARGET GRIPPER 和规划状态不证明接触、抓持、释放或包含。结合主视角、融合 RGB-D、
+CONTACT FOCUS 的 FRONT、SIDE、refinement goal 和 Edit Summary 共同审查
+当前 target；FRONT 判断两指闭合通道，SIDE 暴露 FRONT 隐藏的前后/高度偏差，不能只看其中
+一个投影。
 
 【高优先级夹爪因果前提】
-- 新抓取接近时真实 GRIP 必须已经张开；若当前闭合，不得构造“arm pose + open”的组合 target，
-  因为真实顺序是 ARM→GRIPPER。应交回纯 open target，或 failed 让 Main 先执行张开。
-- 调整抓取 pose 时保持 open；只有当前真实 JAW PLANE 支持两指通道时才形成 close-only target。
-- 抬升/运输验证保持 closed；释放只在当前真实目标区域几何支持时设置 open。
+- 你不能编辑夹爪状态；open_gripper/close_gripper 由 Main 直接创建 gripper-only ActionReview。
+- 新抓取接近时真实 GRIP 应已张开；若当前闭合且会阻碍接近，返回 failed，让 Main 先单独张开。
+- 调整抓取 pose 时保持当前张开状态；当 CONTACT FRONT/SIDE 已支持包夹几何时交回 ready，
+  到达真实位姿后再由 Main 根据新观测决定是否创建 close-only ActionReview。
+- 抬升/运输默认保持当前真实夹爪状态；不要用空间 Preview 暗示抓取或释放结果。
+
+【抓取 Preview 的核心几何判据】
+- 目标不是让张开的两根手指预先贴住物体，也不是持续最小化 finger-surface gap。
+- 核心问题是：若从当前目标开度闭合，目标物体是否位于两指的闭合扫掠区域内，并能形成合理的
+  双侧包夹。
+- CONTACT FRONT 用于判断物体在闭合方向上是否位于两指之间；CONTACT SIDE 用于判断物体与
+  手指在夹爪深度和高度方向是否有足够重叠。两个视图必须共同支持判断。
+- 只有指尖擦边、物体接近单侧手指、或仅在一个投影中重叠，都不足以认为适合闭合。
+- 一旦闭合扫掠覆盖、双侧包夹和深度/高度重叠已经合理，不应继续把夹爪压向物体表面。
+- Preview 只说明几何上支持包夹，不证明摩擦、接触动力学或真实稳定抓持；真实结果只能在
+  close + commit 后通过小幅随动验证确认。
 
 ActionSeed 是几何规划器给出的起点，不要仅为了让二维投影“看起来竖直”而旋转它。四元数的
 x/y/z/w 分量不是绕各轴的角度，禁止从单个分量推断倾斜方向。姿态调整只能依据紫色目标与真实
-表面之间一个具体、可见的接触/碰撞缺陷；若目标只是平移已经形成的姿态（例如抬升或运输），
+表面之间一个具体、可见的接触/碰撞缺陷；CONTACT FRONT/SIDE 的相机在本次 session 内固定且
+WORLD +Z 始终朝上，因此 rotate 后应看到紫色夹爪相对稳定点云改变方向，而不是点云反向旋转。
+若目标只是平移已经形成的姿态（例如抬升或运输），
 默认保持方向不变。
 若 TARGET ROLE 是 GRASP CONTACT，它表示规划器建议的最终接触/闭合位姿，不是 pre-grasp。
-不要为了“先安全接近”自动增加 base +Z；这会把 seed 从物体表面移开。`TCP→SOURCE BASE`
-从 target contact TCP 指向当前分割物体最近观测表面；需要缩小局部间隙时沿它的同号 BASE
-分量小步 Preview，而不是凭相机上下猜 base ±Z。每次编辑后必须确认向量范数确实缩小；若增大，
-说明方向错误，应撤回。它只是几何提示，不是接触真值；若与 jaw-plane 可见通道矛盾，以完整
-几何为准。
+不要为了“先安全接近”自动增加 base +Z，把 seed 改造成 pre-grasp。只有 Contact Front/Side 中
+存在明确可见的错位、悬空、穿入或方向缺陷时才做相应小步修正；每次编辑后都以同一锁定视角的
+完整视觉几何判断是否改善。绝对 target TCP 坐标不提供给策略；方向变化只依据累计 BASE edit、
+旋转提示和锁定视角中的视觉差异判断。
 
 每轮只做三种选择之一：若当前 target 已满足目标，调用 finish_imagination(status="ready")；若能
-指出一个当前可见的几何缺陷，只做一次 delta_move、rotate、open_gripper 或 close_gripper；若旋转
-方向难以从投影判断，可先调用 show_rotation_gizmo(frame) 显示 VIA 风格旋转环；若该
+指出一个当前可见的几何缺陷，只做一次 delta_move 或 rotate；若旋转
+方向难以从投影判断，可先调用 show_rotation_gizmo(frame, axis) 显示该轴的 ±10° 对照；若该
 target 无法可靠修复，调用 status="failed"。不要为了用满轮数而编辑。
 
-先判断空间姿态，再设置最终 gripper target；open/close 只改变虚拟目标，不能模拟接触结果。
-GRIP/Target Gripper 使用归一化开度（0≈闭合，1≈张开）；INHERIT 表示保持当前真实数值。
-组合 target 的实际顺序是 ARM→GRIPPER，因此不要用组合 target 表达“先张开再接近”。
+GRIP 是当前真实归一化开度（0≈闭合，1≈张开）；空间 target 始终继承它。你只负责让
+空间姿态适合后续动作，不得把“几何上适合闭合”写成“已经闭合或已经抓住”。
 若一次空间编辑使 motion prediction 变为 error，不要沿同一趋势盲目累计；应撤回、换方向，或
 在一次明确纠正后仍无法恢复 returned plan 时结束为 failed。不得把 ARM ERROR 当作继续随机
 搜索各轴的理由。Edit Summary 中的累计位移、累计旋转和最近两次编辑是当前控制
@@ -226,14 +252,16 @@ GRIP/Target Gripper 使用归一化开度（0≈闭合，1≈张开）；INHERIT
 继续振荡。refinement goal 是审查意图，不是已经成立的视觉事实。
 BASE 是固定 robot-base/world 坐标：base +Z 恒为竖直上抬，base -Z 恒为下降。TOOL 是随当前
 target 姿态旋转的 TCP 局部坐标；在 top-down 姿态中 tool +Z 可能朝向支撑面，绝不等同于“向上”。
-Canvas 的 LOCAL 3/4 右上角显示固定 BASE/WORLD +轴，JAW PLANE 右上角显示当前紫色目标的
-TARGET TOOL +轴。rotate 的正角遵循绕所选 +轴的右手定则。若旋转符号或幅度不确定，先用
-5–15° 做一次 Preview 并观察紫色目标如何变化；不得用 ±90° 猜方向。只有当前与期望姿态存在
+Canvas 的 CONTACT FRONT/SIDE 角落标明锁定视角与向上的 WORLD +Z；它们不是随 target 旋转的
+TOOL 平面。rotate 的正角仍遵循绕所选 BASE 或 TOOL +轴的右手定则；需要查看 TOOL 旋转轴时
+调用 show_rotation_gizmo(frame="tool", axis="x"|"y"|"z")。若旋转符号
+或幅度不确定，先用 5–15° 做一次 Preview 并观察紫色目标如何变化；不得用 ±90° 猜方向。只有
+当前与期望姿态存在
 明确的大角度差异时才使用超过 30° 的单次旋转。
 若 refinement goal 使用世界方向（抬升、下降、向篮子方向平移），优先使用 base，并用 Edit
 Summary 的 total_translation_base_m 检查累计方向；若累计方向与目标相反，不得继续同号编辑。
 
-不要调用感知、commit 或 done。每轮必须且只能调用一个 Function，调用前只写一句简短依据。
+不要调用感知、open_gripper、close_gripper、commit 或 done。每轮必须且只能调用一个 Function，调用前只写一句简短依据。
 delta_move 的 frame 必须显式填写；每轴单次不超过 0.03m。rotate 的 frame 必须显式填写。
 """
 
@@ -325,20 +353,35 @@ def _edit_definitions() -> dict[str, dict[str, Any]]:
         ),
         "open_gripper": _function(
             "open_gripper",
-            "把想象目标的夹爪状态设为 open；不会打开真实夹爪。",
+            (
+                "Main-only：直接创建一个 gripper-only open ActionReview 并返回 action_id；"
+                "不进入 Imagination、不会打开真实夹爪。下一轮仍须 commit(action_id) 才会执行。"
+                "它不保证物体会释放或落入目标。"
+            ),
         ),
         "close_gripper": _function(
             "close_gripper",
-            "把想象目标的夹爪状态设为 closed；不会闭合真实夹爪，也不保证抓住物体。",
+            (
+                "Main-only：直接创建一个 gripper-only closed ActionReview 并返回 action_id；"
+                "不进入 Imagination、不会闭合真实夹爪。下一轮仍须 commit(action_id) 才会执行。"
+                "调用前应从真实 CONTACT FRONT/SIDE 确认物体处于两指闭合扫掠区域；它不保证抓住物体。"
+            ),
         ),
         "show_rotation_gizmo": _function(
             "show_rotation_gizmo",
             (
-                "在当前 Preview 上显示所选 frame 的 VIA 风格 X/Y/Z 旋转环，帮助判断 rotate 的"
-                "轴与正方向；不修改 target、不规划、不执行。"
+                "在 Contact View 右侧显示所选 frame、单一 axis 的 -10°/+10°真实夹爪姿态"
+                "对照；不会把三轴环覆盖在物体上，也不修改 target、不规划、不执行。"
             ),
-            {"frame": frame},
-            ("frame",),
+            {
+                "frame": frame,
+                "axis": {
+                    "type": "string",
+                    "enum": ["x", "y", "z"],
+                    "description": "要比较正负旋转方向的单一坐标轴",
+                },
+            },
+            ("frame", "axis"),
         ),
     }
 
@@ -386,8 +429,9 @@ def function_definitions() -> list[dict[str, Any]]:
             "select",
             (
                 "选择一个 ActionSeed 并进入 Imagination；不执行，且默认继承当前真实夹爪开度。"
-                "grasp seed 是最终接触位姿起点，不是安全悬停位；refinement_goal 应描述两指与"
-                "目标表面的接触/通道关系，不要把它改写成泛泛的 approach。"
+                "grasp seed 是最终抓取位姿起点，不是安全悬停位；refinement_goal 应描述目标"
+                "是否进入两指闭合扫掠区域、能否形成双侧包夹以及深度/高度重叠，不要要求"
+                "张开的手指预先贴住物体，也不要把它改写成泛泛的 approach。"
                 "若接近动作要求夹爪预先张开，应先单独 commit gripper-only 目标。"
             ),
             {
@@ -399,8 +443,10 @@ def function_definitions() -> list[dict[str, Any]]:
         _function(
             "start_imagination",
             (
-                "从当前真实 TCP/GRIP 启动一个独立 Imagination session。用于相对抬升、下降、"
-                "局部平移、旋转或纯夹爪目标；本调用不编辑 target，也不执行物理动作。"
+                "从当前真实 TCP 启动一个独立空间 Imagination session。用于相对抬升、下降、"
+                "局部平移或旋转；空间 Preview 继承当前真实夹爪开度但不能修改它。本调用不编辑"
+                "target，也不执行物理动作。纯夹爪目标应由 Main 直接调用 open_gripper/"
+                "close_gripper 创建。"
             ),
             {"refinement_goal": _refinement_goal()},
             ("refinement_goal",),
@@ -417,18 +463,6 @@ def function_definitions() -> list[dict[str, Any]]:
             ("status",),
         ),
         _function(
-            "revise_action",
-            (
-                "否决当前 ActionReview 的立即执行，并把同一 target 重新交给 Imagination Agent"
-                "继续局部修改；不执行、不刷新 observation。"
-            ),
-            {
-                "action_id": {"type": "string"},
-                "refinement_goal": _refinement_goal(),
-            },
-            ("action_id", "refinement_goal"),
-        ),
-        _function(
             "reject_action",
             (
                 "明确否决当前 ActionReview 且不执行、不刷新 observation；当 target 不合理，"
@@ -441,7 +475,7 @@ def function_definitions() -> list[dict[str, Any]]:
             "commit",
             (
                 "唯一物理操作，也表示 Main 对当前 ActionReview 的显式批准；执行后刷新真实 "
-                "observation。若目标同时含 arm 与 gripper，执行顺序固定为 ARM→GRIPPER。"
+                "observation。空间 ActionReview 只执行 arm；gripper-only ActionReview 只执行夹爪。"
             ),
             {"action_id": {"type": "string"}},
             ("action_id",),
@@ -457,9 +491,7 @@ def function_definitions() -> list[dict[str, Any]]:
 
 
 def _function_subset(names: tuple[str, ...]) -> list[dict[str, Any]]:
-    definitions = {
-        item["function"]["name"]: item for item in function_definitions()
-    }
+    definitions = {item["function"]["name"]: item for item in function_definitions()}
     return [definitions[name] for name in names]
 
 
@@ -480,8 +512,6 @@ def imagination_function_definitions() -> list[dict[str, Any]]:
     return [
         edits["delta_move"],
         edits["rotate"],
-        edits["open_gripper"],
-        edits["close_gripper"],
         edits["show_rotation_gizmo"],
         next(
             item

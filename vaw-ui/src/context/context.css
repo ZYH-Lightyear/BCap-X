@@ -9,8 +9,8 @@
 *, *::before, *::after { box-sizing: border-box; }
 
 html, body, #root {
-  width: 1920px;
-  height: 1080px;
+  width: 2048px;
+  height: 1280px;
   margin: 0;
   overflow: hidden;
 }
@@ -19,12 +19,12 @@ body { background: #eaf1f8; }
 img { display: block; }
 
 .via-canvas {
-  width: 1920px;
-  height: 1080px;
+  width: 2048px;
+  height: 1280px;
   display: grid;
-  grid-template-rows: 500px 560px;
-  gap: 8px;
-  padding: 6px;
+  grid-template-rows: 540px 733px;
+  gap: 3px;
+  padding: 2px;
   overflow: hidden;
   background: #eaf1f8;
 }
@@ -35,15 +35,14 @@ img { display: block; }
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  border: 2px solid #3867e8;
-  border-radius: 10px;
-  box-shadow: 0 2px 8px rgba(15, 23, 42, .08);
+  border: 1px solid #3867e8;
+  border-radius: 4px;
 }
 
 .via-observed {
   display: grid;
-  grid-template-rows: 56px minmax(0, 1fr);
-  padding: 0 16px 16px;
+  grid-template-rows: 42px minmax(0, 1fr);
+  padding: 0 4px 4px;
   background: #fff;
 }
 
@@ -58,7 +57,7 @@ img { display: block; }
 .via-imagination h1,
 .via-post-commit h1 {
   margin: 0;
-  font: 900 31px "DejaVu Sans Mono", monospace;
+  font: 900 27px "DejaVu Sans Mono", monospace;
   letter-spacing: .02em;
 }
 
@@ -70,8 +69,8 @@ img { display: block; }
   /* At this fixed viewport these widths match the native 4:3 RGB and
      metric-correct 960:570 point-cloud rasters.  Neither visual is
      letterboxed into a mismatched aspect ratio. */
-  grid-template-columns: 565px 714px minmax(0, 1fr);
-  gap: 12px;
+  grid-template-columns: 650px 824px minmax(0, 1fr);
+  gap: 4px;
 }
 
 .via-raster-card,
@@ -80,7 +79,7 @@ img { display: block; }
   min-height: 0;
   overflow: hidden;
   border: 1px solid #cbd7e7;
-  border-radius: 8px;
+  border-radius: 4px;
   background: #edf3fa;
 }
 
@@ -88,9 +87,9 @@ img { display: block; }
 .via-raster-card img { width: 100%; height: 100%; object-fit: contain; }
 .via-raster-card > span {
   position: absolute;
-  top: 10px;
-  left: 12px;
-  padding: 6px 10px;
+  top: 4px;
+  left: 4px;
+  padding: 3px 5px;
   border-radius: 4px;
   color: #1e3a5f;
   background: rgba(255, 255, 255, .9);
@@ -99,8 +98,8 @@ img { display: block; }
 
 .via-robot-state {
   display: grid;
-  grid-template-rows: repeat(4, 1fr);
-  padding: 12px 20px;
+  grid-template-rows: repeat(3, 1fr);
+  padding: 4px;
   background: #fff;
 }
 
@@ -109,7 +108,7 @@ img { display: block; }
   display: grid;
   grid-template-columns: 126px minmax(0, 1fr);
   align-items: center;
-  gap: 10px;
+  gap: 4px;
   border-bottom: 1px solid #dce4ef;
 }
 
@@ -137,8 +136,8 @@ img { display: block; }
   z-index: 4;
   top: 0;
   left: 0;
-  height: 58px;
-  padding: 0 28px;
+  height: 42px;
+  padding: 0 4px;
   pointer-events: none;
 }
 
@@ -157,8 +156,8 @@ img { display: block; }
   width: 100%;
   height: 100%;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 600px;
-  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) 832px;
+  gap: 4px;
   background: #03070e;
 }
 
@@ -179,20 +178,17 @@ img { display: block; }
 .via-contact-rail {
   min-width: 0;
   min-height: 0;
-  display: grid;
-  /* Reserve enough room for the complete causal Waypoint summary.  A taller
-     focus view silently clipped LAST REAL at the fixed 1080 px viewport. */
-  grid-template-rows: 320px minmax(0, 1fr);
-  gap: 8px;
-  padding: 8px 8px 8px 0;
+  height: 100%;
+  padding: 3px 3px 3px 0;
 }
 
 .via-contact-focus {
   position: relative;
   min-height: 0;
+  height: 100%;
   overflow: hidden;
-  border: 2px solid #7c3aed;
-  border-radius: 8px;
+  border: 1px solid #7c3aed;
+  border-radius: 4px;
   background: #e8eff7;
 }
 
@@ -202,78 +198,22 @@ img { display: block; }
   object-fit: contain;
 }
 
-.via-waypoint-panel,
 .via-edit-overlay,
 .via-grounding-overlay,
 .via-error-overlay {
   position: absolute;
   z-index: 3;
-  border: 2px solid #7c3aed;
-  border-radius: 8px;
+  border: 1px solid #7c3aed;
+  border-radius: 4px;
   color: #f8fafc;
   background: rgba(3, 7, 14, .91);
-  box-shadow: 0 5px 18px rgba(0, 0, 0, .38);
 }
-
-.via-waypoint-panel {
-  right: 20px;
-  bottom: 18px;
-  width: 342px;
-  padding: 17px 20px;
-}
-
-.via-contact-rail .via-waypoint-panel {
-  position: static;
-  width: auto;
-  min-height: 0;
-  padding: 10px 16px;
-  overflow: hidden;
-  background: rgba(8, 13, 24, .98);
-}
-
-.via-contact-rail .via-waypoint-panel h2 {
-  margin-bottom: 4px;
-  padding-bottom: 5px;
-  font-size: 17px;
-}
-
-.via-contact-rail .via-waypoint-panel .via-fact-row {
-  min-height: 27px;
-}
-
-.via-contact-rail .via-waypoint-panel .via-fact-row strong,
-.via-contact-rail .via-waypoint-panel .via-fact-row code {
-  font-size: 12px;
-}
-
-.via-contact-rail .via-goal {
-  margin-top: 4px;
-  font-size: 11px;
-  line-height: 1.2;
-}
-
-.via-waypoint-panel h2 {
-  margin: 0 0 9px;
-  padding-bottom: 10px;
-  border-bottom: 1px solid #667085;
-  color: #a78bfa;
-  font: 900 22px "DejaVu Sans Mono", monospace;
-}
-
-.via-waypoint-panel .via-fact-row {
-  grid-template-columns: 112px minmax(0, 1fr);
-  min-height: 39px;
-  border: 0;
-}
-.via-waypoint-panel .via-fact-row strong { color: #9b7cf4; font-size: 15px; }
-.via-waypoint-panel .via-fact-row code { color: #fff; font-size: 15px; }
-.via-goal { margin: 9px 0 0; color: #cbd5e1; font-size: 13px; line-height: 1.35; }
 
 .via-edit-overlay {
-  left: 20px;
-  bottom: 18px;
+  left: 4px;
+  bottom: 4px;
   width: 610px;
-  padding: 11px 18px;
+  padding: 4px;
 }
 .via-edit-overlay .via-fact-row {
   grid-template-columns: 148px minmax(0, 1fr);
@@ -286,10 +226,10 @@ img { display: block; }
 .via-seed-gallery {
   position: absolute;
   z-index: 3;
-  inset: 66px 20px 18px;
+  inset: 44px 4px 4px;
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 14px;
+  gap: 4px;
 }
 
 .via-seed-card {
@@ -297,17 +237,16 @@ img { display: block; }
   display: grid;
   grid-template-rows: 48px minmax(0, 1fr);
   overflow: hidden;
-  border: 2px solid #7c3aed;
-  border-radius: 9px;
+  border: 1px solid #7c3aed;
+  border-radius: 4px;
   background: #0f172a;
-  box-shadow: 0 6px 22px rgba(0, 0, 0, .42);
 }
 .via-seed-card strong {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding: 0 14px;
+  gap: 4px;
+  padding: 0 4px;
   color: #ede9fe;
   border-bottom: 1px solid #6d4bc1;
   font: 900 20px "DejaVu Sans Mono", monospace;
@@ -327,56 +266,55 @@ img { display: block; }
 }
 
 .via-grounding-overlay {
-  left: 20px;
-  bottom: 18px;
+  left: 4px;
+  bottom: 4px;
   width: 520px;
   height: 170px;
   display: grid;
   grid-template-columns: 210px minmax(0, 1fr);
-  gap: 14px;
-  padding: 10px;
+  gap: 4px;
+  padding: 4px;
   border-color: #2563eb;
 }
 .via-grounding-overlay img { width: 100%; height: 100%; object-fit: contain; background: #eaf1f8; }
-.via-grounding-overlay > div { padding: 8px 5px; }
+.via-grounding-overlay > div { padding: 4px; }
 .via-grounding-overlay strong { color: #60a5fa; font: 900 20px "DejaVu Sans Mono", monospace; }
-.via-grounding-overlay p { margin: 10px 0; font-size: 15px; }
+.via-grounding-overlay p { margin: 4px 0; font-size: 15px; }
 .via-grounding-overlay code { color: #bfdbfe; font: 13px "DejaVu Sans Mono", monospace; }
 
 .via-error-overlay {
-  left: 20px;
-  bottom: 18px;
+  left: 4px;
+  bottom: 4px;
   width: 620px;
-  padding: 16px 20px;
+  padding: 4px;
   border-color: #ef4444;
 }
 .via-error-overlay strong { color: #f87171; }
-.via-error-overlay p { margin: 8px 0 0; color: #fff; }
+.via-error-overlay p { margin: 4px 0 0; color: #fff; }
 
 .via-continuity-inset {
   position: absolute;
   z-index: 3;
-  right: 20px;
-  bottom: 18px;
+  right: 4px;
+  bottom: 4px;
   width: 560px;
   height: 170px;
   display: grid;
   grid-template-columns: 330px minmax(0, 1fr);
   overflow: hidden;
-  border: 2px solid #2563eb;
-  border-radius: 8px;
+  border: 1px solid #2563eb;
+  border-radius: 4px;
   color: #f8fafc;
   background: rgba(3, 7, 14, .94);
-  box-shadow: 0 5px 18px rgba(0, 0, 0, .38);
 }
 
 .via-continuity-raster { position: relative; min-width: 0; overflow: hidden; }
 .via-continuity-raster img { width: 100%; height: 100%; object-fit: cover; }
 .via-continuity-raster strong {
   position: absolute;
-  top: 8px;
-  left: 8px;
-  padding: 5px 8px;
+  top: 4px;
+  left: 4px;
+  padding: 3px 4px;
   border-radius: 4px;
   color: #fff;
   background: rgba(37, 99, 235, .92);
@@ -388,8 +326,8 @@ img { display: block; }
   display: flex;
   flex-direction: column;
   justify-content: center;
-  gap: 13px;
-  padding: 16px;
+  gap: 4px;
+  padding: 4px;
   border-left: 1px solid #3b82f6;
 }
 .via-continuity-facts b {
@@ -413,8 +351,8 @@ img { display: block; }
 
 .via-post-commit {
   display: grid;
-  grid-template-rows: 58px minmax(0, 1fr);
-  padding: 0 16px 16px;
+  grid-template-rows: 42px minmax(0, 1fr);
+  padding: 0 4px 4px;
   border-color: #64748b;
   background: #fff;
 }
@@ -425,18 +363,18 @@ img { display: block; }
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 48px minmax(0, 1fr) 420px;
-  gap: 12px;
+  gap: 4px;
 }
 
 .via-post-commit-grid-source {
   grid-template-columns:
     minmax(0, 1fr) 34px minmax(0, 1fr) minmax(0, 1fr) 360px;
-  gap: 9px;
+  gap: 4px;
 }
 
 .via-post-commit-grid-source .via-compare-card strong {
-  right: 12px;
-  max-width: calc(100% - 24px);
+  right: 4px;
+  max-width: calc(100% - 8px);
   font-size: 13px;
   line-height: 1.25;
 }
@@ -446,8 +384,8 @@ img { display: block; }
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  border: 2px solid #94a3b8;
-  border-radius: 9px;
+  border: 1px solid #94a3b8;
+  border-radius: 4px;
   background: #0b1220;
 }
 
@@ -460,10 +398,10 @@ img { display: block; }
 
 .via-compare-card strong {
   position: absolute;
-  top: 12px;
-  left: 12px;
-  padding: 7px 11px;
-  border-radius: 5px;
+  top: 4px;
+  left: 4px;
+  padding: 3px 4px;
+  border-radius: 4px;
   color: #fff;
   background: rgba(15, 23, 42, .86);
   font: 900 17px "DejaVu Sans Mono", monospace;
@@ -484,15 +422,15 @@ img { display: block; }
 .via-post-commit-facts {
   min-width: 0;
   overflow: hidden;
-  padding: 17px 20px;
-  border: 2px solid #94a3b8;
-  border-radius: 9px;
+  padding: 4px;
+  border: 1px solid #94a3b8;
+  border-radius: 4px;
   background: #f8fafc;
 }
 
 .via-post-commit-facts h2 {
-  margin: 0 0 9px;
-  padding-bottom: 11px;
+  margin: 0 0 4px;
+  padding-bottom: 4px;
   border-bottom: 1px solid #cbd5e1;
   color: #334155;
   font: 900 21px "DejaVu Sans Mono", monospace;
@@ -506,10 +444,10 @@ img { display: block; }
 .via-post-commit-facts .via-fact-row strong { color: #475569; font-size: 15px; }
 .via-post-commit-facts .via-fact-row code { font-size: 15px; }
 .via-post-commit-facts p {
-  margin: 15px 0 0;
-  padding: 12px 14px;
-  border: 2px solid #f59e0b;
-  border-radius: 7px;
+  margin: 4px 0 0;
+  padding: 4px;
+  border: 1px solid #f59e0b;
+  border-radius: 4px;
   color: #92400e;
   background: #fffbeb;
   font: 900 15px/1.35 "DejaVu Sans Mono", monospace;
@@ -522,7 +460,7 @@ img { display: block; }
 }
 
 .via-verification-card span {
-  margin-top: 6px;
+  margin-top: 4px;
   color: #78350f;
   font-size: 13px;
 }

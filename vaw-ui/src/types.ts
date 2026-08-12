@@ -1,18 +1,17 @@
 export interface VisualEditSummary {
-  kind: 'delta_move' | 'rotate' | 'gripper'
+  kind: 'delta_move' | 'rotate'
   frame: 'base' | 'tool'
   delta_xyz_m?: number[]
   axis?: 'x' | 'y' | 'z'
   angle_deg?: number
-  gripper_target?: 'open' | 'closed'
 }
 
 export interface ContextSnapshot {
-  schemaVersion: 25
-  schema: 'vaw-context-v24-imagination-agent'
+  schemaVersion: 31
+  schema: 'vaw-context-v30-main-gripper-review'
   renderId: string
   revision: number
-  viewport: { width: 1920; height: 1080 }
+  viewport: { width: 2048; height: 1280 }
   rasterIds: string[]
   rasters: Record<string, string>
   world: {
@@ -25,7 +24,7 @@ export interface ContextSnapshot {
     latestError: string | null
     lastPhysicalAction: {
       intent: string
-      executed_stages: 'arm' | 'gripper' | 'arm+gripper'
+      executed_stages: 'arm' | 'gripper'
       outcome: 'completed' | 'arm_failed' | 'gripper_failed'
       target_gripper?: 'open' | 'closed'
       requested_arm_delta_base_m?: number[]
@@ -52,7 +51,6 @@ export interface ContextSnapshot {
       action_id?: string
       intent?: string
       target_role: 'grasp_contact' | 'point_pose' | 'relative_pose' | 'gripper_only'
-      source_surface_delta_base_m?: number[]
       target: {
         pose?: { position_xyz: number[]; quaternion_xyzw: number[] }
         gripper?: 'open' | 'closed'
@@ -65,9 +63,9 @@ export interface ContextSnapshot {
       }
       latest_edit?: VisualEditSummary
       rotation_gizmo_frame?: 'base' | 'tool'
+      rotation_gizmo_axis?: 'x' | 'y' | 'z'
       edit_summary?: {
-        initial_target: { position_xyz?: number[]; gripper_target?: 'open' | 'closed' }
-        current_target: { position_xyz?: number[]; gripper_target?: 'open' | 'closed' }
+        target_gripper?: 'open' | 'closed'
         total_translation_base_m?: number[]
         total_rotation_axis_base?: number[]
         total_rotation_deg?: number

@@ -59,12 +59,11 @@ class ContextWorkspace:
         motion_backend: str | MotionBackend = "curobo",
         tcp_to_hand_local_xyz: tuple[float, float, float] | None = None,
         semantic_rgb_provider: Callable[[], np.ndarray] | None = None,
+        contact_camera_provider: Any | None = None,
     ) -> None:
         self.api = api
         self.camera_name = str(getattr(api, "camera_name", "agentview"))
-        self.wrist_camera_name = str(
-            getattr(api, "wrist_camera_name", "robot0_eye_in_hand")
-        )
+        self.wrist_camera_name = str(getattr(api, "wrist_camera_name", "robot0_eye_in_hand"))
         self.motion = (
             create_motion_backend(motion_backend, api)
             if isinstance(motion_backend, str)
@@ -80,12 +79,12 @@ class ContextWorkspace:
             if tcp_to_hand_local_xyz is None
             else tcp_to_hand_local_xyz
         )
-        self._tcp_to_hand_local_xyz = _finite_vector3(
-            backend_offset, "tcp_to_hand_local_xyz"
-        )
+        self._tcp_to_hand_local_xyz = _finite_vector3(backend_offset, "tcp_to_hand_local_xyz")
         self._semantic_rgb_provider = semantic_rgb_provider
         self.state = ContextState(task_prompt=task_prompt)
-        self._private = PrivateEnvContext()
+        self._private = PrivateEnvContext(
+            contact_camera_provider=contact_camera_provider,
+        )
         self.finished = False
         self.claimed_success = False
         self._functions = ContextFunctions(self)
@@ -165,7 +164,7 @@ class ContextWorkspace:
         return self.execute(name, **arguments)
 
     def limit_imagination(self) -> ContextStepResult:
-        """Return control to Main when the Imagination turn budget is spent."""
+        """Fail the active Imagination session when its turn budget is spent."""
 
         before = self.state.observation_revision
         self._private.begin_function_call()
@@ -212,9 +211,7 @@ class ContextWorkspace:
             revision_after=revision_after,
             manifest=self.state.manifest(),
             trace_diagnostics=(
-                dict(self._private.trace_diagnostics)
-                if self._private.trace_diagnostics
-                else None
+                dict(self._private.trace_diagnostics) if self._private.trace_diagnostics else None
             ),
         )
 
@@ -245,13 +242,9 @@ class ContextWorkspace:
             try:
                 image = np.asarray(self._semantic_rgb_provider())
             except Exception as exc:
-                raise ContextFunctionError(
-                    f"semantic RGB capture failed: {exc}"
-                ) from exc
+                raise ContextFunctionError(f"semantic RGB capture failed: {exc}") from exc
         if image.ndim != 3 or image.shape[2] not in {3, 4}:
-            raise ContextFunctionError(
-                f"semantic RGB must have shape (H,W,3/4), got {image.shape}"
-            )
+            raise ContextFunctionError(f"semantic RGB must have shape (H,W,3/4), got {image.shape}")
         if image.shape[0] < 2 or image.shape[1] < 2:
             raise ContextFunctionError("semantic RGB is empty")
         if image.dtype != np.uint8:
@@ -284,9 +277,7 @@ class ContextWorkspace:
         semantic_bottom = min(semantic.shape[0], int(np.ceil(bottom * scale_y)))
         crop = semantic[semantic_top:semantic_bottom, semantic_left:semantic_right]
         if crop.size == 0:
-            raise ContextFunctionError(
-                f"region '{within_region_id}' has an empty semantic crop"
-            )
+            raise ContextFunctionError(f"region '{within_region_id}' has an empty semantic crop")
         return crop
 
     def _crop_rgb(
@@ -330,9 +321,7 @@ def _robot_state(
     revision: int,
     tcp_to_hand_local_xyz: np.ndarray,
 ) -> RobotState:
-    cartesian = np.asarray(
-        observation.get("robot_cartesian_pos", []), dtype=np.float64
-    ).reshape(-1)
+    cartesian = np.asarray(observation.get("robot_cartesian_pos", []), dtype=np.float64).reshape(-1)
     ee_pose = None
     tcp_pose = None
     opening = None
@@ -356,9 +345,7 @@ def _robot_state(
             )
     if cartesian.size >= 8 and np.isfinite(cartesian[7]):
         opening = float(cartesian[7])
-    joints_array = np.asarray(
-        observation.get("robot_joint_pos", []), dtype=np.float64
-    ).reshape(-1)
+    joints_array = np.asarray(observation.get("robot_joint_pos", []), dtype=np.float64).reshape(-1)
     joints = (
         tuple(float(value) for value in joints_array[:7])
         if joints_array.size >= 7 and np.isfinite(joints_array[:7]).all()

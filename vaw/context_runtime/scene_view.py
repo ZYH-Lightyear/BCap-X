@@ -22,18 +22,18 @@ from vaw.context_runtime.gripper_mesh import (
     load_panda_urdf_fk,
     mask_outline,
     rasterize_silhouette,
+    thick_mask_outline,
 )
 from vaw.context_runtime.model import Pose, RobotState
 from vaw.context_runtime.near_field import NearFieldPreview
 
 OBSERVED_SCENE_WIDTH = 960
 OBSERVED_SCENE_HEIGHT = 570
-IMAGINATION_SCENE_WIDTH = 1260
-IMAGINATION_SCENE_HEIGHT = 560
+IMAGINATION_SCENE_WIDTH = 1200
+IMAGINATION_SCENE_HEIGHT = 720
 CONTACT_FOCUS_WIDTH_M = 0.32
 
-_BLUE = np.array([37, 99, 235], dtype=np.uint8)
-_BLUE_EDGE = np.array([23, 55, 130], dtype=np.uint8)
+_CURRENT_OUTLINE = np.array([255, 255, 255], dtype=np.uint8)
 _VIOLET = np.array([124, 58, 237], dtype=np.uint8)
 _VIOLET_EDGE = np.array([196, 181, 253], dtype=np.uint8)
 _AXIS_COLORS = ((239, 68, 68), (34, 197, 94), (59, 130, 246))
@@ -61,12 +61,8 @@ class _RasterMap:
     def pixels(self, uv: np.ndarray) -> np.ndarray:
         values = np.asarray(uv, dtype=np.float64)
         out = values.copy()
-        out[..., 0] = (values[..., 0] - self.left) * (
-            self.output_width / self.crop_width
-        )
-        out[..., 1] = (values[..., 1] - self.top) * (
-            self.output_height / self.crop_height
-        )
+        out[..., 0] = (values[..., 0] - self.left) * (self.output_width / self.crop_width)
+        out[..., 1] = (values[..., 1] - self.top) * (self.output_height / self.crop_height)
         return out
 
 
@@ -127,7 +123,7 @@ def render_scene_view(
     # resolution and then enlarging it made diagonal fingers look soft and
     # mask-like; final-resolution silhouettes stay crisp and hole-free.
     if robot is not None:
-        _overlay_current(output_array, camera, mapping, robot, dark=dark)
+        _overlay_current(output_array, camera, mapping, robot)
         if preview is not None:
             _overlay_reference_target(output_array, camera, mapping, robot, preview)
             _overlay_preview(output_array, camera, mapping, robot, preview)
@@ -135,8 +131,6 @@ def render_scene_view(
     draw = ImageDraw.Draw(output, "RGBA")
     if dark:
         _draw_world_axes(draw, camera, mapping)
-    if preview is not None:
-        _draw_target_annotation(draw, camera, mapping, robot, preview)
     return np.asarray(output, dtype=np.uint8)
 
 
@@ -325,16 +319,17 @@ def _overlay_source_surface(
     top = int(round(mapping.top))
     right = int(round(mapping.left + mapping.crop_width))
     bottom = int(round(mapping.top + mapping.crop_height))
-    cropped = Image.fromarray(mask.astype(np.uint8) * 255).crop(
-        (left, top, right, bottom)
+    cropped = Image.fromarray(mask.astype(np.uint8) * 255).crop((left, top, right, bottom))
+    visible = (
+        np.asarray(
+            cropped.resize(
+                (mapping.output_width, mapping.output_height),
+                Image.Resampling.NEAREST,
+            ),
+            dtype=np.uint8,
+        )
+        > 0
     )
-    visible = np.asarray(
-        cropped.resize(
-            (mapping.output_width, mapping.output_height),
-            Image.Resampling.NEAREST,
-        ),
-        dtype=np.uint8,
-    ) > 0
     if not np.any(visible):
         return
     emphasis = np.array([14, 165, 233], dtype=np.uint8)
@@ -365,23 +360,15 @@ def _overlay_current(
     camera: _CameraData,
     mapping: _RasterMap,
     robot: RobotState,
-    *,
-    dark: bool,
 ) -> None:
     if robot.joint_positions_rad is None or robot.gripper_opening is None:
         return
     triangles = _robot_triangles(robot.joint_positions_rad, robot.gripper_opening)
     if triangles is None:
         return
-    _overlay_triangles(
-        image,
-        camera,
-        mapping,
-        triangles,
-        _BLUE,
-        _BLUE_EDGE,
-        alpha=0.68 if dark else 0.78,
-    )
+    mask = _triangle_mask(image, camera, mapping, triangles)
+    if np.any(mask):
+        image[thick_mask_outline(mask, radius=2)] = _CURRENT_OUTLINE
 
 
 def _overlay_preview(
@@ -538,9 +525,7 @@ def _draw_world_axes(
         fill=(226, 232, 240, 255),
         font=_font(15),
     )
-    for index, (name, color) in enumerate(
-        zip(("+X", "+Y", "+Z"), _AXIS_COLORS, strict=True)
-    ):
+    for index, (name, color) in enumerate(zip(("+X", "+Y", "+Z"), _AXIS_COLORS, strict=True)):
         direction = uv[index + 1] - uv[0]
         norm = float(np.linalg.norm(direction))
         if norm <= 1e-9:
@@ -554,33 +539,6 @@ def _draw_world_axes(
             color,
             _font(18),
         )
-
-
-def _draw_target_annotation(
-    draw: ImageDraw.ImageDraw,
-    camera: _CameraData,
-    mapping: _RasterMap,
-    robot: RobotState | None,
-    preview: NearFieldPreview,
-) -> None:
-    pose = preview.target_pose or (robot.tcp_pose if robot is not None else None)
-    if pose is None:
-        return
-    position = np.asarray(pose.position_xyz, dtype=np.float64)
-    points = position[None, :]
-    uv, depth = _project_base(points, camera)
-    uv = mapping.pixels(uv)
-    if not np.isfinite(uv).all() or depth[0] <= 0:
-        return
-    anchor = uv[0]
-    label = np.array(
-        [
-            min(anchor[0] + 220.0, mapping.output_width - 180.0),
-            max(anchor[1] - 76.0, 72.0),
-        ]
-    )
-    draw.line((*anchor, *label), fill=(196, 181, 253, 255), width=4)
-    _boxed_label(draw, tuple(label), "TARGET GRIPPER", (124, 58, 237), _font(19))
 
 
 def _arrow(

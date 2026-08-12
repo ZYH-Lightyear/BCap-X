@@ -99,6 +99,7 @@ def main() -> int:
 
     from capx.envs.simulators.libero import FrankaLiberoTask
     from capx.integrations.franka.libero_reduced import FrankaLiberoApiReduced
+    from vaw.context_runtime.contact_camera import LiberoContactCameraProvider
     from vaw.context_runtime.libero_sensor import make_libero_semantic_rgb_provider
     from vaw.context_runtime.trace import ContextTraceLogger
     from vaw.context_runtime.video import save_episode_videos
@@ -117,6 +118,7 @@ def main() -> int:
         env,
         scale=args.semantic_render_scale,
     )
+    contact_camera_provider = LiberoContactCameraProvider(env)
     condition = "scripted" if args.mode == "scripted" else _safe_name(args.model)
     trace_dir = args.trace_dir or (
         pathlib.Path(__file__).resolve().parent.parent
@@ -125,7 +127,12 @@ def main() -> int:
         / f"{condition}_{args.motion_backend}_{args.suite}_t{args.task_id}_s{args.seed}"
     )
     trace = ContextTraceLogger(trace_dir)
-    trace.log_meta({"semantic_render_scale": args.semantic_render_scale})
+    trace.log_meta(
+        {
+            "semantic_render_scale": args.semantic_render_scale,
+            "contact_camera": "mujoco-direct-simulation-only",
+        }
+    )
     video_capture_enabled = False
     if args.record_video:
         try:
@@ -153,6 +160,7 @@ def main() -> int:
                 motion_backend=args.motion_backend,
                 scripted_refinement=args.scripted_refinement,
                 semantic_rgb_provider=semantic_rgb_provider,
+                contact_camera_provider=contact_camera_provider,
             )
         return _run_agent(
             api,
@@ -162,6 +170,7 @@ def main() -> int:
             trace,
             args,
             semantic_rgb_provider=semantic_rgb_provider,
+            contact_camera_provider=contact_camera_provider,
         )
     finally:
         if args.record_video:
@@ -205,6 +214,7 @@ def _run_agent(
     args: argparse.Namespace,
     *,
     semantic_rgb_provider: Any,
+    contact_camera_provider: Any,
 ) -> int:
     from vaw.agents.providers.openai import OpenAIProvider
     from vaw.agents.providers.text_protocol import TextProtocolProvider
@@ -237,6 +247,7 @@ def _run_agent(
             task_prompt,
             motion_backend=args.motion_backend,
             semantic_rgb_provider=semantic_rgb_provider,
+            contact_camera_provider=contact_camera_provider,
         ),
         renderer,
         imagination_provider=imagination_provider,
@@ -272,6 +283,7 @@ def _run_scripted(
     motion_backend: str,
     scripted_refinement: bool,
     semantic_rgb_provider: Any,
+    contact_camera_provider: Any | None = None,
 ) -> int:
     from vaw.context_runtime.packet import CONTEXT_SCHEMA, ContextCompiler
     from vaw.context_runtime.workspace import ContextWorkspace
@@ -281,6 +293,7 @@ def _run_scripted(
         task_prompt,
         motion_backend=motion_backend,
         semantic_rgb_provider=semantic_rgb_provider,
+        contact_camera_provider=contact_camera_provider,
     )
     compiler = ContextCompiler()
     trace.log_meta(
@@ -302,10 +315,7 @@ def _run_scripted(
         review_before = workspace.state.action_review
         result = workspace.execute(name, **arguments)
         if owner == "main" and name != "commit" and result.ok:
-            if (
-                review_before is not None
-                and workspace.state.action_review is review_before
-            ):
+            if review_before is not None and workspace.state.action_review is review_before:
                 workspace.discard_action_review()
             workspace.consume_main_context()
         env_success = bool(env.task_completed()) if name in workspace.PHYSICAL_FUNCTIONS else None
@@ -327,24 +337,18 @@ def _run_scripted(
             raise RuntimeError(result.result["error"])
         return result.result
 
-    workspace.set_refinement_goal("只把虚拟夹爪目标设为 open")
-    step("open_gripper")
-    action_id = step("finish_imagination", status="ready")["action_id"]
+    action_id = step("open_gripper")["action_id"]
     step("commit", action_id=action_id)
     region_id = step("detection_and_sam", query=object_query)["region_id"]
     step("locate_point", query=point_query, within_region_id=region_id)
     seed_ids = step("propose_grasps", region_id=region_id)["seed_ids"]
     if not seed_ids:
         raise RuntimeError("scripted smoke received no grasp candidates")
-    workspace.set_refinement_goal(
-        f"使两指围绕 {object_query} 形成可审查的对称接触几何"
-    )
+    workspace.set_refinement_goal(f"使两指围绕 {object_query} 形成可审查的对称接触几何")
     step("select", seed_id=seed_ids[0])
     action_id = step("finish_imagination", status="ready")["action_id"]
     step("commit", action_id=action_id)
-    workspace.set_refinement_goal("只把虚拟夹爪目标设为 closed")
-    step("close_gripper")
-    action_id = step("finish_imagination", status="ready")["action_id"]
+    action_id = step("close_gripper")["action_id"]
     step("commit", action_id=action_id)
     if scripted_refinement:
         workspace.set_refinement_goal("验证累计小幅平移与旋转在 Contact Focus 中清晰可见")

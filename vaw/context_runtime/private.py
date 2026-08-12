@@ -38,7 +38,6 @@ class VisualEdit:
     delta_xyz_m: tuple[float, float, float] | None = None
     axis: str | None = None
     angle_deg: float | None = None
-    gripper_target: str | None = None
 
     def summary(self) -> dict[str, Any]:
         result: dict[str, Any] = {"kind": self.kind}
@@ -52,8 +51,6 @@ class VisualEdit:
             result["axis"] = self.axis
         if self.angle_deg is not None:
             result["angle_deg"] = round(float(self.angle_deg), 6)
-        if self.gripper_target is not None:
-            result["gripper_target"] = self.gripper_target
         return result
 
     def command_summary(self) -> dict[str, Any]:
@@ -80,6 +77,7 @@ class ImaginationArtifacts:
     # On-demand visual aid selected by the Imagination Agent.  This is a
     # presenter hint, not part of the physical target or planner input.
     rotation_gizmo_frame: str | None = None
+    rotation_gizmo_axis: str | None = None
     turn_count: int = 0
 
 
@@ -127,17 +125,15 @@ class EditSummary:
     last_edit: VisualEdit | None
 
     def summary(self) -> dict[str, Any]:
-        # A quaternion is an exact transport representation, but its four
-        # components are not per-axis angles.  Exposing both endpoint
-        # quaternions encouraged vision-language models to invent an Euler
-        # interpretation and rotate otherwise useful seeds.  The control
-        # summary therefore carries position/gripper endpoints plus the exact
-        # relative axis-angle that was actually edited.  Full poses remain in
-        # private state and trace diagnostics.
-        result: dict[str, Any] = {
-            "initial_target": _control_target_summary(self.initial_target),
-            "current_target": _control_target_summary(self.current_target),
-        }
+        # Absolute TCP endpoints encouraged models to compare the TCP origin
+        # with guessed object dimensions and override visible contact geometry.
+        # Keep exact endpoints out of policy-visible text; they remain available
+        # to the presenter for rendering the purple robot and to offline trace.
+        # Visible control memory contains only cumulative edits and the explicit
+        # gripper target.
+        result: dict[str, Any] = {}
+        if self.current_target.gripper is not None:
+            result["target_gripper"] = self.current_target.gripper
         if self.total_translation_base_m is not None:
             result["total_translation_base_m"] = [
                 round(float(value), 6) for value in self.total_translation_base_m
@@ -145,25 +141,13 @@ class EditSummary:
         if self.total_rotation_deg is not None:
             result["total_rotation_deg"] = round(float(self.total_rotation_deg), 3)
             result["total_rotation_axis_base"] = [
-                round(float(value), 6)
-                for value in self.total_rotation_axis_base or (0.0, 0.0, 0.0)
+                round(float(value), 6) for value in self.total_rotation_axis_base or (0.0, 0.0, 0.0)
             ]
         if self.previous_edit is not None:
             result["previous_edit"] = self.previous_edit.command_summary()
         if self.last_edit is not None:
             result["last_edit"] = self.last_edit.command_summary()
         return result
-
-
-def _control_target_summary(target: ActionTarget) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    if target.pose is not None:
-        result["position_xyz"] = [
-            round(float(value), 6) for value in target.pose.position_xyz
-        ]
-    if target.gripper is not None:
-        result["gripper_target"] = target.gripper
-    return result
 
 
 def build_edit_summary(
@@ -190,9 +174,7 @@ def build_edit_summary(
         angle = float(np.linalg.norm(rotvec))
         rotation_deg = float(np.rad2deg(angle))
         rotation_axis = (
-            tuple(float(value) for value in rotvec / angle)
-            if angle > 1e-9
-            else (0.0, 0.0, 0.0)
+            tuple(float(value) for value in rotvec / angle) if angle > 1e-9 else (0.0, 0.0, 0.0)
         )
     return EditSummary(
         initial_target=initial,
@@ -225,6 +207,9 @@ class PrivateEnvContext:
     last_physical_artifacts: LastPhysicalArtifacts | None = None
     presentation_event: PresentationEvent | None = None
     trace_diagnostics: dict[str, Any] = field(default_factory=dict)
+    # Simulation-only presenter hook. It is never serialized into ContextPacket
+    # or exposed as an Agent Function.
+    contact_camera_provider: Any | None = None
 
     def begin_revision(self, observation: dict[str, Any]) -> None:
         self.previous_observation = self.observation

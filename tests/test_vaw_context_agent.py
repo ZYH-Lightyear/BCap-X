@@ -39,7 +39,7 @@ class SolidRenderer:
     name = "test-renderer"
 
     def render(self, packet):
-        return np.full((1080, 1920, 3), packet.revision, dtype=np.uint8)
+        return np.full((1280, 2048, 3), packet.revision, dtype=np.uint8)
 
     def close(self):
         return None
@@ -62,21 +62,12 @@ def _user_text(messages) -> str:
 def test_dual_agent_runtime_rebuilds_every_request_without_history(tmp_path: Path) -> None:
     main = RecordingProvider(
         [
-            _response(
-                1,
-                "start_imagination",
-                refinement_goal="设置闭合目标并检查两指通道",
-            ),
-            _response(4, "commit", action_id="a1"),
-            _response(5, "done", success=False),
+            _response(1, "close_gripper"),
+            _response(2, "commit", action_id="a1"),
+            _response(3, "done", success=False),
         ]
     )
-    imagination = RecordingProvider(
-        [
-            _response(2, "close_gripper"),
-            _response(3, "finish_imagination", status="ready"),
-        ]
-    )
+    imagination = RecordingProvider([])
     runtime = ContextRuntime(
         main,
         ContextWorkspace(FakeContextApi(), "test task", motion_backend="pyroki"),
@@ -88,8 +79,8 @@ def test_dual_agent_runtime_rebuilds_every_request_without_history(tmp_path: Pat
 
     result = runtime.run()
 
-    assert result.turns == 5
-    assert len(main.messages) == 3 and len(imagination.messages) == 2
+    assert result.turns == 3
+    assert len(main.messages) == 3 and len(imagination.messages) == 0
     for messages in [*main.messages, *imagination.messages]:
         assert [message["role"] for message in messages] == ["system", "user"]
         assert not any(message.get("role") in {"assistant", "tool"} for message in messages)
@@ -97,32 +88,25 @@ def test_dual_agent_runtime_rebuilds_every_request_without_history(tmp_path: Pat
     assert all(_image_count(messages) == 1 for messages in main.messages)
     post_commit_text = _user_text(main.messages[2])
     assert "Last Physical Action" in post_commit_text
-    assert "设置闭合目标并检查两指通道" in post_commit_text
+    assert "set gripper closed" in post_commit_text
     assert "Main Working Focus" in post_commit_text
-    assert "reason 4" in post_commit_text
-    assert "Refinement Goal：设置闭合目标并检查两指通道" in json.dumps(
-        imagination.messages[0], ensure_ascii=False
-    )
-    assert "reason 1" not in json.dumps(imagination.messages[0], ensure_ascii=False)
+    assert "reason 2" in post_commit_text
     review_text = _user_text(main.messages[1])
-    assert "Main Working Focus" in review_text
-    assert "reason 1" in review_text
-    assert "Edit Summary" in json.dumps(imagination.messages[0], ensure_ascii=False)
-    assert "reason 2" not in json.dumps(main.messages[1], ensure_ascii=False)
+    assert "Main Working Focus" not in review_text
+    assert "reason 1" not in review_text
+    assert '"target_gripper":"closed"' in review_text
 
     rows = [json.loads(line) for line in (tmp_path / "steps.jsonl").read_text().splitlines()]
     assert [row["agent_owner"] for row in rows] == [
         "main",
-        "imagination",
-        "imagination",
         "main",
         "main",
     ]
     assert all("visible_recent_calls" not in row for row in rows)
     assert all("execution_receipt" not in row for row in rows)
     assert rows[0]["main_working_focus"] is None
-    assert rows[3]["main_working_focus"] == "reason 1"
-    assert rows[4]["main_working_focus"] == "reason 4"
+    assert rows[1]["main_working_focus"] is None
+    assert rows[2]["main_working_focus"] == "reason 2"
 
 
 def test_main_keeps_only_one_overwrite_only_working_focus() -> None:
@@ -170,21 +154,12 @@ def test_main_keeps_only_one_overwrite_only_working_focus() -> None:
 def test_runtime_stops_after_environment_terminates_during_commit() -> None:
     main = RecordingProvider(
         [
-            _response(
-                1,
-                "start_imagination",
-                refinement_goal="只设置张开目标",
-            ),
-            _response(4, "commit", action_id="a1"),
-            _response(5, "done", success=False),
+            _response(1, "open_gripper"),
+            _response(2, "commit", action_id="a1"),
+            _response(3, "done", success=False),
         ]
     )
-    imagination = RecordingProvider(
-        [
-            _response(2, "open_gripper"),
-            _response(3, "finish_imagination", status="ready"),
-        ]
-    )
+    imagination = RecordingProvider([])
     terminated = False
 
     def terminal_check() -> bool:
@@ -208,12 +183,10 @@ def test_runtime_stops_after_environment_terminates_during_commit() -> None:
     ).run()
 
     assert result.terminate_mode.value == "env_terminated"
-    assert result.turns == 4
+    assert result.turns == 2
     assert len(main.messages) == 2
     assert [step.op for step in result.steps] == [
-        "main:start_imagination",
-        "imagination:open_gripper",
-        "imagination:finish_imagination",
+        "main:open_gripper",
         "main:commit",
     ]
 
@@ -221,28 +194,22 @@ def test_runtime_stops_after_environment_terminates_during_commit() -> None:
 def test_last_physical_action_persists_across_main_perception_calls() -> None:
     main = RecordingProvider(
         [
-            _response(
-                1,
-                "start_imagination",
-                refinement_goal="只设置真实执行后的张开目标",
-            ),
-            _response(4, "commit", action_id="a1"),
+            _response(1, "open_gripper"),
+            _response(2, "commit", action_id="a1"),
             ModelResponse(text="no function this time", tool_calls=()),
             _response(
-                6,
+                4,
                 "start_imagination",
                 refinement_goal="抬升并检查物体是否随动",
             ),
-            _response(9, "detection_and_sam", query="can"),
-            _response(10, "done", success=False),
+            _response(7, "detection_and_sam", query="can"),
+            _response(8, "done", success=False),
         ]
     )
     imagination = RecordingProvider(
         [
-            _response(2, "open_gripper"),
-            _response(3, "finish_imagination", status="ready"),
-            _response(7, "delta_move", delta_xyz_m=[0.0, 0.0, 0.05], frame="base"),
-            _response(8, "finish_imagination", status="failed"),
+            _response(5, "delta_move", delta_xyz_m=[0.0, 0.0, 0.05], frame="base"),
+            _response(6, "finish_imagination", status="failed"),
         ]
     )
     ContextRuntime(
@@ -253,33 +220,31 @@ def test_last_physical_action_persists_across_main_perception_calls() -> None:
     ).run()
 
     assert "Last Physical Action" in _user_text(main.messages[2])
-    assert "只设置真实执行后的张开目标" in _user_text(main.messages[2])
+    assert "set gripper open" in _user_text(main.messages[2])
     assert "Last Physical Action" in _user_text(main.messages[3])
     assert "Last Physical Action" in _user_text(main.messages[4])
     assert "Last Physical Action" in _user_text(main.messages[5])
-    assert "within [-0.03, 0.03]" in _user_text(imagination.messages[3])
+    assert "within [-0.03, 0.03]" in _user_text(imagination.messages[1])
     assert all(_image_count(messages) == 1 for messages in main.messages)
 
 
 def test_completed_gripper_action_remains_visible_during_lift_review() -> None:
     main = RecordingProvider(
         [
-            _response(1, "start_imagination", refinement_goal="闭合真实夹爪"),
-            _response(4, "commit", action_id="a1"),
+            _response(1, "close_gripper"),
+            _response(2, "commit", action_id="a1"),
             _response(
-                5,
+                3,
                 "start_imagination",
                 refinement_goal="保持闭合并上抬 3cm 核验随动",
             ),
-            _response(8, "done", success=False),
+            _response(6, "done", success=False),
         ]
     )
     imagination = RecordingProvider(
         [
-            _response(2, "close_gripper"),
-            _response(3, "finish_imagination", status="ready"),
-            _response(6, "delta_move", delta_xyz_m=[0.0, 0.0, 0.03], frame="base"),
-            _response(7, "finish_imagination", status="ready"),
+            _response(4, "delta_move", delta_xyz_m=[0.0, 0.0, 0.03], frame="base"),
+            _response(5, "finish_imagination", status="ready"),
         ]
     )
     ContextRuntime(
@@ -350,7 +315,7 @@ def test_review_tool_surface_requires_explicit_commit_revise_or_reject() -> None
     assert workspace.state.action_review is None
 
 
-def test_imagination_turn_limit_returns_neutral_review_to_main(tmp_path: Path) -> None:
+def test_imagination_turn_limit_returns_failed_handoff_to_main(tmp_path: Path) -> None:
     main = RecordingProvider(
         [
             _response(
@@ -363,8 +328,8 @@ def test_imagination_turn_limit_returns_neutral_review_to_main(tmp_path: Path) -
     )
     imagination = RecordingProvider(
         [
-            _response(2, "close_gripper"),
-            _response(3, "open_gripper"),
+            _response(2, "delta_move", delta_xyz_m=[0.01, 0.0, 0.0], frame="base"),
+            _response(3, "rotate", axis="z", angle_deg=5.0, frame="tool"),
         ]
     )
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
@@ -381,10 +346,15 @@ def test_imagination_turn_limit_returns_neutral_review_to_main(tmp_path: Path) -
     assert "Latest Imagination Handoff" in json.dumps(
         main.messages[1], ensure_ascii=False
     )
-    visible = json.dumps(main.messages[1], ensure_ascii=False)
-    assert "review_required" in visible
+    visible = _user_text(main.messages[1])
+    assert '"status":"failed"' in visible
+    assert "review_required" not in visible
+    assert '"review_action_id":null' in visible
     assert "budget_exhausted" not in visible
     assert "turn_limit" not in visible
+    assert [item["function"]["name"] for item in main.tools[1]] == list(
+        STANDARD_MAIN_FUNCTION_NAMES
+    )
     events = [
         json.loads(line)
         for line in (tmp_path / "runtime_events.jsonl").read_text().splitlines()

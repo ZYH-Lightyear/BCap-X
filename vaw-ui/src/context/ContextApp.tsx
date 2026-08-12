@@ -96,10 +96,19 @@ function GroundingOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
 }
 
 function EditOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
+  const action = snapshot.world.action
+  if (action?.target_role === 'gripper_only') {
+    return (
+      <div className="via-edit-overlay">
+        <FactRow label="GRIP TARGET">{action.target.gripper?.toUpperCase() ?? 'N/A'}</FactRow>
+        <FactRow label="PHYSICAL">NOT EXECUTED</FactRow>
+        <FactRow label="EFFECT">CONTACT / DYNAMICS UNKNOWN</FactRow>
+      </div>
+    )
+  }
   const edit = snapshot.world.action?.latest_edit
   const summary = snapshot.world.action?.edit_summary
   const lastEdit = edit ?? summary?.last_edit
-  const target = snapshot.world.action?.target
   const cumulativeMove = summary?.total_translation_base_m
   const cumulativeRotation = summary?.total_rotation_deg
   const hasCumulativeMove = cumulativeMove?.some((value) => Math.abs(value) >= 0.0005)
@@ -123,7 +132,6 @@ function EditOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
       <FactRow label="MOVE TOTAL">{move}</FactRow>
       <FactRow label="ROTATE LAST">{lastRotate}</FactRow>
       <FactRow label="ROTATE TOTAL">{rotate}</FactRow>
-      {target?.pose && <FactRow label="TARGET XYZ">{fmt(target.pose.position_xyz)}</FactRow>}
     </div>
   )
 }
@@ -163,65 +171,15 @@ function PhysicalContinuityInset({ snapshot }: { snapshot: ContextSnapshot }) {
 function decisionHeader(snapshot: ContextSnapshot, seedHeader: string): string {
   switch (snapshot.decision.mode) {
     case 'seeds': return seedHeader
-    case 'editing':
-    case 'reviewed': return 'IMAGINATION · NOT EXECUTED'
+    case 'editing': return 'IMAGINATION · NOT EXECUTED'
+    case 'reviewed': return snapshot.world.action?.target_role === 'gripper_only'
+      ? 'GRIPPER PREVIEW · NOT EXECUTED'
+      : 'ACTION REVIEW · NOT EXECUTED'
     case 'grounding': return 'CURRENT EVIDENCE · OBSERVED'
     case 'error': return 'RECOVERY CONTEXT · OBSERVED'
     case 'terminal': return 'FINAL OBSERVATION · REAL WORLD'
     default: return 'CURRENT GEOMETRY · OBSERVED'
   }
-}
-
-function WaypointPanel({ snapshot }: { snapshot: ContextSnapshot }) {
-  const action = snapshot.world.action
-  const prediction = action?.prediction
-  const planned = prediction?.solve_ik === 'returned'
-  const observedGrip = snapshot.world.robot?.gripper_opening
-  const targetGrip = action?.target.gripper === 'open'
-    ? 1
-    : action?.target.gripper === 'closed'
-      ? 0
-      : observedGrip
-  const grip = targetGrip === undefined
-    ? 'N/A'
-    : `${targetGrip.toFixed(3)} ${action?.target.gripper ? 'TARGET' : 'INHERITED'}`
-  const goal = snapshot.world.refinementGoal ?? action?.intent
-  const lastPhysical = snapshot.world.lastPhysicalAction
-  const lastRealParts: string[] = []
-  if (lastPhysical?.requested_arm_delta_base_m) {
-    lastRealParts.push(`ARM Δ ${fmt(lastPhysical.requested_arm_delta_base_m)}`)
-  }
-  if (lastPhysical?.target_gripper) {
-    lastRealParts.push(`GRIP ${lastPhysical.target_gripper.toUpperCase()}`)
-  }
-  if (lastPhysical) lastRealParts.push(lastPhysical.outcome.toUpperCase())
-  const lastReal = lastRealParts.length > 0 ? lastRealParts.join(' · ') : null
-  const targetRole = action?.target_role
-    ?.replaceAll('_', ' ')
-    .toUpperCase() ?? 'NONE'
-  const sourceDelta = action?.source_surface_delta_base_m
-  const sourceDistance = sourceDelta
-    ? Math.sqrt(sourceDelta.reduce((sum, value) => sum + value * value, 0))
-    : null
-  const sourceDeltaText = sourceDelta && sourceDistance !== null
-    ? `${fmt(sourceDelta, 3)} m · ${(sourceDistance * 1000).toFixed(0)} mm`
-    : null
-  const verification = snapshot.world.physicalVerification
-  return (
-    <aside className="via-waypoint-panel">
-      <h2>WAYPOINT</h2>
-      {lastReal && <FactRow label="LAST REAL">{lastReal}</FactRow>}
-      <FactRow label="TARGET ROLE">{targetRole}</FactRow>
-      {sourceDeltaText && <FactRow label="TCP→SOURCE BASE">{sourceDeltaText}</FactRow>}
-      <FactRow label="ARM">{action ? (planned ? 'PLANNED' : prediction?.solve_ik?.toUpperCase() ?? 'TARGET ONLY') : 'NONE'}</FactRow>
-      <FactRow label="GRIP TARGET">{grip}</FactRow>
-      {verification && (
-        <FactRow label="LAST EFFECT">{verification.kind.replace('_', ' ').toUpperCase()} · UNVERIFIED</FactRow>
-      )}
-      {verification && <FactRow label="NEEDS">{verification.evidenceNeeded}</FactRow>}
-      {goal && <p className="via-goal">{goal}</p>}
-    </aside>
-  )
 }
 
 function ImaginationLayer({ snapshot }: { snapshot: ContextSnapshot }) {
@@ -250,9 +208,8 @@ function ImaginationLayer({ snapshot }: { snapshot: ContextSnapshot }) {
                 </div>
                 <aside className="via-contact-rail">
                   <div className="via-contact-focus">
-                    <Raster snapshot={snapshot} id={snapshot.world.contactFocusRasterId} alt="目标夹爪 jaw-plane 接触视图" />
+                    <Raster snapshot={snapshot} id={snapshot.world.contactFocusRasterId} alt="目标夹爪双正交接触视图" />
                   </div>
-                  <WaypointPanel snapshot={snapshot} />
                 </aside>
               </div>
             : <>

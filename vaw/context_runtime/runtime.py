@@ -44,7 +44,7 @@ from vaw.context_runtime.workspace import ContextStepResult, ContextWorkspace
 NO_CALL_FEEDBACK = "未执行：本轮必须且只能调用一个 Function。"
 MULTI_CALL_ERROR = "未执行：一轮只能调用一个 Function。"
 IMAGINATION_STARTERS = frozenset(
-    {"select", "propose_pose", "start_imagination", "revise_action"}
+    {"select", "propose_pose", "start_imagination"}
 )
 
 
@@ -109,7 +109,7 @@ class ContextRuntime:
                     "context_schema": CONTEXT_SCHEMA,
                     "renderer": renderer.name,
                     "task_prompt": workspace.state.task_prompt,
-                    "orchestration": "main-imagination-single-working-focus",
+                    "orchestration": "main-spatial-imagination-gripper-review",
                     "max_imagination_turns": self.config.max_imagination_turns,
                     "motion_backend": workspace.motion_backend_name,
                 }
@@ -353,6 +353,12 @@ class ContextRuntime:
 
     def _visible_main_working_focus(self, owner: str) -> str | None:
         if owner != "main":
+            return None
+        # Action Review must independently inspect the final visual geometry.
+        # Re-injecting the previous Main rationale caused a first mistaken
+        # judgment (for example, "target too low") to reinforce itself across
+        # repeated revise/ready cycles.
+        if self.workspace.state.action_review is not None:
             return None
         return self._main_working_focus
 

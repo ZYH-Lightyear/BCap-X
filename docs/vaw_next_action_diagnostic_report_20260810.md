@@ -168,25 +168,15 @@ native tool-calling 运行，将决策质量和序列化协议分开评估。
 如果 K=0 显著改善 `next_07/next_10`，主要问题是 History anchoring；如果 native 只改善 no-call，
 但 `next_05` 仍直接 commit，则核心仍是自主视觉决策，而不是协议。
 
-## 8. 复现与产物
+## 8. 历史产物
 
-- Case 定义：`vaw/diagnostics/next_action_cases.json`
-- Runner：`vaw/diagnostics/run_next_action.py`
+该诊断基于已经退役的 K=8 单 Agent Context 协议。对应 Case、Runner 和单元测试已在
+Main/Imagination、history-free Runtime 成为主线后删除，不再作为当前 VAW 的可复现测试入口。
+
 - 原始逐题结果：
   `vaw/out/next_action_diagnostics/gpt55_vs_qwen35plus_20260810_live/results.jsonl`
 - 自动摘要：
   `vaw/out/next_action_diagnostics/gpt55_vs_qwen35plus_20260810_live/summary.md`
-
-复现命令：
-
-```bash
-python -m vaw.diagnostics.run_next_action \
-  --models vapi/gpt-5.5 vapi/qwen3.5-plus \
-  --server-url http://127.0.0.1:8110/chat/completions \
-  --temperature 0 \
-  --max-tokens 768 \
-  --allow-image-egress
-```
 
 该结果只运行一次，不应被解释为模型排名或统计显著结论；它的用途是定位 VAW Agent Loop 的具体
 失效机制，并为后续 protocol、History 和 Prompt 消融提供固定回归集。

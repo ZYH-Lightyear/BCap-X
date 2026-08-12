@@ -45,7 +45,7 @@ M1.5 只有同时满足以下条件才算完成。
 
 ### 2.3 视觉可控性门槛
 
-- 固定输出 `1920×1080`、DPR=1、无滚动、动画或响应式重排；
+- 固定输出 `2048×1280`、DPR=1、无滚动、动画或响应式重排；
 - `OBSERVED NOW` 始终只显示当前真实 observation，不叠加虚拟结果；
 - `select/propose_grasps` 时最多五个 seed 必须同时完整可见，ID 与图像一一对应，不被裁切、
   遮挡或缩小到无法比较；
@@ -55,8 +55,8 @@ M1.5 只有同时满足以下条件才算完成。
 - 单次 `3 cm` 位移和 `10°` 旋转必须在相邻 Preview 中产生清晰可辨的几何变化；
 - target 处不绘制遮挡物体的局部三轴。BASE/WORLD 或 orientation 提示只能出现在固定边角或
   独立 widget；
-- 紫色只表示未执行目标，蓝色只表示当前真实机器人；不预测或暗示物体会被抓住、移动、释放
-  或进入容器。
+- 紫色实体只表示未执行目标；当前真实机器人仅使用白色轮廓标记，不覆盖当前视觉证据。两者都
+  不预测或暗示物体会被抓住、移动、释放或进入容器。
 
 ## 3. 当前基线与已证实缺陷
 
@@ -95,12 +95,13 @@ Current real observation
 Main Agent
   ├─ perception / evidence
   ├─ create ActionSeed + concise refinement goal
+  ├─ create gripper-only open/close ActionReview
   └─ review final ActionReview
         │
         ▼
 Imagination Agent
   ├─ inspect Contact Focus
-  ├─ delta_move / rotate / gripper preview
+  ├─ delta_move / rotate
   ├─ minimal edit memory
   └─ handoff: review_required | failed
         │
@@ -127,9 +128,9 @@ revision 生命周期与最小因果连续性。
 Main System Prompt
 User Task
 Current semantic manifest
-Optional ActionReview
+Optional ActionReview (spatial handoff or Main-created gripper-only preview)
 Optional LastPhysicalAction (one item, overwrite-only)
-Current 1920×1080 Canvas
+Current 2048×1280 Canvas
 ```
 
 不加入 Function transcript、旧 reasoning、旧 evidence ID 或多轮图片历史。
@@ -141,7 +142,7 @@ Imagination System Prompt
 Concise refinement goal
 Current ActionTarget
 EditSummary
-Current 1920×1080 Canvas
+Current 2048×1280 Canvas
 ```
 
 `EditSummary` 是命令状态，不是对话历史：
@@ -174,7 +175,7 @@ EditSummary
 ```text
 LastPhysicalAction
 ├── intent
-├── executed_stages: arm | gripper | arm+gripper
+├── executed_stages: arm | gripper
 └── outcome: completed | arm_failed | gripper_failed
 ```
 
@@ -219,7 +220,8 @@ Imagination 下层采用固定结构：
 - source region 对应的当前 RGB-D surface 可高亮，其他点降低亮度；
 - `delta_move`：显示 previous→current target 的外置箭头、last delta 和 cumulative delta；
 - `rotate`：显示新旧 silhouette 差异和独立 rotation widget，不在物体上叠加三轴；
-- gripper edit：只改变虚拟指宽，并明确物体点保持当前 observation，不模拟动力学；
+- gripper-only preview：由 Main 直接创建，只改变虚拟指宽；不进入 Imagination，并明确物体点
+  保持当前 observation、不模拟动力学；
 - planner error 只作为紧凑状态，不替代几何判断。
 
 ### 6.4 Post-Commit
@@ -240,9 +242,11 @@ failed(source_ref?)
 ```
 
 - Imagination 主动认为足够合理时产生 `review_required`；
-- 达到 turn limit 时也产生 `review_required`，但 `termination_reason=turn_limit` 仅写 trace；
-- Main 不能仅根据 handoff 原因 commit，必须看最终 Preview；
-- Main 也不能把达到编辑上限自动解释为失败；
+- 达到 turn limit 时产生 `failed`，不创建 `ActionReview` 或 action ID；
+- `termination_reason=turn_limit` 只写 trace，不进入 Agent-visible handoff；
+- Main 只审查动作意图、真实执行前提、planner 可执行性和下一物理动作是否合理；局部位置、
+  方向、两指通道与邻近碰撞由 Imagination 单独裁决；
+- Review 不提供返回同一 target 继续微调的 Function；失败后必须换 seed、point 或动作路线；
 - ActionReview 是一次 Main 决策的 offer：下一次成功 Function 若不是 `commit`，即视为放弃，
   action 与私有 plan 同步销毁；无效调用不消费 review；
 - 若 target 没有可执行 motion plan，必须产生 `failed` 或显式 planner error，不创建可 commit
@@ -285,11 +289,11 @@ OR fail this target
 
 - 引入最小 `EditSummary`；
 - refinement goal 改为显式短文本，不再复用完整 rationale；
-- 对 Main 隐藏 `budget_exhausted`，统一为 `review_required`；
+- 对 Main 隐藏内部预算原因；主动 ready 才产生 review，超限产生无 action 的 failed handoff；
 - 更新 Imagination Prompt 和 Function 描述，使 accept/edit/fail 对称。
 
-验收：fake provider 覆盖主动 ready、turn-limit review、failed 和 planner error；真实静态 session
-不再持续出现无信息的正负方向抵消；Main 能审查 limit 交回的最终动作。
+验收：fake provider 覆盖主动 ready、turn-limit failed、agent failed 和 planner error；真实静态
+session 不再持续出现无信息的正负方向抵消；超限 target 不可被 Main commit。
 
 ### M1.5.3 — Post-Commit Continuity
 
@@ -553,14 +557,53 @@ Prompt 要求沿同号 BASE 分量小步试探，并逐轮确认向量范数缩�
 
 v23 的真实短 probe 进一步证明，仅给当前 source vector 仍不足以支持无 transcript 的逐步比较：
 下一轮看不到上一版 target，模型会在向量翻转后继续沿旧方向编辑。v24 因此收紧 Agent 所有权：
-Main 只能通过 `select/propose_pose/start_imagination` 创建局部控制会话，Review 只能
-`commit/reject/revise_action` 或换起点，`delta_move/rotate/open/close` 仅属于 Imagination。
-每次空间编辑后的 Contact Focus 同时显示青色 previous Preview 与紫色 current Preview；按需
-`show_rotation_gizmo(frame)` 显示 VIA 风格三轴旋转环，不改变 target 或 planner。Main、Review、
-Imagination 的 Prompt 顶部共享抓取接近前 open、校准时保持 open、运输时 closed、释放前检查当前
-真实目标区域的因果前提。active target 与 near-field presentation 选择逻辑从巨型 `packet.py`
-拆入独立 presenter。版本更新为 Web schema 25 / `vaw-context-v24-imagination-agent` / renderer
+Main 只能通过 `select/propose_pose/start_imagination` 创建空间控制会话，Review 只能
+`commit/reject` 或换起点，`delta_move/rotate` 仅属于 Imagination；`open/close` 后续收敛为
+Main 直接创建的 gripper-only Review，不再进入空间 Imagination。进一步删除
+把同一 target 退回局部编辑的路径，避免 Main 与 Imagination 成为重复几何裁判。
+每次空间编辑后的 Contact Focus 同时显示青色 previous Preview 与紫色 current Preview；当时按需
+显示的三轴旋转环现已由 v29 的单轴正负对照替代。Main、Review、Imagination 的 Prompt 顶部共享
+抓取接近前 open、校准时保持 open、运输时 closed、释放前检查当前真实目标区域的因果前提。
+active target 与 near-field presentation 选择逻辑从巨型 `packet.py` 拆入独立 presenter。版本更新
+为 Web schema 25 / `vaw-context-v24-imagination-agent` / renderer
 `context-web-v24-imagination-agent`。
+
+v24 的单个正交 Contact Focus 仍会把沿观察方向的偏移压成同一投影，且原始 point-splat 在
+novel view 中产生明显孔洞。v25 将右侧局部证据改为与 target tool 对齐的双正交视图：
+`CONTACT FRONT · TOOL Y-Z` 观察两指闭合通道，`CONTACT SIDE · TOOL X-Z` 暴露 FRONT 隐藏的
+前后与高度偏差。两张图共享同一当前 agentview+wrist RGB-D、目标坐标系、尺度与紫色 Preview。
+RGB-D presenter 同时改为按相邻 sensor pixel 构造纹理三角面，并在深度断层和异常长边处断开，
+以得到连续但不虚构遮挡面的 surface。Canvas 仍固定 `1920×1080`，右侧 rail 经视觉复核扩为
+768 px；坐标提示只绘制当前正交平面中的两根轴，观察方向独立写为 `LOOK +axis`，避免三个轴
+投影到同一点产生标签堆叠。版本
+更新为 Web schema 26 / `vaw-context-v25-dual-contact-surface` / renderer
+`context-web-v25-dual-contact-surface`。
+
+v26 不再把 16:9 当作约束，固定 viewport 改为 `2048×1280`。上层使用 540 px，下层使用
+733 px；imagination scene 与双 Contact raster 分别原生输出 `1200×720` 和 `832×720`，避免
+仅放大 DOM 后产生 letterbox。Canvas 外边距、上下层间隔、卡片间隔和主要边框全部收敛到
+`1–4px`，新增像素只服务当前真实世界与动作想象。版本更新为 Web schema 27 /
+`vaw-context-v28-visual-contact-only` / renderer
+`context-web-v28-visual-contact-only`。Contact Camera 在每次 Imagination 开始时锁定水平朝向，
+WORLD +Z 始终朝上；后续 rotate 只改变虚拟夹爪，不反向旋转当前 RGB-D 点云或支撑面。
+
+v29 将 Contact View 从 agentview/wrist RGB-D 的 novel-view 重投影改为两张 episode-private
+MuJoCo Contact Camera 直接渲染。相机以初始 Imagination target 为中心、WORLD +Z 朝上且在
+session 内锁定；每次截图只临时修改 `frontview/sideview` 相机并在 `finally` 恢复，不推进仿真。
+这消除了深度断层和遮挡造成的重投影孔洞，使当前场景达到 agentview 同源的密集 raster 质量；
+同时它是 simulation-only active sensor，不得在实验中描述为普通 Canvas 重排。旧的物体中心
+三轴旋转环被删除，`show_rotation_gizmo(frame, axis)` 改为 Contact View 独立右栏中的单轴
+`−10° / +10°` 真实夹爪姿态对照，不遮挡接触证据。版本更新为 Web schema 30 /
+`vaw-context-v29-direct-contact-camera` / renderer `context-web-v29-direct-contact-camera`。
+
+v30 将夹爪控制从空间 Imagination 中彻底分离。`open_gripper/close_gripper` 现在只出现在普通
+Main Function 面，直接创建一个 pose-free、gripper-only ActionReview；它不调用 controller、
+不刷新 observation，也不进入 Imagination。下一轮 Main 从当前真实 Contact Front/Side 与全局
+关系审查后显式 `commit/reject`。Imagination 只保留 `delta_move/rotate/rotation gizmo/finish`，
+空间 Preview 始终继承当前真实开度，避免局部姿态优化与接触动作在同一会话互相污染。Context
+中的纯夹爪 Review 只公开目标开度、`NOT EXECUTED` 和接触/动力学未知边界，不伪造 arm motion
+或抓取/释放效果。版本更新为 Web schema 31 / `vaw-context-v30-main-gripper-review` / renderer
+`context-web-v30-main-gripper-review`。
 
 验收：主任务 seeds `0,1,2` 至少 `2/3` env success。
 
@@ -580,7 +623,7 @@ Imagination 的 Prompt 顶部共享抓取接近前 open、校准时保持 open�
 | Model | revision 生命周期、target/edit/review/last-action 状态 | unit tests |
 | Function | preview 无物理副作用、commit-only physics、cached plan 一致 | fake backend |
 | Context | 无隐私泄漏、请求形状稳定、无 transcript history | message snapshot tests |
-| Canvas | 1920×1080、五 seed 完整、metric focus、delta/rotate 可辨识 | deterministic PNG tests |
+| Canvas | 2048×1280、五 seed 完整、metric focus、delta/rotate 可辨识 | deterministic PNG tests |
 | Agent | Imagination 能 accept/edit/fail，Main 能 commit/revise | scripted/fake provider tests |
 | Static VLM | 无选项判断局部缺陷和下一动作 | frozen diagnostic set |
 | Real | 基本 pick-place env success | LIBERO-PRO traces + evaluator |

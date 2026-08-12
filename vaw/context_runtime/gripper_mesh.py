@@ -301,3 +301,31 @@ def mask_outline(mask: np.ndarray) -> np.ndarray:
     eroded[:, 1:] &= mask[:, :-1]
     eroded[:, :-1] &= mask[:, 1:]
     return mask & ~eroded
+
+
+def thick_mask_outline(mask: np.ndarray, *, radius: int = 2) -> np.ndarray:
+    """Return a visible silhouette outline without filling the enclosed mask.
+
+    ``mask_outline`` is intentionally one pixel wide for geometry operations.
+    Policy-visible robot contours need to survive raster scaling, so this helper
+    expands that boundary symmetrically while leaving the silhouette interior
+    untouched.
+    """
+
+    if radius < 0:
+        raise ValueError("radius must be non-negative")
+    outline = mask_outline(np.asarray(mask, dtype=bool))
+    for _ in range(radius):
+        padded = np.pad(outline, 1, mode="constant")
+        outline = (
+            padded[1:-1, 1:-1]
+            | padded[:-2, 1:-1]
+            | padded[2:, 1:-1]
+            | padded[1:-1, :-2]
+            | padded[1:-1, 2:]
+            | padded[:-2, :-2]
+            | padded[:-2, 2:]
+            | padded[2:, :-2]
+            | padded[2:, 2:]
+        )
+    return outline

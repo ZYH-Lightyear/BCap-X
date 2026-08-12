@@ -34,14 +34,14 @@ class Pose:
 
 @dataclass(frozen=True)
 class ActionTarget:
-    """The complete physical target under visual review."""
+    """One atomic arm or gripper target under visual review."""
 
     pose: Pose | None = None
     gripper: GripperTarget | None = None
 
     def __post_init__(self) -> None:
-        if self.pose is None and self.gripper is None:
-            raise ValueError("ActionTarget must contain a pose or gripper target")
+        if (self.pose is None) == (self.gripper is None):
+            raise ValueError("ActionTarget must contain exactly one of pose or gripper")
 
     def summary(self) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -109,7 +109,7 @@ class LastPhysicalAction:
     """
 
     intent: str
-    executed_stages: Literal["arm", "gripper", "arm+gripper"]
+    executed_stages: Literal["arm", "gripper"]
     outcome: Literal["completed", "arm_failed", "gripper_failed"]
     target_gripper: Literal["open", "closed"] | None = None
     requested_arm_delta_base_m: tuple[float, float, float] | None = None

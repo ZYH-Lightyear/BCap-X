@@ -31,10 +31,10 @@ function Root() {
   useEffect(() => {
     window.__VAW_RENDER__ = async (next) => {
       if (
-        next.schemaVersion !== 25
-        || next.schema !== 'vaw-context-v24-imagination-agent'
-        || next.viewport.width !== 1920
-        || next.viewport.height !== 1080
+        next.schemaVersion !== 31
+        || next.schema !== 'vaw-context-v30-main-gripper-review'
+        || next.viewport.width !== 2048
+        || next.viewport.height !== 1280
       ) {
         throw new Error('Unsupported VAW Context snapshot')
       }
