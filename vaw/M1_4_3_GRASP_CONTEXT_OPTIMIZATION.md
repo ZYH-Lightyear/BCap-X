@@ -1,4 +1,9 @@
-# VAW M1.4.3 — 20-Turn Grasp Context Optimization
+# ARCHIVED — VAW M1.4.3 20-Turn Grasp Context Optimization
+
+> **历史实验计划，不是当前规范。** 本文的 Context v7、20-turn 基线、Imagination
+> `open/close` 和当时的可视化缺陷保留为失败证据；后续实现已跨多个 M1.5 版本演进。
+> 当前代码契约见 [`CURRENT_ARCHITECTURE.md`](CURRENT_ARCHITECTURE.md)，当前验收路线见
+> [`M1_5_AGENTIC_SYSTEM_COMPLETION.md`](M1_5_AGENTIC_SYSTEM_COMPLETION.md)。
 
 ## 目标
 

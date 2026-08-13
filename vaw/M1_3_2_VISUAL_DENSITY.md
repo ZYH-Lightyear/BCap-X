@@ -1,5 +1,8 @@
-# VAW M1.3.2：Visual Density 与动作后视觉核验
+# ARCHIVED — VAW M1.3.2 Visual Density 设计稿
 
+> **历史设计冻结，未按本文形态实现，已被 M1.5 架构取代。** 当前 Canvas、Function ownership
+> 和 Context Builder 见 [`CURRENT_ARCHITECTURE.md`](CURRENT_ARCHITECTURE.md)。以下
+> `1440×1080`、wrist RGB、K=8 和旧 renderer 内容只用于解释设计演进。
 > 状态：设计冻结，尚未实现  
 > 目标 renderer：`context-web-v2-dense`  
 > 输出：固定 `1440×1080`、DPR=1

@@ -7,8 +7,8 @@ export interface VisualEditSummary {
 }
 
 export interface ContextSnapshot {
-  schemaVersion: 31
-  schema: 'vaw-context-v30-main-gripper-review'
+  schemaVersion: 32
+  schema: 'vaw-context-v31-separated-control-guides'
   renderId: string
   revision: number
   viewport: { width: 2048; height: 1280 }

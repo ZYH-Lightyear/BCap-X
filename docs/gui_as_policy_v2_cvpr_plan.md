@@ -3,6 +3,13 @@
 > 取代 v1 笔记（`gui_as_policy_research_note.md`）中模糊的性质清单。本版回答三件事：
 > 定位是什么、训什么/优化目标是什么、实现怎么做到 paper-level 最小。
 
+> **实现快照说明（2026-08-13）**：本文是论文研究计划，包含尚未完成的训练与奖励设计；它不
+> 充当运行时接口文档。当前 M1.5 实现采用 history-free Main/Imagination ownership、互斥工具面、
+> commit-only physics、`2048×1280` Canvas 和 simulation-only Direct Contact Camera。精确契约见
+> [`vaw/CURRENT_ARCHITECTURE.md`](../vaw/CURRENT_ARCHITECTURE.md)，运行方法见
+> [`vaw/README.md`](../vaw/README.md)。论文 Method 更新时应明确区分通用 VAW 表示与
+> Direct Contact Camera 这一仿真实验性观测条件。
+
 ## 0. 论文标题、一句话总结与 Main Contributions
 
 **标题（主选）**：

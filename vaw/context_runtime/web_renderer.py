@@ -15,7 +15,7 @@ from vaw.context_runtime.packet import (
 
 
 class ContextWebRenderer:
-    name = "context-web-v30-main-gripper-review"
+    name = "context-web-v31-separated-control-guides"
     width = CONTEXT_WIDTH
     height = CONTEXT_HEIGHT
 

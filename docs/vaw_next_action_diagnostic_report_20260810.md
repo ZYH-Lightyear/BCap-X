@@ -1,5 +1,9 @@
 # VAW 开放式下一步动作诊断报告（2026-08-10）
 
+> **冻结历史报告。** 本文中的“当前”指 2026-08-10 的十一 Function、K=8 History 和
+> `1920×1440` Canvas，不代表现有 VAW Runtime。结果和原输入应保持不变以便复现；当前实现契约
+> 见 [`vaw/CURRENT_ARCHITECTURE.md`](../vaw/CURRENT_ARCHITECTURE.md)。
+
 ## 1. 目的
 
 此前的静态选择题中，GPT5.5 得到 9/10，Qwen3.5-Plus 得到 10/10。但选择题会替模型指出

@@ -10,7 +10,7 @@
       "reasoning_style": "openrouter"
     },
     "vapi": {
-      "base_url": "https://api.gpt.ge/v1/",
+      "base_url": "https://api.vveai.com/v1/",
       "api_key_env": ["V_API_KEY", "LLM_API_KEY"],
       "reasoning_effort": "none",
       "token_field": "auto",

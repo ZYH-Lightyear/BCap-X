@@ -8,8 +8,9 @@ call。
 和物理提交；Imagination Agent 在独立、无物理副作用的会话中连续检查和微调一个
 `ActionTarget`。
 
-当前权威目标、完成定义、Agentic Context 设计和逐版本验收路线见
-[`M1_5_AGENTIC_SYSTEM_COMPLETION.md`](M1_5_AGENTIC_SYSTEM_COMPLETION.md)。双 Agent 基线见
+当前实现契约见 [`CURRENT_ARCHITECTURE.md`](CURRENT_ARCHITECTURE.md)；权威目标、完成定义和
+逐版本验收路线见 [`M1_5_AGENTIC_SYSTEM_COMPLETION.md`](M1_5_AGENTIC_SYSTEM_COMPLETION.md)。
+双 Agent 基线见
 [`M1_4_2_DUAL_AGENT_RUNTIME.md`](M1_4_2_DUAL_AGENT_RUNTIME.md)；早期 20-turn 抓取审计见
 [`M1_4_3_GRASP_CONTEXT_OPTIMIZATION.md`](M1_4_3_GRASP_CONTEXT_OPTIMIZATION.md)，二者只作为
 历史失败证据，不再定义当前完成标准。
@@ -100,27 +101,31 @@ Main 自己的一句依据，用于在感知调用后保留“抓取失败，正
 
 ## Canvas
 
-Web schema 31 / `vaw-context-v30-main-gripper-review` / renderer
-`context-web-v30-main-gripper-review`：
+Web schema 32 / `vaw-context-v31-separated-control-guides` / renderer
+`context-web-v31-separated-control-guides`：
 
 - 上层 `OBSERVED NOW · REAL WORLD`：干净 agentview、与 agentview 标定透视一致的稠密
   RGB-D surface 和四行本体状态；
 - `ACTION SEEDS`：最多五个候选以固定五列占满下层，统一尺度并完整显示；每张卡直接标出
   精确 `APPROACH BASE [x,y,z]`，使 Main 不必从二维投影猜 side/top-down；
-- active target 时下层为 `IMAGINATION · NOT EXECUTED`：左侧保留同一当前 RGB-D surface 的
-  camera-aligned 全局 Preview；右侧同时显示与目标夹爪对齐的 `CONTACT FRONT · TOOL Y-Z`
-  和 `CONTACT SIDE · TOOL X-Z`。前者展示两指闭合通道，后者暴露单一正投影隐藏的前后/高度
-  偏差；紫色 target 始终表示未执行；
+- active target 时下层为 `IMAGINATION · NOT EXECUTED`：左侧保留当前 RGB-D surface 的
+  camera-aligned 全局 Preview；右侧同时显示重力稳定、session 锁定的 `CONTACT FRONT` 和
+  `CONTACT SIDE`。两张图提供互补的闭合通道、前后和高度证据，但不再宣称是随 target 旋转的
+  TOOL 平面；紫色 target 始终表示未执行；
 - 真实 LIBERO-PRO 的 Contact View 不再从 agentview/wrist RGB-D 重投影 novel view，而是由
   两张 episode-private、重力稳定且 session 锁定的 MuJoCo Contact Camera 直接光栅化；因此
   背景、物体表面、机器人与遮挡边界具有与 agentview 相同的稠密图像质量，不再产生重投影孔洞。
   这是 simulation-only active sensor，实验中必须与仅重排原观测的 Canvas 版本区分；
+- Contact View 左上 `ROTATE BASE` 是固定斜视的三维右手正向控制图例；右上 `MOVE BASE`
+  根据真实相机标定只显示两个最具屏幕可见性的 BASE 正轴，最接近视线方向的第三轴独立放入
+  `DEPTH` 子卡，并用 `IN/OUT`、叉/点表达深度正方向，避免三轴与标签堆叠；
 - `rotate` 仍使用所选 +轴的右手定则；`show_rotation_gizmo(frame, axis)` 不再把三轴旋转环覆盖
   在物体中心，而是在每张 Contact View 的独立右侧栏显示该单轴 `−10° / +10°` 两张真实夹爪
   姿态对照。它只解释符号，不修改 target、不规划、不执行；
 - 每次空间编辑后，Contact Focus 同时显示青色 `PREVIOUS PREVIEW` 和紫色 `CURRENT PREVIEW`，
   让 history-free Agent 在一张当前图里比较编辑前后；
-- Canvas 不再绘制 Waypoint 文字卡；下层空间全部用于当前点云、紫色 target 与 Contact Focus，
+- Canvas 不再绘制 Waypoint 文字卡；下层空间全部用于当前 scene raster、紫色 target 与
+  Direct Contact Camera，
   避免把待验证的 intent、target 或 source metric 误读为已经成立的世界状态；
 - 没有 active target 时，下层明确标成 `CURRENT EVIDENCE · OBSERVED` 或
   `CURRENT GEOMETRY · OBSERVED`；当前真实机器人仅以白色轮廓标记，不再使用蓝色实体 mask，

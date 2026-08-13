@@ -218,7 +218,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("proxy", "direct", "both"), default="proxy")
     parser.add_argument("--proxy-url", default="http://localhost:8110/chat/completions")
-    parser.add_argument("--direct-base-url", default="https://api.gpt.ge/v1")
+    parser.add_argument("--direct-base-url", default="https://api.vveai.com/v1")
     parser.add_argument("--model", default="vapi/gpt-5.5", help="Use vapi/... for proxy mode; direct mode strips leading vapi/.")
     parser.add_argument("--api-key", default=None, help="Direct V-API key. Defaults to V_API_KEY or LLM_API_KEY.")
     parser.add_argument("--env-file", default=".env", help="Optional dotenv file to load before reading API keys.")

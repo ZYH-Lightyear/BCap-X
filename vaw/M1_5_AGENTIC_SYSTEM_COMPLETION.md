@@ -14,6 +14,9 @@ Canvas、Function 和 Prompt 都只是该闭环的组成部分。任何单独截
 
 本文是 M1.5 的权威设计与验收文档。`M1_4_2_DUAL_AGENT_RUNTIME.md` 和
 `M1_4_3_GRASP_CONTEXT_OPTIMIZATION.md` 保留为历史基线与失败记录；若与本文冲突，以本文为准。
+当前已实现的 Runtime、Function ownership、Context Builder 和 Canvas 契约集中记录在
+[`CURRENT_ARCHITECTURE.md`](CURRENT_ARCHITECTURE.md)，本文继续承担研究目标、版本演进与验收
+记录，不再要求读者从全部历史版本段落反推当前实现。
 
 ## 2. 完成定义
 
@@ -33,8 +36,8 @@ M1.5 只有同时满足以下条件才算完成。
 
 - `commit(action_id)` 是唯一物理 Function；
 - Imagination 不直接 commit，Main 不承担逐步局部优化；
-- Imagination 正常结束、达到编辑上限或失败都必须明确把控制权交还 Main；编辑上限不能被
-  表达成动作失败或自动批准；
+- Imagination 正常结束、达到编辑上限或失败都必须明确把控制权交还 Main；只有主动
+  `ready` 才能产生 ActionReview，编辑上限按 `failed` 返回且不创建 action ID，更不能自动批准；
 - Main 必须看到最终 Preview，并能够选择 commit、重新进入 Imagination、换 seed 或放弃；
 - commit 后的新请求必须包含当前真实视觉和一条最小动作连续性信息，使 Main 知道刚执行的是
   arm、gripper 或二者，以及原始意图；
@@ -205,21 +208,23 @@ LastPhysicalAction
 
 ### 6.3 Contact Focus
 
-Imagination 下层采用固定结构：
+当前 Imagination 下层采用固定结构：
 
 ```text
-┌──────────────── Contact Focus ───────────────┬── Global inset ─┐
-│ target 周围固定物理范围                       │ 整臂/障碍关系    │
-│ current object surface + current/target hand │                │
-│ previous target outline + current target     │                │
-│ contact corridor / jaw clearance evidence    │                │
-└──────────────────────────────────────────────┴────────────────┘
+┌──────── camera-aligned global Preview ───────┬── CONTACT FRONT ─┐
+│ current dense RGB-D surface                  │ direct MuJoCo RGB│
+│ white current outline + purple target        ├── CONTACT SIDE ──┤
+│                                              │ direct MuJoCo RGB│
+└──────────────────────────────────────────────┴───────────────────┘
 ```
 
-- compiler 根据 target depth 和相机标定，将默认 `20 cm` 物理范围转换为图像 crop；
-- source region 对应的当前 RGB-D surface 可高亮，其他点降低亮度；
-- `delta_move`：显示 previous→current target 的外置箭头、last delta 和 cumulative delta；
-- `rotate`：显示新旧 silhouette 差异和独立 rotation widget，不在物体上叠加三轴；
+- Contact Front/Side 由 episode-private MuJoCo Camera 直接渲染，不再由稀疏点云 novel-view
+  重投影；相机在一次 Imagination session 内锁定且 WORLD +Z 保持竖直；
+- 当前真实夹爪只显示白色轮廓；青色表示 previous Preview，紫色表示 current Preview；
+- `delta_move`：根据每张 Contact Camera 的真实标定显示两个屏幕内 BASE 正轴；最接近视线方向
+  的第三轴放入独立 `DEPTH IN/OUT` 子卡，避免三轴在同一原点重叠；
+- `rotate`：左上固定 `ROTATE BASE` 三维右手正向图例不覆盖物体；需要确认具体 frame/axis 的
+  正负结果时，`show_rotation_gizmo` 在独立侧栏显示 `−10°/+10°` 真实夹爪姿态对照；
 - gripper-only preview：由 Main 直接创建，只改变虚拟指宽；不进入 Imagination，并明确物体点
   保持当前 observation、不模拟动力学；
 - planner error 只作为紧凑状态，不替代几何判断。
@@ -605,6 +610,14 @@ Main Function 面，直接创建一个 pose-free、gripper-only ActionReview；�
 或抓取/释放效果。版本更新为 Web schema 31 / `vaw-context-v30-main-gripper-review` / renderer
 `context-web-v30-main-gripper-review`。
 
+v31 收敛 Contact View 的控制提示。此前三个 BASE 平移轴被投影到同一个二维原点，当其中一轴
+接近相机光轴时会出现箭头、标签重叠和伪透视歧义。新版本根据每张 Direct Contact Camera 的
+标定保留两个最具屏幕可见性的 BASE 正轴，并将最接近视线方向的第三轴独立显示为
+`DEPTH +axis IN/OUT`；`ROTATE BASE` 保持为固定斜视的三维右手正向控制图例，与 scene projection
+明确分离。该修改改变了策略可见 raster 语义但不改变 Function 或 Context 字段，因此版本更新为
+Web schema 32 / `vaw-context-v31-separated-control-guides` / renderer
+`context-web-v31-separated-control-guides`。
+
 验收：主任务 seeds `0,1,2` 至少 `2/3` env success。
 
 ### M1.5.5 — Basic Generalization and Freeze
@@ -658,6 +671,8 @@ Main Function 面，直接创建一个 pose-free、gripper-only ActionReview；�
 | M1.5.4-r | rotate 必须在调用前具有可读的 BASE/TOOL frame、轴与符号依据 | in progress | pending v21 unit/snapshot/static diagnostics | `m154u_qwen35plus_physical_verification_t0_s0` | v20 已产生正确随动核验，但一次无证据 `base-X -90°` 破坏 grasp；v21 只增加坐标指南和小角度探索语义，不加入任务分支或角度 clamp |
 | M1.5.4-s | Main 必须从精确 BASE approach 解释 seed，且不能把纯 arm approach 叙述为抓取失败 | in progress | pending v22 unit/Web/frozen seed diagnostics | `m154r_v21_rotate_guide_qwen35plus_t0_s0` | v21 首次 rotate 收敛为 15°，但 Main 将 approach_z≈-1 的 seed 误称 side grasp；point-pose approach 后又在未闭合时错误宣称抓取失败，主任务仍为 `env_success=false` |
 | M1.5.4-t | 接触微调必须获得带 BASE 方向的 source surface correction，而非孤立距离 | in progress | 67 full VAW tests + Ruff + Web build + deterministic direction fixture | pending v23 seed-1 control probe | v22 正确识别 top-down seed，但 `TCP→SOURCE` 从 3→18→27 mm 时仍连续 base -Z 并撞入 collision；v23 用唯一 BASE delta 向量替换标量，不加入任务分支 |
+| M1.5.4-u | Main/Imagination ownership、Direct Contact Camera 与 gripper-only Review 应形成统一当前规范 | in progress | current architecture/code contract + VAW regression | `m154u_v24_imagination_agent_qwen35plus_t0_s1` 及后续 v29/v30 traces | 双 Agent ownership、history-free Context、Direct Contact Camera 与 Main-only gripper Review 已落地；真实任务成功率门槛仍未达到 |
+| M1.5.4-v | Contact 控制提示必须在二维相机中无歧义表达三个 BASE 平移轴和三维旋转正向 | in progress | schema 32 packet/Web contract + deterministic Contact guide tests | pending frozen-seed rerun | 两个屏幕内平移轴与独立 DEPTH IN/OUT 已分离；renderer 元数据升级，避免与 v30 trace 混淆 |
 | M1.5.4 | 完整闭环可达到基本 pick-place 成功 | in progress | 65 full VAW tests + Ruff + Web build | pending frozen seeds 0/1/2 | 尚未达到 `2/3 env_success`，不得宣称完成 |
 
 ## 11. 非目标

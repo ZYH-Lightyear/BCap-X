@@ -1,4 +1,4 @@
-"""Deterministic compiler for the fixed-size persistent-Waypoint Canvas."""
+"""Deterministic compiler for the fixed-size dual-agent VAW Canvas."""
 
 from __future__ import annotations
 
@@ -52,8 +52,8 @@ from vaw.context_runtime.private import (
 from vaw.context_runtime.scene_view import render_scene_view
 from vaw.context_runtime.workspace import ContextWorkspace
 
-CONTEXT_SCHEMA = "vaw-context-v30-main-gripper-review"
-CONTEXT_WEB_SCHEMA_VERSION = 31
+CONTEXT_SCHEMA = "vaw-context-v31-separated-control-guides"
+CONTEXT_WEB_SCHEMA_VERSION = 32
 CONTEXT_WIDTH = 2048
 CONTEXT_HEIGHT = 1280
 

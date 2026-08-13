@@ -1,5 +1,9 @@
 # VAW Static VLM Diagnostic
 
+> **冻结诊断资产。** 题目与图片来自旧 Canvas/schema，用于复现当时的视觉理解结果，不代表当前
+> `vaw-context-v31-separated-control-guides` 输入。不要在更新 Runtime 时重写题目或覆盖图片；
+> 当前架构见 [`../CURRENT_ARCHITECTURE.md`](../CURRENT_ARCHITECTURE.md)。
+
 这是一个与 Agent Loop 隔离的小型静态诊断集，用于回答一个更窄的问题：模型能否仅凭
 当前 VAW Canvas 正确理解抓持状态、闭合条件、preview/observed 归因和局部位姿微调。
 

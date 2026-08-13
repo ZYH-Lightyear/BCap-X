@@ -1,4 +1,10 @@
-# VAW M1.4.2 — Main / Imagination Dual-Agent Runtime
+# ARCHIVED — VAW M1.4.2 Main / Imagination Dual-Agent Runtime
+
+> **历史基线，不是当前接口。** 本文保留最初双 Agent 拆分时的状态、预算耗尽和
+> `open/close` Imagination 语义，供复现设计演进。当前实现已改为 history-free Main /
+> Imagination ownership、Main-only gripper ActionReview、turn-limit failed 和 `2048×1280`
+> Direct Contact Camera Canvas。现行契约见 [`CURRENT_ARCHITECTURE.md`](CURRENT_ARCHITECTURE.md)，
+> 当前 Milestone 见 [`M1_5_AGENTIC_SYSTEM_COMPLETION.md`](M1_5_AGENTIC_SYSTEM_COMPLETION.md)。
 
 ## 目标
 

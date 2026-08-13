@@ -188,7 +188,7 @@ def create_app(
 def main(
     host: str = "0.0.0.0",
     port: int = 8110,
-    base_url: str = "https://api.gpt.ge/v1/",
+    base_url: str = "https://api.vveai.com/v1/",
     api_key: str | None = None,
     api_key_env: str = "V_API_KEY,LLM_API_KEY",
     key_file: str | None = None,

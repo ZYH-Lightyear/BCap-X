@@ -31,8 +31,8 @@ function Root() {
   useEffect(() => {
     window.__VAW_RENDER__ = async (next) => {
       if (
-        next.schemaVersion !== 31
-        || next.schema !== 'vaw-context-v30-main-gripper-review'
+        next.schemaVersion !== 32
+        || next.schema !== 'vaw-context-v31-separated-control-guides'
         || next.viewport.width !== 2048
         || next.viewport.height !== 1280
       ) {
