@@ -499,3 +499,69 @@ def test_imagination_receives_cumulative_edit_summary_not_transcript() -> None:
     main_review = _user_text(main.messages[1])
     assert "Action Review Edit Summary" in main_review
     assert '"total_translation_base_m":[0.01,0.01,0.0]' in main_review
+
+
+def test_review_select_implicitly_declines_and_notifies_main_after_imagination() -> None:
+    main = RecordingProvider(
+        [
+            _response(1, "detection_and_sam", query="can"),
+            _response(2, "propose_grasps", region_id="region1"),
+            _response(3, "close_gripper"),
+            _response(
+                4,
+                "select",
+                seed_id="s1",
+                refinement_goal="check whether the fingers can surround the can",
+            ),
+            _response(6, "done", success=False),
+        ]
+    )
+    imagination = RecordingProvider(
+        [_response(5, "finish_imagination", status="failed")]
+    )
+    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
+    result = ContextRuntime(
+        main,
+        workspace,
+        SolidRenderer(),
+        imagination_provider=imagination,
+    ).run()
+
+    select_step = next(step for step in result.steps if step.op == "main:select")
+    assert select_step.ok
+    assert '"declined_how":"implicit"' in select_step.result
+    assert '"declined_action_id":"a1"' in select_step.result
+    returned = main.messages[4]
+    notice_text = _user_text(returned)
+    assert "上一轮通知" in notice_text
+    assert "a1" in notice_text
+    assert "不是 reject_action" in notice_text
+    assert "select" in notice_text
+    assert workspace.state.action_review is None
+
+
+def test_failed_commit_uses_function_failure_label_and_recovery_fields() -> None:
+    api = FakeContextApi()
+    api.gripper_error = True
+    main = RecordingProvider(
+        [
+            _response(1, "close_gripper"),
+            _response(2, "commit", action_id="a1"),
+            _response(3, "done", success=False),
+        ]
+    )
+    ContextRuntime(
+        main,
+        ContextWorkspace(api, "task", motion_backend="pyroki"),
+        SolidRenderer(),
+        imagination_provider=RecordingProvider([]),
+    ).run()
+
+    post = _user_text(main.messages[2])
+    assert "上一轮执行失败" in post
+    assert "上轮协议错误" not in post
+    assert '"failed_action_id":"a1"' in post
+    assert '"evidence_invalidated":true' in post
+    assert '"recovery_hint"' in post
+    assert "detection_and_sam" in post
+    assert "Last Physical Action" in post

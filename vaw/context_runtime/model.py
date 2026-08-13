@@ -113,6 +113,11 @@ class LastPhysicalAction:
     outcome: Literal["completed", "arm_failed", "gripper_failed"]
     target_gripper: Literal["open", "closed"] | None = None
     requested_arm_delta_base_m: tuple[float, float, float] | None = None
+    failed_action_id: str | None = None
+    error_detail: str | None = None
+    source_query: str | None = None
+    evidence_invalidated: bool = False
+    recovery_hint: str | None = None
 
     def summary(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -126,6 +131,16 @@ class LastPhysicalAction:
             result["requested_arm_delta_base_m"] = _floats(
                 self.requested_arm_delta_base_m
             )
+        if self.failed_action_id is not None:
+            result["failed_action_id"] = self.failed_action_id
+        if self.error_detail:
+            result["error_detail"] = self.error_detail
+        if self.source_query:
+            result["source_query"] = self.source_query
+        if self.evidence_invalidated:
+            result["evidence_invalidated"] = True
+        if self.recovery_hint:
+            result["recovery_hint"] = self.recovery_hint
         return result
 
 

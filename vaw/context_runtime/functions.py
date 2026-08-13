@@ -64,6 +64,13 @@ class _PreparedGrasp:
     approach_z: float
 
 
+_COMMIT_FAILURE_RECOVERY_HINT = (
+    "region/seed/action_id 已随新观测作废，不能再 commit 该 id。"
+    "若仍操作同一物体，请重新 detection_and_sam（优先使用 source_query）；"
+    "若从当前真实 TCP 继续靠近，调用 start_imagination。"
+)
+
+
 class ContextFunctions:
     """Function semantics separated from workspace lifecycle/dispatch."""
 
@@ -842,6 +849,11 @@ class ContextFunctions:
             outcome=outcome,
             target_gripper=action.target.gripper,
             requested_arm_delta_base_m=requested_arm_delta,
+            failed_action_id=action_id if execution_error is not None else None,
+            error_detail=str(execution_error) if execution_error is not None else None,
+            source_query=causal_subject.query if causal_subject is not None else None,
+            evidence_invalidated=True,
+            recovery_hint=_COMMIT_FAILURE_RECOVERY_HINT if execution_error is not None else None,
         )
         self.ws._private.last_physical_artifacts = LastPhysicalArtifacts(
             focus_pose=focus_pose,
@@ -967,7 +979,11 @@ class ContextFunctions:
         if action is None or action.action_id != action_id:
             raise ContextFunctionError(f"unknown or expired action_id '{action_id}'")
         self.ws.discard_action_review()
-        return {}
+        return {
+            "declined_action_id": action_id,
+            "declined_how": "explicit",
+            "declined_intent": action.intent,
+        }
 
     def limit_imagination(self) -> dict[str, Any]:
         """Fail a refinement session that did not converge within its budget."""

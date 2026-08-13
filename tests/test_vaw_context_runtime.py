@@ -326,12 +326,15 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
     assert "局部几何的唯一" in SYSTEM_PROMPT
     assert "不能再次按像素判断毫米级 gap" in SYSTEM_PROMPT
     assert "达到内部微调上限时只会交回 failed" in SYSTEM_PROMPT
-    assert "不要把最小化 finger-surface gap 当作优化目标" in SYSTEM_PROMPT
+    assert "若按当前这颗 seed 闭合" in SYSTEM_PROMPT
+    assert "不要另写一种" in SYSTEM_PROMPT
     assert "current_tcp" in pose["description"]
     assert "绝不能虚构 `current_tcp`" in SYSTEM_PROMPT
     assert "GRIP 仍大于 0 可能是物体阻挡手指" in SYSTEM_PROMPT
     assert "requested_arm_delta_base_m" in SYSTEM_PROMPT
     assert "reject_action(action_id)" in ACTION_REVIEW_SYSTEM_PROMPT
+    assert "evidence_invalidated" in SYSTEM_PROMPT
+    assert "会立即作废当前 action_id" in ACTION_REVIEW_SYSTEM_PROMPT
     assert "局部、可执行的下一步" in ACTION_REVIEW_SYSTEM_PROMPT
     assert "gripper-only open" in ACTION_REVIEW_SYSTEM_PROMPT
     assert "尚未移动到容器" in ACTION_REVIEW_SYSTEM_PROMPT
@@ -343,21 +346,22 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
     assert "固定 source" in ACTION_REVIEW_SYSTEM_PROMPT
     assert "不是 pre-grasp" in IMAGINATION_SYSTEM_PROMPT
     assert "TCP→SOURCE" not in IMAGINATION_SYSTEM_PROMPT
-    assert "完整视觉几何判断" in IMAGINATION_SYSTEM_PROMPT
+    assert "不要连续往下压来假装包夹" in IMAGINATION_SYSTEM_PROMPT
     assert "该几何已经由 Imagination 裁决" in ACTION_REVIEW_SYSTEM_PROMPT
     assert "两指闭合扫掠" in ACTION_REVIEW_SYSTEM_PROMPT
     assert "张开的手指预先贴住物体" in ACTION_REVIEW_SYSTEM_PROMPT
-    assert "双侧包夹" in IMAGINATION_SYSTEM_PROMPT
-    assert "深度和高度方向是否有足够重叠" in IMAGINATION_SYSTEM_PROMPT
-    assert "只有指尖擦边" in IMAGINATION_SYSTEM_PROMPT
-    assert "不证明摩擦、接触动力学或真实稳定抓持" in IMAGINATION_SYSTEM_PROMPT
+    assert "两边都能碰到" in IMAGINATION_SYSTEM_PROMPT
+    assert "深度和高度够不够" in IMAGINATION_SYSTEM_PROMPT
+    assert "指尖擦边" in IMAGINATION_SYSTEM_PROMPT
+    assert "不证明真的抓住" in IMAGINATION_SYSTEM_PROMPT
     select_description = next(
         item["function"]["description"]
         for item in main
         if item["function"]["name"] == "select"
     )
-    assert "闭合扫掠区域" in select_description
-    assert "不要要求张开的手指预先贴住物体" in select_description
+    assert "两指扫掠" in select_description
+    assert "不要另写抓取方向" in select_description
+    assert "不要要求手指先贴住物体" in select_description
     assert "继续随机" in IMAGINATION_SYSTEM_PROMPT
     assert "非物理 Function 不刷新真实 observation" in SYSTEM_PROMPT
     assert "不得仅因下层切换" in SYSTEM_PROMPT
@@ -657,7 +661,12 @@ def test_reject_action_explicitly_discards_review_without_physics() -> None:
 
     result = workspace.execute("reject_action", action_id=action_id)
 
-    assert result.ok and result.result == {}
+    assert result.ok
+    assert result.result == {
+        "declined_action_id": action_id,
+        "declined_how": "explicit",
+        "declined_intent": "set gripper open",
+    }
     assert workspace.state.action_review is None
     assert workspace._private.review_artifacts == {}
     assert workspace.state.observation_revision == revision
@@ -680,6 +689,11 @@ def test_commit_records_failed_stage_without_claiming_task_effect() -> None:
     assert arm_api.operation_log == ["arm"]
     assert arm_workspace.state.last_physical_action.executed_stages == "arm"
     assert arm_workspace.state.last_physical_action.outcome == "arm_failed"
+    assert arm_workspace.state.last_physical_action.failed_action_id == arm_action
+    assert arm_workspace.state.last_physical_action.evidence_invalidated is True
+    assert arm_workspace.state.last_physical_action.recovery_hint
+    assert arm_workspace.state.last_physical_action.error_detail
+    assert arm_workspace.state.action_review is None
 
     gripper_api = FakeContextApi()
     gripper_api.gripper_error = True
@@ -696,6 +710,33 @@ def test_commit_records_failed_stage_without_claiming_task_effect() -> None:
     assert gripper_api.operation_log == ["gripper:closed"]
     assert gripper_workspace.state.last_physical_action.executed_stages == "gripper"
     assert gripper_workspace.state.last_physical_action.outcome == "gripper_failed"
+    assert gripper_workspace.state.last_physical_action.failed_action_id == gripper_action
+    assert gripper_workspace.state.last_physical_action.evidence_invalidated is True
+    assert gripper_workspace.state.last_physical_action.recovery_hint
+
+
+def test_failed_grasp_commit_exposes_source_query_for_redetection() -> None:
+    api = FakeContextApi()
+    api.move_error = True
+    workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
+    workspace.set_refinement_goal("grasp the can")
+    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    seed_id = workspace.execute("propose_grasps", region_id=region).result["seed_ids"][0]
+    workspace.execute("select", seed_id=seed_id)
+    action_id = workspace.execute("finish_imagination", status="ready").result["action_id"]
+
+    result = workspace.execute("commit", action_id=action_id)
+
+    assert not result.ok
+    last = workspace.state.last_physical_action
+    assert last.outcome == "arm_failed"
+    assert last.failed_action_id == action_id
+    assert last.source_query == "can"
+    assert last.evidence_invalidated is True
+    assert last.recovery_hint
+    assert "detection_and_sam" in last.recovery_hint
+    assert region not in workspace.state.regions
+    assert workspace.state.action_review is None
 
 
 def test_grasp_proposal_returns_general_action_seeds() -> None:

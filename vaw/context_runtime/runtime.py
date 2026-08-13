@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 import numpy as np
@@ -46,6 +46,11 @@ MULTI_CALL_ERROR = "未执行：一轮只能调用一个 Function。"
 IMAGINATION_STARTERS = frozenset(
     {"select", "propose_pose", "start_imagination"}
 )
+_NOTICE_LABEL = {
+    "protocol": "上轮协议错误",
+    "function": "上一轮执行失败",
+    "notice": "上一轮通知",
+}
 
 
 class ContextRenderer(Protocol):
@@ -98,7 +103,13 @@ class ContextRuntime:
         self.physical_ops = 0
         self.main_turns = 0
         self.imagination_turns = 0
-        self._feedback: dict[str, str | None] = {"main": None, "imagination": None}
+        self._feedback: dict[str, tuple[str, str] | None] = {
+            "main": None,
+            "imagination": None,
+        }
+        # Survives an Imagination session so Main still sees an implicit review
+        # decline after control returns.
+        self._main_pending_notice: str | None = None
         # One overwrite-only Main belief bridges adjacent semantic decisions.
         # This is intentionally not a transcript: no old images, tool payloads
         # or Imagination rationale are replayed.
@@ -173,7 +184,7 @@ class ContextRuntime:
 
             call, protocol_error = self._single_call(response)
             if protocol_error is not None:
-                self._feedback[owner] = protocol_error
+                self._feedback[owner] = ("protocol", protocol_error)
                 self._log(
                     turn,
                     owner,
@@ -198,7 +209,10 @@ class ContextRuntime:
                 self.physical_ops += 1
             step = self._dispatch(owner, call)
             if not step.ok:
-                self._feedback[owner] = str(step.result.get("error", "Function failed"))
+                self._feedback[owner] = (
+                    "function",
+                    str(step.result.get("error", "Function failed")),
+                )
             physical = owner == "main" and call.name == "commit"
             if physical or (owner == "main" and call.name == "done"):
                 self._update_env_success()
@@ -288,7 +302,7 @@ class ContextRuntime:
                     f"{float(opening):.3f}（0≈闭合，1≈张开）"
                 )
             if feedback:
-                text += f"\n上轮协议错误：{feedback}"
+                text += f"\n{_NOTICE_LABEL[feedback[0]]}：{feedback[1]}"
             return _image_messages(IMAGINATION_SYSTEM_PROMPT, text, context_image)
 
         text = (
@@ -343,7 +357,10 @@ class ContextRuntime:
                 separators=(",", ":"),
             )
         if feedback:
-            text += f"\n上轮协议错误：{feedback}"
+            text += f"\n{_NOTICE_LABEL[feedback[0]]}：{feedback[1]}"
+        if owner == "main" and self._main_pending_notice:
+            text += f"\n{_NOTICE_LABEL['notice']}：{self._main_pending_notice}"
+            self._main_pending_notice = None
         system_prompt = (
             ACTION_REVIEW_SYSTEM_PROMPT
             if self.workspace.state.action_review is not None
@@ -405,17 +422,29 @@ class ContextRuntime:
         review_before = self.workspace.state.action_review
         step = self.workspace.execute(name, **arguments)
         if owner == "main" and name != "commit" and step.ok:
-            # A rejected Function is not a valid decision: retain the causal
-            # comparison so Main can repair its arguments without losing what
-            # just happened.  A reviewed action is a one-decision offer: any
-            # other successful Main call explicitly declines it, so a stale
-            # target cannot be committed on a later turn.  A successful commit
-            # refreshes/replaces causal state atomically inside the workspace.
-            if (
-                review_before is not None
-                and self.workspace.state.action_review is review_before
-            ):
-                self.workspace.discard_action_review()
+            # A rejected Function is not a valid decision: retain the pending
+            # review so Main can repair arguments.  A reviewed action is a
+            # one-decision offer: any other successful Main call declines it,
+            # including select/propose_pose which already clear the review
+            # when they start Imagination.  A successful commit refreshes
+            # causal state atomically inside the workspace.
+            if review_before is not None:
+                how = "explicit" if name == "reject_action" else "implicit"
+                if self.workspace.state.action_review is review_before:
+                    self.workspace.discard_action_review()
+                if how == "implicit":
+                    step = _annotate_declined_review(
+                        step,
+                        review_before.action_id,
+                        review_before.intent,
+                        how,
+                    )
+                self._main_pending_notice = _review_decline_notice(
+                    review_before.action_id,
+                    review_before.intent,
+                    how=how,
+                    function_name=name,
+                )
             self.workspace.consume_main_context()
         return step
 
@@ -538,6 +567,38 @@ def _image_messages(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": content},
     ]
+
+
+def _annotate_declined_review(
+    step: ContextStepResult,
+    action_id: str,
+    intent: str,
+    how: str,
+) -> ContextStepResult:
+    result = dict(step.result)
+    result["declined_action_id"] = action_id
+    result["declined_how"] = how
+    result["declined_intent"] = intent
+    return replace(step, result=result)
+
+
+def _review_decline_notice(
+    action_id: str,
+    intent: str,
+    *,
+    how: str,
+    function_name: str,
+) -> str:
+    if how == "explicit":
+        return (
+            f"已放弃待执行动作 {action_id}（intent={intent}）。"
+            "这是一次明确的 reject_action。旧 action_id 已失效。"
+        )
+    return (
+        f"已放弃待执行动作 {action_id}（intent={intent}）。"
+        f"不是 reject_action，而是因为当时成功调用了 {function_name}。"
+        "旧 action_id 已失效。"
+    )
 
 
 def run_context_episode(

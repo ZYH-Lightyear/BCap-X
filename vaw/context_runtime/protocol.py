@@ -66,8 +66,8 @@ Canvas 上层 OBSERVED NOW 是唯一真实视觉：左侧为当前 agentview，�
 - 抓取位置/方向尚在校准时保持夹爪张开；到达后依据新的真实 CONTACT FRONT/SIDE 再创建
   close-only ActionReview 并单独 commit。
 - 运输疑似或已验证抓取物时保持闭合；只有当前真实目标区域支持释放条件时才 open。
-描述抓取 refinement goal 时，应要求物体进入两指闭合扫掠区域并形成双侧包夹及足够的深度/高度
-重叠；不要要求张开的手指预先贴住物体，也不要把最小化 finger-surface gap 当作优化目标。
+抓取 refinement_goal 用一句反事实：若按当前这颗 seed 闭合，物体会进两指之间吗？不要另写一种
+抓取方向，也不要要求手指先贴住物体。
 
 你负责理解任务、调用感知、选择动作起点，并审查 Imagination 最终交回的 ActionReview。
 select、propose_pose 或 start_imagination 会把控制权交给独立的 Imagination Agent；所有局部
@@ -90,9 +90,8 @@ ActionReview 是一次决策的 offer：交回后你的下一次成功 Function 
 满足，以及 planner 是否返回可执行结果。若这些宏观条件成立则 commit；若对象、意图、前提或
 planner 明确不成立则 reject 并选择新的 seed/point/动作路线。不要接管 Imagination 的局部几何
 职责，也不要从 Contact View 重新要求某个平移或旋转修正。
-当 Function 会启动 Imagination 时，必须在 refinement_goal 参数中写一句短的目标几何；不要把
-整段理由、旧失败、预算或未经验证的物理效果写进去。它应描述需要形成或检查的物理关系，
-不得预先断言 top-down、vertical 或某个旋转方向；除非当前几何已经清楚支持该约束。
+当 Function 会启动 Imagination 时，refinement_goal 写一句短的反事实几何；不要把整段理由、
+旧失败或未经验证的效果写进去，也不要另写一种与 seed 不符的抓取方向。
 
 detection_and_sam 的 region 是当前观测中目标身份与二维位置的权威检测/分割结果，
 但不证明接触、抓持、支撑或包含，也不刷新 observation。
@@ -138,6 +137,9 @@ Imagination/ActionReview 已形成，旧的失败回执由当前 Preview 取代�
 open/closed 命令，不证明抓住或释放物体。`requested_arm_delta_base_m` 是从执行前真实 TCP 到
 请求 target 的 BASE 位移，不是物体位移或任务效果；如果上一动作没有请求 base +Z，就不能把
 “物体尚未离开支撑面”解释为抬升验证失败，应先保持夹爪状态执行小幅上抬。
+若 Last Physical Action 的 outcome 为 arm_failed 或 gripper_failed：旧 action_id、region、seed
+均已作废，不能再 commit 该 id。`evidence_invalidated` 为真。若有 `source_query`，重新
+detection_and_sam 该物体；若仍要从当前真实 TCP 靠近，调用 start_imagination。
 需要从当前真实 TCP 做相对抬升、下降、平移或旋转时，调用 start_imagination；随后由
 Imagination Agent 从当前 TCP 编辑空间 Preview。纯夹爪动作由 Main 直接调用
 open_gripper/close_gripper，不要为它启动 Imagination。propose_pose 只能引用 locate_point
@@ -173,14 +175,16 @@ FRONT/SIDE 判断物体是否位于两指闭合扫掠区域；open 时根据当�
 运输或放置物体；同理，明确用于 grasp approach 的 target 不应因为它尚未移动到容器而被否决。
 你的审查只回答四件事：目标对象和动作意图是否符合当前任务；真实夹爪等执行前提是否满足；
 motion plan 是否可执行；这是否是合理的下一次真实动作。不得因为张开的手指与物体表面仍有
-间隙而拒绝，也不得要求张开的手指预先贴住物体。抓取 Preview 的局部判据是物体处于两指闭合扫掠
-区域，并在闭合方向、夹爪深度和高度上形成合理双侧包夹；该几何已经由 Imagination 裁决。
+间隙而拒绝，也不得要求张开的手指预先贴住物体。抓取 Preview 只问：若现在闭合，物体会不会在
+两指之间、两边都能碰到；该几何已经由 Imagination 裁决。
 
 本轮必须明确选择且只调用一个提供的 Review Function：
 - 意图、执行前提和 planner 均成立：commit(action_id)；
 - 需要换已有 seed/point：调用 select/propose_pose，创建新的 Imagination；
 - 对象、意图、执行前提或 planner 明确不成立：reject_action(action_id)；
 - 只有当前真实视觉已经满足 User Task 时才 done(success=true)。
+select、propose_pose 或 done 会立即作废当前 action_id。若还想执行眼前这个 Preview，本轮只能
+commit。
 
 不要用感知 Function 隐式跳过 Review。规划 returned/checked 不保证任务效果。Last Physical Action
 是最近真实命令的因果事实，不是当前 Preview，也不证明抓取/释放成功。
@@ -215,33 +219,20 @@ CONTACT FOCUS 的 FRONT、SIDE、refinement goal 和 Edit Summary 共同审查
   到达真实位姿后再由 Main 根据新观测决定是否创建 close-only ActionReview。
 - 抬升/运输默认保持当前真实夹爪状态；不要用空间 Preview 暗示抓取或释放结果。
 
-【抓取 Preview 的核心几何判据】
-- 目标不是让张开的两根手指预先贴住物体，也不是持续最小化 finger-surface gap。
-- 核心问题是：若从当前目标开度闭合，目标物体是否位于两指的闭合扫掠区域内，并能形成合理的
-  双侧包夹。
-- CONTACT FRONT 用于判断物体在闭合方向上是否位于两指之间；CONTACT SIDE 用于判断物体与
-  手指在夹爪深度和高度方向是否有足够重叠。两个视图必须共同支持判断。
-- 只有指尖擦边、物体接近单侧手指、或仅在一个投影中重叠，都不足以认为适合闭合。
-- 一旦闭合扫掠覆盖、双侧包夹和深度/高度重叠已经合理，不应继续把夹爪压向物体表面。
-- Preview 只说明几何上支持包夹，不证明摩擦、接触动力学或真实稳定抓持；真实结果只能在
-  close + commit 后通过小幅随动验证确认。
+【抓取 Preview】
+只问：若从当前开度闭合，物体会落在两指扫掠里、两边都能碰到吗？FRONT 看是否在两指之间，SIDE
+看深度和高度够不够。指尖擦边或只靠一边则还不够。够了就 ready，不要再往物体上压。Preview
+不证明真的抓住。
 
-ActionSeed 是几何规划器给出的起点，不要仅为了让二维投影“看起来竖直”而旋转它。四元数的
-x/y/z/w 分量不是绕各轴的角度，禁止从单个分量推断倾斜方向。姿态调整只能依据紫色目标与真实
-表面之间一个具体、可见的接触/碰撞缺陷；CONTACT FRONT/SIDE 的相机在本次 session 内固定且
-WORLD +Z 始终朝上，因此 rotate 后应看到紫色夹爪相对稳定点云改变方向，而不是点云反向旋转。
-若目标只是平移已经形成的姿态（例如抬升或运输），
-默认保持方向不变。
-若 TARGET ROLE 是 GRASP CONTACT，它表示规划器建议的最终接触/闭合位姿，不是 pre-grasp。
-不要为了“先安全接近”自动增加 base +Z，把 seed 改造成 pre-grasp。只有 Contact Front/Side 中
-存在明确可见的错位、悬空、穿入或方向缺陷时才做相应小步修正；每次编辑后都以同一锁定视角的
-完整视觉几何判断是否改善。绝对 target TCP 坐标不提供给策略；方向变化只依据累计 BASE edit、
-旋转提示和锁定视角中的视觉差异判断。
+ActionSeed 是规划器给的起点，不要仅为了让画面“看起来竖直”而旋转。四元数分量不是各轴角度。
+姿态只改 CONTACT 里能指出来的那一个缺陷；相机在本次 session 内固定、WORLD +Z 始终朝上，rotate
+后应看到紫色夹爪相对点云转动，而不是点云反向旋转。若只是平移已有姿态（抬升/运输），保持方向。
+GRASP CONTACT 是建议的闭合起点，不是 pre-grasp。不要抬高以求更安全。若闭合后大概
+只会捏到盖顶，转一次仍进不了两指之间，就 failed 换 seed；不要连续往下压来假装包夹。改完用同一
+视角看是否变好。
 
-每轮只做三种选择之一：若当前 target 已满足目标，调用 finish_imagination(status="ready")；若能
-指出一个当前可见的几何缺陷，只做一次 delta_move 或 rotate；若旋转
-方向难以从投影判断，可先调用 show_rotation_gizmo(frame, axis) 显示该轴的 ±10° 对照；若该
-target 无法可靠修复，调用 status="failed"。不要为了用满轮数而编辑。
+每轮三选一：已经像能包住 → ready；能指出一个可见缺陷 → 一次 delta_move 或 rotate；看不清转
+哪边 → 先 gizmo，下一轮必须 rotate 或停；修不好 → failed。不要为了用满轮数而改。
 
 GRIP 是当前真实归一化开度（0≈闭合，1≈张开）；空间 target 始终继承它。你只负责让
 空间姿态适合后续动作，不得把“几何上适合闭合”写成“已经闭合或已经抓住”。
@@ -290,8 +281,7 @@ def _refinement_goal() -> dict[str, Any]:
     return {
         "type": "string",
         "description": (
-            "一句短的目标物理关系；描述希望形成或检查什么，不预先断言未经视觉支持的 "
-            "top-down、vertical 或旋转方向"
+            "一句短的反事实：若执行当前设想，应看到什么几何关系。不要另写一种抓取方向。"
         ),
     }
 
@@ -429,9 +419,8 @@ def function_definitions() -> list[dict[str, Any]]:
             "select",
             (
                 "选择一个 ActionSeed 并进入 Imagination；不执行，且默认继承当前真实夹爪开度。"
-                "grasp seed 是最终抓取位姿起点，不是安全悬停位；refinement_goal 应描述目标"
-                "是否进入两指闭合扫掠区域、能否形成双侧包夹以及深度/高度重叠，不要要求"
-                "张开的手指预先贴住物体，也不要把它改写成泛泛的 approach。"
+                "grasp seed 是闭合起点，不是悬停点。refinement_goal 用一句反事实：若按该 seed "
+                "闭合，物体是否在两指扫掠里。不要另写抓取方向，也不要要求手指先贴住物体。"
                 "若接近动作要求夹爪预先张开，应先单独 commit gripper-only 目标。"
             ),
             {

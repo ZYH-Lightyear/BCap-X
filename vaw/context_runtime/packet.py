@@ -20,7 +20,6 @@ from vaw.context_runtime.gripper_mesh import (
     rasterize_silhouette,
 )
 from vaw.context_runtime.model import (
-    ActionTarget,
     ContextState,
     LastPhysicalAction,
     PointEvidence,
@@ -33,9 +32,6 @@ from vaw.context_runtime.near_field import (
     render_contact_focus,
 )
 from vaw.context_runtime.presentation import (
-    artifact_plan as _artifact_plan,
-)
-from vaw.context_runtime.presentation import (
     compile_active_presentation as _active_presentation,
 )
 from vaw.context_runtime.presentation import (
@@ -44,11 +40,7 @@ from vaw.context_runtime.presentation import (
 from vaw.context_runtime.presentation import (
     observed_source_ref as _observed_source_ref,
 )
-from vaw.context_runtime.private import (
-    ActionReviewArtifacts,
-    ImaginationArtifacts,
-    PrivateEnvContext,
-)
+from vaw.context_runtime.private import PrivateEnvContext
 from vaw.context_runtime.scene_view import render_scene_view
 from vaw.context_runtime.workspace import ContextWorkspace
 
@@ -1112,39 +1104,6 @@ def _overlay_mask(
     return raster
 
 
-def _overlay_robot_imagination(
-    rgb: np.ndarray,
-    *,
-    robot_mask: np.ndarray | None,
-    gripper_mask: np.ndarray | None,
-) -> np.ndarray:
-    """Make the target hand dominant while keeping arm geometry translucent."""
-
-    raster = _overlay_mask(rgb, robot_mask, VIOLET, alpha=0.26)
-    return _overlay_mask(raster, gripper_mask, VIOLET, alpha=0.80)
-
-
-def _mask_box(mask: np.ndarray | None) -> tuple[float, float, float, float] | None:
-    if mask is None or not mask.any():
-        return None
-    ys, xs = np.nonzero(mask)
-    return (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
-
-
-def _union_boxes(
-    boxes: list[tuple[float, float, float, float] | None],
-) -> tuple[float, float, float, float] | None:
-    valid = [box for box in boxes if box is not None]
-    if not valid:
-        return None
-    return (
-        min(box[0] for box in valid),
-        min(box[1] for box in valid),
-        max(box[2] for box in valid),
-        max(box[3] for box in valid),
-    )
-
-
 def _pixel_box(
     pixel: tuple[float, float] | None,
     *,
@@ -1160,302 +1119,9 @@ def _pixel_box(
     )
 
 
-def _proposal_raster(
-    rgb: np.ndarray,
-    state: ContextState,
-    camera: dict[str, Any],
-    target: ActionTarget,
-    artifacts: ImaginationArtifacts | ActionReviewArtifacts | None,
-) -> np.ndarray:
-    """Render current RGB plus the reviewed target without predicting dynamics."""
-
-    robot = state.robot
-    plan = _artifact_plan(artifacts)
-    joints = plan.prediction.joint_positions_rad if plan is not None else None
-    if target.pose is None and robot is not None:
-        joints = robot.joint_positions_rad
-    current_opening = robot.gripper_opening if robot is not None else None
-    target_opening = (
-        1.0 if target.gripper == "open" else 0.0 if target.gripper == "closed" else current_opening
-    )
-    robot_mask = None
-    gripper_mask = None
-    if joints is not None and target_opening is not None:
-        robot_mask = _robot_mask(
-            joints,
-            target_opening,
-            camera,
-            rgb.shape[1],
-            rgb.shape[0],
-        )
-        gripper_mask = _gripper_mask(
-            joints,
-            target_opening,
-            camera,
-            rgb.shape[1],
-            rgb.shape[0],
-        )
-
-    raster = rgb.copy()
-    visual_edit = (
-        artifacts.latest_visual_edit if isinstance(artifacts, ImaginationArtifacts) else None
-    )
-    if (
-        visual_edit is not None
-        and robot is not None
-        and robot.joint_positions_rad is not None
-        and current_opening is not None
-    ):
-        observed_gripper = _gripper_mask(
-            robot.joint_positions_rad,
-            current_opening,
-            camera,
-            rgb.shape[1],
-            rgb.shape[0],
-        )
-        raster = _overlay_mask(raster, observed_gripper, BLUE, alpha=0.58)
-    raster = _overlay_robot_imagination(
-        raster,
-        robot_mask=robot_mask,
-        gripper_mask=gripper_mask,
-    )
-
-    image = Image.fromarray(raster).convert("RGB")
-    draw = ImageDraw.Draw(image, "RGBA")
-    source_ref = _observed_source_ref(artifacts)
-    source_bbox = _source_bbox(state, source_ref, camera)
-    reference_pixel = None
-    target_pixel = _pose_origin_pixel(target.pose, camera) if target.pose is not None else None
-    if visual_edit is not None and target.pose is not None:
-        reference = visual_edit.reference_pose
-        reference_pixel = _pose_origin_pixel(reference, camera)
-        axes_rotation = (
-            Rotation.identity()
-            if visual_edit.frame == "base"
-            else Rotation.from_quat(np.asarray(reference.quaternion_xyzw, dtype=np.float64))
-        )
-        if visual_edit.kind == "rotate":
-            _draw_pose_axes(draw, reference.position_xyz, axes_rotation, camera, BLUE)
-            _draw_pose_axes(
-                draw,
-                target.pose.position_xyz,
-                Rotation.from_quat(np.asarray(target.pose.quaternion_xyzw, dtype=np.float64)),
-                camera,
-                GREEN,
-            )
-            _draw_rotation_arc(
-                draw,
-                visual_edit,
-                camera,
-            )
-        elif reference_pixel is not None and target_pixel is not None:
-            _arrow(draw, reference_pixel, target_pixel, GREEN, width=4)
-    elif source_bbox is not None:
-        draw.rectangle(source_bbox, outline=(*BLUE, 230), width=2)
-        if source_ref is not None:
-            _label(
-                draw,
-                (source_bbox[0] + 3, max(2.0, source_bbox[1] - 18.0)),
-                source_ref,
-                BLUE,
-            )
-
-    annotated = np.asarray(image, dtype=np.uint8)
-    focus_box = _union_boxes(
-        [
-            source_bbox,
-            _mask_box(gripper_mask),
-            _pixel_box(reference_pixel, radius=14.0),
-            _pixel_box(target_pixel, radius=14.0),
-        ]
-    )
-    if focus_box is None:
-        focus_box = _mask_box(robot_mask)
-    if focus_box is None:
-        focus_box = (0.0, 0.0, float(rgb.shape[1]), float(rgb.shape[0]))
-    focus_box = _fit_box_aspect(focus_box, target_aspect=1.8)
-    left, top, right, bottom = _expanded_bounds(
-        focus_box,
-        rgb.shape[1],
-        rgb.shape[0],
-        ratio=0.28,
-    )
-    focus = Image.fromarray(annotated[top:bottom, left:right]).convert("RGB")
-    focus_width, focus_height = 1280, 640
-    focus = focus.resize((focus_width, focus_height), Image.Resampling.BILINEAR)
-
-    overview = Image.fromarray(annotated).convert("RGB")
-    overview.thumbnail((346, 253), Image.Resampling.BILINEAR)
-    inset = Image.new("RGB", (overview.width + 8, overview.height + 8), "white")
-    inset.paste(overview, (4, 4))
-    focus.paste(inset, (focus_width - inset.width - 12, 12))
-    ImageDraw.Draw(focus, "RGBA").rectangle(
-        (
-            focus_width - inset.width - 12,
-            12,
-            focus_width - 12,
-            12 + inset.height,
-        ),
-        outline=(*VIOLET, 255),
-        width=3,
-    )
-    return np.asarray(focus, dtype=np.uint8)
-
-
-def _agentview_with_base_axes(
-    rgb: np.ndarray,
-    camera: dict[str, Any],
-    robot: RobotState | None,
-) -> np.ndarray:
-    """Draw the fixed LIBERO agentview control legend used by base-frame edits.
-
-    This is deliberately a command-direction legend rather than a projected
-    3-D gizmo.  LIBERO-PRO uses one fixed agentview: base +Z raises the TCP,
-    base +Y moves screen-right, and base +X moves toward the image bottom.
-    """
-
-    del camera, robot
-    image = Image.fromarray(rgb).convert("RGB")
-    draw = ImageDraw.Draw(image, "RGBA")
-    origin = np.array([90.0, float(rgb.shape[0] - 112)], dtype=np.float64)
-    directions = (
-        np.array([0.0, 1.0]),  # BASE +X: image down
-        np.array([1.0, 0.0]),  # BASE +Y: image right
-        np.array([0.0, -1.0]),  # BASE +Z: image up / physical lift
-    )
-    colors = ((220, 38, 38), (22, 163, 74), (37, 99, 235))
-    draw.ellipse(
-        (origin[0] - 7, origin[1] - 7, origin[0] + 7, origin[1] + 7),
-        fill=(255, 255, 255, 245),
-        outline=(71, 85, 105, 255),
-        width=2,
-    )
-    for index, (color, axis_name) in enumerate(zip(colors, "XYZ", strict=True)):
-        direction = directions[index]
-        length = float(np.linalg.norm(direction))
-        label = f"+{axis_name}"
-        unit = direction / length
-        endpoint = origin + unit * 64.0
-        _arrow(draw, tuple(origin), tuple(endpoint), color, width=7)
-        _axis_label_box(draw, tuple(endpoint + unit * 20.0), label, color)
-    return np.asarray(image, dtype=np.uint8)
-
-
-def _axis_label_box(
-    draw: ImageDraw.ImageDraw,
-    anchor: tuple[float, float],
-    label: str,
-    color: tuple[int, int, int],
-) -> None:
-    font = _font(17)
-    box = draw.textbbox((0, 0), label, font=font)
-    width = box[2] - box[0] + 14
-    height = box[3] - box[1] + 10
-    left = float(anchor[0]) - width * 0.5
-    top = float(anchor[1]) - height * 0.5
-    draw.rounded_rectangle(
-        (left, top, left + width, top + height),
-        radius=4,
-        fill=(255, 255, 255, 232),
-        outline=(*color, 255),
-        width=3,
-    )
-    draw.text(
-        (left + 7, top + 4 - box[1]),
-        label,
-        fill=(*color, 255),
-        font=font,
-    )
-
-
-def _font(size: int) -> ImageFont.ImageFont:
-    try:
-        return ImageFont.truetype("DejaVuSansMono-Bold.ttf", size)
-    except OSError:
-        return ImageFont.load_default()
-
-
 def _pose_origin_pixel(pose: Pose, camera: dict[str, Any]) -> tuple[float, float] | None:
     projected = _project_pose(pose, camera)
     return None if projected is None else projected[:2]
-
-
-def _draw_pose_axes(
-    draw: ImageDraw.ImageDraw,
-    origin_xyz: tuple[float, float, float],
-    rotation: Rotation,
-    camera: dict[str, Any],
-    color: tuple[int, int, int],
-    *,
-    length_m: float = 0.045,
-) -> None:
-    origin = np.asarray(origin_xyz, dtype=np.float64)
-    points = np.vstack([origin, origin + rotation.as_matrix().T * length_m])
-    try:
-        projected = project_world_to_pixel(points, camera["intrinsics"], camera["pose_mat"])
-    except (KeyError, ValueError, np.linalg.LinAlgError):
-        return
-    if not np.isfinite(projected).all() or np.any(projected[:, 2] <= 0):
-        return
-    center = tuple(float(value) for value in projected[0, :2])
-    for index, axis in enumerate("xyz", start=1):
-        endpoint = tuple(float(value) for value in projected[index, :2])
-        draw.line((*center, *endpoint), fill=(*color, 210), width=3)
-        draw.text(
-            (endpoint[0] + 2, endpoint[1] - 6),
-            axis,
-            fill=(*color, 255),
-            font=ImageFont.load_default(),
-        )
-
-
-def _draw_rotation_arc(
-    draw: ImageDraw.ImageDraw,
-    edit: Any,
-    camera: dict[str, Any],
-) -> None:
-    if edit.axis not in {"x", "y", "z"} or edit.angle_deg is None:
-        return
-    axis_index = "xyz".index(edit.axis)
-    axis_unit = np.eye(3, dtype=np.float64)[axis_index]
-    reference_rotation = Rotation.from_quat(
-        np.asarray(edit.reference_pose.quaternion_xyzw, dtype=np.float64)
-    ).as_matrix()
-    axis_base = axis_unit if edit.frame == "base" else reference_rotation @ axis_unit
-    radial_base = (
-        np.eye(3, dtype=np.float64)[(axis_index + 1) % 3]
-        if edit.frame == "base"
-        else reference_rotation[:, (axis_index + 1) % 3]
-    )
-    center = np.asarray(edit.reference_pose.position_xyz, dtype=np.float64)
-    samples = np.linspace(
-        0.0,
-        np.deg2rad(float(edit.angle_deg)),
-        num=25,
-        dtype=np.float64,
-    )
-    arc = np.vstack(
-        [
-            center + Rotation.from_rotvec(axis_base * angle).apply(radial_base * 0.05)
-            for angle in samples
-        ]
-    )
-    try:
-        projected = project_world_to_pixel(
-            arc,
-            camera["intrinsics"],
-            camera["pose_mat"],
-        )
-    except (KeyError, ValueError, np.linalg.LinAlgError):
-        return
-    if not np.isfinite(projected).all() or np.any(projected[:, 2] <= 0):
-        return
-    points = [tuple(float(value) for value in pixel[:2]) for pixel in projected]
-    colors = ((220, 38, 38), GREEN, BLUE)
-    color = colors[axis_index]
-    draw.line(points, fill=(*color, 240), width=5, joint="curve")
-    if len(points) >= 2:
-        _arrow(draw, points[-2], points[-1], color, width=5)
 
 
 def _arrow(
