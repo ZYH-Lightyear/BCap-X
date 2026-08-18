@@ -9,6 +9,11 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from capx.utils.depth_utils import depth_to_pointcloud
+from vaw.context_runtime.attached_object import (
+    ObjectProxyCandidate,
+    bind_proxy_to_tcp,
+    fit_gravity_stable_proxy,
+)
 from vaw.context_runtime.errors import ContextFunctionError
 from vaw.context_runtime.geometry import (
     GRASP_POSE_TO_CONTACT_M,
@@ -20,21 +25,18 @@ from vaw.context_runtime.geometry import (
 )
 from vaw.context_runtime.model import (
     ActionPrediction,
-    ActionReview,
     ActionSeed,
     ActionTarget,
-    ImaginationHandoff,
-    ImaginationState,
     LastPhysicalAction,
+    PendingAction,
     PointEvidence,
     Pose,
+    RefinementSession,
     RegionEvidence,
 )
 from vaw.context_runtime.motion import MotionBackendError, MotionPlan
 from vaw.context_runtime.private import (
-    ActionReviewArtifacts,
-    CausalSubjectArtifact,
-    ImaginationArtifacts,
+    ActionArtifacts,
     LastPhysicalArtifacts,
     PlanningContext,
     RegionGeometryArtifact,
@@ -62,12 +64,21 @@ class _PreparedGrasp:
     score: float
     raw_index: int
     approach_z: float
+    family: str = "cgn"
+
+
+_LIBERO_TOP_QUAT_XYZW = (1.0, 0.0, 0.0, 0.0)
+_TOP_GRASP_OFFSET_M = 0.04
+_MAX_TOP_GRASPS = 1
+_MAX_PCA_GRASPS = 2
+_MAX_CGN_GRASPS = 2
+_SEMANTIC_QUERY_RETRIES = 2
 
 
 _COMMIT_FAILURE_RECOVERY_HINT = (
     "region/seed/action_id 已随新观测作废，不能再 commit 该 id。"
     "若仍操作同一物体，请重新 detection_and_sam（优先使用 source_query）；"
-    "若从当前真实 TCP 继续靠近，调用 start_imagination。"
+    "若从当前真实 TCP 继续靠近，由 Main 调用 refine_action。"
 )
 
 
@@ -75,26 +86,28 @@ class ContextFunctions:
     """Function semantics separated from workspace lifecycle/dispatch."""
 
     MAX_DELTA_M = 0.03
-    MAX_ROTATION_DEG = 90.0
+    MAX_ROTATION_DEG = 10.0
 
     def __init__(self, workspace: ContextWorkspace) -> None:
         self.ws = workspace
-        self.handlers: dict[str, Callable[..., dict[str, Any]]] = {
+        self.main_handlers: dict[str, Callable[..., dict[str, Any]]] = {
             "detection_and_sam": self.detection_and_sam,
             "locate_point": self.locate_point,
             "propose_grasps": self.propose_grasps,
             "propose_pose": self.propose_pose,
             "select": self.select,
-            "start_imagination": self.start_imagination,
-            "delta_move": self.delta_move,
-            "rotate": self.rotate,
+            "delta_move": self.direct_delta_move,
             "commit": self.commit,
             "open_gripper": self.open_gripper,
             "close_gripper": self.close_gripper,
-            "show_rotation_gizmo": self.show_rotation_gizmo,
-            "finish_imagination": self.finish_imagination,
             "reject_action": self.reject_action,
             "done": self.done,
+        }
+        self.imagination_handlers: dict[str, Callable[..., dict[str, Any]]] = {
+            "delta_move": self.delta_move,
+            "rotate": self.rotate,
+            "show_rotation_gizmo": self.show_rotation_gizmo,
+            "finish_imagination": self.finish_imagination,
         }
 
     # ---------------------------------------------------------- perception --
@@ -170,6 +183,15 @@ class ContextFunctions:
         )
         if geometry is not None:
             self.ws._private.region_geometry[region_id] = geometry
+            self.ws._private.trace_diagnostics["object_volume_proxy"] = {
+                "region_id": region_id,
+                "available": geometry.volume_proxy is not None,
+                "extent_xyz_m": (
+                    list(geometry.volume_proxy.extent_xyz_m)
+                    if geometry.volume_proxy is not None
+                    else None
+                ),
+            }
         return {
             "region_id": region_id,
             "bbox_xyxy_px": [round(float(value), 3) for value in global_box],
@@ -192,52 +214,90 @@ class ContextFunctions:
             return _bounded_box(box, rgb.shape[1], rgb.shape[0])
 
         coord_space = _grounding_coord_space(self.ws.api)
-        candidate_reply = self.ws._call_backend(
-            "query_vlm",
-            candidate_prompt(
-                query,
-                width=rgb.shape[1],
-                height=rgb.shape[0],
-                coord_space=coord_space,
-            ),
-            images=rgb,
-            temperature=0.0,
-            max_tokens=512,
-        )
-        try:
-            candidates = parse_candidates(
-                str(candidate_reply),
-                width=rgb.shape[1],
-                height=rgb.shape[0],
-                coord_space=coord_space,
-            )
-        except ValueError as exc:
-            raise ContextFunctionError(f"semantic candidate parsing failed: {exc}") from exc
         diagnostics: dict[str, Any] = {
             "mode": "candidate_review",
             "coord_space": coord_space,
-            "candidate_reply": str(candidate_reply),
-            "candidate_boxes": [
-                [round(float(value), 3) for value in item.box_xyxy_px] for item in candidates
-            ],
+            "candidate_attempts": [],
+            "review_attempts": [],
         }
         self.ws._private.trace_diagnostics["semantic_grounding"] = diagnostics
+
+        candidate_query = candidate_prompt(
+            query,
+            width=rgb.shape[1],
+            height=rgb.shape[0],
+            coord_space=coord_space,
+        )
+        candidates = None
+        candidate_error: ValueError | None = None
+        for attempt in range(1, _SEMANTIC_QUERY_RETRIES + 2):
+            candidate_reply = self.ws._call_backend(
+                "query_vlm",
+                candidate_query,
+                images=rgb,
+                temperature=0.0,
+                max_tokens=512,
+            )
+            raw_reply = str(candidate_reply)
+            attempt_record: dict[str, Any] = {
+                "attempt": attempt,
+                "reply": raw_reply,
+                "reply_length": len(raw_reply),
+            }
+            diagnostics["candidate_attempts"].append(attempt_record)
+            diagnostics["candidate_reply"] = raw_reply
+            try:
+                candidates = parse_candidates(
+                    raw_reply,
+                    width=rgb.shape[1],
+                    height=rgb.shape[0],
+                    coord_space=coord_space,
+                )
+            except ValueError as exc:
+                candidate_error = exc
+                attempt_record["parse_error"] = str(exc)
+                continue
+            break
+        if candidates is None:
+            message = str(candidate_error or "unknown parse error")
+            raise ContextFunctionError(f"semantic candidate parsing failed: {message}")
+        diagnostics["candidate_boxes"] = [
+            [round(float(value), 3) for value in item.box_xyxy_px] for item in candidates
+        ]
         if not candidates:
             raise ContextFunctionError(f"semantic grounding found no candidate for '{query}'")
 
         review_raster = render_candidate_review(rgb, candidates)
-        review_reply = self.ws._call_backend(
-            "query_vlm",
-            review_prompt(query),
-            images=review_raster,
-            temperature=0.0,
-            max_tokens=160,
-        )
-        diagnostics["review_reply"] = str(review_reply)
-        try:
-            selected = parse_choice(str(review_reply), count=len(candidates))
-        except ValueError as exc:
-            raise ContextFunctionError(f"semantic candidate review failed: {exc}") from exc
+        selected = None
+        review_parsed = False
+        review_error: ValueError | None = None
+        for attempt in range(1, _SEMANTIC_QUERY_RETRIES + 2):
+            review_reply = self.ws._call_backend(
+                "query_vlm",
+                review_prompt(query),
+                images=review_raster,
+                temperature=0.0,
+                max_tokens=160,
+            )
+            raw_reply = str(review_reply)
+            attempt_record = {
+                "attempt": attempt,
+                "reply": raw_reply,
+                "reply_length": len(raw_reply),
+            }
+            diagnostics["review_attempts"].append(attempt_record)
+            diagnostics["review_reply"] = raw_reply
+            try:
+                selected = parse_choice(raw_reply, count=len(candidates))
+            except ValueError as exc:
+                review_error = exc
+                attempt_record["parse_error"] = str(exc)
+                continue
+            review_parsed = True
+            break
+        if not review_parsed:
+            message = str(review_error or "unknown parse error")
+            raise ContextFunctionError(f"semantic candidate review failed: {message}")
         diagnostics["selected_candidate"] = None if selected is None else int(selected + 1)
         if selected is None:
             raise ContextFunctionError(
@@ -308,6 +368,9 @@ class ContextFunctions:
             base_from_camera = np.asarray(camera["pose_mat"], dtype=np.float64).reshape(4, 4)
         except (KeyError, ValueError) as exc:
             raise ContextFunctionError(f"invalid camera pose: {exc}") from exc
+        object_points = (
+            geometry.filtered_object_points_base if geometry is not None else None
+        )
         prepared, diagnostic = _prepare_grasps(
             planned,
             poses_are_base_frame=False,
@@ -317,28 +380,60 @@ class ContextFunctions:
                 if self.ws.state.robot is not None and self.ws.state.robot.ee_pose is not None
                 else None
             ),
-            object_points_base=(
-                geometry.filtered_object_points_base if geometry is not None else None
-            ),
+            object_points_base=object_points,
         )
+        geometric, geometric_diagnostic = _geometric_grasps(object_points)
+        pool = [*geometric, *prepared]
+        ranked = _select_grasp_mixture(
+            pool, limit=max(len(pool), self.ws.MAX_GRASP_CANDIDATES)
+        )
+        reachable: list[tuple[_PreparedGrasp, ActionPrediction]] = []
+        dropped: list[dict[str, Any]] = []
+        for item in ranked:
+            if len(reachable) >= self.ws.MAX_GRASP_CANDIDATES:
+                break
+            prediction = self._predict(item.target)
+            if not self._seed_is_reachable(item.target, prediction):
+                dropped.append(
+                    {
+                        "family": item.family,
+                        "solve_ik": prediction.solve_ik,
+                        "reason": (
+                            "ik_error"
+                            if prediction.solve_ik != "returned"
+                            else "ik_mismatch"
+                        ),
+                        "target_xyz": _rounded_vector(item.target.position_xyz),
+                    }
+                )
+                continue
+            reachable.append((item, prediction))
         self.ws._private.trace_diagnostics["grasp_candidates"] = {
-            "selected_source": "single_view" if prepared else None,
-            "object_points": _point_summary(
-                geometry.filtered_object_points_base if geometry is not None else None
-            ),
-            "attempts": [{"source": "single_view", **diagnostic}],
+            "selected_source": "mixture" if reachable else None,
+            "object_points": _point_summary(object_points),
+            "attempts": [
+                {"source": "single_view", **diagnostic},
+                {"source": "geometric", **geometric_diagnostic},
+            ],
+            "dropped_unreachable": dropped,
+            "selected": [
+                {
+                    "family": item.family,
+                    "approach_z": round(item.approach_z, 6),
+                    "target_xyz": _rounded_vector(item.target.position_xyz),
+                }
+                for item, _prediction in reachable
+            ],
         }
-        if not prepared:
+        if not reachable:
             raise ContextFunctionError(
-                f"grasp planner returned no geometrically valid candidates for '{region_id}'"
+                f"grasp planner returned no kinematically reachable candidates for '{region_id}'"
             )
 
         ids: list[str] = []
-        ordered = sorted(prepared, key=lambda item: item.score, reverse=True)
-        for item in ordered[: self.ws.MAX_GRASP_CANDIDATES]:
+        for item, prediction in reachable:
             seed_id = self.ws.state.next_id("s")
             target = ActionTarget(pose=item.target)
-            prediction = self._predict(item.target)
             self.ws.state.seeds[seed_id] = ActionSeed(
                 seed_id=seed_id,
                 target=target,
@@ -349,6 +444,7 @@ class ContextFunctions:
                     source_kind="grasp", source_ref=seed_id, region_id=region_id
                 ),
                 preview_plan=MotionPlan(self.ws.motion_backend_name, prediction),
+                family=item.family,
             )
             ids.append(seed_id)
         return {"seed_ids": ids}
@@ -388,12 +484,18 @@ class ContextFunctions:
         filtered = self._filter_object_points(object_points)
         if not _has_points(filtered):
             filtered = object_points
+        volume_proxy = fit_gravity_stable_proxy(
+            query,
+            self.ws.state.observation_revision,
+            filtered,
+        )
         return RegionGeometryArtifact(
             agentview_mask=np.asarray(agentview_mask, dtype=bool).copy(),
             wrist_mask=None if wrist_mask is None else np.asarray(wrist_mask, dtype=bool).copy(),
             object_points_base=object_points,
             scene_points_base=scene_points,
             filtered_object_points_base=filtered,
+            volume_proxy=volume_proxy,
         )
 
     def _segment_wrist_mask(
@@ -454,12 +556,17 @@ class ContextFunctions:
             tuple(float(value) for value in np.asarray(point.position_xyz) + offset),
             quaternion,
         )
-        return self._start_imagination(
+        return self._create_pending_action(
             ActionTarget(pose=target),
-            ImaginationArtifacts(
-                planning_context=PlanningContext(source_kind="point", source_ref=point_id),
-                preview_plan=self.ws.motion.plan_pose(target),
+            ActionArtifacts(
+                planning_context=PlanningContext(
+                    source_kind="point",
+                    source_ref=point_id,
+                    region_id=point.within_region_id,
+                ),
+                motion_plan=self.ws.motion.plan_pose(target),
             ),
+            intent=f"move to {point.query}",
         )
 
     def select(self, seed_id: str) -> dict[str, Any]:
@@ -468,32 +575,22 @@ class ContextFunctions:
         if artifacts is None:
             raise ContextFunctionError(f"seed '{seed_id}' has no private artifacts")
         plan = self._plan_target(seed.target, artifacts.planning_context)
-        return self._start_imagination(
-            seed.target,
-            ImaginationArtifacts(
-                planning_context=artifacts.planning_context,
-                preview_plan=plan,
-            ),
+        region = (
+            self.ws.state.regions.get(artifacts.planning_context.region_id)
+            if artifacts.planning_context is not None
+            and artifacts.planning_context.region_id is not None
+            else None
         )
-
-    def start_imagination(self) -> dict[str, Any]:
-        """Transfer the observed TCP to Imagination without editing it.
-
-        This explicit handoff keeps Main out of local manipulation.  The
-        baseline pose is public so the Imagination Agent can subsequently
-        translate or rotate it; no planner call is needed until the first
-        spatial edit.
-        """
-
-        robot = self.ws.state.robot
-        if robot is None or robot.tcp_pose is None:
-            raise ContextFunctionError("current TCP pose is unavailable")
-        target = ActionTarget(pose=robot.tcp_pose)
-        return self._start_imagination(
-            target,
-            ImaginationArtifacts(
-                planning_context=PlanningContext(source_kind="current"),
-                initial_target=target,
+        return self._create_pending_action(
+            seed.target,
+            ActionArtifacts(
+                planning_context=artifacts.planning_context,
+                motion_plan=plan,
+            ),
+            intent=(
+                f"approach {region.query} for grasp"
+                if region is not None
+                else "execute selected spatial approach"
             ),
         )
 
@@ -525,22 +622,11 @@ class ContextFunctions:
         )
         planning_context = artifacts.planning_context
         plan = self._plan_adjusted_pose(target, planning_context)
-        current = self.ws.state.imagination
-        gripper = (
-            current.target.gripper
-            if current is not None
-            else (
-                artifacts.initial_target.gripper if artifacts.initial_target is not None else None
-            )
-        )
-        return self._store_imagination(
-            ActionTarget(
-                pose=target,
-                gripper=gripper,
-            ),
-            ImaginationArtifacts(
+        return self._store_pending_action(
+            ActionTarget(pose=target),
+            ActionArtifacts(
                 planning_context=planning_context,
-                preview_plan=plan,
+                motion_plan=plan,
                 initial_target=artifacts.initial_target,
                 previous_visual_edit=artifacts.previous_visual_edit,
                 latest_visual_edit=visual_edit,
@@ -568,7 +654,7 @@ class ContextFunctions:
         if angle == 0.0:
             raise ContextFunctionError("angle_deg must be non-zero")
         if abs(angle) > self.MAX_ROTATION_DEG:
-            raise ContextFunctionError("angle_deg must be within [-90, 90] degrees")
+            raise ContextFunctionError("angle_deg must be within [-10, 10] degrees")
         normalized_frame = _frame(frame)
         reference, artifacts = self._adjustment_reference()
         reference_rotation = _pose_rotation(reference)
@@ -592,22 +678,11 @@ class ContextFunctions:
         )
         planning_context = artifacts.planning_context
         plan = self._plan_adjusted_pose(target, planning_context)
-        current = self.ws.state.imagination
-        gripper = (
-            current.target.gripper
-            if current is not None
-            else (
-                artifacts.initial_target.gripper if artifacts.initial_target is not None else None
-            )
-        )
-        return self._store_imagination(
-            ActionTarget(
-                pose=target,
-                gripper=gripper,
-            ),
-            ImaginationArtifacts(
+        return self._store_pending_action(
+            ActionTarget(pose=target),
+            ActionArtifacts(
                 planning_context=planning_context,
-                preview_plan=plan,
+                motion_plan=plan,
                 initial_target=artifacts.initial_target,
                 previous_visual_edit=artifacts.previous_visual_edit,
                 latest_visual_edit=visual_edit,
@@ -617,20 +692,15 @@ class ContextFunctions:
             ),
         )
 
-    def _adjustment_reference(self) -> tuple[Pose, ImaginationArtifacts]:
-        imagination = self.ws.state.imagination
-        if imagination is not None and imagination.target.pose is not None:
-            reference_rotation = _pose_rotation(imagination.target.pose)
+    def _adjustment_reference(self) -> tuple[Pose, ActionArtifacts]:
+        action = self.ws.state.pending_action
+        if action is not None:
+            reference_rotation = _pose_rotation(action.target.pose)
             reference = Pose(
-                imagination.target.pose.position_xyz,
+                action.target.pose.position_xyz,
                 tuple(float(value) for value in reference_rotation.as_quat()),
             )
-            return reference, self.ws._private.imagination_artifacts or ImaginationArtifacts()
-
-        if self.ws.state.action_review is not None:
-            raise ContextFunctionError(
-                "an ActionReview is pending; Main must commit or reject it before spatial editing"
-            )
+            return reference, self.ws._private.action_artifacts or ActionArtifacts()
 
         robot = self.ws.state.robot
         if robot is None or robot.tcp_pose is None:
@@ -645,7 +715,7 @@ class ContextFunctions:
         )
         return (
             reference,
-            ImaginationArtifacts(initial_target=ActionTarget(pose=reference)),
+            ActionArtifacts(initial_target=ActionTarget(pose=reference)),
         )
 
     def _plan_adjusted_pose(
@@ -653,6 +723,8 @@ class ContextFunctions:
         target: Pose,
         planning_context: PlanningContext | None,
     ) -> MotionPlan:
+        backend, route = self.ws.motion_backend_for_target(target)
+        self.ws._private.trace_diagnostics["motion_route"] = route
         if planning_context is not None and planning_context.region_id is not None:
             region = self.ws.state.regions.get(planning_context.region_id)
             mask = self.ws._private.region_masks.get(planning_context.region_id)
@@ -660,22 +732,24 @@ class ContextFunctions:
                 raise ContextFunctionError(
                     f"grasp source '{planning_context.source_ref}' is unavailable"
                 )
-            return self.ws.motion.plan_grasp(
+            return backend.plan_grasp(
                 target,
                 object_name=region.query,
                 object_mask=mask,
             )
-        return self.ws.motion.plan_pose(target)
+        return backend.plan_pose(target)
 
-    def _start_imagination(
-        self, target: ActionTarget, artifacts: ImaginationArtifacts
+    def _create_pending_action(
+        self,
+        target: ActionTarget,
+        artifacts: ActionArtifacts,
+        *,
+        intent: str,
     ) -> dict[str, Any]:
-        self.ws.state.action_review = None
-        self.ws._private.review_artifacts.clear()
-        self.ws._private.imagination_artifacts = None
-        artifacts = ImaginationArtifacts(
+        action_id = self.ws.state.next_id("a")
+        artifacts = ActionArtifacts(
             planning_context=artifacts.planning_context,
-            preview_plan=artifacts.preview_plan,
+            motion_plan=artifacts.motion_plan,
             initial_target=target,
             previous_visual_edit=None,
             latest_visual_edit=artifacts.latest_visual_edit,
@@ -683,17 +757,21 @@ class ContextFunctions:
             rotation_gizmo_axis=None,
             turn_count=0,
         )
-        return self._store_imagination(target, artifacts)
+        self.ws.state.pending_action = PendingAction(action_id, target, intent)
+        self.ws._private.action_artifacts = artifacts
+        self.ws._private.clear_contact_camera_lock()
+        return _preview_result(action_id, target, artifacts)
 
-    def _store_imagination(
-        self, target: ActionTarget, artifacts: ImaginationArtifacts
+    def _store_pending_action(
+        self, target: ActionTarget, artifacts: ActionArtifacts
     ) -> dict[str, Any]:
+        action = self.ws.state.pending_action
+        if action is None:
+            raise ContextFunctionError("there is no pending action to edit")
         before_target = (
-            self.ws.state.imagination.target.summary()
-            if self.ws.state.imagination is not None
-            else None
+            action.target.summary()
         )
-        previous = self.ws._private.imagination_artifacts
+        previous = self.ws._private.action_artifacts
         turn_count = previous.turn_count if previous is not None else 0
         initial_target = (
             previous.initial_target
@@ -722,15 +800,15 @@ class ContextFunctions:
             if previous is not None
             else None
         )
-        self.ws.state.action_review = None
-        self.ws._private.review_artifacts.clear()
-        self.ws.state.imagination = ImaginationState(
-            target=target,
-            refinement_goal=self.ws.refinement_goal,
+        self.ws.state.pending_action = PendingAction(
+            action.action_id,
+            target,
+            action.intent,
+            ready_for_commit=False,
         )
-        self.ws._private.imagination_artifacts = ImaginationArtifacts(
+        self.ws._private.action_artifacts = ActionArtifacts(
             planning_context=artifacts.planning_context,
-            preview_plan=artifacts.preview_plan,
+            motion_plan=artifacts.motion_plan,
             initial_target=initial_target,
             previous_visual_edit=previous_edit,
             latest_visual_edit=latest_edit,
@@ -741,7 +819,11 @@ class ContextFunctions:
         self.ws._private.trace_diagnostics["imagination_edit"] = {
             "target_before": before_target,
             "target_after": target.summary(),
-            "refinement_goal": self.ws.refinement_goal,
+            "refinement_instruction": (
+                self.ws.state.refinement.instruction
+                if self.ws.state.refinement is not None
+                else None
+            ),
             "turn_count": turn_count,
             "latest_visual_edit": (
                 artifacts.latest_visual_edit.summary()
@@ -757,23 +839,154 @@ class ContextFunctions:
                 else None
             ),
         }
-        return _preview_result(target, self.ws._private.imagination_artifacts)
+        return _preview_result(action.action_id, target, self.ws._private.action_artifacts)
 
     def _plan_target(
         self, target: ActionTarget, context: PlanningContext | None
     ) -> MotionPlan | None:
-        if target.pose is None:
-            return None
-        return self._plan_adjusted_pose(target.pose, context)
+        if context is not None and context.region_id is not None:
+            region = self.ws.state.regions.get(context.region_id)
+            mask = self.ws._private.region_masks.get(context.region_id)
+            if region is None or mask is None:
+                raise ContextFunctionError(
+                    f"grasp source '{context.source_ref}' is unavailable"
+                )
+            return self.ws.motion.plan_grasp(
+                target.pose,
+                object_name=region.query,
+                object_mask=mask,
+            )
+        return self.ws.motion.plan_pose(target.pose)
 
     def _predict(self, target: Pose) -> ActionPrediction:
         return self.ws.motion.preview(target)
 
+    def _seed_is_reachable(self, target: Pose, prediction: ActionPrediction) -> bool:
+        """Keep only seeds whose IK joints actually realise the shown TCP."""
+
+        if prediction.solve_ik != "returned" or prediction.joint_positions_rad is None:
+            return False
+        override = getattr(self.ws.api, "seed_ik_matches_target", None)
+        if override is True:
+            return True
+        if callable(override):
+            return bool(override(target, prediction))
+        from vaw.context_runtime.gripper_mesh import load_panda_urdf_fk
+        from vaw.context_runtime.packet import _candidate_fk_matches_target
+
+        if load_panda_urdf_fk() is None:
+            return True
+        return _candidate_fk_matches_target(
+            prediction.joint_positions_rad,
+            target,
+            self.ws._tcp_to_hand_local_xyz,
+        )
+
     # ------------------------------------------------------------- physical --
+    def direct_delta_move(
+        self,
+        delta_xyz_m: list[float],
+        frame: str,
+    ) -> dict[str, Any]:
+        """Execute one small Main-owned TCP translation immediately."""
+
+        delta = _vector(delta_xyz_m, 3, "delta_xyz_m")
+        if not np.any(delta != 0.0):
+            raise ContextFunctionError("delta_xyz_m must contain a non-zero offset")
+        if np.any(np.abs(delta) > self.MAX_DELTA_M):
+            raise ContextFunctionError(
+                "each delta_xyz_m component must be within [-0.03, 0.03] meters"
+            )
+        normalized_frame = _frame(frame)
+        robot = self.ws.state.robot
+        if robot is None or robot.tcp_pose is None:
+            raise ContextFunctionError("current TCP pose is unavailable")
+        reference = robot.tcp_pose
+        rotation = _pose_rotation(reference)
+        displacement = delta if normalized_frame == "base" else rotation.apply(delta)
+        displacement_base = tuple(float(value) for value in displacement)
+        target = Pose(
+            tuple(
+                float(value)
+                for value in np.asarray(reference.position_xyz, dtype=np.float64)
+                + displacement
+            ),
+            tuple(float(value) for value in rotation.as_quat()),
+        )
+        # Planning is not a physical event.  A failure before ``execute`` must
+        # not refresh the observation or enter TaskMemory.
+        try:
+            plan = self.ws.local_motion.plan_pose(target)
+        except MotionBackendError as exc:
+            raise ContextFunctionError(str(exc)) from exc
+        if plan.prediction.solve_ik != "returned":
+            raise ContextFunctionError(
+                plan.prediction.detail or "direct delta_move has no executable plan"
+            )
+
+        previous_physical = self.ws._private.last_physical_artifacts
+        execution_error: ContextFunctionError | None = None
+        try:
+            self.ws.execute_motion_plan(plan, target)
+        except MotionBackendError as exc:
+            execution_error = ContextFunctionError(str(exc))
+        finally:
+            self.ws.refresh_observation()
+
+        self.ws.state.last_physical_action = LastPhysicalAction(
+            intent=f"direct delta_move in {normalized_frame} frame",
+            executed_stages="arm",
+            outcome="completed" if execution_error is None else "arm_failed",
+            requested_arm_delta_base_m=displacement_base,
+            error_detail=str(execution_error) if execution_error is not None else None,
+            evidence_invalidated=True,
+            recovery_hint=(
+                _COMMIT_FAILURE_RECOVERY_HINT if execution_error is not None else None
+            ),
+        )
+        self.ws._private.last_physical_artifacts = LastPhysicalArtifacts(
+            focus_pose=target,
+            subject_query=(
+                previous_physical.subject_query
+                if previous_physical is not None
+                else None
+            ),
+            subject_points_base=(
+                previous_physical.subject_points_base
+                if previous_physical is not None
+                else None
+            ),
+        )
+        self.ws._private.trace_diagnostics["direct_delta_move"] = {
+            "motion_backend": plan.backend,
+            "frame": normalized_frame,
+            "delta_xyz_m": [float(value) for value in delta],
+            "delta_base_m": list(displacement_base),
+        }
+        if execution_error is not None:
+            raise execution_error
+        achieved = self.ws.state.robot.tcp_pose if self.ws.state.robot is not None else None
+        result: dict[str, Any] = {}
+        if achieved is not None:
+            result["position_error_m"] = round(
+                float(
+                    np.linalg.norm(
+                        np.asarray(achieved.position_xyz, dtype=np.float64)
+                        - np.asarray(target.position_xyz, dtype=np.float64)
+                    )
+                ),
+                6,
+            )
+        return result
+
     def commit(self, action_id: str) -> dict[str, Any]:
-        action = self.ws.state.action_review
+        action = self.ws.state.pending_action
         if action is None or action.action_id != action_id:
             raise ContextFunctionError(f"unknown or expired action_id '{action_id}'")
+        if not action.ready_for_commit:
+            raise ContextFunctionError(
+                f"action '{action_id}' is a coarse proposal; call refine_action before commit"
+            )
         start_tcp = self.ws.state.robot.tcp_pose if self.ws.state.robot is not None else None
         requested_arm_delta = (
             tuple(
@@ -783,19 +996,35 @@ class ContextFunctions:
                     - np.asarray(start_tcp.position_xyz, dtype=np.float64)
                 )
             )
-            if action.target.pose is not None and start_tcp is not None
+            if start_tcp is not None
             else None
         )
+        focus_pose = action.target.pose
+        artifacts = self.ws._private.action_artifacts
+        # Missing private artifacts or a missing plan are pre-dispatch
+        # failures.  Keep the current observation/revision intact and expose
+        # the problem only as the current FunctionEvent.
+        if artifacts is None:
+            raise ContextFunctionError(
+                f"active action '{action_id}' has no private artifacts"
+            )
+        if artifacts.motion_plan is None:
+            raise ContextFunctionError(
+                f"active action '{action_id}' has no cached motion plan"
+            )
+
         execution_error: ContextFunctionError | None = None
-        failed_stage: str | None = "arm" if action.target.pose is not None else "gripper"
-        executed_stages: list[str] = []
-        focus_pose = action.target.pose or (
-            self.ws.state.robot.tcp_pose if self.ws.state.robot is not None else None
-        )
-        artifacts = self.ws._private.review_artifacts.get(action_id)
+        failed_stage: str | None = "arm"
+        executed_stages: list[str] = ["arm"]
         previous_physical = self.ws._private.last_physical_artifacts
-        causal_subject = previous_physical.causal_subject if previous_physical is not None else None
+        subject_query = previous_physical.subject_query if previous_physical is not None else None
+        subject_points = (
+            previous_physical.subject_points_base
+            if previous_physical is not None
+            else None
+        )
         planning_context = artifacts.planning_context if artifacts is not None else None
+        object_proxy = None
         if (
             planning_context is not None
             and planning_context.source_kind == "grasp"
@@ -803,40 +1032,41 @@ class ContextFunctions:
         ):
             source = self.ws.state.regions.get(planning_context.region_id)
             if source is not None:
-                causal_subject = CausalSubjectArtifact(
-                    query=source.query,
-                    bbox_xyxy_px=source.bbox_xyxy_px,
-                    source_revision=source.source_revision,
-                )
+                subject_query = source.query
+            geometry = self.ws._private.region_geometry.get(planning_context.region_id)
+            if geometry is not None:
+                object_proxy = geometry.volume_proxy
+                subject_points = geometry.filtered_object_points_base
+        elif (
+            planning_context is not None
+            and planning_context.source_kind == "point"
+            and planning_context.source_ref is not None
+        ):
+            # Preserve the destination region for post-commit Contact views.
+            # The point itself is only a coarse anchor and has no extent; its
+            # parent region provides the opening/boundary geometry needed to
+            # frame placement corrections and release.
+            point = self.ws.state.points.get(planning_context.source_ref)
+            region = (
+                self.ws.state.regions.get(point.within_region_id)
+                if point is not None and point.within_region_id is not None
+                else None
+            )
+            if region is not None:
+                subject_query = region.query
+                geometry = self.ws._private.region_geometry.get(region.region_id)
+                if geometry is not None:
+                    subject_points = geometry.filtered_object_points_base
+                    object_proxy = geometry.volume_proxy
         try:
-            if artifacts is None:
-                raise ContextFunctionError(f"active action '{action_id}' has no private artifacts")
-            if action.target.pose is not None:
-                failed_stage = "arm"
-                executed_stages.append("arm")
-                if artifacts.motion_plan is None:
-                    raise ContextFunctionError(
-                        f"active action '{action_id}' has no cached motion plan"
-                    )
-                self.ws.motion.execute(artifacts.motion_plan, action.target.pose)
-            elif action.target.gripper is not None:
-                failed_stage = "gripper"
-                executed_stages.append("gripper")
-                backend_function = (
-                    "open_gripper" if action.target.gripper == "open" else "close_gripper"
-                )
-                self.ws._call_backend(backend_function)
+            self.ws.execute_motion_plan(artifacts.motion_plan, action.target.pose)
             failed_stage = None
         except MotionBackendError as exc:
             execution_error = ContextFunctionError(str(exc))
-        except ContextFunctionError as exc:
-            execution_error = exc
         finally:
             self.ws.refresh_observation()
 
-        if not executed_stages and failed_stage is not None:
-            executed_stages.append(failed_stage)
-        stage_summary = "arm" if executed_stages == ["arm"] else "gripper"
+        stage_summary = "arm"
         if execution_error is None:
             outcome = "completed"
         elif failed_stage == "arm":
@@ -847,29 +1077,49 @@ class ContextFunctions:
             intent=action.intent,
             executed_stages=stage_summary,
             outcome=outcome,
-            target_gripper=action.target.gripper,
             requested_arm_delta_base_m=requested_arm_delta,
             failed_action_id=action_id if execution_error is not None else None,
             error_detail=str(execution_error) if execution_error is not None else None,
-            source_query=causal_subject.query if causal_subject is not None else None,
+            source_query=subject_query,
             evidence_invalidated=True,
             recovery_hint=_COMMIT_FAILURE_RECOVERY_HINT if execution_error is not None else None,
         )
         self.ws._private.last_physical_artifacts = LastPhysicalArtifacts(
             focus_pose=focus_pose,
-            causal_subject=causal_subject,
+            subject_query=subject_query,
+            subject_points_base=subject_points,
         )
+        can_promote_proxy = (
+            execution_error is None
+            and object_proxy is not None
+            and self.ws._private.attachment_hypothesis is None
+        )
+        self.ws._private.object_proxy_candidate = (
+            ObjectProxyCandidate(action_id=action_id, proxy=object_proxy)
+            if can_promote_proxy
+            else None
+        )
+        if (
+            execution_error is None
+            and planning_context is not None
+            and planning_context.source_kind == "grasp"
+        ):
+            self.ws._private.attachment_hypothesis = None
 
         self.ws._private.trace_diagnostics["waypoint_commit"] = {
             "action_id": action_id,
+            "motion_backend": artifacts.motion_plan.backend,
             "executed_stages": list(executed_stages),
             "failed_stage": failed_stage,
-            "target_gripper_state": action.target.gripper,
+            "object_proxy_promoted": (
+                self.ws._private.object_proxy_candidate is not None
+                and self.ws._private.object_proxy_candidate.action_id == action_id
+            ),
         }
 
         achieved = self.ws.state.robot.ee_pose if self.ws.state.robot is not None else None
         position_error = None
-        if achieved is not None and action.target.pose is not None:
+        if achieved is not None:
             achieved_tcp_position = tcp_position_from_hand_pose(
                 achieved.position_xyz,
                 achieved.quaternion_xyzw,
@@ -878,21 +1128,18 @@ class ContextFunctions:
             position_error = float(
                 np.linalg.norm(achieved_tcp_position - np.asarray(action.target.pose.position_xyz))
             )
-        opening = self.ws.state.robot.gripper_opening if self.ws.state.robot is not None else None
         if execution_error is not None:
             raise execution_error
         result: dict[str, Any] = {}
         if position_error is not None:
             result["position_error_m"] = round(position_error, 6)
-        if action.target.gripper is not None and opening is not None:
-            result["gripper_opening"] = round(float(opening), 6)
         return result
 
     def open_gripper(self) -> dict[str, Any]:
-        return self._create_gripper_review("open")
+        return self._execute_gripper("open")
 
     def close_gripper(self) -> dict[str, Any]:
-        return self._create_gripper_review("closed")
+        return self._execute_gripper("closed")
 
     def show_rotation_gizmo(self, frame: str, axis: str) -> dict[str, Any]:
         """Request a non-occluding +/- guide for one rotation axis."""
@@ -901,11 +1148,11 @@ class ContextFunctions:
         normalized_axis = str(axis).lower()
         if normalized_axis not in {"x", "y", "z"}:
             raise ContextFunctionError("axis must be one of 'x', 'y', or 'z'")
-        imagination = self.ws.state.imagination
-        if imagination is None:
-            raise ContextFunctionError("there is no active imagination session")
-        artifacts = self.ws._private.imagination_artifacts or ImaginationArtifacts()
-        self.ws._private.imagination_artifacts = replace(
+        action = self.ws.state.pending_action
+        if action is None:
+            raise ContextFunctionError("there is no pending action")
+        artifacts = self.ws._private.action_artifacts or ActionArtifacts()
+        self.ws._private.action_artifacts = replace(
             artifacts,
             rotation_gizmo_frame=normalized_frame,
             rotation_gizmo_axis=normalized_axis,
@@ -913,7 +1160,7 @@ class ContextFunctions:
         self.ws._private.trace_diagnostics["rotation_gizmo"] = {
             "frame": normalized_frame,
             "axis": normalized_axis,
-            "target": imagination.target.summary(),
+            "target": action.target.summary(),
         }
         return {
             "preview": "updated",
@@ -923,62 +1170,87 @@ class ContextFunctions:
             },
         }
 
-    def _create_gripper_review(self, target: str) -> dict[str, Any]:
-        """Create a Main-owned gripper-only review without entering Imagination."""
+    def _execute_gripper(self, target: str) -> dict[str, Any]:
+        """Execute a simple Main-owned gripper command immediately."""
 
-        if self.ws.state.imagination is not None:
-            raise ContextFunctionError(
-                "open_gripper/close_gripper are Main-only; finish or fail Imagination first"
-            )
-        if self.ws.state.action_review is not None:
-            raise ContextFunctionError(
-                "an ActionReview is already pending; commit or reject it first"
-            )
         normalized_target = _gripper_target(target)
-        action_target = ActionTarget(gripper=normalized_target)
-        action_id = self.ws.state.next_id("a")
-        intent = f"set gripper {normalized_target}"
-        summary_artifacts = ImaginationArtifacts(
-            initial_target=action_target,
+        backend_function = (
+            "open_gripper" if normalized_target == "open" else "close_gripper"
         )
-        review = ActionReview(
-            action_id=action_id,
-            target=action_target,
-            intent=intent,
+        focus_pose = self.ws.state.robot.tcp_pose if self.ws.state.robot is not None else None
+        previous_physical = self.ws._private.last_physical_artifacts
+        candidate = self.ws._private.object_proxy_candidate
+        execution_error: ContextFunctionError | None = None
+        try:
+            self.ws._call_backend(backend_function)
+        except ContextFunctionError as exc:
+            execution_error = exc
+        finally:
+            self.ws.refresh_observation()
+        self.ws.state.last_physical_action = LastPhysicalAction(
+            intent=f"direct {backend_function}",
+            executed_stages="gripper",
+            outcome="completed" if execution_error is None else "gripper_failed",
+            target_gripper=normalized_target,
+            error_detail=str(execution_error) if execution_error is not None else None,
+            evidence_invalidated=True,
         )
-        self.ws.state.action_review = review
-        self.ws.state.last_handoff = None
-        self.ws._private.review_artifacts = {
-            action_id: ActionReviewArtifacts(
-                termination_reason="main_gripper_preview",
-                edit_summary=build_edit_summary(action_target, summary_artifacts),
+        self.ws._private.last_physical_artifacts = LastPhysicalArtifacts(
+            focus_pose=focus_pose,
+            subject_query=(
+                previous_physical.subject_query
+                if previous_physical is not None
+                else None
+            ),
+            subject_points_base=(
+                previous_physical.subject_points_base
+                if previous_physical is not None
+                else None
+            ),
+        )
+        if execution_error is None and normalized_target == "open":
+            self.ws._private.object_proxy_candidate = None
+            self.ws._private.attachment_hypothesis = None
+        elif execution_error is None and normalized_target == "closed" and candidate is not None:
+            observed_tcp = (
+                self.ws.state.robot.tcp_pose if self.ws.state.robot is not None else None
             )
+            if observed_tcp is not None:
+                self.ws._private.attachment_hypothesis = bind_proxy_to_tcp(
+                    candidate,
+                    observed_tcp,
+                )
+                self.ws._private.object_proxy_candidate = None
+        self.ws._private.trace_diagnostics["attachment_preview"] = {
+            "command": normalized_target,
+            "candidate_available_before": candidate is not None,
+            "hypothesis_available_after": (
+                self.ws._private.attachment_hypothesis is not None
+            ),
         }
-        self.ws._private.imagination_artifacts = None
-        self.ws._private.trace_diagnostics["main_gripper_review"] = {
-            "action_id": action_id,
-            "target_gripper": normalized_target,
-            "physical_effect": False,
-        }
-        return {"action_id": action_id}
+        if execution_error is not None:
+            raise execution_error
+        opening = self.ws.state.robot.gripper_opening if self.ws.state.robot is not None else None
+        return (
+            {"gripper_opening": round(float(opening), 6)}
+            if opening is not None
+            else {}
+        )
 
     def finish_imagination(self, status: str) -> dict[str, Any]:
         if status not in {"ready", "failed"}:
             raise ContextFunctionError("status must be 'ready' or 'failed'")
-        imagination = self.ws.state.imagination
-        if imagination is None:
-            raise ContextFunctionError("there is no active imagination session")
         if status == "failed":
             return self._fail_imagination("agent_failed")
-        return self._handoff_review("agent_ready")
+        return self._finish_refinement("agent_ready")
 
     def reject_action(self, action_id: str) -> dict[str, Any]:
         """Decline a reviewed virtual target without changing the world."""
 
-        action = self.ws.state.action_review
+        action = self.ws.state.pending_action
         if action is None or action.action_id != action_id:
             raise ContextFunctionError(f"unknown or expired action_id '{action_id}'")
-        self.ws.discard_action_review()
+        self.ws.discard_pending_action()
         return {
             "declined_action_id": action_id,
             "declined_how": "explicit",
@@ -991,71 +1263,46 @@ class ContextFunctions:
         return self._fail_imagination("turn_limit")
 
     def _fail_imagination(self, termination_reason: str) -> dict[str, Any]:
-        imagination = self.ws.state.imagination
-        if imagination is None:
-            raise ContextFunctionError("there is no active imagination session")
-        source_ref = _planning_source_ref(self.ws._private.imagination_artifacts)
-        self.ws.state.imagination = None
-        self.ws._private.imagination_artifacts = None
-        self.ws.state.last_handoff = ImaginationHandoff(status="failed", source_ref=source_ref)
+        session = self.ws.state.refinement
+        if session is None:
+            raise ContextFunctionError("there is no active refinement session")
+        source_ref = _planning_source_ref(self.ws._private.action_artifacts)
+        failed_action_id = session.action_id
+        # A failed refinement is not a deliverable action.  Keeping the coarse
+        # target live caused Main to re-dispatch the same impossible local task
+        # indefinitely.  Seeds/evidence remain valid so Main can choose a new
+        # source, but the failed action itself is retired.
+        self.ws.discard_pending_action()
         self.ws._private.trace_diagnostics["imagination_handoff"] = {
             "status": "failed",
             "termination_reason": termination_reason,
-            "target": imagination.target.summary(),
             "source_ref": source_ref,
+            "failed_action_id": failed_action_id,
         }
-        return self.ws.state.last_handoff.summary()
+        return {"status": "failed", "source_ref": source_ref}
 
-    def _handoff_review(self, termination_reason: str) -> dict[str, Any]:
-        imagination = self.ws.state.imagination
-        if imagination is None:
-            raise ContextFunctionError("there is no active imagination session")
-        artifacts = self.ws._private.imagination_artifacts or ImaginationArtifacts()
-        plan = artifacts.preview_plan
-        if imagination.target.pose is not None and (
-            plan is None or plan.prediction.solve_ik != "returned"
-        ):
-            source_ref = _planning_source_ref(artifacts)
-            self.ws.state.imagination = None
-            self.ws._private.imagination_artifacts = None
-            self.ws.state.last_handoff = ImaginationHandoff("failed", source_ref=source_ref)
-            self.ws._private.trace_diagnostics["imagination_handoff"] = {
-                "status": "failed",
-                "termination_reason": f"{termination_reason}_without_executable_plan",
-                "target": imagination.target.summary(),
-                "source_ref": source_ref,
-            }
-            return self.ws.state.last_handoff.summary()
-
-        action_id = self.ws.state.next_id("a")
-        review = ActionReview(
-            action_id,
-            imagination.target,
-            imagination.refinement_goal,
-        )
-        self.ws.state.action_review = review
-        self.ws._private.review_artifacts = {
-            action_id: ActionReviewArtifacts(
-                motion_plan=plan,
-                planning_context=artifacts.planning_context,
-                termination_reason=termination_reason,
-                edit_summary=build_edit_summary(imagination.target, artifacts),
+    def _finish_refinement(self, termination_reason: str) -> dict[str, Any]:
+        session = self.ws.state.refinement
+        action = self.ws.state.pending_action
+        if session is None or action is None:
+            raise ContextFunctionError("there is no active refinement session")
+        artifacts = self.ws._private.action_artifacts or ActionArtifacts()
+        plan = artifacts.motion_plan
+        if plan is None or plan.prediction.solve_ik != "returned":
+            return self._fail_imagination(
+                f"{termination_reason}_without_executable_plan"
             )
-        }
-        self.ws.state.imagination = None
-        self.ws._private.imagination_artifacts = None
-        self.ws.state.last_handoff = ImaginationHandoff(
-            "review_required", action_id, _planning_source_ref(artifacts)
-        )
+        self.ws.state.pending_action = replace(action, ready_for_commit=True)
+        self.ws.state.refinement = None
         self.ws._private.trace_diagnostics["imagination_handoff"] = {
-            "status": "review_required",
+            "status": "ready",
             "termination_reason": termination_reason,
-            "action_id": action_id,
+            "action_id": action.action_id,
             "source_ref": _planning_source_ref(artifacts),
-            "target": review.target.summary(),
-            "intent": review.intent,
+            "target": action.target.summary(),
+            "intent": action.intent,
         }
-        return self.ws.state.last_handoff.summary()
+        return {"status": "ready", "action_id": action.action_id}
 
     def done(self, success: bool) -> dict[str, Any]:
         self.ws.finished = True
@@ -1071,18 +1318,19 @@ def _gripper_target(value: str | None) -> str | None:
     return value
 
 
-def _planning_source_ref(artifacts: ImaginationArtifacts | None) -> str | None:
+def _planning_source_ref(artifacts: ActionArtifacts | None) -> str | None:
     if artifacts is None or artifacts.planning_context is None:
         return None
     return artifacts.planning_context.source_ref
 
 
 def _preview_result(
+    action_id: str,
     target: ActionTarget,
-    artifacts: ImaginationArtifacts,
+    artifacts: ActionArtifacts,
 ) -> dict[str, Any]:
-    result: dict[str, Any] = {"preview": "updated"}
-    plan = artifacts.preview_plan
+    result: dict[str, Any] = {"action_id": action_id, "preview": "updated"}
+    plan = artifacts.motion_plan
     if plan is not None:
         prediction = plan.prediction
         result.update(
@@ -1226,6 +1474,190 @@ def _has_points(points: Any) -> bool:
         return False
 
 
+def _source_extent(
+    object_points: np.ndarray,
+) -> tuple[np.ndarray | None, float | None]:
+    if object_points.shape[0] == 0:
+        return None, None
+    lower, upper = np.quantile(object_points, [0.02, 0.98], axis=0)
+    source_center = (lower + upper) / 2.0
+    source_radius_m = max(0.04, float(np.linalg.norm(upper - lower)))
+    return source_center, source_radius_m
+
+
+def _approach_vector(item: _PreparedGrasp) -> np.ndarray:
+    return Rotation.from_quat(np.asarray(item.target.quaternion_xyzw)).as_matrix()[:, 2]
+
+
+def _near_duplicate_approach(
+    item: _PreparedGrasp,
+    chosen: list[_PreparedGrasp],
+    *,
+    threshold: float = 0.97,
+) -> bool:
+    if not chosen:
+        return False
+    approach = _approach_vector(item)
+    return any(
+        float(np.dot(approach, _approach_vector(existing))) >= threshold
+        for existing in chosen
+    )
+
+
+def _prepared_from_contact(
+    position_xyz: np.ndarray,
+    quaternion_xyzw: tuple[float, float, float, float],
+    *,
+    family: str,
+    score: float,
+    raw_index: int,
+    source_center: np.ndarray | None,
+    source_radius_m: float | None,
+) -> _PreparedGrasp | None:
+    rotation = Rotation.from_quat(np.asarray(quaternion_xyzw)).as_matrix()
+    if not np.isfinite(position_xyz).all() or not np.isfinite(quaternion_xyzw).all():
+        return None
+    approach_z = float(rotation[2, 2])
+    if approach_z > 0.0:
+        return None
+    contact = np.asarray(position_xyz, dtype=np.float64).reshape(3)
+    if (
+        source_center is not None
+        and source_radius_m is not None
+        and float(np.linalg.norm(contact - source_center)) > source_radius_m
+    ):
+        return None
+    return _PreparedGrasp(
+        target=Pose(
+            tuple(float(value) for value in contact),
+            quaternion_xyzw,
+        ),
+        score=score,
+        raw_index=raw_index,
+        approach_z=approach_z,
+        family=family,
+    )
+
+
+def _side_quaternion_xyzw(approach_axis: np.ndarray) -> tuple[float, float, float, float] | None:
+    z_axis = np.asarray(approach_axis, dtype=np.float64)
+    norm = float(np.linalg.norm(z_axis))
+    if norm < 1e-8:
+        return None
+    z_axis = z_axis / norm
+    y_axis = np.cross(z_axis, np.array([0.0, 0.0, 1.0]))
+    y_norm = float(np.linalg.norm(y_axis))
+    if y_norm < 1e-8:
+        return None
+    y_axis = y_axis / y_norm
+    x_axis = np.cross(y_axis, z_axis)
+    quaternion = Rotation.from_matrix(np.column_stack([x_axis, y_axis, z_axis])).as_quat()
+    return tuple(float(value) for value in quaternion)
+
+
+def _geometric_grasps(
+    object_points_base: np.ndarray | None,
+) -> tuple[list[_PreparedGrasp], dict[str, Any]]:
+    object_points = (
+        _points_array(object_points_base)
+        if object_points_base is not None and _has_points(object_points_base)
+        else np.empty((0, 3), dtype=np.float64)
+    )
+    source_center, source_radius_m = _source_extent(object_points)
+    prepared: list[_PreparedGrasp] = []
+    rejected: list[dict[str, Any]] = []
+    if object_points.shape[0] < 20:
+        return prepared, {"raw_count": 0, "accepted_count": 0, "rejected": rejected}
+
+    center = np.median(object_points, axis=0)
+    top_z = float(np.percentile(object_points[:, 2], 95))
+    top = _prepared_from_contact(
+        np.array([center[0], center[1], top_z - _TOP_GRASP_OFFSET_M]),
+        _LIBERO_TOP_QUAT_XYZW,
+        family="top",
+        score=0.6,
+        raw_index=0,
+        source_center=source_center,
+        source_radius_m=source_radius_m,
+    )
+    if top is None:
+        rejected.append({"index": 0, "family": "top", "reasons": ["filtered"]})
+    else:
+        prepared.append(top)
+
+    covariance = np.cov((object_points - center).T)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    body_axis = eigenvectors[:, int(np.argmax(eigenvalues))].copy()
+    body_axis[2] = 0.0
+    if float(np.linalg.norm(body_axis)) < 1e-8:
+        body_axis = np.array([1.0, 0.0, 0.0])
+    body_axis = body_axis / np.linalg.norm(body_axis)
+    side_axis = np.array([-body_axis[1], body_axis[0], 0.0])
+    grasp_z = float(
+        np.clip(center[2], np.percentile(object_points[:, 2], 30), np.percentile(object_points[:, 2], 70))
+    )
+    grasp = np.array([center[0], center[1], grasp_z])
+    for offset, sign in enumerate((1.0, -1.0), start=1):
+        quaternion = _side_quaternion_xyzw(sign * side_axis)
+        if quaternion is None:
+            rejected.append({"index": offset, "family": "pca", "reasons": ["invalid_rotation"]})
+            continue
+        item = _prepared_from_contact(
+            grasp,
+            quaternion,
+            family="pca",
+            score=0.55,
+            raw_index=offset,
+            source_center=source_center,
+            source_radius_m=source_radius_m,
+        )
+        if item is None:
+            rejected.append({"index": offset, "family": "pca", "reasons": ["filtered"]})
+        else:
+            prepared.append(item)
+    return prepared, {
+        "raw_count": 3,
+        "accepted_count": len(prepared),
+        "rejected": rejected,
+    }
+
+
+def _select_grasp_mixture(
+    prepared: list[_PreparedGrasp],
+    *,
+    limit: int,
+) -> list[_PreparedGrasp]:
+    chosen: list[_PreparedGrasp] = []
+    quotas = {"top": _MAX_TOP_GRASPS, "pca": _MAX_PCA_GRASPS, "cgn": _MAX_CGN_GRASPS}
+    for family, quota in quotas.items():
+        pool = [item for item in prepared if item.family == family]
+        pool.sort(key=lambda item: item.score, reverse=True)
+        taken = 0
+        for item in pool:
+            if taken >= quota or len(chosen) >= limit:
+                break
+            if family == "cgn" and _near_duplicate_approach(item, chosen):
+                continue
+            chosen.append(item)
+            taken += 1
+    leftover = [item for item in prepared if item not in chosen]
+    leftover.sort(key=lambda item: _min_approach_dot(item, chosen))
+    for item in leftover:
+        if len(chosen) >= limit:
+            break
+        if _near_duplicate_approach(item, chosen, threshold=0.995):
+            continue
+        chosen.append(item)
+    return chosen[:limit]
+
+
+def _min_approach_dot(item: _PreparedGrasp, chosen: list[_PreparedGrasp]) -> float:
+    if not chosen:
+        return 1.0
+    approach = _approach_vector(item)
+    return min(float(np.dot(approach, _approach_vector(existing))) for existing in chosen)
+
+
 def _prepare_grasps(
     planned: Any,
     *,
@@ -1271,16 +1703,7 @@ def _prepare_grasps(
         if object_points_base is not None and _has_points(object_points_base)
         else np.empty((0, 3), dtype=np.float64)
     )
-    source_center: np.ndarray | None = None
-    source_radius_m: float | None = None
-    if object_points.shape[0]:
-        lower, upper = np.quantile(object_points, [0.02, 0.98], axis=0)
-        source_center = (lower + upper) / 2.0
-        # A valid grasp TCP may lie inside the object rather than directly on
-        # an observed surface, so use one complete source diagonal as the
-        # conservative consistency radius.  Four centimetres covers tiny or
-        # sparsely sampled targets without admitting scene-scale outliers.
-        source_radius_m = max(0.04, float(np.linalg.norm(upper - lower)))
+    source_center, source_radius_m = _source_extent(object_points)
     prepared: list[_PreparedGrasp] = []
     rejected: list[dict[str, Any]] = []
     for index, (pose, score) in enumerate(zip(poses_array, scores_array, strict=True)):
@@ -1358,6 +1781,7 @@ def _prepare_grasps(
                 score=float(score),
                 raw_index=index,
                 approach_z=approach_z,
+                family="cgn",
             )
         )
 

@@ -121,7 +121,7 @@ def test_near_field_places_contact_side_below_gripper(monkeypatch) -> None:
     assert float(np.median(red_rows)) < front.shape[0] / 2
 
 
-def test_near_field_overlays_current_gripper_as_white_outline(monkeypatch) -> None:
+def test_near_field_does_not_overlay_current_gripper_outline(monkeypatch) -> None:
     triangle = np.array(
         [[[-0.04, -0.04, 0.0], [0.04, -0.04, 0.0], [0.0, 0.05, 0.04]]],
         dtype=np.float64,
@@ -140,9 +140,7 @@ def test_near_field_overlays_current_gripper_as_white_outline(monkeypatch) -> No
     baseline = render_near_field(_camera((180, 180, 180)), None, _robot())
 
     assert raster is not None and baseline is not None
-    white_outline = np.all(raster == np.array([255, 255, 255]), axis=-1)
-    baseline_white = np.all(baseline == np.array([255, 255, 255]), axis=-1)
-    assert np.count_nonzero(white_outline) > np.count_nonzero(baseline_white) + 100
+    assert np.array_equal(raster, baseline)
 
 
 def test_near_field_overlays_preview_gripper_on_same_current_cloud(monkeypatch) -> None:
@@ -189,6 +187,110 @@ def test_near_field_overlays_preview_gripper_on_same_current_cloud(monkeypatch) 
     assert np.array_equal(focus, raster)
 
 
+def test_semantic_preview_uses_realized_tcp_and_has_no_palm_fill() -> None:
+    preview = NearFieldPreview(
+        target_pose=Pose((0.3, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)),
+        joint_positions_rad=tuple(np.zeros(7)),
+        gripper_opening=0.75,
+        gripper_style="semantic-wireframe",
+        realized_tcp_pose=Pose((0.02, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)),
+    )
+
+    triangles = near_field_module._preview_gripper_triangles(_robot(), preview)
+
+    assert triangles is not None
+    assert triangles.shape == (36, 3, 3)
+    # Rendering follows the TCP realised by returned joints, not an unchecked
+    # ideal target pose far away from it.
+    assert abs(float(np.median(triangles[..., 0])) - 0.02) < 0.02
+    assert near_field_module._preview_hand_triangles(_robot(), preview) is None
+
+
+def test_semantic_preview_is_hidden_without_returned_joint_realisation() -> None:
+    preview = NearFieldPreview(
+        target_pose=Pose((0.02, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)),
+        joint_positions_rad=None,
+        gripper_opening=0.75,
+        gripper_style="semantic-wireframe",
+        realized_tcp_pose=None,
+    )
+
+    assert near_field_module._preview_gripper_triangles(_robot(), preview) is None
+
+
+def test_preview_faintly_fills_only_the_rigid_hand_occupancy(monkeypatch) -> None:
+    # Use a small 3-D palm proxy.  A single XY plane is edge-on in both
+    # gravity-stable Contact views and therefore has no silhouette area.
+    corners = np.array(
+        [
+            [-0.05, -0.04, -0.025],
+            [0.05, -0.04, -0.025],
+            [0.05, 0.04, -0.025],
+            [-0.05, 0.04, -0.025],
+            [-0.05, -0.04, 0.025],
+            [0.05, -0.04, 0.025],
+            [0.05, 0.04, 0.025],
+            [-0.05, 0.04, 0.025],
+        ],
+        dtype=np.float64,
+    )
+    faces = np.array(
+        [
+            [0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6],
+            [0, 4, 5], [0, 5, 1], [1, 5, 6], [1, 6, 2],
+            [2, 6, 7], [2, 7, 3], [3, 7, 4], [3, 4, 0],
+        ],
+        dtype=np.int64,
+    )
+    gripper = corners[faces]
+    palm = gripper * np.array([0.55, 0.55, 0.70])[None, None, :]
+
+    class LineOnlyFK:
+        def triangles(self, joints, opening):
+            del joints, opening
+            return gripper
+
+    class OccupancyFK(LineOnlyFK):
+        def hand_triangles(self, joints, opening):
+            del joints, opening
+            return palm
+
+    preview = NearFieldPreview(
+        target_pose=Pose((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)),
+        joint_positions_rad=tuple(np.zeros(7)),
+        gripper_opening=0.5,
+    )
+    monkeypatch.setattr(
+        near_field_module,
+        "load_panda_urdf_fk",
+        lambda: LineOnlyFK(),
+    )
+    line_only = render_near_field(
+        _camera((180, 180, 180)),
+        None,
+        _robot(),
+        preview,
+    )
+    monkeypatch.setattr(
+        near_field_module,
+        "load_panda_urdf_fk",
+        lambda: OccupancyFK(),
+    )
+    occupied = render_near_field(
+        _camera((180, 180, 180)),
+        None,
+        _robot(),
+        preview,
+    )
+
+    assert line_only is not None and occupied is not None
+    changed = np.any(line_only != occupied, axis=-1)
+    assert np.count_nonzero(changed) > 20
+    # The majority of the grasp aperture remains unchanged: this is a palm
+    # occupancy cue, not a return to an opaque full-gripper mask.
+    assert np.count_nonzero(changed) < occupied.shape[0] * occupied.shape[1] * 0.1
+
+
 def test_near_field_rotate_preview_changes_visual_cue_deterministically(monkeypatch) -> None:
     monkeypatch.setattr(near_field_module, "load_panda_urdf_fk", lambda: None)
     reference = Pose((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
@@ -220,7 +322,7 @@ def test_near_field_rotate_preview_changes_visual_cue_deterministically(monkeypa
     )
 
 
-def test_near_field_exposes_previous_preview_and_on_demand_rotation_gizmo(
+def test_near_field_rotation_gizmo_does_not_draw_previous_preview(
     monkeypatch,
 ) -> None:
     triangle = np.array(
@@ -241,7 +343,7 @@ def test_near_field_exposes_previous_preview_and_on_demand_rotation_gizmo(
         (0.02, 0.0, 0.0),
         tuple(Rotation.from_euler("y", 12.0, degrees=True).as_quat()),
     )
-    preview = NearFieldPreview(
+    with_previous = NearFieldPreview(
         target_pose=target,
         joint_positions_rad=(0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
         gripper_opening=0.5,
@@ -250,16 +352,25 @@ def test_near_field_exposes_previous_preview_and_on_demand_rotation_gizmo(
         rotation_gizmo_frame="tool",
         rotation_gizmo_axis="y",
     )
-    without_memory = NearFieldPreview(
+    without_previous = NearFieldPreview(
+        target_pose=target,
+        joint_positions_rad=(0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        gripper_opening=0.5,
+        rotation_gizmo_frame="tool",
+        rotation_gizmo_axis="y",
+    )
+    without_gizmo = NearFieldPreview(
         target_pose=target,
         joint_positions_rad=(0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
         gripper_opening=0.5,
     )
 
-    first = render_near_field(_camera((180, 180, 180)), None, _robot(), preview)
-    second = render_near_field(_camera((180, 180, 180)), None, _robot(), preview)
+    first = render_near_field(_camera((180, 180, 180)), None, _robot(), with_previous)
+    second = render_near_field(
+        _camera((180, 180, 180)), None, _robot(), without_previous
+    )
     baseline = render_near_field(
-        _camera((180, 180, 180)), None, _robot(), without_memory
+        _camera((180, 180, 180)), None, _robot(), without_gizmo
     )
 
     assert first is not None and baseline is not None
@@ -426,6 +537,48 @@ def test_direct_translation_guide_separates_view_normal_axis_from_screen_axes(
         )
         assert not np.any(np.all(screen_axes == depth_color, axis=-1))
         assert np.count_nonzero(np.all(depth_card == depth_color, axis=-1)) > 20
+
+
+def test_direct_contact_view_draws_single_five_centimetre_scale(monkeypatch) -> None:
+    monkeypatch.setattr(near_field_module, "load_panda_urdf_fk", lambda: None)
+    camera = _camera((116, 137, 158))
+    camera["images"]["rgb"] = np.full(
+        (near_field_module.CONTACT_PANEL_HEIGHT, CONTACT_FOCUS_WIDTH, 3),
+        (116, 137, 158),
+        dtype=np.uint8,
+    )
+    camera["intrinsics"] = np.array(
+        [[500.0, 0.0, 416.0], [0.0, 500.0, 179.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    target = Pose((0.0, 0.0, 0.3), (0.0, 0.0, 0.0, 1.0))
+    preview = NearFieldPreview(
+        target_pose=target,
+        joint_positions_rad=None,
+        gripper_opening=0.5,
+        visual_edit=VisualEdit(
+            kind="delta_move",
+            frame="base",
+            reference_pose=Pose((0.0, 0.0, 0.28), (0.0, 0.0, 0.0, 1.0)),
+            delta_xyz_m=(0.0, 0.0, 0.02),
+        ),
+    )
+
+    raster = render_contact_focus(
+        camera,
+        None,
+        _robot(),
+        preview,
+        contact_cameras=ContactCameraPair(front=camera, side=camera),
+    )
+
+    assert raster is not None
+    panel = raster[: near_field_module.CONTACT_PANEL_HEIGHT]
+    scale_region = panel[-78:-22, -170:-8]
+    accent = np.array([30, 64, 175], dtype=np.uint8)
+    white = np.array([255, 255, 255], dtype=np.uint8)
+    assert np.count_nonzero(np.all(scale_region == accent, axis=-1)) > 20
+    assert np.count_nonzero(np.all(scale_region == white, axis=-1)) > 20
 
 
 def test_base_axis_screen_directions_follow_camera_calibration() -> None:

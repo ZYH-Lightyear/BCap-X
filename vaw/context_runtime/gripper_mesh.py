@@ -24,6 +24,8 @@ from functools import lru_cache
 from typing import Any
 
 import numpy as np
+from PIL import Image, ImageDraw
+from scipy.spatial.transform import Rotation
 
 
 class PandaUrdfGripperFK:
@@ -70,6 +72,25 @@ class PandaUrdfGripperFK:
             joint_positions_rad,
             gripper_opening,
             self._GRIPPER_LINKS,
+        )
+
+    def hand_triangles(
+        self,
+        joint_positions_rad: np.ndarray,
+        gripper_opening: float,
+    ) -> np.ndarray:
+        """Return only the rigid palm/hand collision body.
+
+        The policy renderer uses this subset for a faint occupancy fill while
+        keeping the fingers and the rest of the robot as transparent line art.
+        It prevents the hand crossbar from visually disappearing without
+        hiding the object inside the grasp aperture.
+        """
+
+        return self._triangles_for_links(
+            joint_positions_rad,
+            gripper_opening,
+            ("panda_hand",),
         )
 
     def robot_triangles(
@@ -185,6 +206,103 @@ def load_panda_urdf_fk() -> PandaUrdfGripperFK | None:
         return PandaUrdfGripperFK()
     except (ImportError, FileNotFoundError):
         return None
+
+
+def semantic_parallel_jaw_triangles(
+    position_xyz: tuple[float, float, float] | np.ndarray,
+    quaternion_xyzw: tuple[float, float, float, float] | np.ndarray,
+    gripper_opening: float,
+) -> np.ndarray:
+    """Return a deliberately simple, metric parallel-jaw target glyph.
+
+    The glyph is expressed in the public fingertip/contact TCP frame: local
+    ``+Z`` points from the palm toward the contact plane and local ``Y`` is the
+    finger-closing axis.  It has two equal fingers and one thin palm crossbar;
+    callers render only its 3-D edges, never a filled mask.  This is a visual
+    comparison mode, not a replacement for FK or collision geometry.
+    """
+
+    position = np.asarray(position_xyz, dtype=np.float64).reshape(3)
+    quaternion = np.asarray(quaternion_xyzw, dtype=np.float64).reshape(4)
+    opening = float(gripper_opening)
+    if not (
+        np.isfinite(position).all()
+        and np.isfinite(quaternion).all()
+        and np.isfinite(opening)
+        and np.linalg.norm(quaternion) > 1e-12
+    ):
+        raise ValueError("semantic gripper pose and opening must be finite")
+
+    # The Panda's maximum inner finger gap is approximately 8 cm.  Keep the
+    # visual proportions metric so contact-camera scale bars remain meaningful.
+    inner_gap = 0.08 * float(np.clip(opening, 0.0, 1.0))
+    finger_thickness_y = 0.014
+    finger_depth_x = 0.022
+    finger_length_z = 0.082
+    finger_center_z = -0.5 * finger_length_z
+    finger_center_y = 0.5 * (inner_gap + finger_thickness_y)
+    palm_span_y = max(0.115, inner_gap + 2.0 * finger_thickness_y + 0.012)
+
+    local = np.concatenate(
+        (
+            _cuboid_triangles(
+                center=(0.0, -finger_center_y, finger_center_z),
+                size=(finger_depth_x, finger_thickness_y, finger_length_z),
+            ),
+            _cuboid_triangles(
+                center=(0.0, finger_center_y, finger_center_z),
+                size=(finger_depth_x, finger_thickness_y, finger_length_z),
+            ),
+            _cuboid_triangles(
+                center=(0.0, 0.0, -0.092),
+                size=(0.026, palm_span_y, 0.009),
+            ),
+        ),
+        axis=0,
+    )
+    rotation = Rotation.from_quat(quaternion / np.linalg.norm(quaternion)).as_matrix()
+    return np.ascontiguousarray(local @ rotation.T + position)
+
+
+def _cuboid_triangles(
+    *,
+    center: tuple[float, float, float],
+    size: tuple[float, float, float],
+) -> np.ndarray:
+    half = 0.5 * np.asarray(size, dtype=np.float64)
+    origin = np.asarray(center, dtype=np.float64)
+    signs = np.asarray(
+        [
+            [-1, -1, -1],
+            [1, -1, -1],
+            [1, 1, -1],
+            [-1, 1, -1],
+            [-1, -1, 1],
+            [1, -1, 1],
+            [1, 1, 1],
+            [-1, 1, 1],
+        ],
+        dtype=np.float64,
+    )
+    vertices = origin + signs * half
+    faces = np.asarray(
+        [
+            [0, 1, 2],
+            [0, 2, 3],
+            [4, 6, 5],
+            [4, 7, 6],
+            [0, 4, 5],
+            [0, 5, 1],
+            [1, 5, 6],
+            [1, 6, 2],
+            [2, 6, 7],
+            [2, 7, 3],
+            [3, 7, 4],
+            [3, 4, 0],
+        ],
+        dtype=np.int64,
+    )
+    return vertices[faces]
 
 
 def rasterize_silhouette(
@@ -329,3 +447,147 @@ def thick_mask_outline(mask: np.ndarray, *, radius: int = 2) -> np.ndarray:
             | padded[2:, 2:]
         )
     return outline
+
+
+def overlay_projected_mesh_outline(
+    image: np.ndarray,
+    triangles_base: np.ndarray,
+    triangles_px: np.ndarray,
+    depths: np.ndarray,
+    *,
+    color: tuple[int, int, int] = (216, 203, 255),
+    camera_position_base: np.ndarray | None = None,
+    view_forward_base: np.ndarray | None = None,
+    crease_angle_deg: float = 32.0,
+) -> None:
+    """Draw a transparent 3-D line rendering over an RGB raster.
+
+    The silhouette supplies the outer boundary.  Shared edges between visible
+    faces are retained only at real geometric creases, which conveys palm and
+    finger thickness without filling or hiding any observed RGB pixel.
+
+    Exactly one viewing model is required: ``camera_position_base`` for a
+    perspective camera, or ``view_forward_base`` for an orthographic view.
+    The input ``triangles_px`` must already use the final raster coordinates.
+    """
+
+    values = np.asarray(triangles_base, dtype=np.float64).reshape(-1, 3, 3)
+    projected = np.asarray(triangles_px, dtype=np.float64).reshape(-1, 3, 2)
+    triangle_depths = np.asarray(depths, dtype=np.float64).reshape(-1, 3)
+    if not (len(values) == len(projected) == len(triangle_depths)):
+        raise ValueError("3-D triangles, projected triangles and depths must align")
+    perspective = camera_position_base is not None
+    orthographic = view_forward_base is not None
+    if perspective == orthographic:
+        raise ValueError("provide exactly one camera position or view-forward vector")
+
+    mask = rasterize_silhouette(
+        projected,
+        triangle_depths,
+        image.shape[1],
+        image.shape[0],
+    )
+    if np.any(mask):
+        image[mask_outline(mask)] = np.asarray(color, dtype=np.uint8)
+
+    segments = _visible_crease_segments(
+        values,
+        projected,
+        triangle_depths,
+        camera_position_base=camera_position_base,
+        view_forward_base=view_forward_base,
+        crease_angle_deg=crease_angle_deg,
+    )
+    if not segments:
+        return
+    rendered = Image.fromarray(np.asarray(image, dtype=np.uint8))
+    draw = ImageDraw.Draw(rendered, "RGBA")
+    rgba = (*color, 245)
+    for start, end in segments:
+        draw.line((*start, *end), fill=rgba, width=1)
+    image[:] = np.asarray(rendered, dtype=np.uint8)
+
+
+def _visible_crease_segments(
+    triangles_base: np.ndarray,
+    triangles_px: np.ndarray,
+    depths: np.ndarray,
+    *,
+    camera_position_base: np.ndarray | None,
+    view_forward_base: np.ndarray | None,
+    crease_angle_deg: float,
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Return projected shared edges that express visible 3-D structure."""
+
+    triangles = np.asarray(triangles_base, dtype=np.float64).reshape(-1, 3, 3)
+    projected = np.asarray(triangles_px, dtype=np.float64).reshape(-1, 3, 2)
+    triangle_depths = np.asarray(depths, dtype=np.float64).reshape(-1, 3)
+    flat = triangles.reshape(-1, 3)
+    flat_px = projected.reshape(-1, 2)
+    if len(flat) == 0:
+        return []
+
+    # URDF visuals repeat vertices per triangle and per sub-mesh.  Weld only
+    # for line extraction; the actual rendering geometry remains untouched.
+    quantized = np.rint(flat / 1e-5).astype(np.int64)
+    _keys, inverse = np.unique(quantized, axis=0, return_inverse=True)
+    face_indices = inverse.reshape(-1, 3)
+    vertex_count = int(inverse.max()) + 1
+    vertices_px = np.zeros((vertex_count, 2), dtype=np.float64)
+    counts = np.zeros(vertex_count, dtype=np.int64)
+    np.add.at(vertices_px, inverse, flat_px)
+    np.add.at(counts, inverse, 1)
+    vertices_px /= counts[:, None]
+
+    normals = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    lengths = np.linalg.norm(normals, axis=1)
+    valid = lengths > 1e-10
+    normals[valid] /= lengths[valid, None]
+    centers = triangles.mean(axis=1)
+    if camera_position_base is not None:
+        camera = np.asarray(camera_position_base, dtype=np.float64).reshape(3)
+        front_facing = valid & (
+            np.einsum("ij,ij->i", normals, centers - camera) < 0.0
+        )
+    else:
+        forward = np.asarray(view_forward_base, dtype=np.float64).reshape(3)
+        norm = float(np.linalg.norm(forward))
+        if norm <= 1e-10:
+            raise ValueError("view-forward vector must be non-zero")
+        front_facing = valid & ((normals @ (forward / norm)) < 0.0)
+    front_facing &= np.isfinite(projected).all(axis=(1, 2))
+    front_facing &= np.isfinite(triangle_depths).all(axis=1)
+    front_facing &= triangle_depths.min(axis=1) > 1e-6
+
+    adjacency: dict[tuple[int, int], list[int]] = {}
+    for face_index, face in enumerate(face_indices):
+        for start, end in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
+            key = (int(min(start, end)), int(max(start, end)))
+            adjacency.setdefault(key, []).append(face_index)
+
+    crease_limit = float(np.cos(np.deg2rad(float(crease_angle_deg))))
+    segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for (start_index, end_index), faces in adjacency.items():
+        # The silhouette already supplies open/sub-mesh boundaries.  Drawing
+        # every such edge turns a close contact view into a dense wire ball.
+        if len(faces) < 2:
+            continue
+        first, second = faces[:2]
+        if not (front_facing[first] and front_facing[second]):
+            continue
+        if abs(float(np.dot(normals[first], normals[second]))) > crease_limit:
+            continue
+        start = vertices_px[start_index]
+        end = vertices_px[end_index]
+        if not np.isfinite((start, end)).all():
+            continue
+        segments.append(
+            (
+                (float(start[0]), float(start[1])),
+                (float(end[0]), float(end[1])),
+            )
+        )
+    return segments

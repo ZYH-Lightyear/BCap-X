@@ -3,19 +3,34 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pytest
 
 from tests.test_vaw_context_runtime import FakeContextApi
+from vaw.context_runtime.contact_camera import ContactCameraPair, ContactCameraSelection
 from vaw.context_runtime.packet import (
     CONTEXT_HEIGHT,
+    CONTEXT_SCHEMA,
+    CONTEXT_WEB_SCHEMA_VERSION,
     CONTEXT_WIDTH,
     ContextCompiler,
-    _observed_source_ref,
+    _contact_camera_center,
+    _presentation_region_ref,
 )
-from vaw.context_runtime.near_field import gravity_stable_contact_frame_quaternion
-from vaw.context_runtime.presentation import compile_near_field_preview
-from vaw.context_runtime.model import LastPhysicalAction
-from vaw.context_runtime.contact_camera import ContactCameraPair
+from vaw.context_runtime.private import LastPhysicalArtifacts
+from vaw.context_runtime.model import Pose
 from vaw.context_runtime.workspace import ContextWorkspace
+
+
+def _workspace() -> ContextWorkspace:
+    api = FakeContextApi()
+    api.rgb[:, :, 0] = np.arange(api.rgb.shape[1], dtype=np.uint8)
+    return ContextWorkspace(api, "place the can in the basket", motion_backend="pyroki")
+
+
+def _selected_action(workspace: ContextWorkspace) -> str:
+    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    seed = workspace.execute("propose_grasps", region_id=region).result["seed_ids"][0]
+    return workspace.execute("select", seed_id=seed).result["action_id"]
 
 
 def _walk_keys(value):
@@ -28,425 +43,310 @@ def _walk_keys(value):
             yield from _walk_keys(item)
 
 
-def _workspace() -> ContextWorkspace:
-    api = FakeContextApi()
-    api.rgb[:, :, 0] = np.arange(api.rgb.shape[1], dtype=np.uint8)
-    return ContextWorkspace(api, "place the can in the basket", motion_backend="pyroki")
-
-
-def _direct_camera(color: tuple[int, int, int]) -> dict:
-    rgb = np.full((358, 832, 3), color, dtype=np.uint8)
-    return {
-        "images": {
-            "rgb": rgb,
-            "depth": np.full((358, 832), 0.3, dtype=np.float64),
-        },
-        "intrinsics": np.array(
-            [[500.0, 0.0, 416.0], [0.0, 500.0, 179.0], [0.0, 0.0, 1.0]],
-            dtype=np.float64,
-        ),
-        "pose_mat": np.eye(4, dtype=np.float64),
-    }
-
-
-def test_agentview_is_the_clean_current_rgb() -> None:
+def test_main_packet_uses_clean_current_rgb_and_fixed_viewport() -> None:
     workspace = _workspace()
     packet = ContextCompiler().compile(workspace)
 
-    assert np.array_equal(packet.rasters["agentview"], workspace._private.camera("agentview")["images"]["rgb"])
+    assert packet.schema == CONTEXT_SCHEMA
+    assert packet.projection == "main"
+    assert np.array_equal(
+        packet.rasters["agentview"],
+        workspace._private.camera("agentview")["images"]["rgb"],
+    )
+    assert packet.summary()["viewport"] == {
+        "width": CONTEXT_WIDTH,
+        "height": CONTEXT_HEIGHT,
+    }
 
 
-def test_packet_modes_follow_owner_and_evidence_not_history() -> None:
+def test_live_opposite_scene_camera_is_fixed_per_episode_and_refreshed_per_revision() -> None:
+    calls: list[object] = []
+
+    def provider(request):
+        calls.append(request)
+        value = 30 + 20 * len(calls)
+        return {
+            "images": {
+                "rgb": np.full((request.height, request.width, 3), value, dtype=np.uint8)
+            },
+            "intrinsics": np.eye(3, dtype=np.float64),
+            "pose_mat": np.eye(4, dtype=np.float64),
+            "view_name": "opposite",
+        }
+
+    workspace = ContextWorkspace(
+        FakeContextApi(),
+        "task",
+        motion_backend="pyroki",
+        opposite_scene_camera_provider=provider,
+    )
+    compiler = ContextCompiler()
+
+    first = compiler.compile(workspace)
+    repeated = compiler.compile(workspace)
+    assert len(calls) == 1
+    assert np.all(first.rasters["observed_scene"] == 50)
+    assert np.array_equal(
+        first.rasters["observed_scene"], repeated.rasters["observed_scene"]
+    )
+    locked_center = calls[0].center_base_xyz
+
+    workspace.refresh_observation()
+    refreshed = compiler.compile(workspace)
+    assert len(calls) == 2
+    assert calls[1].center_base_xyz == locked_center
+    assert np.all(refreshed.rasters["observed_scene"] == 70)
+
+
+def test_pending_action_is_main_owned_until_explicit_refinement() -> None:
+    workspace = _workspace()
+    compiler = ContextCompiler()
+    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    seed = workspace.execute("propose_grasps", region_id=region).result["seed_ids"][0]
+    selected = workspace.execute("select", seed_id=seed)
+
+    main_packet = compiler.compile(workspace)
+    assert main_packet.projection == "main"
+    assert main_packet.decision.mode == "proposal"
+    assert main_packet.manifest()["pending_action"] == {
+        "action_id": selected.result["action_id"],
+        "intent": "approach can for grasp",
+        "state": "coarse",
+    }
+    assert main_packet.manifest()["regions"] == [
+        {"id": region, "query": "can"}
+    ]
+    assert main_packet.manifest()["seed_ids"]
+    assert main_packet.world.action["status"] == "coarse"
+
+    workspace.begin_refinement("下移直到罐体处于两指扫掠区域", selected.result["action_id"])
+    focused = compiler.compile_imagination(workspace)
+    assert focused.projection == "imagination"
+    assert focused.decision.mode == "editing"
+    assert focused.world.action["status"] == "refining"
+    assert focused.world.refinement_goal == "下移直到罐体处于两指扫掠区域"
+
+    workspace.execute_imagination("finish_imagination", status="ready")
+    reviewed = compiler.compile(workspace)
+    assert reviewed.decision.mode == "proposal"
+    assert reviewed.world.action["status"] == "ready"
+
+
+def test_focused_projection_uses_same_revision_and_sensor_rasters() -> None:
+    workspace = _workspace()
+    action_id = _selected_action(workspace)
+    workspace.begin_refinement("向上 1cm", action_id)
+    compiler = ContextCompiler()
+
+    main = compiler.compile(workspace)
+    focused = compiler.compile_imagination(workspace)
+
+    assert main.revision == focused.revision
+    assert main.manifest() == focused.manifest()
+    assert set(main.rasters) == set(focused.rasters)
+    for raster_id in main.rasters:
+        assert np.array_equal(main.rasters[raster_id], focused.rasters[raster_id])
+
+
+def test_contact_camera_pair_is_locked_per_refinement_and_reselected_on_reentry() -> None:
+    calls: list[object] = []
+
+    def provider(request):
+        calls.append(request)
+        camera = {
+            "images": {
+                "rgb": np.zeros((358, 832, 3), dtype=np.uint8),
+            },
+            "intrinsics": np.array(
+                [[360.0, 0.0, 456.0], [0.0, 360.0, 146.0], [0.0, 0.0, 1.0]],
+                dtype=np.float64,
+            ),
+            "pose_mat": np.eye(4, dtype=np.float64),
+            "view_name": "front",
+        }
+        return ContactCameraPair(
+            front=camera,
+            side={**camera, "view_name": "side"},
+            selection=ContactCameraSelection(1, 1, 1.0, 1.0, 1.0),
+        )
+
+    api = FakeContextApi()
+    workspace = ContextWorkspace(
+        api,
+        "place the can in the basket",
+        motion_backend="pyroki",
+        contact_camera_provider=provider,
+    )
+    compiler = ContextCompiler()
+    action_id = _selected_action(workspace)
+    workspace.begin_refinement("向下微调", action_id)
+
+    compiler.compile_imagination(workspace)
+    compiler.compile_imagination(workspace)
+    assert len(calls) == 1
+    assert calls[0].required_points_base is not None
+    assert len(calls[0].required_points_base) > 0
+
+    workspace.execute_imagination(
+        "delta_move", delta_xyz_m=[0.0, 0.0, 0.01], frame="base"
+    )
+    workspace.execute_imagination("finish_imagination", status="ready")
+    compiler.compile(workspace)
+    assert len(calls) == 1
+
+    workspace.begin_refinement("再次检查", action_id)
+    compiler.compile_imagination(workspace)
+    assert len(calls) == 2
+
+
+def test_point_pose_contact_framing_uses_parent_destination_region() -> None:
+    workspace = _workspace()
+    region_id = workspace.execute(
+        "detection_and_sam", query="basket opening"
+    ).result["region_id"]
+    point_id = workspace.execute(
+        "locate_point",
+        query="center of basket opening",
+        within_region_id=region_id,
+    ).result["point_id"]
+    workspace.execute(
+        "propose_pose",
+        point_id=point_id,
+        offset_xyz=[0.0, 0.0, 0.18],
+    )
+
+    artifacts = workspace._private.action_artifacts
+    assert _presentation_region_ref(workspace.state, artifacts) == region_id
+
+    geometry = workspace._private.region_geometry[region_id]
+    target = workspace.state.pending_action.target.pose.position_xyz
+    center = np.asarray(
+        _contact_camera_center(target, geometry.filtered_object_points_base)
+    )
+    assert np.isfinite(center).all()
+    assert not np.allclose(center, np.asarray(target))
+
+
+def test_point_pose_commit_replaces_stale_grasp_points_with_destination_geometry() -> None:
+    workspace = _workspace()
+    stale_points = np.array([[0.1, -0.2, 0.04], [0.12, -0.18, 0.08]])
+    workspace._private.last_physical_artifacts = LastPhysicalArtifacts(
+        focus_pose=Pose((0.1, -0.2, 0.1), (0.0, 0.0, 0.0, 1.0)),
+        subject_query="can",
+        subject_points_base=stale_points,
+    )
+    region_id = workspace.execute(
+        "detection_and_sam", query="basket"
+    ).result["region_id"]
+    destination_points = workspace._private.region_geometry[
+        region_id
+    ].filtered_object_points_base.copy()
+    point_id = workspace.execute(
+        "locate_point",
+        query="basket opening center",
+        within_region_id=region_id,
+    ).result["point_id"]
+    action_id = workspace.execute(
+        "propose_pose",
+        point_id=point_id,
+        offset_xyz=[0.0, 0.0, 0.18],
+    ).result["action_id"]
+    workspace.begin_refinement("align with the visible opening", action_id)
+    workspace.execute_imagination("finish_imagination", status="ready")
+
+    result = workspace.execute("commit", action_id=action_id)
+
+    assert result.ok
+    physical = workspace._private.last_physical_artifacts
+    assert physical is not None
+    assert physical.subject_query == "basket"
+    assert np.array_equal(physical.subject_points_base, destination_points)
+
+
+def test_packet_modes_are_result_driven_without_owner_state() -> None:
     workspace = _workspace()
     compiler = ContextCompiler()
     assert compiler.compile(workspace).decision.mode == "idle"
 
     region = workspace.execute("detection_and_sam", query="can").result["region_id"]
     assert compiler.compile(workspace).decision.mode == "grounding"
-
-    seed_id = workspace.execute("propose_grasps", region_id=region).result["seed_ids"][0]
+    seeds = workspace.execute("propose_grasps", region_id=region).result["seed_ids"]
     packet = compiler.compile(workspace)
     assert packet.decision.mode == "seeds"
-    assert packet.decision.seed_ids == (seed_id,)
+    assert set(seeds).issubset(packet.decision.seed_ids)
 
-    workspace.set_refinement_goal("check grasp geometry")
-    workspace.execute("select", seed_id=seed_id)
-    packet = compiler.compile(workspace)
-    assert packet.decision.mode == "editing"
-    assert packet.world.owner == "imagination"
-    assert packet.world.action["status"] == "editing"
-    assert packet.world.action["target_role"] == "grasp_contact"
-    assert "source_surface_delta_base_m" not in packet.world.action
-    assert packet.world.imagination_scene_raster_id == "imagination_scene"
-
-    action_id = workspace.execute("finish_imagination", status="ready").result[
-        "action_id"
-    ]
-    packet = compiler.compile(workspace)
-    assert packet.decision.mode == "reviewed"
-    assert packet.world.action["action_id"] == action_id
-    assert packet.world.action["intent"] == "check grasp geometry"
-    assert packet.manifest()["review_action_id"] == action_id
-    assert packet.world.action["status"] == "review"
-    assert "handoff_reason" not in packet.world.action
-
-
-def test_action_review_preserves_cumulative_imagination_edit() -> None:
-    workspace = _workspace()
-    compiler = ContextCompiler()
-    workspace.set_refinement_goal("沿 base +Z 抬升 TCP")
-    workspace.execute(
-        "delta_move", delta_xyz_m=[0.0, 0.0, 0.03], frame="base"
-    )
-    workspace.execute(
-        "delta_move", delta_xyz_m=[0.0, 0.0, -0.01], frame="base"
-    )
-
-    action_id = workspace.execute("finish_imagination", status="ready").result[
-        "action_id"
-    ]
-    packet = compiler.compile(workspace)
-
-    assert packet.world.action["action_id"] == action_id
-    summary = packet.world.action["edit_summary"]
-    assert summary["total_translation_base_m"] == [0.0, 0.0, 0.02]
-    assert summary["previous_edit"]["delta_xyz_m"] == [0.0, 0.0, 0.03]
-    assert summary["last_edit"]["delta_xyz_m"] == [0.0, 0.0, -0.01]
-    assert "latest_edit" not in packet.world.action
-
-
-def test_contact_camera_is_locked_to_imagination_start_pose() -> None:
-    workspace = _workspace()
-    compiler = ContextCompiler()
-    workspace.set_refinement_goal("rotate without rotating the observed world")
-    workspace.execute("start_imagination")
-
-    before = compiler.compile(workspace).rasters["contact_focus"].copy()
-    workspace.execute("rotate", axis="z", angle_deg=35.0, frame="base")
-    preview = workspace._private.imagination_artifacts
-    assert preview is not None and preview.initial_target is not None
-    after = compiler.compile(workspace).rasters["contact_focus"]
-
-    # The full raster changes because the purple target and rotate annotation
-    # change, but the presenter derives the camera from the immutable initial
-    # target rather than the edited endpoint.
-    assert not np.array_equal(before, after)
-    initial_pose = preview.initial_target.pose
-    current_pose = workspace.state.imagination.target.pose
-    assert initial_pose is not None and current_pose is not None
-    initial_frame = gravity_stable_contact_frame_quaternion(initial_pose)
-    current_frame = gravity_stable_contact_frame_quaternion(current_pose)
-    assert not np.allclose(initial_frame, current_frame)
-    compiled = compile_near_field_preview(
-        workspace.state,
-        workspace.state.imagination.target,
-        preview,
-    )
-    assert compiled is not None
-    assert np.allclose(compiled.contact_frame_quaternion_xyzw, initial_frame)
-
-
-def test_compiler_uses_private_direct_contact_camera_only_for_active_target() -> None:
-    requests = []
-
-    def provider(request):
-        requests.append(request)
-        return ContactCameraPair(
-            front=_direct_camera((90, 100, 110)),
-            side=_direct_camera((130, 140, 150)),
-        )
-
-    api = FakeContextApi()
-    workspace = ContextWorkspace(
-        api,
-        "task",
-        motion_backend="pyroki",
-        contact_camera_provider=provider,
-    )
-    compiler = ContextCompiler()
-    compiler.compile(workspace)
-    assert requests == []
-
-    workspace.set_refinement_goal("check local geometry")
-    workspace.execute("start_imagination")
-    packet = compiler.compile(workspace)
-
-    assert len(requests) == 1
-    assert requests[0].width == 832
-    assert requests[0].panel_height == 358
-    assert packet.rasters["contact_focus"].shape == (720, 832, 3)
-    assert "depth" not in json.dumps(packet.summary()).lower()
-
-
-def test_main_gripper_review_is_pose_free_and_visualized_as_unexecuted() -> None:
-    workspace = _workspace()
-    action_id = workspace.execute("close_gripper").result["action_id"]
-
-    packet = ContextCompiler().compile(workspace)
-
-    assert packet.world.owner == "main"
-    assert packet.decision.mode == "reviewed"
-    assert packet.manifest()["review_action_id"] == action_id
-    assert packet.world.action == {
-        "status": "review",
-        "target": {"gripper": "closed"},
-        "target_role": "gripper_only",
-        "action_id": action_id,
-        "intent": "set gripper closed",
-        "edit_summary": {"target_gripper": "closed"},
-    }
-    assert packet.world.contact_focus_raster_id == "contact_focus"
-    assert packet.rasters["contact_focus"].shape == (720, 832, 3)
-
-
-def test_failed_imagination_returns_to_visible_seed_catalog() -> None:
-    workspace = _workspace()
-    compiler = ContextCompiler()
-    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
-    seed_id = workspace.execute("propose_grasps", region_id=region).result[
-        "seed_ids"
-    ][0]
-    workspace.set_refinement_goal("reject an unsuitable seed")
-    workspace.execute("select", seed_id=seed_id)
-
-    result = workspace.execute("finish_imagination", status="failed")
-    packet = compiler.compile(workspace)
-
-    assert result.result == {"status": "failed", "source_ref": seed_id}
-    assert workspace.state.last_handoff is not None
-    assert workspace.state.last_handoff.source_ref == seed_id
-    assert packet.world.owner == "main"
-    assert packet.world.action is None
-    assert packet.decision.mode == "seeds"
-    assert packet.decision.seed_ids == (seed_id,)
-
-
-def test_non_executable_limit_reports_rejected_source_to_main() -> None:
-    workspace = _workspace()
-    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
-    seed_id = workspace.execute("propose_grasps", region_id=region).result[
-        "seed_ids"
-    ][0]
-    workspace.set_refinement_goal("review this seed")
-    workspace.execute("select", seed_id=seed_id)
-    artifacts = workspace._private.imagination_artifacts
-    assert artifacts is not None
-    workspace._private.imagination_artifacts = type(artifacts)(
-        planning_context=artifacts.planning_context,
-        preview_plan=None,
-        initial_target=artifacts.initial_target,
-    )
-
-    result = workspace.limit_imagination()
-
-    assert result.result == {"status": "failed", "source_ref": seed_id}
-
-
-def test_turn_limit_is_presented_as_failed_handoff_without_action() -> None:
-    workspace = _workspace()
-    workspace.execute("start_imagination")
-    result = workspace.limit_imagination()
-
-    packet = ContextCompiler().compile(workspace)
-
-    assert result.result == {"status": "failed"}
-    assert packet.world.owner == "main"
-    assert packet.world.action is None
-    assert "turn_limit" not in json.dumps(packet.summary())
-    assert packet.decision.action_id is None
-    assert packet.decision.mode != "reviewed"
-
-
-def test_new_grounding_evidence_supersedes_but_preserves_action_review() -> None:
-    workspace = _workspace()
-    compiler = ContextCompiler()
-    workspace.execute("delta_move", delta_xyz_m=[0.01, 0.0, 0.0], frame="base")
-    action_id = workspace.execute("finish_imagination", status="ready").result[
-        "action_id"
-    ]
-    assert compiler.compile(workspace).decision.mode == "reviewed"
-
-    region_id = workspace.execute("detection_and_sam", query="basket").result["region_id"]
-    packet = compiler.compile(workspace)
-
-    assert packet.decision.mode == "grounding"
-    assert packet.decision.region_ids == (region_id,)
-    assert packet.manifest()["review_action_id"] == action_id
-    assert packet.world.action["action_id"] == action_id
-
-
-def test_grasp_preview_focuses_observed_region_instead_of_virtual_seed() -> None:
-    workspace = _workspace()
-    region_id = workspace.execute("detection_and_sam", query="can").result["region_id"]
-    seed_id = workspace.execute("propose_grasps", region_id=region_id).result[
-        "seed_ids"
-    ][0]
-    workspace.set_refinement_goal("review source alignment")
-    workspace.execute("select", seed_id=seed_id)
-
-    assert _observed_source_ref(workspace._private.imagination_artifacts) == region_id
-
-
-def test_observed_views_stay_current_but_imagination_scene_gains_preview() -> None:
-    workspace = _workspace()
-    compiler = ContextCompiler()
-    observed = compiler.compile(workspace)
-    workspace.execute("delta_move", delta_xyz_m=[0.0, 0.0, -0.02], frame="base")
-    editing = compiler.compile(workspace)
-
-    assert np.array_equal(observed.rasters["agentview"], editing.rasters["agentview"])
-    assert np.array_equal(
-        observed.rasters["observed_scene"], editing.rasters["observed_scene"]
-    )
-    assert not np.array_equal(
-        observed.rasters["imagination_scene"],
-        editing.rasters["imagination_scene"],
-    )
-    assert observed.rasters["observed_scene"].shape == (570, 960, 3)
-    assert editing.rasters["imagination_scene"].shape == (720, 1200, 3)
-    assert "contact_focus" not in observed.rasters
-    assert editing.world.contact_focus_raster_id == "contact_focus"
-    assert editing.rasters["contact_focus"].shape == (720, 832, 3)
+    workspace.execute("select", seed_id=seeds[0])
+    assert compiler.compile(workspace).decision.mode == "proposal"
+    assert not hasattr(workspace.state, "owner")
+    assert not hasattr(workspace.state, "action_review")
 
 
 def test_packet_is_deterministic_and_does_not_leak_private_state() -> None:
     workspace = _workspace()
-    workspace.execute("delta_move", delta_xyz_m=[0.01, 0.0, 0.0], frame="base")
-    first = ContextCompiler().compile(workspace)
-    second = ContextCompiler().compile(workspace)
-    assert first.summary() == second.summary()
-    assert all(np.array_equal(first.rasters[key], second.rasters[key]) for key in first.rasters)
+    workspace.execute("detection_and_sam", query="can")
+    compiler = ContextCompiler()
+    first = compiler.compile(workspace)
+    second = compiler.compile(workspace)
 
-    snapshot = first.web_snapshot(render_id="privacy")
+    assert first.summary() == second.summary()
+    for raster_id in first.rasters:
+        assert np.array_equal(first.rasters[raster_id], second.rasters[raster_id])
+    snapshot = first.web_snapshot(render_id="fixture")
+    assert snapshot["schemaVersion"] == CONTEXT_WEB_SCHEMA_VERSION
+    assert snapshot["projection"] == "main"
+    serialized = json.dumps(snapshot, ensure_ascii=False).lower()
     forbidden = {
         "depth",
         "intrinsics",
         "posemat",
         "rawmask",
-        "cloud",
-        "envsuccess",
-        "reward",
+        "pointcloud",
         "privileged",
-        "score",
-        "trajectoryrad",
-        "planningcontext",
-        "history",
-        "receipt",
+        "reward",
+        "success",
     }
     assert forbidden.isdisjoint(set(_walk_keys(snapshot)))
-    encoded = json.dumps(snapshot).lower()
-    assert "functionrecord" not in encoded and "waypointdraft" not in encoded
-    assert snapshot["schemaVersion"] == 32
-    assert snapshot["schema"] == "vaw-context-v31-separated-control-guides"
-    assert snapshot["viewport"] == {"width": CONTEXT_WIDTH, "height": CONTEXT_HEIGHT}
+    assert all(word not in serialized for word in ("receipt_id", "context_schema"))
 
 
-def test_commit_comparison_persists_across_nonphysical_grounding() -> None:
-    workspace = _workspace()
-    action_id = workspace.execute("open_gripper").result["action_id"]
-    workspace.execute("commit", action_id=action_id)
-    packet = ContextCompiler().compile(workspace)
-    assert packet.decision.mode == "post_commit"
-    assert packet.world.action is None
-    assert packet.world.owner == "main"
-    assert packet.world.last_physical_action is not None
-    assert packet.world.last_physical_action.executed_stages == "gripper"
-    assert packet.world.last_physical_action.outcome == "completed"
-    assert packet.world.physical_verification is not None
-    assert packet.world.physical_verification.kind == "release"
-    assert packet.world.post_commit_before_raster_id == "post_commit:before"
-    assert packet.world.post_commit_current_raster_id == "post_commit:current"
-    assert packet.rasters["post_commit:before"].shape == (390, 760, 3)
-    assert packet.rasters["post_commit:current"].shape == (390, 760, 3)
-
-    workspace.consume_main_context()
-    consumed = ContextCompiler().compile(workspace)
-    assert consumed.decision.mode == "post_commit"
-    assert consumed.world.last_physical_action is not None
-    assert consumed.world.last_physical_action.executed_stages == "gripper"
-    assert "post_commit:before" in consumed.rasters
-    assert "post_commit:current" in consumed.rasters
-
-    region_id = workspace.execute("detection_and_sam", query="basket").result[
-        "region_id"
-    ]
-    workspace.consume_main_context()
-    grounded = ContextCompiler().compile(workspace)
-    assert grounded.decision.mode == "grounding"
-    assert grounded.decision.region_ids == (region_id,)
-    assert grounded.world.post_commit_before_raster_id == "post_commit:before"
-    assert grounded.world.post_commit_current_raster_id == "post_commit:current"
-    assert "post_commit:before" in grounded.rasters
-    assert "post_commit:current" in grounded.rasters
-
-    workspace.execute("delta_move", delta_xyz_m=[0.0, 0.0, 0.01], frame="base")
-    editing = ContextCompiler().compile(workspace)
-    assert workspace.state.last_physical_action is not None
-    assert editing.world.last_physical_action is not None
-    assert editing.world.last_physical_action.target_gripper == "open"
-    action_id = workspace.execute("finish_imagination", status="ready").result[
-        "action_id"
-    ]
-    assert action_id
-    reviewed = ContextCompiler().compile(workspace)
-    assert workspace.state.last_physical_action is not None
-    assert reviewed.world.last_physical_action is not None
-    assert reviewed.world.last_physical_action.target_gripper == "open"
-    assert reviewed.decision.mode == "reviewed"
-    assert reviewed.world.action is not None
-    assert reviewed.world.action["action_id"] == action_id
-
-    workspace.state.last_physical_action = LastPhysicalAction(
-        intent="old failed move",
-        executed_stages="arm",
-        outcome="arm_failed",
+def test_context_compiler_preview_gripper_style_is_explicit_and_validated() -> None:
+    assert ContextCompiler().preview_gripper_style == "fk-mesh"
+    assert (
+        ContextCompiler(preview_gripper_style="semantic-wireframe").preview_gripper_style
+        == "semantic-wireframe"
     )
-    assert ContextCompiler().compile(workspace).world.last_physical_action is None
+    with pytest.raises(ValueError, match="unsupported preview gripper style"):
+        ContextCompiler(preview_gripper_style="unknown")
 
 
-def test_grasp_source_location_persists_for_lift_causal_verification() -> None:
+def test_commit_refreshes_revision_and_clears_pending_action() -> None:
     workspace = _workspace()
-    region_id = workspace.execute("detection_and_sam", query="can").result[
-        "region_id"
-    ]
-    seed_id = workspace.execute("propose_grasps", region_id=region_id).result[
-        "seed_ids"
-    ][0]
-    workspace.set_refinement_goal("contact the can")
-    workspace.execute("select", seed_id=seed_id)
-    action_id = workspace.execute("finish_imagination", status="ready").result[
-        "action_id"
-    ]
-    workspace.execute("commit", action_id=action_id)
-
-    close_id = workspace.execute("close_gripper").result["action_id"]
-    workspace.execute("commit", action_id=close_id)
-
-    first = ContextCompiler().compile(workspace)
-    assert first.world.causal_source_label == "can"
-    assert first.world.causal_source_before_raster_id == "causal_source:before"
-    assert first.world.causal_source_current_raster_id == "causal_source:current"
-    assert first.world.physical_verification is not None
-    assert first.world.physical_verification.kind == "closure"
-    assert "PARTIAL GRIP OPENING" in first.world.physical_verification.ambiguity
-
-    workspace.set_refinement_goal("lift to verify following")
-    workspace.execute(
-        "delta_move", delta_xyz_m=[0.0, 0.0, 0.03], frame="base"
+    compiler = ContextCompiler()
+    action_id = _selected_action(workspace)
+    workspace.begin_refinement("向上 1cm", action_id)
+    workspace.execute_imagination(
+        "delta_move", delta_xyz_m=[0.0, 0.0, 0.01], frame="base"
     )
-    lift_id = workspace.execute("finish_imagination", status="ready").result[
-        "action_id"
-    ]
-    reviewed = ContextCompiler().compile(workspace)
-    assert reviewed.decision.mode == "reviewed"
-    workspace.execute("commit", action_id=lift_id)
+    action_id = workspace.execute_imagination(
+        "finish_imagination", status="ready"
+    ).result["action_id"]
+    before = workspace.state.observation_revision
 
-    lifted = ContextCompiler().compile(workspace)
-    assert lifted.decision.mode == "post_commit"
-    assert lifted.world.causal_source_label == "can"
-    assert lifted.world.physical_verification is not None
-    assert lifted.world.physical_verification.kind == "arm_motion"
-    assert "OCCLUSION" in lifted.world.physical_verification.ambiguity
-    for raster_id in ("causal_source:before", "causal_source:current"):
-        assert raster_id in lifted.rasters
-        assert lifted.rasters[raster_id].shape == (390, 520, 3)
+    result = workspace.execute("commit", action_id=action_id)
+    packet = compiler.compile(workspace)
+
+    assert result.ok
+    assert workspace.state.observation_revision == before + 1
+    assert workspace.state.pending_action is None
+    assert packet.manifest()["pending_action"] is None
+    assert packet.decision.mode == "contact"
+    assert workspace.state.last_physical_action is not None
+    assert workspace._private.last_physical_artifacts is not None
+    assert packet.world.contact_focus_raster_id == "contact_focus"
+
+    # Perception may add a small evidence inset, but it must not erase current
+    # post-physical contact continuity.
+    workspace.execute("detection_and_sam", query="can")
+    grounded = compiler.compile(workspace)
+    assert grounded.decision.mode == "contact"
+    assert grounded.decision.primary_raster_id is not None

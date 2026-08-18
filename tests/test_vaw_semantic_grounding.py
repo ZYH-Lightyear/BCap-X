@@ -44,6 +44,22 @@ def test_parse_candidates_preserves_pixel_coordinates() -> None:
     assert candidates[0].box_xyxy_px == pytest.approx((16.0, 24.0, 64.0, 84.0))
 
 
+def test_parse_candidates_accepts_prose_around_json() -> None:
+    candidates = parse_candidates(
+        'Candidates follow: [{"box":[16,24,64,84],"evidence":"pixel"}] done.',
+        width=160,
+        height=120,
+        coord_space="pixel",
+    )
+
+    assert candidates[0].box_xyxy_px == pytest.approx((16.0, 24.0, 64.0, 84.0))
+
+
+def test_parse_candidates_rejects_empty_reply() -> None:
+    with pytest.raises(ValueError, match="no valid JSON"):
+        parse_candidates("", width=160, height=120, coord_space="pixel")
+
+
 def test_candidate_review_is_fixed_and_choice_can_be_ambiguous() -> None:
     rgb = np.zeros((120, 160, 3), dtype=np.uint8)
     candidates = [

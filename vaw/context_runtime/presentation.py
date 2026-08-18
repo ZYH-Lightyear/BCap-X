@@ -8,19 +8,20 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
+from scipy.spatial.transform import Rotation
+
+from vaw.context_runtime.gripper_mesh import load_panda_urdf_fk
 from vaw.context_runtime.model import ActionTarget, ContextState, Pose
 from vaw.context_runtime.near_field import (
     NearFieldPreview,
+    PreviewGripperStyle,
     gravity_stable_contact_frame_quaternion,
 )
-from vaw.context_runtime.private import (
-    ActionReviewArtifacts,
-    ImaginationArtifacts,
-    build_edit_summary,
-)
+from vaw.context_runtime.private import ActionArtifacts, build_edit_summary
 from vaw.context_runtime.workspace import ContextWorkspace
 
-PresentationArtifacts = ImaginationArtifacts | ActionReviewArtifacts
+PresentationArtifacts = ActionArtifacts
 
 
 def compile_active_presentation(
@@ -29,33 +30,25 @@ def compile_active_presentation(
     """Select the one virtual target currently visible to the policy."""
 
     state = workspace.state
-    if state.imagination is not None:
-        artifacts = workspace._private.imagination_artifacts
-        target = state.imagination.target
+    if state.pending_action is not None:
+        action = state.pending_action
+        artifacts = workspace._private.action_artifacts
         return (
-            target,
+            action.target,
             artifacts,
             _target_presentation(
                 workspace,
-                target,
+                action.target,
                 artifacts,
-                status="editing",
-                action_id=None,
-            ),
-        )
-    if state.action_review is not None:
-        review = state.action_review
-        artifacts = workspace._private.review_artifacts.get(review.action_id)
-        return (
-            review.target,
-            artifacts,
-            _target_presentation(
-                workspace,
-                review.target,
-                artifacts,
-                status="review",
-                action_id=review.action_id,
-                intent=review.intent,
+                status=(
+                    "refining"
+                    if state.refinement is not None
+                    else "ready"
+                    if action.ready_for_commit
+                    else "coarse"
+                ),
+                action_id=action.action_id,
+                intent=action.intent,
             ),
         )
     return None, None, None
@@ -82,20 +75,13 @@ def _target_presentation(
     plan = artifact_plan(artifacts)
     if plan is not None:
         result["prediction"] = plan.prediction.summary()
-    if isinstance(artifacts, ImaginationArtifacts) and artifacts.latest_visual_edit:
+    if artifacts is not None and artifacts.latest_visual_edit:
         result["latest_edit"] = artifacts.latest_visual_edit.summary()
-    edit_summary = (
-        build_edit_summary(target, artifacts)
-        if isinstance(artifacts, ImaginationArtifacts)
-        else artifacts.edit_summary
-        if isinstance(artifacts, ActionReviewArtifacts)
-        else None
-    )
+    edit_summary = build_edit_summary(target, artifacts) if artifacts is not None else None
     if edit_summary is not None:
         result["edit_summary"] = edit_summary.summary()
     if (
-        isinstance(artifacts, ImaginationArtifacts)
-        and artifacts.rotation_gizmo_frame is not None
+        artifacts is not None and artifacts.rotation_gizmo_frame is not None
         and artifacts.rotation_gizmo_axis is not None
     ):
         result["rotation_gizmo_frame"] = artifacts.rotation_gizmo_frame
@@ -107,8 +93,6 @@ def target_role(
     target: ActionTarget,
     artifacts: PresentationArtifacts | None,
 ) -> str:
-    if target.pose is None:
-        return "gripper_only"
     context = artifacts.planning_context if artifacts is not None else None
     if context is not None and context.source_kind == "grasp":
         return "grasp_contact"
@@ -125,17 +109,16 @@ def observed_source_ref(artifacts: PresentationArtifacts | None) -> str | None:
 
 
 def artifact_plan(artifacts: PresentationArtifacts | None):
-    if isinstance(artifacts, ImaginationArtifacts):
-        return artifacts.preview_plan
-    if isinstance(artifacts, ActionReviewArtifacts):
-        return artifacts.motion_plan
-    return None
+    return artifacts.motion_plan if artifacts is not None else None
 
 
 def compile_near_field_preview(
     state: ContextState,
     target: ActionTarget,
     artifacts: PresentationArtifacts | None,
+    *,
+    gripper_style: PreviewGripperStyle = "fk-mesh",
+    tcp_to_hand_local_xyz: np.ndarray | None = None,
 ) -> NearFieldPreview | None:
     """Compile current and previous virtual gripper geometry for one RGB-D view."""
 
@@ -148,17 +131,9 @@ def compile_near_field_preview(
         if plan is not None and plan.prediction.solve_ik == "returned"
         else None
     )
-    if target.pose is None:
-        joints = robot.joint_positions_rad
-    opening = (
-        1.0
-        if target.gripper == "open"
-        else 0.0
-        if target.gripper == "closed"
-        else robot.gripper_opening
-    )
+    opening = robot.gripper_opening
     visual_edit = (
-        artifacts.latest_visual_edit if isinstance(artifacts, ImaginationArtifacts) else None
+        artifacts.latest_visual_edit if artifacts is not None else None
     )
     previous_pose: Pose | None = (
         visual_edit.reference_pose
@@ -166,23 +141,24 @@ def compile_near_field_preview(
         else None
     )
     contact_frame_pose = _contact_frame_pose(target, artifacts, robot.tcp_pose)
+    realized_tcp_pose = _realized_tcp_pose(joints, tcp_to_hand_local_xyz)
     return NearFieldPreview(
         target_pose=target.pose,
         joint_positions_rad=joints,
         gripper_opening=opening,
+        gripper_style=gripper_style,
+        realized_tcp_pose=realized_tcp_pose,
         visual_edit=visual_edit,
         previous_target_pose=previous_pose,
         previous_gripper_opening=(robot.gripper_opening if previous_pose is not None else None),
         rotation_gizmo_frame=(
             artifacts.rotation_gizmo_frame
-            if isinstance(artifacts, ImaginationArtifacts)
-            and artifacts.rotation_gizmo_frame in {"base", "tool"}
+            if artifacts is not None and artifacts.rotation_gizmo_frame in {"base", "tool"}
             else None
         ),
         rotation_gizmo_axis=(
             artifacts.rotation_gizmo_axis
-            if isinstance(artifacts, ImaginationArtifacts)
-            and artifacts.rotation_gizmo_axis in {"x", "y", "z"}
+            if artifacts is not None and artifacts.rotation_gizmo_axis in {"x", "y", "z"}
             else None
         ),
         contact_frame_quaternion_xyzw=(
@@ -196,6 +172,29 @@ def compile_near_field_preview(
     )
 
 
+def _realized_tcp_pose(
+    joints: tuple[float, ...] | None,
+    tcp_to_hand_local_xyz: np.ndarray | None,
+) -> Pose | None:
+    """Recover the TCP actually realised by returned joints for line-art mode."""
+
+    if joints is None or tcp_to_hand_local_xyz is None:
+        return None
+    fk = load_panda_urdf_fk()
+    if fk is None:
+        return None
+    try:
+        hand = fk.frame(np.asarray(joints, dtype=np.float64), "panda_hand")
+        rotation = hand[:3, :3]
+        position = hand[:3, 3] - rotation @ np.asarray(
+            tcp_to_hand_local_xyz, dtype=np.float64
+        ).reshape(3)
+        quaternion = Rotation.from_matrix(rotation).as_quat()
+        return Pose(tuple(position), tuple(quaternion))
+    except (KeyError, RuntimeError, ValueError, np.linalg.LinAlgError):
+        return None
+
+
 def _contact_frame_pose(
     target: ActionTarget,
     artifacts: PresentationArtifacts | None,
@@ -203,14 +202,10 @@ def _contact_frame_pose(
 ) -> Pose | None:
     """Return the immutable pose that defines one Contact Camera session."""
 
-    if isinstance(artifacts, ImaginationArtifacts):
+    if artifacts is not None:
         initial = artifacts.initial_target
         if initial is not None and initial.pose is not None:
             return initial.pose
-    elif isinstance(artifacts, ActionReviewArtifacts):
-        summary = artifacts.edit_summary
-        if summary is not None and summary.initial_target.pose is not None:
-            return summary.initial_target.pose
     return target.pose or observed_tcp
 
 

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from vaw.context_runtime.errors import ContextFunctionError
 from vaw.context_runtime.functions import ContextFunctions
@@ -15,15 +16,23 @@ from vaw.context_runtime.geometry import (
     DEFAULT_TCP_TO_HAND_LOCAL_XYZ,
     tcp_position_from_hand_pose,
 )
+from vaw.context_runtime.memory import record_physical_transaction
 from vaw.context_runtime.model import (
     ActionSeed,
     ContextState,
     PointEvidence,
     Pose,
+    RefinementSession,
     RegionEvidence,
     RobotState,
 )
-from vaw.context_runtime.motion import MotionBackend, create_motion_backend
+from vaw.context_runtime.motion import (
+    MotionBackend,
+    MotionBackendError,
+    MotionPlan,
+    PyrokiMotionBackend,
+    create_motion_backend,
+)
 from vaw.context_runtime.private import PresentationEvent, PrivateEnvContext
 from vaw.context_runtime.protocol import parse_action
 
@@ -47,9 +56,16 @@ class ContextWorkspace:
     """Own one episode's public state, private sensors and function dispatcher."""
 
     MAX_GRASP_CANDIDATES = 5
-    # Waypoint editors never mutate the environment.  Runtime physical-op
-    # accounting and environment-success checks share this single boundary.
-    PHYSICAL_FUNCTIONS = frozenset({"commit"})
+    # PyRoki is useful for genuinely local Cartesian corrections.  A small
+    # *edit* to a far-away proposal is still a large robot motion and must stay
+    # on the collision-aware coarse planner.
+    LOCAL_TRANSLATION_LIMIT_M = 0.06
+    LOCAL_ROTATION_LIMIT_DEG = 20.0
+    # Main may execute simple local controls directly.  ``commit`` is reserved
+    # for a spatial action that Imagination explicitly returned as ready.
+    PHYSICAL_FUNCTIONS = frozenset(
+        {"delta_move", "open_gripper", "close_gripper", "commit"}
+    )
 
     def __init__(
         self,
@@ -57,9 +73,11 @@ class ContextWorkspace:
         task_prompt: str,
         *,
         motion_backend: str | MotionBackend = "curobo",
+        local_motion_backend: str | MotionBackend | None = None,
         tcp_to_hand_local_xyz: tuple[float, float, float] | None = None,
         semantic_rgb_provider: Callable[[], np.ndarray] | None = None,
         contact_camera_provider: Any | None = None,
+        opposite_scene_camera_provider: Any | None = None,
     ) -> None:
         self.api = api
         self.camera_name = str(getattr(api, "camera_name", "agentview"))
@@ -80,47 +98,131 @@ class ContextWorkspace:
             else tcp_to_hand_local_xyz
         )
         self._tcp_to_hand_local_xyz = _finite_vector3(backend_offset, "tcp_to_hand_local_xyz")
+        if local_motion_backend is None:
+            self.local_motion = (
+                PyrokiMotionBackend(
+                    api,
+                    public_tcp_to_hand_local_xyz=tuple(self._tcp_to_hand_local_xyz),
+                )
+                if isinstance(motion_backend, str)
+                and str(motion_backend).strip().lower() == "curobo"
+                else self.motion
+            )
+        else:
+            self.local_motion = (
+                PyrokiMotionBackend(
+                    api,
+                    public_tcp_to_hand_local_xyz=tuple(self._tcp_to_hand_local_xyz),
+                )
+                if isinstance(local_motion_backend, str)
+                and local_motion_backend.strip().lower() == "pyroki"
+                else create_motion_backend(local_motion_backend, api)
+                if isinstance(local_motion_backend, str)
+                else local_motion_backend
+            )
+        self.local_motion_backend_name = str(self.local_motion.name)
+        self._motion_executors = {
+            str(self.motion.name): self.motion,
+            str(self.local_motion.name): self.local_motion,
+        }
         self._semantic_rgb_provider = semantic_rgb_provider
         self.state = ContextState(task_prompt=task_prompt)
         self._private = PrivateEnvContext(
             contact_camera_provider=contact_camera_provider,
+            opposite_scene_camera_provider=opposite_scene_camera_provider,
         )
         self.finished = False
         self.claimed_success = False
         self._functions = ContextFunctions(self)
-        self.refinement_goal = task_prompt
         self.refresh_observation()
 
-    def set_refinement_goal(self, text: str) -> None:
-        """Set the session-local goal used if the next call starts imagination."""
+    def execute_motion_plan(self, plan: MotionPlan, target: Pose) -> None:
+        """Execute through the backend that produced the cached plan."""
 
-        normalized = " ".join(str(text).split())
-        self.refinement_goal = normalized or f"为任务“{self.state.task_prompt}”检查并调整动作"
+        backend = self._motion_executors.get(str(plan.backend))
+        if backend is None:
+            raise MotionBackendError(
+                f"no executor is registered for motion plan backend '{plan.backend}'"
+            )
+        backend.execute(plan, target)
 
-    def consume_main_context(self) -> None:
-        """Consume one-shot visual context after a valid Main decision.
+    def motion_backend_for_target(
+        self,
+        target: Pose,
+    ) -> tuple[MotionBackend, dict[str, Any]]:
+        """Route by the full observed-TCP-to-target displacement.
 
-        The immediately following Main request may see the latest imagination
-        handoff and the full before/current physical comparison.  Later
-        non-physical calls may replace the large decision surface with new
-        evidence, while retaining a compact crop from the same current
-        observation as physical continuity.  The crop is revision-local and is
-        replaced automatically by the next commit; it is not object tracking.
-
-        ``LastPhysicalAction`` is deliberately *not* cleared here.  It is a
-        compact, overwrite-only fact about the current observation revision,
-        not transcript history.  Keeping it until the next commit prevents a
-        perception call (for example, locating a destination) from erasing why
-        the robot is currently holding or approaching something.
+        Imagination edits are expressed relative to a virtual target, so the
+        latest edit magnitude is not a valid proxy for execution distance.
+        Keep distant or substantially rotated targets on the coarse planner;
+        use the local planner only after the real robot is already near the
+        requested pose.
         """
 
-        self.state.last_handoff = None
+        robot = self.state.robot
+        current = robot.tcp_pose if robot is not None else None
+        if current is None or self.local_motion is self.motion:
+            return self.motion, {
+                "backend": str(self.motion.name),
+                "reason": "single_backend" if current is not None else "tcp_unavailable",
+            }
 
-    def discard_action_review(self) -> None:
-        """Discard the current review offer without changing the real world."""
+        current_position = np.asarray(current.position_xyz, dtype=np.float64)
+        target_position = np.asarray(target.position_xyz, dtype=np.float64)
+        translation_m = float(np.linalg.norm(target_position - current_position))
+        current_rotation = Rotation.from_quat(
+            np.asarray(current.quaternion_xyzw, dtype=np.float64)
+        )
+        target_rotation = Rotation.from_quat(
+            np.asarray(target.quaternion_xyzw, dtype=np.float64)
+        )
+        rotation_deg = float(
+            np.rad2deg((current_rotation.inv() * target_rotation).magnitude())
+        )
+        use_local = (
+            translation_m <= self.LOCAL_TRANSLATION_LIMIT_M
+            and rotation_deg <= self.LOCAL_ROTATION_LIMIT_DEG
+        )
+        backend = self.local_motion if use_local else self.motion
+        return backend, {
+            "backend": str(backend.name),
+            "translation_m": round(translation_m, 6),
+            "rotation_deg": round(rotation_deg, 3),
+            "local_translation_limit_m": self.LOCAL_TRANSLATION_LIMIT_M,
+            "local_rotation_limit_deg": self.LOCAL_ROTATION_LIMIT_DEG,
+            "reason": "local_target" if use_local else "coarse_target",
+        }
 
-        self.state.action_review = None
-        self._private.review_artifacts.clear()
+    def begin_refinement(self, instruction: str, action_id: str) -> str:
+        """Open one synchronous Imagination task without yielding Main ownership."""
+
+        if self.state.refinement is not None:
+            raise ContextFunctionError("a refinement task is already active")
+        normalized = " ".join(str(instruction).split())
+        if not normalized:
+            raise ContextFunctionError("instruction must not be empty")
+        action = self.state.pending_action
+        if action is None or action.action_id != action_id:
+            raise ContextFunctionError(f"unknown or expired action_id '{action_id}'")
+        # A Contact Camera pair is selected once at refinement entry and then
+        # remains fixed while Imagination edits the virtual target.  Re-entering
+        # refinement intentionally performs a fresh visibility selection.
+        self._private.clear_contact_camera_lock()
+        self.state.refinement = RefinementSession(
+            action_id=action.action_id,
+            instruction=normalized,
+            initial_target=action.target,
+            created_action=False,
+        )
+        return action.action_id
+
+    def discard_pending_action(self) -> None:
+        """Discard the current virtual action without changing the real world."""
+
+        self.state.pending_action = None
+        self.state.refinement = None
+        self._private.action_artifacts = None
+        self._private.clear_contact_camera_lock()
 
     def refresh_observation(self) -> dict[str, Any]:
         observation = self._call_backend("get_observation")
@@ -137,10 +239,49 @@ class ContextWorkspace:
 
     def execute(self, function_name: str, **arguments: Any) -> ContextStepResult:
         before = self.state.observation_revision
+        pending_intent = (
+            self.state.pending_action.intent
+            if self.state.pending_action is not None
+            else None
+        )
+        previous_physical = self.state.last_physical_action
         self._private.begin_function_call()
-        handler = self._functions.handlers.get(function_name)
+        handler = self._functions.main_handlers.get(function_name)
         if handler is None:
             result: dict[str, Any] = {"error": f"unknown function '{function_name}'"}
+        elif self.finished:
+            result = {"error": "episode already ended"}
+        else:
+            try:
+                inspect.signature(handler).bind(**arguments)
+            except TypeError as exc:
+                result = {"error": str(exc)}
+            else:
+                try:
+                    result = handler(**arguments)
+                except ContextFunctionError as exc:
+                    result = {"error": str(exc)}
+        return self._record(
+            function_name,
+            arguments,
+            result,
+            before,
+            pending_intent=pending_intent,
+            previous_physical=previous_physical,
+        )
+
+    def execute_imagination(
+        self, function_name: str, **arguments: Any
+    ) -> ContextStepResult:
+        """Dispatch one editor on the private Imagination tool surface."""
+
+        before = self.state.observation_revision
+        self._private.begin_function_call()
+        handler = self._functions.imagination_handlers.get(function_name)
+        if handler is None:
+            result: dict[str, Any] = {
+                "error": f"unknown imagination function '{function_name}'"
+            }
         elif self.finished:
             result = {"error": "episode already ended"}
         else:
@@ -157,14 +298,14 @@ class ContextWorkspace:
 
     def execute_action(self, payload: str | dict[str, Any]) -> ContextStepResult:
         try:
-            name, arguments = parse_action(payload)
+            name, arguments = parse_action(payload, allowed=tuple(self._functions.main_handlers))
         except ValueError as exc:
             shown_payload = payload if isinstance(payload, str) else dict(payload)
             return self.reject("invalid", {"payload": shown_payload}, str(exc))
         return self.execute(name, **arguments)
 
-    def limit_imagination(self) -> ContextStepResult:
-        """Fail the active Imagination session when its turn budget is spent."""
+    def limit_refinement(self) -> ContextStepResult:
+        """Fail the active Imagination task when its private budget is spent."""
 
         before = self.state.observation_revision
         self._private.begin_function_call()
@@ -172,7 +313,7 @@ class ContextWorkspace:
             result = self._functions.limit_imagination()
         except ContextFunctionError as exc:
             result = {"error": str(exc)}
-        return self._record("imagination_limit", {}, result, before)
+        return self._record("refinement_limit", {}, result, before)
 
     def reject(
         self,
@@ -196,8 +337,24 @@ class ContextWorkspace:
         arguments: dict[str, Any],
         result: dict[str, Any],
         revision_before: int,
+        *,
+        pending_intent: str | None = None,
+        previous_physical: Any | None = None,
     ) -> ContextStepResult:
         revision_after = self.state.observation_revision
+        physical = self.state.last_physical_action
+        if (
+            function_name in self.PHYSICAL_FUNCTIONS
+            and physical is not None
+            and physical is not previous_physical
+        ):
+            record_physical_transaction(
+                self.state.task_memory,
+                function_name=function_name,
+                arguments=arguments,
+                intent=pending_intent,
+                physical_outcome=physical.outcome,
+            )
         self._private.presentation_event = PresentationEvent(
             function_name=function_name,
             result=dict(result),

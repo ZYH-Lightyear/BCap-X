@@ -1,4 +1,4 @@
-"""Dual-agent fixed-viewport renderer that consumes only a ContextPacket."""
+"""Fixed-viewport renderer for Main and focused Imagination projections."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from vaw.context_runtime.packet import (
 
 
 class ContextWebRenderer:
-    name = "context-web-v31-separated-control-guides"
+    name = "context-web-v37-working-memory"
     width = CONTEXT_WIDTH
     height = CONTEXT_HEIGHT
 

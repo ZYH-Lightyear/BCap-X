@@ -1,6 +1,6 @@
-"""Run the VAW M1.4 Context Runtime on a real LIBERO-PRO task.
+"""Run the Main-ReAct VAW Runtime on a real LIBERO-PRO task.
 
-The default ``agent`` mode runs the Main/Imagination dual-agent contract.
+The default ``agent`` mode lets Main synchronously delegate local refinement.
 ``scripted`` is an environment wiring/visual trace smoke, not an agent policy.
 
 Examples:
@@ -50,8 +50,18 @@ def _parse_args() -> argparse.Namespace:
         choices=("pyroki", "curobo"),
         default="curobo",
         help=(
-            "private imagination planner (default: curobo); "
-            "delta_move/rotate remain virtual until commit"
+            "coarse spatial planner (default: curobo); when curobo is selected, "
+            "Imagination targets near the observed TCP use PyRoki while farther "
+            "targets remain on CuRobo"
+        ),
+    )
+    parser.add_argument(
+        "--preview-gripper",
+        choices=("fk-mesh", "semantic-wireframe"),
+        default="fk-mesh",
+        help=(
+            "virtual gripper rendering only: exact returned-joints FK mesh "
+            "(default) or a symmetric metric wireframe for visual ablation"
         ),
     )
     parser.add_argument("--headed", action="store_true")
@@ -99,7 +109,10 @@ def main() -> int:
 
     from capx.envs.simulators.libero import FrankaLiberoTask
     from capx.integrations.franka.libero_reduced import FrankaLiberoApiReduced
-    from vaw.context_runtime.contact_camera import LiberoContactCameraProvider
+    from vaw.context_runtime.contact_camera import (
+        LiberoContactCameraProvider,
+        LiberoOppositeSceneCameraProvider,
+    )
     from vaw.context_runtime.libero_sensor import make_libero_semantic_rgb_provider
     from vaw.context_runtime.trace import ContextTraceLogger
     from vaw.context_runtime.video import save_episode_videos
@@ -119,6 +132,7 @@ def main() -> int:
         scale=args.semantic_render_scale,
     )
     contact_camera_provider = LiberoContactCameraProvider(env)
+    opposite_scene_camera_provider = LiberoOppositeSceneCameraProvider(env)
     condition = "scripted" if args.mode == "scripted" else _safe_name(args.model)
     trace_dir = args.trace_dir or (
         pathlib.Path(__file__).resolve().parent.parent
@@ -131,6 +145,8 @@ def main() -> int:
         {
             "semantic_render_scale": args.semantic_render_scale,
             "contact_camera": "mujoco-direct-simulation-only",
+            "opposite_scene_camera": "mujoco-direct-simulation-only",
+            "preview_gripper": args.preview_gripper,
         }
     )
     video_capture_enabled = False
@@ -143,9 +159,10 @@ def main() -> int:
             trace.log_meta({"video_capture_error": message})
             print(f"[video] capture unavailable: {message}")
     renderer = ContextWebRenderer(headed=args.headed)
+    local_motion = "pyroki" if args.motion_backend == "curobo" else args.motion_backend
     print(
         f"[task] {args.suite}:{args.task_id} seed={args.seed} "
-        f"motion={args.motion_backend}: {task_prompt}"
+        f"motion={args.motion_backend} local={local_motion}: {task_prompt}"
     )
     try:
         if args.mode == "scripted":
@@ -161,6 +178,8 @@ def main() -> int:
                 scripted_refinement=args.scripted_refinement,
                 semantic_rgb_provider=semantic_rgb_provider,
                 contact_camera_provider=contact_camera_provider,
+                opposite_scene_camera_provider=opposite_scene_camera_provider,
+                preview_gripper_style=args.preview_gripper,
             )
         return _run_agent(
             api,
@@ -171,6 +190,7 @@ def main() -> int:
             args,
             semantic_rgb_provider=semantic_rgb_provider,
             contact_camera_provider=contact_camera_provider,
+            opposite_scene_camera_provider=opposite_scene_camera_provider,
         )
     finally:
         if args.record_video:
@@ -215,9 +235,11 @@ def _run_agent(
     *,
     semantic_rgb_provider: Any,
     contact_camera_provider: Any,
+    opposite_scene_camera_provider: Any,
 ) -> int:
     from vaw.agents.providers.openai import OpenAIProvider
     from vaw.agents.providers.text_protocol import TextProtocolProvider
+    from vaw.context_runtime.packet import ContextCompiler
     from vaw.context_runtime.runtime import ContextRunConfig, ContextRuntime
     from vaw.context_runtime.workspace import ContextWorkspace
 
@@ -248,9 +270,11 @@ def _run_agent(
             motion_backend=args.motion_backend,
             semantic_rgb_provider=semantic_rgb_provider,
             contact_camera_provider=contact_camera_provider,
+            opposite_scene_camera_provider=opposite_scene_camera_provider,
         ),
         renderer,
         imagination_provider=imagination_provider,
+        compiler=ContextCompiler(preview_gripper_style=args.preview_gripper),
         config=ContextRunConfig(
             max_main_turns=args.max_turns,
             max_imagination_turns=args.max_imagination_turns,
@@ -284,6 +308,8 @@ def _run_scripted(
     scripted_refinement: bool,
     semantic_rgb_provider: Any,
     contact_camera_provider: Any | None = None,
+    opposite_scene_camera_provider: Any | None = None,
+    preview_gripper_style: str = "fk-mesh",
 ) -> int:
     from vaw.context_runtime.packet import CONTEXT_SCHEMA, ContextCompiler
     from vaw.context_runtime.workspace import ContextWorkspace
@@ -294,8 +320,9 @@ def _run_scripted(
         motion_backend=motion_backend,
         semantic_rgb_provider=semantic_rgb_provider,
         contact_camera_provider=contact_camera_provider,
+        opposite_scene_camera_provider=opposite_scene_camera_provider,
     )
-    compiler = ContextCompiler()
+    compiler = ContextCompiler(preview_gripper_style=preview_gripper_style)
     trace.log_meta(
         {
             "mode": "scripted",
@@ -303,25 +330,33 @@ def _run_scripted(
             "task_prompt": task_prompt,
             "renderer": renderer.name,
             "motion_backend": workspace.motion_backend_name,
+            "local_motion_backend": workspace.local_motion_backend_name,
+            "preview_gripper": preview_gripper_style,
         }
     )
     turn = 0
 
-    def step(name: str, **arguments: Any) -> dict[str, Any]:
+    def step(name: str, *, trace_owner: str = "main", **arguments: Any) -> dict[str, Any]:
         nonlocal turn
-        owner = workspace.state.owner
-        packet = compiler.compile(workspace)
+        packet = (
+            compiler.compile_imagination(workspace)
+            if workspace.state.refinement is not None
+            else compiler.compile(workspace)
+        )
         image = renderer.render(packet)
-        review_before = workspace.state.action_review
-        result = workspace.execute(name, **arguments)
-        if owner == "main" and name != "commit" and result.ok:
-            if review_before is not None and workspace.state.action_review is review_before:
-                workspace.discard_action_review()
-            workspace.consume_main_context()
-        env_success = bool(env.task_completed()) if name in workspace.PHYSICAL_FUNCTIONS else None
+        result = (
+            workspace.execute_imagination(name, **arguments)
+            if trace_owner == "imagination"
+            else workspace.execute(name, **arguments)
+        )
+        env_success = (
+            bool(env.task_completed())
+            if trace_owner == "main" and name in workspace.PHYSICAL_FUNCTIONS
+            else None
+        )
         trace.log_turn(
             turn=turn,
-            agent_owner=owner,
+            agent_owner=trace_owner,
             image=image,
             packet=packet,
             function_call={"name": name, "arguments": arguments},
@@ -337,34 +372,36 @@ def _run_scripted(
             raise RuntimeError(result.result["error"])
         return result.result
 
-    action_id = step("open_gripper")["action_id"]
-    step("commit", action_id=action_id)
+    step("open_gripper")
     region_id = step("detection_and_sam", query=object_query)["region_id"]
     step("locate_point", query=point_query, within_region_id=region_id)
     seed_ids = step("propose_grasps", region_id=region_id)["seed_ids"]
     if not seed_ids:
         raise RuntimeError("scripted smoke received no grasp candidates")
-    workspace.set_refinement_goal(f"使两指围绕 {object_query} 形成可审查的对称接触几何")
-    step("select", seed_id=seed_ids[0])
-    action_id = step("finish_imagination", status="ready")["action_id"]
-    step("commit", action_id=action_id)
-    action_id = step("close_gripper")["action_id"]
-    step("commit", action_id=action_id)
+    action_id = step("select", seed_id=seed_ids[0])["action_id"]
+    workspace.begin_refinement(
+        f"使两指围绕 {object_query} 形成可审查的对称接触几何",
+        action_id,
+    )
     if scripted_refinement:
-        workspace.set_refinement_goal("验证累计小幅平移与旋转在 Contact Focus 中清晰可见")
         step(
             "delta_move",
+            trace_owner="imagination",
             delta_xyz_m=[0.0, 0.0, 0.03],
             frame="base",
         )
         step(
             "rotate",
+            trace_owner="imagination",
             axis="z",
             angle_deg=5.0,
             frame="tool",
         )
-        action_id = step("finish_imagination", status="ready")["action_id"]
-        step("commit", action_id=action_id)
+    action_id = step(
+        "finish_imagination", trace_owner="imagination", status="ready"
+    )["action_id"]
+    step("commit", action_id=action_id)
+    step("close_gripper")
     step("done", success=False)
 
     final_packet = compiler.compile(workspace)

@@ -8,9 +8,15 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from vaw.context_runtime.attached_object import (
+    AttachmentHypothesis,
+    ObjectProxyCandidate,
+    ObjectVolumeProxy,
+)
 from vaw.context_runtime.model import ActionTarget, Pose
 
 if TYPE_CHECKING:
+    from vaw.context_runtime.contact_camera import ContactCameraPair
     from vaw.context_runtime.motion import MotionPlan
 
 
@@ -21,6 +27,7 @@ class RegionGeometryArtifact:
     object_points_base: np.ndarray
     scene_points_base: np.ndarray
     filtered_object_points_base: np.ndarray
+    volume_proxy: ObjectVolumeProxy | None = None
 
 
 @dataclass(frozen=True)
@@ -65,12 +72,13 @@ class VisualEdit:
 class SeedArtifacts:
     planning_context: PlanningContext | None = None
     preview_plan: MotionPlan | None = None
+    family: str | None = None
 
 
 @dataclass(frozen=True)
-class ImaginationArtifacts:
+class ActionArtifacts:
     planning_context: PlanningContext | None = None
-    preview_plan: MotionPlan | None = None
+    motion_plan: MotionPlan | None = None
     initial_target: ActionTarget | None = None
     previous_visual_edit: VisualEdit | None = None
     latest_visual_edit: VisualEdit | None = None
@@ -82,34 +90,12 @@ class ImaginationArtifacts:
 
 
 @dataclass(frozen=True)
-class ActionReviewArtifacts:
-    motion_plan: MotionPlan | None = None
-    planning_context: PlanningContext | None = None
-    termination_reason: str = "agent_ready"
-    # Exact command-state summary copied at the Imagination -> Main boundary.
-    # Without this, Main only sees the endpoint and loses whether refinement
-    # moved in the intended base-frame direction.
-    edit_summary: EditSummary | None = None
-
-
-@dataclass(frozen=True)
-class CausalSubjectArtifact:
-    """One fixed image-space subject anchor for post-commit verification.
-
-    This is not an object tracker.  It remembers only the most recent grasp
-    source crop so a later lift or transport can show whether that same image
-    location became empty in the current observation.
-    """
-
-    query: str
-    bbox_xyxy_px: tuple[float, float, float, float]
-    source_revision: int
-
-
-@dataclass(frozen=True)
 class LastPhysicalArtifacts:
     focus_pose: Pose | None = None
-    causal_subject: CausalSubjectArtifact | None = None
+    subject_query: str | None = None
+    # Previous sensor geometry is used only to choose an unobstructed current
+    # Contact Camera.  It is not tracked, rendered as truth or serialized.
+    subject_points_base: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -128,12 +114,10 @@ class EditSummary:
         # Absolute TCP endpoints encouraged models to compare the TCP origin
         # with guessed object dimensions and override visible contact geometry.
         # Keep exact endpoints out of policy-visible text; they remain available
-        # to the presenter for rendering the purple robot and to offline trace.
+        # to the presenter for rendering the lavender Preview outline and trace.
         # Visible control memory contains only cumulative edits and the explicit
         # gripper target.
         result: dict[str, Any] = {}
-        if self.current_target.gripper is not None:
-            result["target_gripper"] = self.current_target.gripper
         if self.total_translation_base_m is not None:
             result["total_translation_base_m"] = [
                 round(float(value), 6) for value in self.total_translation_base_m
@@ -152,7 +136,7 @@ class EditSummary:
 
 def build_edit_summary(
     current_target: ActionTarget,
-    artifacts: ImaginationArtifacts | None,
+    artifacts: ActionArtifacts | None,
 ) -> EditSummary:
     """Compile exact cumulative pose change without replaying tool history."""
 
@@ -164,18 +148,17 @@ def build_edit_summary(
     translation: tuple[float, float, float] | None = None
     rotation_axis: tuple[float, float, float] | None = None
     rotation_deg: float | None = None
-    if initial.pose is not None and current_target.pose is not None:
-        initial_position = np.asarray(initial.pose.position_xyz, dtype=np.float64)
-        current_position = np.asarray(current_target.pose.position_xyz, dtype=np.float64)
-        translation = tuple(float(value) for value in current_position - initial_position)
-        initial_rotation = Rotation.from_quat(initial.pose.quaternion_xyzw)
-        current_rotation = Rotation.from_quat(current_target.pose.quaternion_xyzw)
-        rotvec = (current_rotation * initial_rotation.inv()).as_rotvec()
-        angle = float(np.linalg.norm(rotvec))
-        rotation_deg = float(np.rad2deg(angle))
-        rotation_axis = (
-            tuple(float(value) for value in rotvec / angle) if angle > 1e-9 else (0.0, 0.0, 0.0)
-        )
+    initial_position = np.asarray(initial.pose.position_xyz, dtype=np.float64)
+    current_position = np.asarray(current_target.pose.position_xyz, dtype=np.float64)
+    translation = tuple(float(value) for value in current_position - initial_position)
+    initial_rotation = Rotation.from_quat(initial.pose.quaternion_xyzw)
+    current_rotation = Rotation.from_quat(current_target.pose.quaternion_xyzw)
+    rotvec = (current_rotation * initial_rotation.inv()).as_rotvec()
+    angle = float(np.linalg.norm(rotvec))
+    rotation_deg = float(np.rad2deg(angle))
+    rotation_axis = (
+        tuple(float(value) for value in rotvec / angle) if angle > 1e-9 else (0.0, 0.0, 0.0)
+    )
     return EditSummary(
         initial_target=initial,
         current_target=current_target,
@@ -202,14 +185,33 @@ class PrivateEnvContext:
     region_masks: dict[str, np.ndarray] = field(default_factory=dict)
     region_geometry: dict[str, RegionGeometryArtifact] = field(default_factory=dict)
     seed_artifacts: dict[str, SeedArtifacts] = field(default_factory=dict)
-    imagination_artifacts: ImaginationArtifacts | None = None
-    review_artifacts: dict[str, ActionReviewArtifacts] = field(default_factory=dict)
+    action_artifacts: ActionArtifacts | None = None
     last_physical_artifacts: LastPhysicalArtifacts | None = None
+    # These two artifacts intentionally survive observation revisions.  A
+    # successful object approach promotes a revision-local region proxy to a
+    # candidate, regardless of whether the pose came from a grasp seed or a
+    # point inside that region. A subsequent close binds it to the observed
+    # TCP. Both are hypotheses for visualization, never environment truth.
+    object_proxy_candidate: ObjectProxyCandidate | None = None
+    attachment_hypothesis: AttachmentHypothesis | None = None
     presentation_event: PresentationEvent | None = None
     trace_diagnostics: dict[str, Any] = field(default_factory=dict)
     # Simulation-only presenter hook. It is never serialized into ContextPacket
     # or exposed as an Agent Function.
     contact_camera_provider: Any | None = None
+    contact_camera_pair: ContactCameraPair | None = None
+    contact_camera_action_id: str | None = None
+    opposite_scene_camera_provider: Any | None = None
+    opposite_scene_camera: dict[str, Any] | None = None
+    opposite_scene_camera_revision: int | None = None
+    # The centre is estimated once from the first real RGB-D observation and
+    # retained for the episode.  Pixel content refreshes; the camera does not
+    # wander as objects or the robot move.
+    opposite_scene_center_base_xyz: tuple[float, float, float] | None = None
+
+    def clear_contact_camera_lock(self) -> None:
+        self.contact_camera_pair = None
+        self.contact_camera_action_id = None
 
     def begin_revision(self, observation: dict[str, Any]) -> None:
         self.previous_observation = self.observation
@@ -218,14 +220,20 @@ class PrivateEnvContext:
         self.region_masks.clear()
         self.region_geometry.clear()
         self.seed_artifacts.clear()
-        self.imagination_artifacts = None
-        self.review_artifacts.clear()
+        self.action_artifacts = None
         self.last_physical_artifacts = None
         self.presentation_event = None
         self.trace_diagnostics.clear()
+        self.clear_contact_camera_lock()
+        self.opposite_scene_camera = None
+        self.opposite_scene_camera_revision = None
 
     def begin_function_call(self) -> None:
         self.trace_diagnostics.clear()
+        if self.contact_camera_pair is not None:
+            self.trace_diagnostics["contact_camera_selection"] = (
+                self.contact_camera_pair.selection.summary()
+            )
 
     def camera(self, name: str, *, previous: bool = False) -> dict[str, Any]:
         observation = self.previous_observation if previous else self.observation
@@ -238,12 +246,14 @@ class PrivateEnvContext:
 
 
 __all__ = [
+    "AttachmentHypothesis",
     "EditSummary",
-    "ImaginationArtifacts",
+    "ActionArtifacts",
+    "ObjectProxyCandidate",
+    "ObjectVolumeProxy",
     "PlanningContext",
     "PresentationEvent",
     "PrivateEnvContext",
-    "ActionReviewArtifacts",
     "LastPhysicalArtifacts",
     "RegionGeometryArtifact",
     "SeedArtifacts",

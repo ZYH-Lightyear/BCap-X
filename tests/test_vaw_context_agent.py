@@ -7,11 +7,11 @@ import numpy as np
 
 from tests.test_vaw_context_runtime import FakeContextApi
 from vaw.agents.contracts import ModelResponse, ToolCall
-from vaw.context_runtime.runtime import ContextRunConfig, ContextRuntime
 from vaw.context_runtime.protocol import (
-    REVIEW_FUNCTION_NAMES,
-    STANDARD_MAIN_FUNCTION_NAMES,
+    IMAGINATION_FUNCTION_NAMES,
+    MAIN_FUNCTION_NAMES,
 )
+from vaw.context_runtime.runtime import ContextRunConfig, ContextRuntime
 from vaw.context_runtime.trace import ContextTraceLogger
 from vaw.context_runtime.workspace import ContextWorkspace
 
@@ -26,8 +26,8 @@ def _response(index: int, name: str, **arguments) -> ModelResponse:
 class RecordingProvider:
     def __init__(self, responses: list[ModelResponse]) -> None:
         self.responses = list(responses)
-        self.messages = []
-        self.tools = []
+        self.messages: list = []
+        self.tools: list = []
 
     def generate(self, messages, tools=None):
         self.messages.append(messages)
@@ -35,14 +35,22 @@ class RecordingProvider:
         return self.responses.pop(0)
 
 
-class SolidRenderer:
+class RecordingRenderer:
     name = "test-renderer"
 
+    def __init__(self) -> None:
+        self.projections: list[str] = []
+
     def render(self, packet):
+        self.projections.append(packet.projection)
         return np.full((1280, 2048, 3), packet.revision, dtype=np.uint8)
 
     def close(self):
         return None
+
+
+def _user_text(messages) -> str:
+    return str(messages[1]["content"][0]["text"])
 
 
 def _image_count(messages) -> int:
@@ -55,23 +63,37 @@ def _image_count(messages) -> int:
     )
 
 
-def _user_text(messages) -> str:
-    return str(messages[1]["content"][0]["text"])
+def _tool_names(definitions) -> list[str]:
+    return [item["function"]["name"] for item in definitions]
 
 
-def test_dual_agent_runtime_rebuilds_every_request_without_history(tmp_path: Path) -> None:
+def test_main_react_calls_imagination_as_one_nested_function(tmp_path: Path) -> None:
     main = RecordingProvider(
         [
-            _response(1, "close_gripper"),
-            _response(2, "commit", action_id="a1"),
-            _response(3, "done", success=False),
+            _response(1, "detection_and_sam", query="can"),
+            _response(2, "propose_grasps", region_id="region1"),
+            _response(3, "select", seed_id="s1"),
+            _response(
+                4,
+                "refine_action",
+                action_id="a1",
+                instruction="两指对称包夹罐体，保持张开",
+            ),
+            _response(5, "commit", action_id="a1"),
+            _response(6, "done", success=False),
         ]
     )
-    imagination = RecordingProvider([])
+    imagination = RecordingProvider(
+        [
+            _response(1, "delta_move", delta_xyz_m=[0.0, 0.0, -0.01], frame="base"),
+            _response(2, "finish_imagination", status="ready"),
+        ]
+    )
+    renderer = RecordingRenderer()
     runtime = ContextRuntime(
         main,
         ContextWorkspace(FakeContextApi(), "test task", motion_backend="pyroki"),
-        SolidRenderer(),
+        renderer,
         imagination_provider=imagination,
         config=ContextRunConfig(max_main_turns=8, max_imagination_turns=4),
         trace=ContextTraceLogger(tmp_path),
@@ -79,92 +101,172 @@ def test_dual_agent_runtime_rebuilds_every_request_without_history(tmp_path: Pat
 
     result = runtime.run()
 
-    assert result.turns == 3
-    assert len(main.messages) == 3 and len(imagination.messages) == 0
-    for messages in [*main.messages, *imagination.messages]:
-        assert [message["role"] for message in messages] == ["system", "user"]
-        assert not any(message.get("role") in {"assistant", "tool"} for message in messages)
-        assert _image_count(messages) >= 1
+    assert result.turns == 6
+    assert len(main.messages) == 6
+    assert len(imagination.messages) == 2
+    assert all(_tool_names(tools) == list(MAIN_FUNCTION_NAMES) for tools in main.tools)
+    assert all(
+        _tool_names(tools) == list(IMAGINATION_FUNCTION_NAMES)
+        for tools in imagination.tools
+    )
     assert all(_image_count(messages) == 1 for messages in main.messages)
-    post_commit_text = _user_text(main.messages[2])
-    assert "Last Physical Action" in post_commit_text
-    assert "set gripper closed" in post_commit_text
-    assert "Main Working Focus" in post_commit_text
-    assert "reason 2" in post_commit_text
-    review_text = _user_text(main.messages[1])
-    assert "Main Working Focus" not in review_text
-    assert "reason 1" not in review_text
-    assert '"target_gripper":"closed"' in review_text
+    assert all(_image_count(messages) == 1 for messages in imagination.messages)
+    assert all(
+        "Carried Geometry：unavailable_use_gripper_only_fallback"
+        in _user_text(messages)
+        for messages in imagination.messages
+    )
+    assert renderer.projections.count("imagination") == 2
+    assert renderer.projections.count("main") == 6
 
+    # Internal edit calls live only in a nested trace, not Main's top-level log.
     rows = [json.loads(line) for line in (tmp_path / "steps.jsonl").read_text().splitlines()]
-    assert [row["agent_owner"] for row in rows] == [
-        "main",
-        "main",
-        "main",
+    assert [row["function_call"]["name"] for row in rows] == [
+        "detection_and_sam",
+        "propose_grasps",
+        "select",
+        "refine_action",
+        "commit",
+        "done",
     ]
-    assert all("visible_recent_calls" not in row for row in rows)
-    assert all("execution_receipt" not in row for row in rows)
-    assert rows[0]["main_working_focus"] is None
-    assert rows[1]["main_working_focus"] is None
-    assert rows[2]["main_working_focus"] == "reason 2"
+    nested = tmp_path / "subagents" / "imagination_0001" / "steps.jsonl"
+    nested_rows = [json.loads(line) for line in nested.read_text().splitlines()]
+    assert [row["function_call"]["name"] for row in nested_rows] == [
+        "delta_move",
+        "finish_imagination",
+    ]
+    refine_result = rows[3]["function_result"]
+    assert refine_result == {"status": "ready", "action_id": "a1"}
+    assert "subtrace" not in _user_text(main.messages[4])
 
 
-def test_main_keeps_only_one_overwrite_only_working_focus() -> None:
+def test_refinement_requires_an_explicit_live_action() -> None:
     main = RecordingProvider(
         [
-            ModelResponse(
-                text="当前抬升核验显示目标没有随动；重新定位目标以重抓。",
-                tool_calls=(
-                    ToolCall(
-                        id="call-1",
-                        name="detection_and_sam",
-                        args={"query": "can"},
-                    ),
-                ),
+            _response(
+                1,
+                "refine_action",
+                instruction="从当前 TCP 向上移动 1cm",
             ),
-            ModelResponse(
-                text="region 已确认；生成不同抓取起点。",
-                tool_calls=(
-                    ToolCall(
-                        id="call-2",
-                        name="propose_grasps",
-                        args={"region_id": "region1"},
-                    ),
-                ),
-            ),
-            _response(3, "done", success=False),
-        ]
-    )
-    runtime = ContextRuntime(
-        main,
-        ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki"),
-        SolidRenderer(),
-    )
-
-    runtime.run()
-
-    second = _user_text(main.messages[1])
-    third = _user_text(main.messages[2])
-    assert "目标没有随动；重新定位目标以重抓" in second
-    assert "region 已确认；生成不同抓取起点" in third
-    assert "目标没有随动；重新定位目标以重抓" not in third
-    assert "function_result" not in third and "call-2" not in third
-
-
-def test_runtime_stops_after_environment_terminates_during_commit() -> None:
-    main = RecordingProvider(
-        [
-            _response(1, "open_gripper"),
-            _response(2, "commit", action_id="a1"),
-            _response(3, "done", success=False),
+            _response(2, "done", success=False),
         ]
     )
     imagination = RecordingProvider([])
+    api = FakeContextApi()
+
+    result = ContextRuntime(
+        main,
+        ContextWorkspace(api, "task", motion_backend="pyroki"),
+        RecordingRenderer(),
+        imagination_provider=imagination,
+    ).run()
+
+    assert [step.op for step in result.steps] == [
+        "main:refine_action",
+        "main:done",
+    ]
+    assert not result.steps[0].ok
+    assert imagination.messages == []
+    assert api.operation_log == []
+
+
+def test_imagination_limit_retires_action_and_returns_one_clean_failure(tmp_path: Path) -> None:
+    main = RecordingProvider(
+        [
+            _response(1, "refine_action", instruction="检查旋转方向"),
+            _response(2, "done", success=False),
+        ]
+    )
+    imagination = RecordingProvider(
+        [
+            _response(1, "show_rotation_gizmo", frame="base", axis="z"),
+            _response(2, "show_rotation_gizmo", frame="tool", axis="y"),
+        ]
+    )
+    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
+    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    seed = workspace.execute("propose_grasps", region_id=region).result["seed_ids"][0]
+    action_id = workspace.execute("select", seed_id=seed).result["action_id"]
+    main.responses[0] = _response(
+        1,
+        "refine_action",
+        action_id=action_id,
+        instruction="检查旋转方向",
+    )
+
+    ContextRuntime(
+        main,
+        workspace,
+        RecordingRenderer(),
+        imagination_provider=imagination,
+        config=ContextRunConfig(max_main_turns=4, max_imagination_turns=2),
+        trace=ContextTraceLogger(tmp_path),
+    ).run()
+
+    assert workspace.state.refinement is None
+    assert workspace.state.pending_action is None
+    assert '"status":"failed"' in _user_text(main.messages[1])
+    assert "show_rotation_gizmo" not in _user_text(main.messages[1])
+
+
+def test_main_context_is_rebuilt_without_transcript_history() -> None:
+    main = RecordingProvider(
+        [
+            _response(1, "detection_and_sam", query="can"),
+            _response(2, "propose_grasps", region_id="region1"),
+            _response(3, "done", success=False),
+        ]
+    )
+
+    ContextRuntime(
+        main,
+        ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki"),
+        RecordingRenderer(),
+    ).run()
+
+    assert all([message["role"] for message in messages] == ["system", "user"] for messages in main.messages)
+    assert "Task Memory" in _user_text(main.messages[1])
+    assert "Live References" in _user_text(main.messages[1])
+    assert "Current Function Event" in _user_text(main.messages[1])
+    assert '"function":"detection_and_sam"' in _user_text(main.messages[1])
+    assert '"function":"propose_grasps"' in _user_text(main.messages[2])
+    assert '"function":"detection_and_sam"' not in _user_text(main.messages[2])
+    assert "Last Function Outcome" not in _user_text(main.messages[1])
+    assert "receipt" not in _user_text(main.messages[1]).lower()
+
+
+def test_task_memory_survives_perception_while_current_event_is_overwritten() -> None:
+    main = RecordingProvider(
+        [
+            _response(1, "open_gripper"),
+            _response(2, "detection_and_sam", query="can"),
+            _response(3, "done", success=False),
+        ]
+    )
+    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
+
+    ContextRuntime(main, workspace, RecordingRenderer()).run()
+
+    after_open = _user_text(main.messages[1])
+    after_detection = _user_text(main.messages[2])
+    assert '"op":"open_gripper","status":"executed"' in after_open
+    assert '"function":"open_gripper"' in after_open
+    assert '"op":"open_gripper","status":"executed"' in after_detection
+    assert '"function":"detection_and_sam"' in after_detection
+    assert '"function":"open_gripper"' not in after_detection
+    assert "Last Physical Action" not in after_open
+    assert "Physical Effect Verification" not in after_open
+    assert workspace.state.last_physical_action is not None
+
+
+def test_runtime_stops_after_environment_terminates_during_direct_gripper_action() -> None:
+    main = RecordingProvider(
+        [
+            _response(1, "open_gripper"),
+            _response(2, "done", success=False),
+        ]
+    )
     terminated = False
-
-    def terminal_check() -> bool:
-        return terminated
-
     api = FakeContextApi()
     original_open = api.open_gripper
 
@@ -177,391 +279,10 @@ def test_runtime_stops_after_environment_terminates_during_commit() -> None:
     result = ContextRuntime(
         main,
         ContextWorkspace(api, "task", motion_backend="pyroki"),
-        SolidRenderer(),
-        imagination_provider=imagination,
-        env_terminal_check=terminal_check,
+        RecordingRenderer(),
+        env_terminal_check=lambda: terminated,
     ).run()
 
     assert result.terminate_mode.value == "env_terminated"
-    assert result.turns == 2
-    assert len(main.messages) == 2
-    assert [step.op for step in result.steps] == [
-        "main:open_gripper",
-        "main:commit",
-    ]
-
-
-def test_last_physical_action_persists_across_main_perception_calls() -> None:
-    main = RecordingProvider(
-        [
-            _response(1, "open_gripper"),
-            _response(2, "commit", action_id="a1"),
-            ModelResponse(text="no function this time", tool_calls=()),
-            _response(
-                4,
-                "start_imagination",
-                refinement_goal="抬升并检查物体是否随动",
-            ),
-            _response(7, "detection_and_sam", query="can"),
-            _response(8, "done", success=False),
-        ]
-    )
-    imagination = RecordingProvider(
-        [
-            _response(5, "delta_move", delta_xyz_m=[0.0, 0.0, 0.05], frame="base"),
-            _response(6, "finish_imagination", status="failed"),
-        ]
-    )
-    ContextRuntime(
-        main,
-        ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki"),
-        SolidRenderer(),
-        imagination_provider=imagination,
-    ).run()
-
-    assert "Last Physical Action" in _user_text(main.messages[2])
-    assert "set gripper open" in _user_text(main.messages[2])
-    assert "Last Physical Action" in _user_text(main.messages[3])
-    assert "Last Physical Action" in _user_text(main.messages[4])
-    assert "Last Physical Action" in _user_text(main.messages[5])
-    assert "within [-0.03, 0.03]" in _user_text(imagination.messages[1])
-    assert all(_image_count(messages) == 1 for messages in main.messages)
-
-
-def test_completed_gripper_action_remains_visible_during_lift_review() -> None:
-    main = RecordingProvider(
-        [
-            _response(1, "close_gripper"),
-            _response(2, "commit", action_id="a1"),
-            _response(
-                3,
-                "start_imagination",
-                refinement_goal="保持闭合并上抬 3cm 核验随动",
-            ),
-            _response(6, "done", success=False),
-        ]
-    )
-    imagination = RecordingProvider(
-        [
-            _response(4, "delta_move", delta_xyz_m=[0.0, 0.0, 0.03], frame="base"),
-            _response(5, "finish_imagination", status="ready"),
-        ]
-    )
-    ContextRuntime(
-        main,
-        ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki"),
-        SolidRenderer(),
-        imagination_provider=imagination,
-    ).run()
-
-    review_text = _user_text(main.messages[3])
-    assert "Last Physical Action" in review_text
-    assert '"target_gripper":"closed"' in review_text
-    assert '"outcome":"completed"' in review_text
-    assert '"total_translation_base_m":[0.0,0.0,0.03]' in review_text
-
-
-def test_review_tool_surface_requires_explicit_commit_revise_or_reject() -> None:
-    main = RecordingProvider(
-        [
-            _response(
-                1,
-                "start_imagination",
-                refinement_goal="检查目标位置",
-            ),
-            _response(4, "detection_and_sam", query="basket"),
-            _response(5, "reject_action", action_id="a1"),
-            _response(6, "detection_and_sam", query="basket"),
-            _response(7, "done", success=False),
-        ]
-    )
-    imagination = RecordingProvider(
-        [
-            _response(2, "delta_move", delta_xyz_m=[0.0, 0.0, 0.01], frame="base"),
-            _response(3, "finish_imagination", status="ready"),
-        ]
-    )
-    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
-    runtime = ContextRuntime(
-        main,
-        workspace,
-        SolidRenderer(),
-        imagination_provider=imagination,
-    )
-
-    result = runtime.run()
-
-    invalid_perception = result.steps[3]
-    assert invalid_perception.op == "main:detection_and_sam"
-    assert not invalid_perception.ok
-    assert "unknown function 'detection_and_sam'" in invalid_perception.result
-    assert [item["function"]["name"] for item in main.tools[0]] == list(
-        STANDARD_MAIN_FUNCTION_NAMES
-    )
-    assert [item["function"]["name"] for item in main.tools[1]] == list(
-        REVIEW_FUNCTION_NAMES
-    )
-    assert [item["function"]["name"] for item in main.tools[2]] == list(
-        REVIEW_FUNCTION_NAMES
-    )
-    assert [item["function"]["name"] for item in main.tools[3]] == list(
-        STANDARD_MAIN_FUNCTION_NAMES
-    )
-    assert "当前只负责审查一个" in main.messages[1][0]["content"]
-    assert "unknown function 'detection_and_sam'" in _user_text(main.messages[2])
-    assert any(step.op == "main:reject_action" and step.ok for step in result.steps)
-    assert any(step.op == "main:detection_and_sam" and step.ok for step in result.steps)
-    assert workspace.state.regions
-    assert workspace.state.action_review is None
-
-
-def test_imagination_turn_limit_returns_failed_handoff_to_main(tmp_path: Path) -> None:
-    main = RecordingProvider(
-        [
-            _response(
-                1,
-                "start_imagination",
-                refinement_goal="仅预览张开夹爪",
-            ),
-            _response(4, "done", success=False),
-        ]
-    )
-    imagination = RecordingProvider(
-        [
-            _response(2, "delta_move", delta_xyz_m=[0.01, 0.0, 0.0], frame="base"),
-            _response(3, "rotate", axis="z", angle_deg=5.0, frame="tool"),
-        ]
-    )
-    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
-    result = ContextRuntime(
-        main,
-        workspace,
-        SolidRenderer(),
-        imagination_provider=imagination,
-        config=ContextRunConfig(max_main_turns=4, max_imagination_turns=2),
-        trace=ContextTraceLogger(tmp_path),
-    ).run()
-
-    assert result.turns == 4
-    assert "Latest Imagination Handoff" in json.dumps(
-        main.messages[1], ensure_ascii=False
-    )
-    visible = _user_text(main.messages[1])
-    assert '"status":"failed"' in visible
-    assert "review_required" not in visible
-    assert '"review_action_id":null' in visible
-    assert "budget_exhausted" not in visible
-    assert "turn_limit" not in visible
-    assert [item["function"]["name"] for item in main.tools[1]] == list(
-        STANDARD_MAIN_FUNCTION_NAMES
-    )
-    events = [
-        json.loads(line)
-        for line in (tmp_path / "runtime_events.jsonl").read_text().splitlines()
-    ]
-    assert events[-1]["termination_reason"] == "turn_limit"
-
-
-def test_invalid_imagination_tool_is_one_shot_feedback_not_history() -> None:
-    main = RecordingProvider(
-        [
-            _response(
-                1,
-                "start_imagination",
-                refinement_goal="仅预览张开夹爪",
-            ),
-            _response(4, "done", success=False),
-        ]
-    )
-    imagination = RecordingProvider(
-        [
-            _response(2, "detection_and_sam", query="can"),
-            _response(3, "finish_imagination", status="failed"),
-        ]
-    )
-    ContextRuntime(
-        main,
-        ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki"),
-        SolidRenderer(),
-        imagination_provider=imagination,
-        config=ContextRunConfig(max_main_turns=4, max_imagination_turns=4),
-    ).run()
-
-    second = json.dumps(imagination.messages[1], ensure_ascii=False)
-    assert "unknown function 'detection_and_sam'" in second
-    assert "call-2" not in second
-
-
-def test_failed_imagination_tells_main_which_seed_was_rejected() -> None:
-    main = RecordingProvider(
-        [
-            _response(1, "detection_and_sam", query="can"),
-            _response(2, "propose_grasps", region_id="region1"),
-            _response(
-                3,
-                "select",
-                seed_id="s1",
-                refinement_goal="check whether the fingers can surround the can",
-            ),
-            _response(5, "done", success=False),
-        ]
-    )
-    imagination = RecordingProvider(
-        [_response(4, "finish_imagination", status="failed")]
-    )
-
-    ContextRuntime(
-        main,
-        ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki"),
-        SolidRenderer(),
-        imagination_provider=imagination,
-    ).run()
-
-    handoff_text = _user_text(main.messages[3])
-    assert '"status":"failed"' in handoff_text
-    assert '"source_ref":"s1"' in handoff_text
-
-
-def test_main_starter_requires_explicit_refinement_goal() -> None:
-    main = RecordingProvider(
-        [
-            _response(1, "start_imagination"),
-            _response(2, "done", success=False),
-        ]
-    )
-    imagination = RecordingProvider([])
-    ContextRuntime(
-        main,
-        ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki"),
-        SolidRenderer(),
-        imagination_provider=imagination,
-    ).run()
-
-    assert imagination.messages == []
-    assert "refinement_goal is required" in _user_text(main.messages[1])
-
-
-def test_imagination_receives_cumulative_edit_summary_not_transcript() -> None:
-    main = RecordingProvider(
-        [
-            _response(
-                1,
-                "start_imagination",
-                refinement_goal="把 TCP 移到目标几何中心",
-            ),
-            _response(5, "done", success=False),
-        ]
-    )
-    imagination = RecordingProvider(
-        [
-            _response(
-                2,
-                "delta_move",
-                delta_xyz_m=[0.01, 0.0, 0.0],
-                frame="base",
-            ),
-            _response(
-                3,
-                "delta_move",
-                delta_xyz_m=[0.0, 0.02, 0.0],
-                frame="base",
-            ),
-            _response(
-                4,
-                "delta_move",
-                delta_xyz_m=[0.0, -0.01, 0.0],
-                frame="base",
-            ),
-            _response(5, "finish_imagination", status="ready"),
-        ]
-    )
-    ContextRuntime(
-        main,
-        ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki"),
-        SolidRenderer(),
-        imagination_provider=imagination,
-    ).run()
-
-    first = _user_text(imagination.messages[0])
-    second = _user_text(imagination.messages[1])
-    third = _user_text(imagination.messages[2])
-    fourth = _user_text(imagination.messages[3])
-    assert "把 TCP 移到目标几何中心" in first
-    assert '"total_translation_base_m":[0.0,0.0,0.0]' in first
-    assert "quaternion_xyzw" not in first
-    assert "Target Gripper：inherit observed opening" in first
-    assert '"last_edit"' in second
-    assert '"total_translation_base_m":[0.01,0.0,0.0]' in second
-    assert '"previous_edit"' in third and '"last_edit"' in third
-    assert '"total_translation_base_m":[0.01,0.02,0.0]' in third
-    assert '"total_translation_base_m":[0.01,0.01,0.0]' in fourth
-    assert "reason 2" not in second and "reason 3" not in third
-    main_review = _user_text(main.messages[1])
-    assert "Action Review Edit Summary" in main_review
-    assert '"total_translation_base_m":[0.01,0.01,0.0]' in main_review
-
-
-def test_review_select_implicitly_declines_and_notifies_main_after_imagination() -> None:
-    main = RecordingProvider(
-        [
-            _response(1, "detection_and_sam", query="can"),
-            _response(2, "propose_grasps", region_id="region1"),
-            _response(3, "close_gripper"),
-            _response(
-                4,
-                "select",
-                seed_id="s1",
-                refinement_goal="check whether the fingers can surround the can",
-            ),
-            _response(6, "done", success=False),
-        ]
-    )
-    imagination = RecordingProvider(
-        [_response(5, "finish_imagination", status="failed")]
-    )
-    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
-    result = ContextRuntime(
-        main,
-        workspace,
-        SolidRenderer(),
-        imagination_provider=imagination,
-    ).run()
-
-    select_step = next(step for step in result.steps if step.op == "main:select")
-    assert select_step.ok
-    assert '"declined_how":"implicit"' in select_step.result
-    assert '"declined_action_id":"a1"' in select_step.result
-    returned = main.messages[4]
-    notice_text = _user_text(returned)
-    assert "上一轮通知" in notice_text
-    assert "a1" in notice_text
-    assert "不是 reject_action" in notice_text
-    assert "select" in notice_text
-    assert workspace.state.action_review is None
-
-
-def test_failed_commit_uses_function_failure_label_and_recovery_fields() -> None:
-    api = FakeContextApi()
-    api.gripper_error = True
-    main = RecordingProvider(
-        [
-            _response(1, "close_gripper"),
-            _response(2, "commit", action_id="a1"),
-            _response(3, "done", success=False),
-        ]
-    )
-    ContextRuntime(
-        main,
-        ContextWorkspace(api, "task", motion_backend="pyroki"),
-        SolidRenderer(),
-        imagination_provider=RecordingProvider([]),
-    ).run()
-
-    post = _user_text(main.messages[2])
-    assert "上一轮执行失败" in post
-    assert "上轮协议错误" not in post
-    assert '"failed_action_id":"a1"' in post
-    assert '"evidence_invalidated":true' in post
-    assert '"recovery_hint"' in post
-    assert "detection_and_sam" in post
-    assert "Last Physical Action" in post
+    assert result.turns == 1
+    assert [step.op for step in result.steps] == ["main:open_gripper"]

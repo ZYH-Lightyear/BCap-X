@@ -1,4 +1,4 @@
-"""Deterministic compiler for the fixed-size dual-agent VAW Canvas."""
+"""Deterministic compiler for Main and focused Imagination canvases."""
 
 from __future__ import annotations
 
@@ -12,16 +12,20 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from scipy.spatial.transform import Rotation
 
-from vaw.context_runtime.contact_camera import ContactCameraRequest
+from vaw.context_runtime.attached_object import volume_triangles_base
+from vaw.context_runtime.contact_camera import (
+    ContactCameraRequest,
+    OppositeSceneCameraRequest,
+)
 from vaw.context_runtime.geometry import project_world_to_pixel
 from vaw.context_runtime.gripper_mesh import (
     load_panda_urdf_fk,
     mask_outline,
+    overlay_projected_mesh_outline,
     rasterize_silhouette,
 )
 from vaw.context_runtime.model import (
     ContextState,
-    LastPhysicalAction,
     PointEvidence,
     Pose,
     RobotState,
@@ -29,6 +33,10 @@ from vaw.context_runtime.model import (
 from vaw.context_runtime.near_field import (
     CONTACT_FOCUS_WIDTH,
     CONTACT_PANEL_HEIGHT,
+    NearFieldPreview,
+    PreviewGripperStyle,
+    _direct_target_gripper_triangles,
+    gravity_stable_contact_frame_quaternion,
     render_contact_focus,
 )
 from vaw.context_runtime.presentation import (
@@ -41,11 +49,15 @@ from vaw.context_runtime.presentation import (
     observed_source_ref as _observed_source_ref,
 )
 from vaw.context_runtime.private import PrivateEnvContext
-from vaw.context_runtime.scene_view import render_scene_view
+from vaw.context_runtime.scene_view import (
+    OBSERVED_SCENE_HEIGHT,
+    OBSERVED_SCENE_WIDTH,
+    render_scene_view,
+)
 from vaw.context_runtime.workspace import ContextWorkspace
 
-CONTEXT_SCHEMA = "vaw-context-v31-separated-control-guides"
-CONTEXT_WEB_SCHEMA_VERSION = 32
+CONTEXT_SCHEMA = "vaw-context-v37-working-memory"
+CONTEXT_WEB_SCHEMA_VERSION = 38
 CONTEXT_WIDTH = 2048
 CONTEXT_HEIGHT = 1280
 
@@ -61,11 +73,11 @@ DecisionMode = Literal[
     "grounding",
     "seeds",
     "editing",
-    "reviewed",
-    "post_commit",
-    "error",
+    "proposal",
+    "contact",
     "terminal",
 ]
+ContextProjection = Literal["main", "imagination"]
 
 
 @dataclass(frozen=True)
@@ -123,6 +135,7 @@ class SeedSpec:
     solve_ik: str
     source_revision: int
     raster_id: str
+    family: str | None = None
 
     def summary(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -142,6 +155,8 @@ class SeedSpec:
             "sourceRevision": self.source_revision,
             "rasterId": self.raster_id,
         }
+        if self.family:
+            out["family"] = self.family
         return out
 
 
@@ -152,17 +167,8 @@ class WorldContextSpec:
     imagination_scene_raster_id: str
     contact_focus_raster_id: str | None
     robot: RobotState | None
-    owner: str
     action: dict[str, Any] | None
     refinement_goal: str | None
-    latest_error: str | None
-    last_physical_action: LastPhysicalAction | None = None
-    post_commit_before_raster_id: str | None = None
-    post_commit_current_raster_id: str | None = None
-    causal_source_before_raster_id: str | None = None
-    causal_source_current_raster_id: str | None = None
-    causal_source_label: str | None = None
-    physical_verification: PhysicalVerificationSpec | None = None
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -171,48 +177,8 @@ class WorldContextSpec:
             "imaginationSceneRasterId": self.imagination_scene_raster_id,
             "contactFocusRasterId": self.contact_focus_raster_id,
             "robot": self.robot.summary() if self.robot is not None else None,
-            "owner": self.owner,
             "action": self.action,
             "refinementGoal": self.refinement_goal,
-            "latestError": self.latest_error,
-            "lastPhysicalAction": (
-                self.last_physical_action.summary()
-                if self.last_physical_action is not None
-                else None
-            ),
-            "postCommitBeforeRasterId": self.post_commit_before_raster_id,
-            "postCommitCurrentRasterId": self.post_commit_current_raster_id,
-            "causalSourceBeforeRasterId": self.causal_source_before_raster_id,
-            "causalSourceCurrentRasterId": self.causal_source_current_raster_id,
-            "causalSourceLabel": self.causal_source_label,
-            "physicalVerification": (
-                self.physical_verification.summary()
-                if self.physical_verification is not None
-                else None
-            ),
-        }
-
-
-@dataclass(frozen=True)
-class PhysicalVerificationSpec:
-    """Non-privileged interpretation boundary for the latest physical command.
-
-    This never predicts task success.  It states only which command effect is
-    still unverified and what kind of current visual evidence could resolve
-    it, so Main does not have to reinterpret a normalized jaw opening on every
-    ownership handoff.
-    """
-
-    kind: Literal["closure", "release", "arm_motion"]
-    evidence_needed: str
-    ambiguity: str
-
-    def summary(self) -> dict[str, str]:
-        return {
-            "status": "unverified",
-            "kind": self.kind,
-            "evidenceNeeded": self.evidence_needed,
-            "ambiguity": self.ambiguity,
         }
 
 
@@ -257,6 +223,7 @@ class ContextPacket:
     catalog: EvidenceCatalogSpec
     decision: DecisionWorkspaceSpec
     rasters: dict[str, np.ndarray]
+    projection: ContextProjection = "main"
     schema: str = CONTEXT_SCHEMA
 
     def summary(self) -> dict[str, Any]:
@@ -264,6 +231,7 @@ class ContextPacket:
 
         return {
             "schema": self.schema,
+            "projection": self.projection,
             "revision": self.revision,
             "viewport": {"width": CONTEXT_WIDTH, "height": CONTEXT_HEIGHT},
             "world": self.world.summary(),
@@ -274,13 +242,32 @@ class ContextPacket:
 
     def manifest(self) -> dict[str, Any]:
         return {
-            "owner": self.world.owner,
-            "review_action_id": (
-                self.world.action.get("action_id") if self.world.action is not None else None
+            "pending_action": (
+                {
+                    "action_id": self.world.action.get("action_id"),
+                    "intent": self.world.action.get("intent"),
+                    "state": self.world.action.get("status"),
+                }
+                if self.world.action is not None
+                else None
             ),
-            "valid_region_ids": [item.region_id for item in self.catalog.regions],
-            "valid_point_ids": [item.point_id for item in self.catalog.points],
-            "valid_seed_ids": [item.seed_id for item in self.catalog.seeds],
+            "regions": [
+                {"id": item.region_id, "query": item.query}
+                for item in self.catalog.regions
+            ],
+            "points": [
+                {
+                    "id": item.point_id,
+                    "query": item.query,
+                    **(
+                        {"within_region_id": item.within_region_id}
+                        if item.within_region_id is not None
+                        else {}
+                    ),
+                }
+                for item in self.catalog.points
+            ],
+            "seed_ids": [item.seed_id for item in self.catalog.seeds],
         }
 
     def web_snapshot(self, *, render_id: str) -> dict[str, Any]:
@@ -298,7 +285,17 @@ class ContextPacket:
 class ContextCompiler:
     """Trusted presenter: private geometry in, policy-visible packet out."""
 
-    def compile(self, workspace: ContextWorkspace) -> ContextPacket:
+    def __init__(self, *, preview_gripper_style: PreviewGripperStyle = "fk-mesh") -> None:
+        if preview_gripper_style not in {"fk-mesh", "semantic-wireframe"}:
+            raise ValueError(f"unsupported preview gripper style: {preview_gripper_style}")
+        self.preview_gripper_style = preview_gripper_style
+
+    def compile(
+        self,
+        workspace: ContextWorkspace,
+        *,
+        projection: ContextProjection = "main",
+    ) -> ContextPacket:
         state = workspace.state
         private = workspace._private
         camera = private.camera(workspace.camera_name)
@@ -308,46 +305,133 @@ class ContextCompiler:
             wrist_camera = private.camera(workspace.wrist_camera_name)
         target, active_artifacts, action_presentation = _active_presentation(workspace)
         scene_preview = (
-            _near_field_preview(state, target, active_artifacts) if target is not None else None
+            _near_field_preview(
+                state,
+                target,
+                active_artifacts,
+                gripper_style=self.preview_gripper_style,
+                tcp_to_hand_local_xyz=workspace._tcp_to_hand_local_xyz,
+            )
+            if target is not None
+            else None
         )
-        source_ref = _observed_source_ref(active_artifacts)
+        contact_preview = scene_preview or _current_physical_contact_preview(workspace)
+        carried_volume_triangles = None
+        if target is not None and private.attachment_hypothesis is not None:
+            carried_volume_triangles = volume_triangles_base(
+                private.attachment_hypothesis,
+                target.pose,
+            )
+        framing_carried_triangles = carried_volume_triangles
+        if (
+            framing_carried_triangles is None
+            and private.attachment_hypothesis is not None
+            and state.robot is not None
+            and state.robot.tcp_pose is not None
+        ):
+            # Physical Contact views use the attachment only as a camera
+            # framing prior at the current observed TCP.  The proxy is not
+            # drawn as observed truth; the direct MuJoCo RGB remains the
+            # policy-visible evidence.
+            framing_carried_triangles = volume_triangles_base(
+                private.attachment_hypothesis,
+                state.robot.tcp_pose,
+            )
+        source_ref = _presentation_region_ref(state, active_artifacts)
         source_mask = private.region_masks.get(source_ref) if source_ref is not None else None
         contact_cameras = None
         if (
-            scene_preview is not None
-            and scene_preview.contact_frame_position_xyz is not None
-            and scene_preview.contact_frame_quaternion_xyzw is not None
+            contact_preview is not None
+            and contact_preview.contact_frame_position_xyz is not None
+            and contact_preview.contact_frame_quaternion_xyzw is not None
             and callable(private.contact_camera_provider)
         ):
-            contact_cameras = private.contact_camera_provider(
-                ContactCameraRequest(
-                    center_base_xyz=scene_preview.contact_frame_position_xyz,
-                    frame_quaternion_xyzw=(scene_preview.contact_frame_quaternion_xyzw),
-                    width=CONTACT_FOCUS_WIDTH,
-                    panel_height=CONTACT_PANEL_HEIGHT,
-                )
+            action_id = (
+                state.pending_action.action_id if state.pending_action is not None else None
             )
-        observed_scene = render_scene_view(
+            if (
+                private.contact_camera_pair is None
+                or private.contact_camera_action_id != action_id
+            ):
+                required_preview_points = _preview_contact_points(
+                    state.robot,
+                    contact_preview,
+                )
+                subject_points = None
+                if source_ref is not None:
+                    geometry = private.region_geometry.get(source_ref)
+                    if geometry is not None:
+                        subject_points = geometry.filtered_object_points_base
+                if (
+                    subject_points is None
+                    and private.last_physical_artifacts is not None
+                ):
+                    subject_points = (
+                        private.last_physical_artifacts.subject_points_base
+                    )
+                if framing_carried_triangles is not None:
+                    carried_points = framing_carried_triangles.reshape(-1, 3)
+                    last_subject = private.last_physical_artifacts
+                    stale_carried_surface = (
+                        target is None
+                        and private.attachment_hypothesis is not None
+                        and last_subject is not None
+                        and last_subject.subject_query
+                        == private.attachment_hypothesis.query
+                    )
+                    subject_points = (
+                        carried_points
+                        if subject_points is None or stale_carried_surface
+                        else np.vstack((subject_points, carried_points))
+                    )
+                contact_center = _contact_camera_center(
+                    contact_preview.contact_frame_position_xyz,
+                    subject_points,
+                    required_preview_points,
+                )
+                private.trace_diagnostics["contact_camera_framing"] = {
+                    "center_base_xyz": [round(float(value), 6) for value in contact_center],
+                    "subject_point_count": (
+                        int(len(subject_points)) if subject_points is not None else 0
+                    ),
+                    "destination_region_id": source_ref,
+                }
+                private.contact_camera_pair = private.contact_camera_provider(
+                    ContactCameraRequest(
+                        center_base_xyz=contact_center,
+                        frame_quaternion_xyzw=(
+                            contact_preview.contact_frame_quaternion_xyzw
+                        ),
+                        width=CONTACT_FOCUS_WIDTH,
+                        panel_height=CONTACT_PANEL_HEIGHT,
+                        subject_points_base=subject_points,
+                        required_points_base=required_preview_points,
+                    )
+                )
+                private.contact_camera_action_id = action_id
+            contact_cameras = private.contact_camera_pair
+        observed_scene = _compile_observed_scene(
+            workspace,
             camera,
             wrist_camera,
-            state.robot,
-            dark=False,
         )
         imagination_scene = render_scene_view(
             camera,
             wrist_camera,
             state.robot,
-            scene_preview,
+            contact_preview,
             dark=True,
             source_mask=source_mask,
+            carried_volume_triangles_base=carried_volume_triangles,
         )
         contact_focus = render_contact_focus(
             camera,
             wrist_camera,
             state.robot,
-            scene_preview,
+            contact_preview,
             source_mask=source_mask,
             contact_cameras=contact_cameras,
+            carried_volume_triangles_base=carried_volume_triangles,
         )
 
         # The persistent world view is deliberately sensor-clean.  All
@@ -362,17 +446,6 @@ class ContextCompiler:
         if contact_focus is not None:
             contact_focus_id = "contact_focus"
             rasters[contact_focus_id] = contact_focus
-        (
-            post_before_id,
-            post_current_id,
-            causal_before_id,
-            causal_current_id,
-        ) = _compile_post_commit_rasters(
-            workspace,
-            camera,
-            rasters,
-        )
-
         region_specs = self._compile_regions(state, rgb, private.region_masks, rasters)
         point_specs = self._compile_points(state, rgb, rasters)
         seed_specs = self._compile_seeds(
@@ -384,7 +457,6 @@ class ContextCompiler:
             tcp_to_hand_local_xyz=workspace._tcp_to_hand_local_xyz,
         )
         decision = _decision_spec(workspace)
-        event = private.presentation_event
         packet = ContextPacket(
             revision=state.observation_revision,
             world=WorldContextSpec(
@@ -393,29 +465,9 @@ class ContextCompiler:
                 imagination_scene_raster_id="imagination_scene",
                 contact_focus_raster_id=contact_focus_id,
                 robot=state.robot,
-                owner=state.owner,
                 action=action_presentation,
                 refinement_goal=(
-                    state.imagination.refinement_goal if state.imagination is not None else None
-                ),
-                latest_error=event.error if event is not None else None,
-                last_physical_action=_visible_last_physical_action(state),
-                post_commit_before_raster_id=post_before_id,
-                post_commit_current_raster_id=post_current_id,
-                causal_source_before_raster_id=causal_before_id,
-                causal_source_current_raster_id=causal_current_id,
-                causal_source_label=(
-                    private.last_physical_artifacts.causal_subject.query
-                    if private.last_physical_artifacts is not None
-                    and private.last_physical_artifacts.causal_subject is not None
-                    else None
-                ),
-                physical_verification=_physical_verification_spec(
-                    _visible_last_physical_action(state),
-                    has_causal_subject=(
-                        private.last_physical_artifacts is not None
-                        and private.last_physical_artifacts.causal_subject is not None
-                    ),
+                    state.refinement.instruction if state.refinement is not None else None
                 ),
             ),
             catalog=EvidenceCatalogSpec(
@@ -425,9 +477,18 @@ class ContextCompiler:
             ),
             decision=decision,
             rasters=rasters,
+            projection=projection,
         )
         _validate_packet(packet)
         return packet
+
+
+    def compile_imagination(self, workspace: ContextWorkspace) -> ContextPacket:
+        """Compile the same trusted state into a focused SubAgent projection."""
+
+        if workspace.state.refinement is None:
+            raise ValueError("focused imagination context requires an active refinement")
+        return self.compile(workspace, projection="imagination")
 
     @staticmethod
     def _compile_regions(
@@ -520,8 +581,6 @@ class ContextCompiler:
                     float(value)
                     for value in (np.asarray(pose.position_xyz) - np.asarray(anchor.position_xyz))
                 )
-            robot_mask = None
-            gripper_mask = None
             prediction = (
                 artifact.preview_plan.prediction
                 if artifact is not None and artifact.preview_plan is not None
@@ -534,35 +593,20 @@ class ContextCompiler:
                     pose,
                     tcp_to_hand_local_xyz,
                 )
-                if preview_matches:
-                    opening = (
-                        state.robot.gripper_opening
-                        if state.robot is not None and state.robot.gripper_opening is not None
-                        else 1.0
-                    )
-                    robot_mask = _robot_mask(
-                        prediction.joint_positions_rad,
-                        opening,
-                        camera,
-                        rgb.shape[1],
-                        rgb.shape[0],
-                    )
-                    gripper_mask = _gripper_mask(
-                        prediction.joint_positions_rad,
-                        opening,
-                        camera,
-                        rgb.shape[1],
-                        rgb.shape[0],
-                    )
-                else:
+                if not preview_matches:
                     displayed_solve_ik = "mismatch"
+            gripper_geometry = _seed_gripper_geometry(
+                state.robot,
+                pose,
+                camera,
+                rgb,
+            )
             rasters[raster_id] = _candidate_crop(
                 rgb,
                 source.bbox_xyxy_px if source is not None else None,
                 pose,
                 camera,
-                robot_mask=robot_mask,
-                gripper_mask=gripper_mask,
+                gripper_geometry=gripper_geometry,
             )
             specs.append(
                 SeedSpec(
@@ -573,80 +617,140 @@ class ContextCompiler:
                     solve_ik=displayed_solve_ik,
                     source_revision=seed.source_revision,
                     raster_id=raster_id,
+                    family=artifact.family if artifact is not None else None,
                 )
             )
         return specs
 
 
-def _visible_last_physical_action(state: ContextState) -> LastPhysicalAction | None:
-    """Keep successful causal facts, but let a new Preview supersede old failure."""
+def _presentation_region_ref(
+    state: ContextState,
+    artifacts: Any | None,
+) -> str | None:
+    """Resolve the observed region supporting the current virtual target.
 
-    action = state.last_physical_action
-    if action is None:
-        return None
-    if state.imagination is None and state.action_review is None:
-        return action
-    return action if action.outcome == "completed" else None
-
-
-def _physical_verification_spec(
-    action: LastPhysicalAction | None,
-    *,
-    has_causal_subject: bool,
-) -> PhysicalVerificationSpec | None:
-    """Describe evidence still missing after a successful control command.
-
-    The mapping is deliberately command-causal rather than task-specific.  It
-    does not claim that closing grasps, opening releases, or moving transports
-    an object.  Those effects remain for the VLM to verify from current RGB-D.
+    Grasp actions already carry their source region.  Point actions carry a
+    point ID, so placement previews must follow the point's parent region to
+    keep the destination geometry in the Contact Camera frame.
     """
 
-    if action is None or action.outcome != "completed":
-        return None
-    if action.target_gripper == "closed":
-        return PhysicalVerificationSpec(
-            kind="closure",
-            evidence_needed="OBJECT FOLLOWING AFTER ARM MOTION",
-            ambiguity="PARTIAL GRIP OPENING MAY BE CONTACT OR FAILED CLOSURE",
-        )
-    if action.target_gripper == "open":
-        return PhysicalVerificationSpec(
-            kind="release",
-            evidence_needed="OBJECT / TARGET RELATION IN CURRENT RGB",
-            ambiguity="OPENING CONFIRMS COMMAND ONLY, NOT RELEASE OR PLACEMENT",
-        )
-    if action.executed_stages == "arm":
-        return PhysicalVerificationSpec(
-            kind="arm_motion",
-            evidence_needed=(
-                "COMPARE CURRENT SOURCE AND ACTION AREA"
-                if has_causal_subject
-                else "TASK-RELEVANT CHANGE IN CURRENT RGB"
-            ),
-            ambiguity=(
-                "FIXED SOURCE CHANGE MAY BE OCCLUSION, NOT OBJECT FOLLOWING"
-                if has_causal_subject
-                else "ARM ARRIVAL DOES NOT PROVE OBJECT MOTION"
-            ),
-        )
+    source_ref = _observed_source_ref(artifacts)
+    if source_ref in state.regions:
+        return source_ref
+    if source_ref in state.points:
+        parent = state.points[source_ref].within_region_id
+        return parent if parent in state.regions else None
     return None
+
+
+def _contact_camera_center(
+    target_xyz: tuple[float, float, float],
+    subject_points: np.ndarray | None,
+    required_points: np.ndarray | None = None,
+) -> tuple[float, float, float]:
+    """Frame both the virtual TCP and relevant observed geometry.
+
+    Robust bounds ignore sparse RGB-D outliers.  The camera remains locked for
+    the refinement session; only its initial centre is destination-aware.
+    """
+
+    target = np.asarray(target_xyz, dtype=np.float64).reshape(3)
+    point_groups: list[np.ndarray] = []
+    if subject_points is not None:
+        points = np.asarray(subject_points, dtype=np.float64).reshape(-1, 3)
+        points = points[np.isfinite(points).all(axis=1)]
+        if len(points):
+            lower = np.quantile(points, 0.02, axis=0)
+            upper = np.quantile(points, 0.98, axis=0)
+            point_groups.extend((lower.reshape(1, 3), upper.reshape(1, 3)))
+    if required_points is not None:
+        required = np.asarray(required_points, dtype=np.float64).reshape(-1, 3)
+        required = required[np.isfinite(required).all(axis=1)]
+        if len(required):
+            point_groups.extend(
+                (
+                    np.min(required, axis=0).reshape(1, 3),
+                    np.max(required, axis=0).reshape(1, 3),
+                )
+            )
+    if not point_groups:
+        return tuple(float(value) for value in target)
+    bounds = np.vstack(point_groups)
+    lower = np.min(bounds, axis=0)
+    upper = np.max(bounds, axis=0)
+    lower = np.minimum(lower, target)
+    upper = np.maximum(upper, target)
+    center = 0.5 * (lower + upper)
+    return tuple(float(value) for value in center)
+
+
+def _preview_contact_points(
+    robot: RobotState | None,
+    preview: NearFieldPreview | None,
+) -> np.ndarray | None:
+    """Return private target-gripper vertices that must remain in frame."""
+
+    if robot is None or preview is None or preview.gripper_opening is None:
+        return None
+    triangles = None
+    if preview.joint_positions_rad is not None:
+        fk = load_panda_urdf_fk()
+        if fk is not None:
+            try:
+                triangles = fk.triangles(
+                    np.asarray(preview.joint_positions_rad, dtype=np.float64),
+                    float(preview.gripper_opening),
+                )
+            except (KeyError, RuntimeError, ValueError, np.linalg.LinAlgError):
+                triangles = None
+    if triangles is None:
+        triangles = _direct_target_gripper_triangles(
+            robot,
+            preview.target_pose,
+            preview.gripper_opening,
+        )
+    if triangles is None:
+        return None
+    points = np.asarray(triangles, dtype=np.float64).reshape(-1, 3)
+    points = points[np.isfinite(points).all(axis=1)]
+    return np.ascontiguousarray(points) if len(points) else None
+
+
+def _current_physical_contact_preview(
+    workspace: ContextWorkspace,
+) -> NearFieldPreview | None:
+    """Anchor current-only Contact Views at the latest physical target."""
+
+    if workspace.state.pending_action is not None:
+        return None
+    artifacts = workspace._private.last_physical_artifacts
+    if workspace.state.last_physical_action is None or artifacts is None:
+        return None
+    focus = artifacts.focus_pose
+    if focus is None:
+        robot = workspace.state.robot
+        focus = robot.tcp_pose if robot is not None else None
+    if focus is None:
+        return None
+    return NearFieldPreview(
+        target_pose=None,
+        joint_positions_rad=None,
+        gripper_opening=None,
+        contact_frame_quaternion_xyzw=gravity_stable_contact_frame_quaternion(focus),
+        contact_frame_position_xyz=focus.position_xyz,
+    )
 
 
 def _decision_spec(workspace: ContextWorkspace) -> DecisionWorkspaceSpec:
     state = workspace.state
     event = workspace._private.presentation_event
-    if state.imagination is not None:
+    if state.refinement is not None:
         return DecisionWorkspaceSpec(
             mode="editing",
             seed_ids=tuple(state.seeds)[:5],
         )
 
-    # A non-physical Function presents its new evidence in the large decision
-    # surface.  The last physical current crop remains available as a compact
-    # revision-local continuity inset; it must not replace the new evidence.
     if event is not None:
-        if event.error is not None:
-            return DecisionWorkspaceSpec(mode="error")
         if event.function_name == "done":
             return DecisionWorkspaceSpec(mode="terminal")
         result = event.result
@@ -654,188 +758,42 @@ def _decision_spec(workspace: ContextWorkspace) -> DecisionWorkspaceSpec:
         if isinstance(seed_ids, list):
             valid = tuple(str(value) for value in seed_ids if str(value) in state.seeds)[:5]
             return DecisionWorkspaceSpec(mode="seeds", seed_ids=valid)
-        region_id = result.get("region_id")
-        point_id = result.get("point_id")
-        if isinstance(region_id, str) or isinstance(point_id, str):
-            regions, points = _grounding_references(state, region_id, point_id)
-            primary = None
-            if isinstance(point_id, str) and point_id in state.points:
-                primary = f"point:{point_id}"
-            elif isinstance(region_id, str) and region_id in state.regions:
-                primary = f"region:{region_id}"
-            return DecisionWorkspaceSpec(
-                mode="grounding",
-                region_ids=regions,
-                point_ids=points,
-                primary_raster_id=primary,
-            )
 
-    if state.action_review is not None:
+    if state.pending_action is not None:
         return DecisionWorkspaceSpec(
-            mode="reviewed",
+            mode="proposal",
             seed_ids=tuple(state.seeds)[:5],
-            action_id=state.action_review.action_id,
+            action_id=state.pending_action.action_id,
         )
 
-    # A newly returned ActionReview is the decision Main must make now.  The
-    # previous physical comparison remains available in the packet as causal
-    # context, but must not replace the virtual target being reviewed.
+    region_id = event.result.get("region_id") if event is not None else None
+    point_id = event.result.get("point_id") if event is not None else None
+    regions, points = _grounding_references(state, region_id, point_id)
+    primary = None
+    if isinstance(point_id, str) and point_id in state.points:
+        primary = f"point:{point_id}"
+    elif isinstance(region_id, str) and region_id in state.regions:
+        primary = f"region:{region_id}"
+
     if (
         state.last_physical_action is not None
         and workspace._private.last_physical_artifacts is not None
     ):
-        return DecisionWorkspaceSpec(mode="post_commit")
-    if state.last_handoff is not None and state.last_handoff.status == "failed" and state.seeds:
         return DecisionWorkspaceSpec(
-            mode="seeds",
-            seed_ids=tuple(state.seeds)[:5],
+            mode="contact",
+            region_ids=regions,
+            point_ids=points,
+            primary_raster_id=primary,
         )
 
+    if isinstance(region_id, str) or isinstance(point_id, str):
+        return DecisionWorkspaceSpec(
+            mode="grounding",
+            region_ids=regions,
+            point_ids=points,
+            primary_raster_id=primary,
+        )
     return DecisionWorkspaceSpec(mode="idle")
-
-
-def _compile_post_commit_rasters(
-    workspace: ContextWorkspace,
-    current_camera: dict[str, Any],
-    rasters: dict[str, np.ndarray],
-) -> tuple[str | None, str | None, str | None, str | None]:
-    """Compile one policy-visible before/current comparison around the target.
-
-    Sensor calibration remains private: it is used only to project the last
-    physical target into each observation.  The packet receives two RGB crops
-    at the same metric scale, never the old raw frame as a second model image.
-    """
-
-    if (
-        workspace.state.last_physical_action is None
-        or workspace._private.last_physical_artifacts is None
-    ):
-        return None, None, None, None
-    artifacts = workspace._private.last_physical_artifacts
-    try:
-        previous_camera = workspace._private.camera(
-            workspace.camera_name,
-            previous=True,
-        )
-    except RuntimeError:
-        previous_camera = current_camera
-    focus_pose = artifacts.focus_pose if artifacts is not None else None
-    before_id = "post_commit:before"
-    current_id = "post_commit:current"
-    rasters[before_id] = _metric_focus_crop(previous_camera, focus_pose)
-    rasters[current_id] = _metric_focus_crop(current_camera, focus_pose)
-    causal_before_id = None
-    causal_current_id = None
-    subject = artifacts.causal_subject
-    if subject is not None:
-        causal_before_id = "causal_source:before"
-        causal_current_id = "causal_source:current"
-        rasters[causal_before_id] = _fixed_source_crop(
-            previous_camera,
-            subject.bbox_xyxy_px,
-        )
-        rasters[causal_current_id] = _fixed_source_crop(
-            current_camera,
-            subject.bbox_xyxy_px,
-        )
-    return before_id, current_id, causal_before_id, causal_current_id
-
-
-def _fixed_source_crop(
-    camera: dict[str, Any],
-    bbox_xyxy_px: tuple[float, float, float, float],
-    *,
-    output_size: tuple[int, int] = (520, 390),
-) -> np.ndarray:
-    """Crop the same image-space neighborhood before and after a commit.
-
-    The box is deliberately fixed rather than tracked.  If a grasped object
-    moves with the robot, its original location should become empty; if it
-    remains there, the current crop exposes the failed causal effect.
-    """
-
-    rgb = _rgb(camera)
-    x1, y1, x2, y2 = (float(value) for value in bbox_xyxy_px)
-    width = max(x2 - x1, 1.0)
-    height = max(y2 - y1, 1.0)
-    expanded = _fit_box_aspect(
-        (
-            x1 - 2.0 * width,
-            y1 - 2.0 * height,
-            x2 + 2.0 * width,
-            y2 + 2.0 * height,
-        ),
-        target_aspect=output_size[0] / output_size[1],
-    )
-    left, top, right, bottom = _expanded_bounds(
-        expanded,
-        rgb.shape[1],
-        rgb.shape[0],
-        ratio=0.0,
-    )
-    crop = rgb[top:bottom, left:right]
-    if crop.size == 0:
-        crop = rgb
-    image = Image.fromarray(crop).convert("RGB")
-    image = image.resize(output_size, Image.Resampling.LANCZOS)
-    return np.asarray(image, dtype=np.uint8)
-
-
-def _metric_focus_crop(
-    camera: dict[str, Any],
-    focus_pose: Pose | None,
-    *,
-    span_m: float = 0.32,
-    output_size: tuple[int, int] = (760, 390),
-) -> np.ndarray:
-    """Return a deterministic target-centred RGB crop or a full-view fallback."""
-
-    rgb = _rgb(camera)
-    bounds: tuple[int, int, int, int] | None = None
-    if focus_pose is not None:
-        try:
-            projected = project_world_to_pixel(
-                np.asarray([focus_pose.position_xyz], dtype=np.float64),
-                camera["intrinsics"],
-                camera["pose_mat"],
-            )[0]
-            depth = float(projected[2])
-            intrinsics = np.asarray(camera["intrinsics"], dtype=np.float64)
-            if (
-                np.isfinite(projected).all()
-                and depth > 1e-4
-                and 0.0 <= float(projected[0]) < rgb.shape[1]
-                and 0.0 <= float(projected[1]) < rgb.shape[0]
-            ):
-                half_w = float(intrinsics[0, 0]) * span_m / (2.0 * depth)
-                half_h = float(intrinsics[1, 1]) * span_m / (2.0 * depth)
-                crop_box = _fit_box_aspect(
-                    (
-                        float(projected[0] - half_w),
-                        float(projected[1] - half_h),
-                        float(projected[0] + half_w),
-                        float(projected[1] + half_h),
-                    ),
-                    target_aspect=output_size[0] / output_size[1],
-                )
-                bounds = _expanded_bounds(
-                    crop_box,
-                    rgb.shape[1],
-                    rgb.shape[0],
-                    ratio=0.0,
-                )
-        except (KeyError, TypeError, ValueError, np.linalg.LinAlgError):
-            bounds = None
-    if bounds is None:
-        crop = rgb
-    else:
-        left, top, right, bottom = bounds
-        crop = rgb[top:bottom, left:right]
-        if crop.size == 0:
-            crop = rgb
-    image = Image.fromarray(crop).convert("RGB")
-    image = image.resize(output_size, Image.Resampling.LANCZOS)
-    return np.asarray(image, dtype=np.uint8)
 
 
 def _grounding_references(
@@ -942,16 +900,59 @@ def _point_crop(rgb: np.ndarray, pixel: tuple[float, float], label: str) -> np.n
     return np.asarray(image, dtype=np.uint8)
 
 
+def _seed_gripper_geometry(
+    robot: RobotState | None,
+    pose: Pose,
+    camera: dict[str, Any],
+    rgb: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return target triangles and silhouette bounds when projection has area.
+
+    Side grasps collapse to an edge-on sliver from agentview; those cards keep
+    the schematic contour glyph. Other poses use projected 3-D line art.
+    """
+
+    if robot is None:
+        return None
+    triangles = _direct_target_gripper_triangles(
+        robot,
+        pose,
+        robot.gripper_opening,
+    )
+    if triangles is None:
+        return None
+    projected = project_world_to_pixel(
+        np.asarray(triangles, dtype=np.float64).reshape(-1, 3),
+        camera["intrinsics"],
+        camera["pose_mat"],
+    ).reshape(-1, 3, 3)
+    mask = rasterize_silhouette(
+        projected[..., :2],
+        projected[..., 2],
+        rgb.shape[1],
+        rgb.shape[0],
+    )
+    if not np.any(mask):
+        return None
+    ys, xs = np.nonzero(mask)
+    height = int(ys.max() - ys.min()) + 1
+    width = int(xs.max() - xs.min()) + 1
+    if min(height, width) < 14 or int(mask.sum()) < 120:
+        return None
+    return triangles, mask
+
+
 def _candidate_crop(
     rgb: np.ndarray,
     bbox: tuple[float, float, float, float] | None,
     pose: Pose,
     camera: dict[str, Any],
     *,
-    robot_mask: np.ndarray | None,
-    gripper_mask: np.ndarray | None,
+    gripper_geometry: tuple[np.ndarray, np.ndarray] | None,
 ) -> np.ndarray:
-    has_robot_mask = robot_mask is not None and robot_mask.any()
+    gripper_triangles, gripper_mask = (
+        gripper_geometry if gripper_geometry is not None else (None, None)
+    )
     has_gripper_mask = gripper_mask is not None and gripper_mask.any()
     glyph = None if has_gripper_mask else _candidate_gripper_glyph(pose, camera)
     if bbox is not None:
@@ -1001,13 +1002,23 @@ def _candidate_crop(
         rgb.shape[0],
         ratio=0.24 if has_gripper_mask else 0.18,
     )
-    raster = rgb[top:bottom, left:right].copy()
-    local_robot = robot_mask[top:bottom, left:right] if has_robot_mask else None
-    local_gripper = gripper_mask[top:bottom, left:right] if has_gripper_mask else None
-    # The hand/object relationship is the decision evidence.  Preserve the
-    # true whole-arm silhouette, but keep it subordinate to the target hand.
-    raster = _overlay_mask(raster, local_robot, VIOLET, alpha=0.10)
-    raster = _overlay_mask(raster, local_gripper, VIOLET, alpha=0.80)
+    line_art = rgb.copy()
+    if gripper_triangles is not None:
+        projected = project_world_to_pixel(
+            np.asarray(gripper_triangles, dtype=np.float64).reshape(-1, 3),
+            camera["intrinsics"],
+            camera["pose_mat"],
+        ).reshape(-1, 3, 3)
+        overlay_projected_mesh_outline(
+            line_art,
+            gripper_triangles,
+            projected[..., :2],
+            projected[..., 2],
+            camera_position_base=np.asarray(camera["pose_mat"], dtype=np.float64)[
+                :3, 3
+            ],
+        )
+    raster = line_art[top:bottom, left:right].copy()
     image = Image.fromarray(raster).convert("RGB")
     draw = ImageDraw.Draw(image, "RGBA")
     if bbox is not None:
@@ -1088,22 +1099,6 @@ def _fit_box_aspect(
     )
 
 
-def _overlay_mask(
-    rgb: np.ndarray,
-    mask: np.ndarray | None,
-    color: tuple[int, int, int],
-    *,
-    alpha: float,
-) -> np.ndarray:
-    if mask is None or mask.shape != rgb.shape[:2] or not mask.any():
-        return rgb
-    out = rgb.astype(np.float64)
-    out[mask] = out[mask] * (1.0 - alpha) + np.asarray(color) * alpha
-    raster = np.clip(out, 0, 255).astype(np.uint8)
-    raster[mask_outline(mask)] = color
-    return raster
-
-
 def _pixel_box(
     pixel: tuple[float, float] | None,
     *,
@@ -1162,7 +1157,7 @@ def _source_bbox(
     if point is not None:
         return _pixel_box(point.pixel_xy, radius=18.0)
     seed = state.seeds.get(source_ref)
-    if seed is None or seed.target.pose is None:
+    if seed is None:
         return None
     projected = _pose_origin_pixel(seed.target.pose, camera)
     return _pixel_box(projected, radius=18.0)
@@ -1205,51 +1200,6 @@ def _candidate_fk_matches_target(
         position_error <= _CANDIDATE_FK_POSITION_TOLERANCE_M
         and rotation_error <= _CANDIDATE_FK_ROTATION_TOLERANCE_RAD
     )
-
-
-def _robot_mask(
-    joints: tuple[float, ...],
-    opening: float,
-    camera: dict[str, Any],
-    width: int,
-    height: int,
-) -> np.ndarray | None:
-    return _panda_mask(joints, opening, camera, width, height, whole_robot=True)
-
-
-def _gripper_mask(
-    joints: tuple[float, ...],
-    opening: float,
-    camera: dict[str, Any],
-    width: int,
-    height: int,
-) -> np.ndarray | None:
-    return _panda_mask(joints, opening, camera, width, height, whole_robot=False)
-
-
-def _panda_mask(
-    joints: tuple[float, ...],
-    opening: float,
-    camera: dict[str, Any],
-    width: int,
-    height: int,
-    *,
-    whole_robot: bool,
-) -> np.ndarray | None:
-    fk = load_panda_urdf_fk()
-    if fk is None:
-        return None
-    try:
-        triangle_fn = fk.robot_triangles if whole_robot else fk.triangles
-        triangles = triangle_fn(np.asarray(joints), float(opening))
-        projected = project_world_to_pixel(
-            triangles.reshape(-1, 3),
-            camera["intrinsics"],
-            camera["pose_mat"],
-        ).reshape(-1, 3, 3)
-        return rasterize_silhouette(projected[:, :, :2], projected[:, :, 2], width, height)
-    except (KeyError, RuntimeError, ValueError, np.linalg.LinAlgError):
-        return None
 
 
 def _project_pose(pose: Pose, camera: dict[str, Any]) -> tuple[float, float, float, float] | None:
@@ -1332,6 +1282,97 @@ def _label(
         fill=(*color, 220),
     )
     draw.text((x, y), text, font=font, fill=(255, 255, 255, 255))
+
+
+def _compile_observed_scene(
+    workspace: ContextWorkspace,
+    agentview: dict[str, Any],
+    wrist_camera: dict[str, Any] | None,
+) -> np.ndarray:
+    """Compile the complementary observed view without exposing calibration.
+
+    Offline fixtures intentionally retain the camera-aligned RGB-D fallback.
+    A live LIBERO runner injects the opposite-camera provider; its pose is
+    episode-stable and its RGB is refreshed once per physical revision.
+    """
+
+    private = workspace._private
+    provider = private.opposite_scene_camera_provider
+    if not callable(provider):
+        return render_scene_view(
+            agentview,
+            wrist_camera,
+            workspace.state.robot,
+            dark=False,
+        )
+    revision = workspace.state.observation_revision
+    if (
+        private.opposite_scene_camera is None
+        or private.opposite_scene_camera_revision != revision
+    ):
+        if private.opposite_scene_center_base_xyz is None:
+            private.opposite_scene_center_base_xyz = _observed_workspace_center(agentview)
+        pose_mat = np.asarray(agentview["pose_mat"], dtype=np.float64).reshape(4, 4)
+        forward = pose_mat[:3, 2]
+        private.opposite_scene_camera = provider(
+            OppositeSceneCameraRequest(
+                center_base_xyz=private.opposite_scene_center_base_xyz,
+                agentview_forward_base_xyz=tuple(float(value) for value in forward),
+                width=OBSERVED_SCENE_WIDTH,
+                height=OBSERVED_SCENE_HEIGHT,
+            )
+        )
+        private.opposite_scene_camera_revision = revision
+    return _rgb(private.opposite_scene_camera).copy()
+
+
+def _observed_workspace_center(camera: dict[str, Any]) -> tuple[float, float, float]:
+    """Estimate one robust LIBERO workspace centre from the first RGB-D frame."""
+
+    try:
+        depth = np.asarray(camera["images"]["depth"], dtype=np.float64)
+        if depth.ndim == 3:
+            depth = depth[..., 0]
+        intrinsics = np.asarray(camera["intrinsics"], dtype=np.float64).reshape(3, 3)
+        base_from_camera = np.asarray(camera["pose_mat"], dtype=np.float64).reshape(4, 4)
+    except (KeyError, TypeError, ValueError):
+        return (0.55, 0.0, 0.08)
+    height, width = depth.shape
+    stride = max(4, min(height, width) // 80)
+    rows, cols = np.mgrid[0:height:stride, 0:width:stride]
+    sampled_depth = depth[rows, cols]
+    valid = np.isfinite(sampled_depth) & (sampled_depth > 0.03) & (sampled_depth < 3.0)
+    if np.count_nonzero(valid) < 32:
+        return (0.55, 0.0, 0.08)
+    pixels = np.column_stack(
+        (
+            cols[valid].astype(np.float64),
+            rows[valid].astype(np.float64),
+            np.ones(np.count_nonzero(valid), dtype=np.float64),
+        )
+    )
+    rays = (np.linalg.inv(intrinsics) @ pixels.T).T
+    points_camera = rays * sampled_depth[valid, None]
+    homogeneous = np.column_stack(
+        (points_camera, np.ones(len(points_camera), dtype=np.float64))
+    )
+    points_base = (base_from_camera @ homogeneous.T).T[:, :3]
+    # Low surfaces contain the manipulable workspace while excluding the wall
+    # and most robot links.  Quantile midpoints resist a single close object.
+    usable = points_base[
+        np.isfinite(points_base).all(axis=1)
+        & (points_base[:, 2] >= -0.06)
+        & (points_base[:, 2] <= 0.28)
+    ]
+    if len(usable) < 32:
+        return (0.55, 0.0, 0.08)
+    low, high = np.percentile(usable[:, :2], (12.0, 88.0), axis=0)
+    center_xy = 0.5 * (low + high)
+    center_z = float(np.clip(np.percentile(usable[:, 2], 65.0) + 0.06, 0.06, 0.18))
+    center = np.array([center_xy[0], center_xy[1], center_z], dtype=np.float64)
+    if not np.isfinite(center).all():
+        return (0.55, 0.0, 0.08)
+    return tuple(float(value) for value in center)
 
 
 def _rgb(camera: dict[str, Any]) -> np.ndarray:

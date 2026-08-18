@@ -21,8 +21,9 @@ from scipy.spatial.transform import Rotation
 from vaw.context_runtime.gripper_mesh import (
     load_panda_urdf_fk,
     mask_outline,
+    overlay_projected_mesh_outline,
     rasterize_silhouette,
-    thick_mask_outline,
+    semantic_parallel_jaw_triangles,
 )
 from vaw.context_runtime.model import Pose, RobotState
 from vaw.context_runtime.near_field import NearFieldPreview
@@ -33,9 +34,11 @@ IMAGINATION_SCENE_WIDTH = 1200
 IMAGINATION_SCENE_HEIGHT = 720
 CONTACT_FOCUS_WIDTH_M = 0.32
 
-_CURRENT_OUTLINE = np.array([255, 255, 255], dtype=np.uint8)
-_VIOLET = np.array([124, 58, 237], dtype=np.uint8)
-_VIOLET_EDGE = np.array([196, 181, 253], dtype=np.uint8)
+_PREVIEW_EDGE = (216, 203, 255)
+_PREVIEW_OCCUPANCY = np.array([167, 139, 250], dtype=np.uint8)
+_PREVIEW_OCCUPANCY_ALPHA = 0.18
+_AMBER = np.array([245, 158, 11], dtype=np.uint8)
+_AMBER_EDGE = np.array([253, 230, 138], dtype=np.uint8)
 _AXIS_COLORS = ((239, 68, 68), (34, 197, 94), (59, 130, 246))
 
 
@@ -80,6 +83,7 @@ def render_scene_view(
     *,
     dark: bool,
     source_mask: np.ndarray | None = None,
+    carried_volume_triangles_base: np.ndarray | None = None,
 ) -> np.ndarray:
     """Render current dense RGB-D with an optional unexecuted target gripper."""
 
@@ -119,14 +123,22 @@ def render_scene_view(
     ).copy()
     if dark and source_mask is not None:
         _overlay_source_surface(output_array, source_mask, mapping)
-    # Rasterize geometry at final resolution.  Compositing at the source depth
-    # resolution and then enlarging it made diagonal fingers look soft and
-    # mask-like; final-resolution silhouettes stay crisp and hole-free.
+    # Project geometry at final resolution.  Drawing at source depth resolution
+    # and then enlarging it made diagonal fingers soft; final-resolution line
+    # art stays crisp while preserving every observed RGB pixel inside it.
     if robot is not None:
-        _overlay_current(output_array, camera, mapping, robot)
         if preview is not None:
-            _overlay_reference_target(output_array, camera, mapping, robot, preview)
             _overlay_preview(output_array, camera, mapping, robot, preview)
+        if carried_volume_triangles_base is not None:
+            _overlay_triangles(
+                output_array,
+                camera,
+                mapping,
+                carried_volume_triangles_base,
+                _AMBER,
+                _AMBER_EDGE,
+                alpha=0.42,
+            )
     output = Image.fromarray(output_array)
     draw = ImageDraw.Draw(output, "RGBA")
     if dark:
@@ -355,22 +367,6 @@ def _project_base(
     return uv, depth
 
 
-def _overlay_current(
-    image: np.ndarray,
-    camera: _CameraData,
-    mapping: _RasterMap,
-    robot: RobotState,
-) -> None:
-    if robot.joint_positions_rad is None or robot.gripper_opening is None:
-        return
-    triangles = _robot_triangles(robot.joint_positions_rad, robot.gripper_opening)
-    if triangles is None:
-        return
-    mask = _triangle_mask(image, camera, mapping, triangles)
-    if np.any(mask):
-        image[thick_mask_outline(mask, radius=2)] = _CURRENT_OUTLINE
-
-
 def _overlay_preview(
     image: np.ndarray,
     camera: _CameraData,
@@ -379,58 +375,48 @@ def _overlay_preview(
     preview: NearFieldPreview,
 ) -> None:
     triangles = None
-    if preview.joint_positions_rad is not None and preview.gripper_opening is not None:
+    hand_triangles = None
+    if preview.gripper_style == "semantic-wireframe":
+        if (
+            preview.joint_positions_rad is not None
+            and preview.realized_tcp_pose is not None
+            and preview.gripper_opening is not None
+        ):
+            triangles = semantic_parallel_jaw_triangles(
+                preview.realized_tcp_pose.position_xyz,
+                preview.realized_tcp_pose.quaternion_xyzw,
+                preview.gripper_opening,
+            )
+    elif preview.joint_positions_rad is not None and preview.gripper_opening is not None:
         triangles = _robot_triangles(
+            preview.joint_positions_rad,
+            preview.gripper_opening,
+        )
+        hand_triangles = _hand_triangles(
             preview.joint_positions_rad,
             preview.gripper_opening,
         )
     elif preview.target_pose is not None and preview.gripper_opening is not None:
         triangles = _target_gripper_triangles(robot, preview)
+        hand_triangles = _target_hand_triangles(robot, preview)
     if triangles is None:
         return
-    _overlay_triangles(
+    if hand_triangles is not None:
+        _overlay_triangles(
+            image,
+            camera,
+            mapping,
+            hand_triangles,
+            _PREVIEW_OCCUPANCY,
+            np.asarray(_PREVIEW_EDGE, dtype=np.uint8),
+            alpha=_PREVIEW_OCCUPANCY_ALPHA,
+        )
+    _overlay_preview_outline(
         image,
         camera,
         mapping,
         triangles,
-        _VIOLET,
-        _VIOLET_EDGE,
-        alpha=0.90,
     )
-
-
-def _overlay_reference_target(
-    image: np.ndarray,
-    camera: _CameraData,
-    mapping: _RasterMap,
-    robot: RobotState,
-    preview: NearFieldPreview,
-) -> None:
-    edit = preview.visual_edit
-    if edit is None or edit.reference_pose is None or preview.gripper_opening is None:
-        return
-    reference = NearFieldPreview(
-        target_pose=edit.reference_pose,
-        joint_positions_rad=None,
-        gripper_opening=preview.gripper_opening,
-    )
-    triangles = _target_gripper_triangles(robot, reference)
-    if triangles is None:
-        return
-    mask = _triangle_mask(image, camera, mapping, triangles)
-    if not np.any(mask):
-        return
-    outline = mask_outline(mask)
-    for _ in range(2):
-        padded = np.pad(outline, 1, mode="constant")
-        outline = (
-            padded[1:-1, 1:-1]
-            | padded[:-2, 1:-1]
-            | padded[2:, 1:-1]
-            | padded[1:-1, :-2]
-            | padded[1:-1, 2:]
-        )
-    image[outline] = np.array([226, 232, 240], dtype=np.uint8)
 
 
 def _robot_triangles(
@@ -446,9 +432,38 @@ def _robot_triangles(
         return None
 
 
+def _hand_triangles(
+    joints: tuple[float, ...],
+    opening: float,
+) -> np.ndarray | None:
+    fk = load_panda_urdf_fk()
+    hand_triangles = getattr(fk, "hand_triangles", None) if fk is not None else None
+    if not callable(hand_triangles):
+        return None
+    try:
+        return hand_triangles(np.asarray(joints, dtype=np.float64), float(opening))
+    except (RuntimeError, ValueError):
+        return None
+
+
 def _target_gripper_triangles(
     robot: RobotState,
     preview: NearFieldPreview,
+) -> np.ndarray | None:
+    return _target_part_triangles(robot, preview, _robot_triangles)
+
+
+def _target_hand_triangles(
+    robot: RobotState,
+    preview: NearFieldPreview,
+) -> np.ndarray | None:
+    return _target_part_triangles(robot, preview, _hand_triangles)
+
+
+def _target_part_triangles(
+    robot: RobotState,
+    preview: NearFieldPreview,
+    triangles_for_part,
 ) -> np.ndarray | None:
     if (
         robot.joint_positions_rad is None
@@ -457,7 +472,10 @@ def _target_gripper_triangles(
         or preview.gripper_opening is None
     ):
         return None
-    triangles = _robot_triangles(robot.joint_positions_rad, preview.gripper_opening)
+    triangles = triangles_for_part(
+        robot.joint_positions_rad,
+        preview.gripper_opening,
+    )
     if triangles is None:
         return None
     current_position = np.asarray(robot.tcp_pose.position_xyz, dtype=np.float64)
@@ -486,6 +504,27 @@ def _overlay_triangles(
         dtype=np.uint8,
     )
     image[mask_outline(mask)] = edge
+
+
+def _overlay_preview_outline(
+    image: np.ndarray,
+    camera: _CameraData,
+    mapping: _RasterMap,
+    triangles: np.ndarray,
+) -> None:
+    """Project one unexecuted robot as transparent 3-D line art."""
+
+    values = np.asarray(triangles, dtype=np.float64).reshape(-1, 3, 3)
+    uv, depth = _project_base(values.reshape(-1, 3), camera)
+    projected = mapping.pixels(uv).reshape(-1, 3, 2)
+    overlay_projected_mesh_outline(
+        image,
+        values,
+        projected,
+        depth.reshape(-1, 3),
+        color=_PREVIEW_EDGE,
+        camera_position_base=camera.base_from_camera[:3, 3],
+    )
 
 
 def _triangle_mask(

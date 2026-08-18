@@ -1,13 +1,25 @@
 # VAW M1.5 — Agentic System Completion
 
+> **现行 Context OS 更新（v37）**：当前实现已经删除旧 `post_commit` 页面、one-shot physical
+> continuity 文本和原始 Function outcome 回灌，改为四个正交输入层：Current Canvas、最多六条
+> 物理 Task Memory、revision-local Live References 和覆盖更新的 Current Function Event。现行规范见
+> [`AGENTIC_CONTEXT_OS.md`](AGENTIC_CONTEXT_OS.md)；下文的 v1–v36 内容保留为实验演进记录，不再
+> 定义当前接口。
+
 ## 1. 目标
 
 M1.5 的目标不是继续优化一张好看的 Canvas，而是完成一个可验证的 Visual Action
 Workspace Agentic System：
 
 > Main Agent 依据当前真实视觉决定任务级动作，Imagination Agent 在清晰、可控的局部视觉中
-> 收敛一个虚拟动作，Main 审查后 commit；物理执行后，Main 根据新的真实状态继续当前目标或
+> 收敛一个虚拟空间动作，Main 审查后 commit；简单局部移动与夹爪控制可由 Main 直接执行；
+> 物理执行后，Main 根据新的真实状态继续当前目标或
 > 进入下一个动作，最终在真实 LIBERO-PRO 中完成基本 pick-and-place。
+
+当前编排已收敛为 Main-owned ReAct：Imagination 是 Main 通过 `refine_action` 同步调用的局部
+SubAgent，不再作为与 Main 并列、逐 turn 切换 ownership 的顶层循环。权威接口以
+[`CURRENT_ARCHITECTURE.md`](CURRENT_ARCHITECTURE.md) 为准；下文旧 `ActionReview/ownership`
+措辞是历史实验记录，不再定义当前代码结构。
 
 Canvas、Function 和 Prompt 都只是该闭环的组成部分。任何单独截图、IK 成功、轨迹生成、
 夹爪闭合、Agent 声称成功或 scripted smoke 都不能证明 M1.5 完成。
@@ -34,11 +46,13 @@ M1.5 只有同时满足以下条件才算完成。
 
 ### 2.2 Agentic 闭环门槛
 
-- `commit(action_id)` 是唯一物理 Function；
+- `commit(action_id)` 只执行 Imagination 返回 ready 的空间动作；Main `delta_move/open/close`
+  是无需 commit 的直接物理 Function；
 - Imagination 不直接 commit，Main 不承担逐步局部优化；
-- Imagination 正常结束、达到编辑上限或失败都必须明确把控制权交还 Main；只有主动
-  `ready` 才能产生 ActionReview，编辑上限按 `failed` 返回且不创建 action ID，更不能自动批准；
-- Main 必须看到最终 Preview，并能够选择 commit、重新进入 Imagination、换 seed 或放弃；
+- Imagination 正常结束、达到编辑上限或失败都必须在同一次 `refine_action` 内返回 Main；主动
+  `ready` 只更新 Main-owned pending action，编辑上限按 `failed` 返回并回滚，更不能自动批准；
+- Main 必须看到最终 Preview，并能够选择 commit、重新进入 Imagination、换 seed 或放弃；粗
+  `select/propose_pose` 不得直接 commit；
 - commit 后的新请求必须包含当前真实视觉和一条最小动作连续性信息，使 Main 知道刚执行的是
   arm、gripper 或二者，以及原始意图；
 - revision-local region/point/seed 不跨物理动作复用；最近一次物理意图在当前真实 observation
@@ -194,7 +208,7 @@ LastPhysicalAction
 ### 6.1 OBSERVED NOW
 
 - 大幅干净 agentview；
-- camera-aligned dense RGB-D world surface；
+- 与 agentview 互补的 episode-locked 反侧 MuJoCo RGB 视角；
 - 紧凑 robot state；
 - 不显示 target、region、seed 或 planner 状态。
 
@@ -213,7 +227,7 @@ LastPhysicalAction
 ```text
 ┌──────── camera-aligned global Preview ───────┬── CONTACT FRONT ─┐
 │ current dense RGB-D surface                  │ direct MuJoCo RGB│
-│ white current outline + purple target        ├── CONTACT SIDE ──┤
+│ current RGB geometry + purple target         ├── CONTACT SIDE ──┤
 │                                              │ direct MuJoCo RGB│
 └──────────────────────────────────────────────┴───────────────────┘
 ```
@@ -223,6 +237,8 @@ LastPhysicalAction
 - 当前真实夹爪只显示白色轮廓；青色表示 previous Preview，紫色表示 current Preview；
 - `delta_move`：根据每张 Contact Camera 的真实标定显示两个屏幕内 BASE 正轴；最接近视线方向
   的第三轴放入独立 `DEPTH IN/OUT` 子卡，避免三轴在同一原点重叠；
+- Contact Camera 在目标深度显示 0–3 cm 透视标尺；平移 Preview 同时显示参考点到目标点的
+  标定投影箭头与实际长度，辅助模型把像素变化映射到厘米动作；
 - `rotate`：左上固定 `ROTATE BASE` 三维右手正向图例不覆盖物体；需要确认具体 frame/axis 的
   正负结果时，`show_rotation_gizmo` 在独立侧栏显示 `−10°/+10°` 真实夹爪姿态对照；
 - gripper-only preview：由 Main 直接创建，只改变虚拟指宽；不进入 Imagination，并明确物体点
@@ -617,6 +633,14 @@ v31 收敛 Contact View 的控制提示。此前三个 BASE 平移轴被投影�
 明确分离。该修改改变了策略可见 raster 语义但不改变 Function 或 Context 字段，因此版本更新为
 Web schema 32 / `vaw-context-v31-separated-control-guides` / renderer
 `context-web-v31-separated-control-guides`。
+
+v33 在 Direct Contact Camera 上加入 visibility-aware session selection。每个新的
+`refine_action` 私下渲染四组候选正交 RGB-D，相机比目标高 12 cm 并朝目标俯视；presenter 用
+当前 region 的 sensed point cloud 投影与候选 depth 判断被更近表面遮挡的比例，优先选择两张图
+中较差者仍清晰的方位。最终只把选中的两张 RGB 送入 Canvas，depth、point cloud 与选择分数
+均不进入策略上下文。同一 refinement 及其 Main review 复用固定相机对，连续 `delta_move` /
+`rotate` 不再触发视角变化；新的 refinement、Action 替换或物理 revision 才重选。该修改不改变
+公开 Function、Context schema 或 renderer 名称。
 
 验收：主任务 seeds `0,1,2` 至少 `2/3` env success。
 

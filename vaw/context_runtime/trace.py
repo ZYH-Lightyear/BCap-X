@@ -44,7 +44,6 @@ class ContextTraceLogger:
         raw_response_text: str = "",
         provider_reasoning: str = "",
         state_summary: dict[str, Any] | None = None,
-        main_working_focus: str | None = None,
     ) -> pathlib.Path:
         name = f"context_{self.index:04d}.png"
         path = self.dir / name
@@ -75,9 +74,6 @@ class ContextTraceLogger:
             "thought": thought,
             "raw_response_text": raw_response_text,
             "provider_reasoning": provider_reasoning,
-            # Exact bounded belief visible to Main before this decision.  It
-            # is absent for Imagination and ActionReview requests.
-            "main_working_focus": main_working_focus,
             "state_summary": state_summary,
             "env_reward": 1.0 if env_success else 0.0,
             "env_success": env_success,
@@ -104,9 +100,75 @@ class ContextTraceLogger:
         with self.events_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    def new_subagent_trace(
+        self,
+        index: int,
+        instruction: str,
+    ) -> SubagentTraceLogger:
+        """Create an isolated trace for one synchronous Imagination call."""
+
+        return SubagentTraceLogger(
+            self.dir / "subagents" / f"imagination_{index:04d}",
+            instruction=instruction,
+        )
+
+
+class SubagentTraceLogger:
+    """Nested trace that never becomes part of Main's policy history."""
+
+    def __init__(self, trace_dir: str | pathlib.Path, *, instruction: str) -> None:
+        self.dir = pathlib.Path(trace_dir)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        for artifact in self.dir.glob("context_*.png"):
+            artifact.unlink()
+        self.steps_path = self.dir / "steps.jsonl"
+        self.meta_path = self.dir / "meta.json"
+        self.steps_path.unlink(missing_ok=True)
+        self.meta_path.write_text(
+            json.dumps(
+                {"agent": "imagination", "instruction": instruction},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self.index = 0
+
+    def log_turn(
+        self,
+        *,
+        turn: int,
+        image: np.ndarray,
+        packet: ContextPacket,
+        function_call: dict[str, Any] | None,
+        step: ContextStepResult | None,
+        thought: str,
+        result: dict[str, Any],
+    ) -> pathlib.Path:
+        name = f"context_{self.index:04d}.png"
+        path = self.dir / name
+        Image.fromarray(np.asarray(image, dtype=np.uint8)).save(path)
+        record = {
+            "index": self.index,
+            "turn": turn,
+            "context_image": name,
+            "context_shape": list(np.asarray(image).shape),
+            "context_packet": packet.summary(),
+            "function_call": function_call,
+            "function_result": result,
+            "runtime_diagnostics": (
+                step.trace_diagnostics if step is not None else None
+            ),
+            "decision_basis": thought,
+        }
+        with self.steps_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self.index += 1
+        return path
+
 
 def _packet_manifest(packet: ContextPacket) -> dict[str, Any]:
     return packet.manifest()
 
 
-__all__ = ["ContextTraceLogger"]
+__all__ = ["ContextTraceLogger", "SubagentTraceLogger"]

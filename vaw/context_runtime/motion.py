@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any, Protocol
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from vaw.context_runtime.model import ActionPrediction, Pose
 
@@ -82,15 +83,29 @@ class PyrokiMotionBackend:
 
     name = "pyroki"
 
-    def __init__(self, api: Any) -> None:
+    def __init__(
+        self,
+        api: Any,
+        *,
+        public_tcp_to_hand_local_xyz: tuple[float, float, float] | None = None,
+    ) -> None:
         self.api = api
-        offset = getattr(api, "_TCP_OFFSET", PYROKI_TCP_TO_HAND_LOCAL_XYZ)
+        api_offset = getattr(api, "_TCP_OFFSET", PYROKI_TCP_TO_HAND_LOCAL_XYZ)
+        self._api_tcp_to_hand_local_xyz = tuple(
+            float(value) for value in _vector(api_offset, 3, "PyRoki API TCP offset")
+        )
+        public_offset = (
+            self._api_tcp_to_hand_local_xyz
+            if public_tcp_to_hand_local_xyz is None
+            else public_tcp_to_hand_local_xyz
+        )
         self.tcp_to_hand_local_xyz = tuple(
-            float(value) for value in _vector(offset, 3, "PyRoki TCP offset")
+            float(value)
+            for value in _vector(public_offset, 3, "public TCP offset")
         )
 
     def preview(self, target: Pose) -> ActionPrediction:
-        return _solve_ik_prediction(self.api, target)
+        return _solve_ik_prediction(self.api, self._api_target(target))
 
     def plan_pose(
         self,
@@ -124,6 +139,31 @@ class PyrokiMotionBackend:
             detail = plan.prediction.detail or "solve_ik returned no joints"
             raise MotionBackendError(detail)
         _call(self.api, "move_to_joints", trajectory[-1])
+
+    def _api_target(self, target: Pose) -> Pose:
+        """Preserve one public TCP convention when used beside CuRobo.
+
+        ``FrankaLiberoApiReduced.solve_ik`` applies ``api._TCP_OFFSET`` before
+        solving for ``panda_hand``.  VAW's public target may instead use the
+        shared CuRobo fingertip offset.  Shift only the private IK request so
+        both planners realise the same physical hand frame; the Action target
+        and all policy-visible geometry remain unchanged.
+        """
+
+        public_offset = np.asarray(self.tcp_to_hand_local_xyz, dtype=np.float64)
+        api_offset = np.asarray(self._api_tcp_to_hand_local_xyz, dtype=np.float64)
+        if np.allclose(public_offset, api_offset, atol=1e-12, rtol=0.0):
+            return target
+        rotation = Rotation.from_quat(
+            np.asarray(target.quaternion_xyzw, dtype=np.float64)
+        )
+        shifted = np.asarray(target.position_xyz, dtype=np.float64) + rotation.apply(
+            public_offset - api_offset
+        )
+        return Pose(
+            tuple(float(value) for value in shifted),
+            target.quaternion_xyzw,
+        )
 
 
 class CuroboMotionBackend:
@@ -320,6 +360,7 @@ def create_motion_backend(name: str, api: Any) -> MotionBackend:
 
 def _solve_ik_prediction(api: Any, target: Pose) -> ActionPrediction:
     try:
+        _seed_pyroki_from_current_observation(api)
         solved = _call(
             api,
             "solve_ik",
@@ -344,6 +385,49 @@ def _solve_ik_prediction(api: Any, target: Pose) -> ActionPrediction:
     except MotionBackendError as exc:
         return ActionPrediction(solve_ik="error", detail=str(exc))
     return ActionPrediction(solve_ik="returned", joint_positions_rad=values)
+
+
+def _seed_pyroki_from_current_observation(api: Any) -> None:
+    """Warm-start the stateful PyRoki API from the real arm configuration.
+
+    ``FrankaLiberoApiReduced.solve_ik`` stores its previous solution in
+    ``api.cfg``.  Candidate previews and CuRobo execution can make that cache
+    differ from the robot's current configuration, which in turn lets a small
+    Cartesian edit jump to a remote IK branch.  Reset the seven arm joints
+    before every solve; retain the solver-native gripper coordinate because the
+    environment exposes that value in normalized controller units instead.
+    """
+
+    observation = _call(api, "get_observation")
+    if not isinstance(observation, dict):
+        raise MotionBackendError("get_observation returned no IK seed")
+    observed = _vector(
+        observation.get("robot_joint_pos", []),
+        minimum_length=7,
+        label="observed robot joints",
+    )
+    previous = getattr(api, "cfg", None)
+    previous_values: np.ndarray | None = None
+    if previous is not None:
+        try:
+            candidate = np.asarray(previous, dtype=np.float64).reshape(-1)
+        except (TypeError, ValueError):
+            candidate = np.empty(0, dtype=np.float64)
+        if candidate.size >= 8 and np.isfinite(candidate).all():
+            previous_values = candidate
+
+    # PyRoki's Panda model includes one gripper coordinate after the seven arm
+    # joints.  It does not affect panda_hand IK.  Preserve its solver-native
+    # value when available; otherwise use a valid neutral seed rather than the
+    # environment's normalized [0, 1] opening.
+    seed = np.zeros(8, dtype=np.float64)
+    seed[:7] = observed[:7]
+    if previous_values is not None:
+        seed[7] = previous_values[7]
+    try:
+        api.cfg = seed
+    except Exception as exc:
+        raise MotionBackendError(f"could not seed PyRoki from current joints: {exc}") from exc
 
 
 def _failed_plan(backend: str, error: Exception) -> MotionPlan:

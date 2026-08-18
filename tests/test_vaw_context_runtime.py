@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -19,18 +20,17 @@ from vaw.context_runtime.motion import (
     CuroboMotionBackend,
     MotionBackendError,
     MotionPlan,
+    PyrokiMotionBackend,
 )
+from vaw.context_runtime.errors import ContextFunctionError
 from vaw.context_runtime.private import build_edit_summary
 from vaw.context_runtime.protocol import (
-    ACTION_REVIEW_SYSTEM_PROMPT,
     IMAGINATION_FUNCTION_NAMES,
     IMAGINATION_SYSTEM_PROMPT,
-    REVIEW_FUNCTION_NAMES,
-    STANDARD_MAIN_FUNCTION_NAMES,
+    MAIN_FUNCTION_NAMES,
     SYSTEM_PROMPT,
     imagination_function_definitions,
     main_function_definitions,
-    review_function_definitions,
 )
 
 
@@ -38,6 +38,7 @@ class FakeContextApi:
     camera_name = "agentview"
     wrist_camera_name = "robot0_eye_in_hand"
     _TCP_OFFSET = np.array([0.0, 0.0, -0.1], dtype=np.float64)
+    seed_ik_matches_target = True
 
     def __init__(self) -> None:
         self.rgb = np.zeros((120, 160, 3), dtype=np.uint8)
@@ -90,7 +91,6 @@ class FakeContextApi:
         pose[:3, :3] = Rotation.from_euler("x", np.pi).as_matrix()
         pose[:3, 3] = [0.0, 0.0, 0.45]
         return [pose], [0.8]
-
     def solve_ik(self, position, quaternion_wxyz, *, return_info=False):
         position = np.asarray(position, dtype=np.float64)
         quaternion = np.asarray(quaternion_wxyz, dtype=np.float64)
@@ -122,6 +122,12 @@ class FakeContextApi:
         if self.gripper_error:
             raise RuntimeError("gripper stalled")
         self.cartesian[7] = 0.1
+
+
+def _selected_action(workspace: ContextWorkspace, query: str = "can") -> str:
+    region = workspace.execute("detection_and_sam", query=query).result["region_id"]
+    seed = workspace.execute("propose_grasps", region_id=region).result["seed_ids"][0]
+    return workspace.execute("select", seed_id=seed).result["action_id"]
 
 
 class FakeCuroboContextApi(FakeContextApi):
@@ -188,6 +194,18 @@ class FakeSemanticGroundingApi(FakeContextApi):
         return json.dumps({"candidate": self.choice})
 
 
+class ScriptedSemanticGroundingApi(FakeContextApi):
+    def __init__(self, replies: list[str]) -> None:
+        super().__init__()
+        self.replies = list(replies)
+        self.query_images: list[np.ndarray] = []
+
+    def query_vlm(self, prompt, images=None, **kwargs):
+        del prompt, kwargs
+        self.query_images.append(np.asarray(images).copy())
+        return self.replies.pop(0)
+
+
 class SpatiallyInconsistentGraspApi(FakeContextApi):
     def segment_sam3_box_prompt(self, rgb, box):
         del box
@@ -231,7 +249,48 @@ class FailedMotionBackend:
         raise AssertionError(f"failed plan must not execute: {plan}, {target}")
 
 
-def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
+class RecordingMotionBackend:
+    tcp_to_hand_local_xyz = (0.0, 0.0, -0.1168)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.pose_plans: list[Pose] = []
+        self.grasp_plans: list[Pose] = []
+        self.executions: list[tuple[MotionPlan, Pose]] = []
+
+    def preview(self, target):
+        return ActionPrediction(
+            solve_ik="returned",
+            joint_positions_rad=tuple(np.zeros(7)),
+        )
+
+    def _plan(self, target):
+        return MotionPlan(
+            self.name,
+            ActionPrediction(
+                solve_ik="returned",
+                joint_positions_rad=tuple(np.zeros(7)),
+                trajectory_checked=self.name == "coarse",
+                collision_checked=self.name == "coarse",
+            ),
+            np.zeros((1, 7)),
+        )
+
+    def plan_pose(self, target, *, preview=None):
+        del preview
+        self.pose_plans.append(target)
+        return self._plan(target)
+
+    def plan_grasp(self, target, *, object_name, object_mask, preview=None):
+        del object_name, object_mask, preview
+        self.grasp_plans.append(target)
+        return self._plan(target)
+
+    def execute(self, plan, target):
+        self.executions.append((plan, target))
+
+
+def test_main_and_imagination_function_contracts_are_disjoint_and_small() -> None:
     assert len(FUNCTION_NAMES) == 15
     assert FUNCTION_NAMES[0] == "detection_and_sam"
     assert FUNCTION_NAMES[1:3] == ("propose_grasps", "locate_point")
@@ -244,48 +303,37 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
     )
     main = function_definitions()
     standard = main_function_definitions()
-    review = review_function_definitions()
     imagination = imagination_function_definitions()
     assert [item["function"]["name"] for item in main] == list(FUNCTION_NAMES)
     assert [item["function"]["name"] for item in imagination] == list(
         IMAGINATION_FUNCTION_NAMES
     )
     assert [item["function"]["name"] for item in standard] == list(
-        STANDARD_MAIN_FUNCTION_NAMES
+        MAIN_FUNCTION_NAMES
     )
-    assert [item["function"]["name"] for item in review] == list(
-        REVIEW_FUNCTION_NAMES
-    )
-    assert "commit" not in STANDARD_MAIN_FUNCTION_NAMES
-    assert "reject_action" not in STANDARD_MAIN_FUNCTION_NAMES
-    assert "delta_move" not in STANDARD_MAIN_FUNCTION_NAMES
-    assert "rotate" not in STANDARD_MAIN_FUNCTION_NAMES
-    assert "open_gripper" in STANDARD_MAIN_FUNCTION_NAMES
-    assert "close_gripper" in STANDARD_MAIN_FUNCTION_NAMES
-    assert "start_imagination" in STANDARD_MAIN_FUNCTION_NAMES
-    assert "detection_and_sam" not in REVIEW_FUNCTION_NAMES
-    assert REVIEW_FUNCTION_NAMES[:2] == ("commit", "reject_action")
-    assert "revise_action" not in FUNCTION_NAMES
-    assert "revise_action" not in REVIEW_FUNCTION_NAMES
-    assert not set(IMAGINATION_FUNCTION_NAMES).intersection(STANDARD_MAIN_FUNCTION_NAMES)
+    assert "commit" in MAIN_FUNCTION_NAMES
+    assert "reject_action" in MAIN_FUNCTION_NAMES
+    assert "refine_action" in MAIN_FUNCTION_NAMES
+    assert "delta_move" in MAIN_FUNCTION_NAMES
+    assert "rotate" not in MAIN_FUNCTION_NAMES
+    assert "start_imagination" not in FUNCTION_NAMES
+    assert set(IMAGINATION_FUNCTION_NAMES).intersection(MAIN_FUNCTION_NAMES) == {
+        "delta_move"
+    }
     open_definition = next(
         x["function"] for x in standard if x["function"]["name"] == "open_gripper"
     )
     close_definition = next(
         x["function"] for x in standard if x["function"]["name"] == "close_gripper"
     )
-    assert "Main-only" in open_definition["description"]
-    assert "不会打开真实夹爪" in open_definition["description"]
-    assert "Main-only" in close_definition["description"]
-    assert "不会闭合真实夹爪" in close_definition["description"]
+    assert "立即打开真实夹爪" in open_definition["description"]
+    assert "立即闭合真实夹爪" in close_definition["description"]
     encoded = json.dumps(main + imagination).lower()
     assert "history" not in encoded and "receipt" not in encoded and "obb" not in encoded
     detection = main[0]["function"]
     assert "bbox detection" in detection["description"]
     assert "sam" in detection["description"].lower()
-    assert "不刷新 observation" in detection["description"]
-    assert "motion planning 失败" in detection["description"]
-    assert "commit 后应重新观察真实画面" not in SYSTEM_PROMPT
+    assert "不移动机器人" in detection["description"]
     for name in ("delta_move", "rotate"):
         definition = next(
             x["function"] for x in imagination if x["function"]["name"] == name
@@ -302,89 +350,228 @@ def test_dual_agent_function_contracts_are_disjoint_and_small() -> None:
         x["function"] for x in main if x["function"]["name"] == "propose_grasps"
     )
     point = next(x["function"] for x in main if x["function"]["name"] == "locate_point")
-    assert "默认几何生成器" in grasps["description"]
-    assert "最终抓取接触/闭合位姿" in grasps["description"]
-    assert "不生成抓取方向" in point["description"]
-    assert "应先使用 propose_grasps" in pose["description"]
-    assert "当前想象目标" in delta["description"]
-    assert "厘米级局部" in delta["description"]
+    assert "TOP、PCA 和 GraspNet" in grasps["description"]
+    assert "不生成方向" in point["description"]
+    assert "粗 Action" in pose["description"]
+    assert "厘米级平移" in delta["description"]
     frame_description = delta["parameters"]["properties"]["frame"]["description"]
-    assert "base" in frame_description and "+Z 恒为竖直上抬" in frame_description
-    assert "tool +Z" in frame_description and "可能朝向支撑面" in frame_description
+    assert "base" in frame_description and "+Z 恒为世界上方" in frame_description
     rotate = next(
         x["function"] for x in imagination if x["function"]["name"] == "rotate"
     )
     assert "右手定则" in rotate["description"]
-    assert "5–15°" in rotate["description"]
-    assert "±90° 猜测" in rotate["description"]
-    assert "WORLD +Z 始终朝上" in IMAGINATION_SYSTEM_PROMPT
-    assert "点云反向旋转" in IMAGINATION_SYSTEM_PROMPT
-    assert "超过 30°" in IMAGINATION_SYSTEM_PROMPT
-    assert "APPROACH BASE" in SYSTEM_PROMPT
-    assert "此前没有真实 closed gripper" in SYSTEM_PROMPT
-    assert "total_translation_base_m" in IMAGINATION_SYSTEM_PROMPT
-    assert "局部几何的唯一" in SYSTEM_PROMPT
-    assert "不能再次按像素判断毫米级 gap" in SYSTEM_PROMPT
-    assert "达到内部微调上限时只会交回 failed" in SYSTEM_PROMPT
-    assert "若按当前这颗 seed 闭合" in SYSTEM_PROMPT
-    assert "不要另写一种" in SYSTEM_PROMPT
-    assert "current_tcp" in pose["description"]
-    assert "绝不能虚构 `current_tcp`" in SYSTEM_PROMPT
-    assert "GRIP 仍大于 0 可能是物体阻挡手指" in SYSTEM_PROMPT
-    assert "requested_arm_delta_base_m" in SYSTEM_PROMPT
-    assert "reject_action(action_id)" in ACTION_REVIEW_SYSTEM_PROMPT
-    assert "evidence_invalidated" in SYSTEM_PROMPT
-    assert "会立即作废当前 action_id" in ACTION_REVIEW_SYSTEM_PROMPT
-    assert "局部、可执行的下一步" in ACTION_REVIEW_SYSTEM_PROMPT
-    assert "gripper-only open" in ACTION_REVIEW_SYSTEM_PROMPT
-    assert "尚未移动到容器" in ACTION_REVIEW_SYSTEM_PROMPT
-    assert "你不是第二个" in ACTION_REVIEW_SYSTEM_PROMPT
-    assert "不得重新要求毫米级 gap" in ACTION_REVIEW_SYSTEM_PROMPT
-    assert "revise_action" not in ACTION_REVIEW_SYSTEM_PROMPT
-    assert "0≈闭合，1≈张开" in ACTION_REVIEW_SYSTEM_PROMPT
-    assert "中间值具有歧义" in ACTION_REVIEW_SYSTEM_PROMPT
-    assert "固定 source" in ACTION_REVIEW_SYSTEM_PROMPT
-    assert "不是 pre-grasp" in IMAGINATION_SYSTEM_PROMPT
-    assert "TCP→SOURCE" not in IMAGINATION_SYSTEM_PROMPT
-    assert "不要连续往下压来假装包夹" in IMAGINATION_SYSTEM_PROMPT
-    assert "该几何已经由 Imagination 裁决" in ACTION_REVIEW_SYSTEM_PROMPT
-    assert "两指闭合扫掠" in ACTION_REVIEW_SYSTEM_PROMPT
-    assert "张开的手指预先贴住物体" in ACTION_REVIEW_SYSTEM_PROMPT
-    assert "两边都能碰到" in IMAGINATION_SYSTEM_PROMPT
-    assert "深度和高度够不够" in IMAGINATION_SYSTEM_PROMPT
-    assert "指尖擦边" in IMAGINATION_SYSTEM_PROMPT
-    assert "不证明真的抓住" in IMAGINATION_SYSTEM_PROMPT
-    select_description = next(
-        item["function"]["description"]
-        for item in main
-        if item["function"]["name"] == "select"
+    assert "绝对值不超过 10°" in rotate["description"]
+    assert rotate["parameters"]["properties"]["angle_deg"]["minimum"] == -10.0
+    assert rotate["parameters"]["properties"]["angle_deg"]["maximum"] == 10.0
+    gizmo = next(
+        x["function"] for x in imagination if x["function"]["name"] == "show_rotation_gizmo"
     )
-    assert "两指扫掠" in select_description
-    assert "不要另写抓取方向" in select_description
-    assert "不要要求手指先贴住物体" in select_description
-    assert "继续随机" in IMAGINATION_SYSTEM_PROMPT
-    assert "非物理 Function 不刷新真实 observation" in SYSTEM_PROMPT
-    assert "不得仅因下层切换" in SYSTEM_PROMPT
-    assert "within_region_id" in SYSTEM_PROMPT
-    assert "空间 ActionReview 与 gripper-only" in SYSTEM_PROMPT
-    assert "你不能编辑夹爪状态" in IMAGINATION_SYSTEM_PROMPT
+    assert "不修改目标" in gizmo["description"]
+    assert "base +Z 恒为上抬" in IMAGINATION_SYSTEM_PROMPT
+    assert "CONTACT FRONT 和 SIDE" in IMAGINATION_SYSTEM_PROMPT
+    assert "gripper-only fallback" in IMAGINATION_SYSTEM_PROMPT
+    assert "琥珀色 carried-volume 是可选" in SYSTEM_PROMPT
+    assert "Main ReAct Agent" in SYSTEM_PROMPT
+    assert "refine_action" in SYSTEM_PROMPT
+    assert "Task Memory" in SYSTEM_PROMPT
+    assert "executed 只表示命令完成" in SYSTEM_PROMPT
+    assert "Current Function Event" in SYSTEM_PROMPT
+    assert "只有目标离开局部视野、身份不确定或必须重新生成抓取方向时" in SYSTEM_PROMPT
+    assert "region 仍然只在当前 observation revision 内有效" in SYSTEM_PROMPT
+    assert "指尖低于物体顶面可以是正常抓取状态" in SYSTEM_PROMPT
+    assert "不得把" in SYSTEM_PROMPT and "指尖—顶面距离" in SYSTEM_PROMPT
+    assert "指尖低于物体顶面并不代表碰撞" in IMAGINATION_SYSTEM_PROMPT
+    assert "真正需要净空" in IMAGINATION_SYSTEM_PROMPT
+    assert "掌部/横梁/指根" in IMAGINATION_SYSTEM_PROMPT
     assert "open_gripper" not in [
         item["function"]["name"] for item in imagination
     ]
-    for name in ("select", "propose_pose", "start_imagination"):
-        definition = next(x["function"] for x in main if x["function"]["name"] == name)
-        assert "refinement_goal" in definition["parameters"]["required"]
+    refine = next(x["function"] for x in standard if x["function"]["name"] == "refine_action")
+    assert refine["parameters"]["required"] == ["action_id", "instruction"]
+    assert "不得要求指尖始终高于物体顶面" in refine["description"]
     for definition in imagination:
         assert "refinement_goal" not in definition["function"]["parameters"]["properties"]
 
 
-def test_action_target_is_atomic_arm_or_gripper_command() -> None:
+def test_action_target_is_a_spatial_pose() -> None:
     pose = Pose((0.4, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0))
 
-    with pytest.raises(ValueError, match="exactly one"):
+    with pytest.raises(TypeError):
         ActionTarget()
-    with pytest.raises(ValueError, match="exactly one"):
-        ActionTarget(pose=pose, gripper="open")
+    assert ActionTarget(pose=pose).pose == pose
+
+
+def test_pyroki_local_backend_preserves_the_public_curobo_tcp_frame() -> None:
+    api = FakeContextApi()
+    backend = PyrokiMotionBackend(
+        api,
+        public_tcp_to_hand_local_xyz=CUROBO_TCP_TO_HAND_LOCAL_XYZ,
+    )
+    target = Pose((0.4, -0.1, 0.2), (1.0, 0.0, 0.0, 0.0))
+
+    plan = backend.plan_pose(target)
+
+    assert plan.prediction.solve_ik == "returned"
+    requested_position = api.solve_calls[-1][0]
+    rotation = Rotation.from_quat(target.quaternion_xyzw)
+    expected = np.asarray(target.position_xyz) + rotation.apply(
+        np.asarray(CUROBO_TCP_TO_HAND_LOCAL_XYZ) - api._TCP_OFFSET
+    )
+    np.testing.assert_allclose(requested_position, expected)
+
+
+def test_pyroki_reseeds_every_solve_from_current_observed_arm_joints() -> None:
+    class StatefulPyrokiApi(FakeContextApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cfg = np.full(8, 9.0, dtype=np.float64)
+            self.ik_seeds: list[np.ndarray] = []
+
+        def solve_ik(self, position, quaternion_wxyz, *, return_info=False):
+            self.ik_seeds.append(np.asarray(self.cfg, dtype=np.float64).copy())
+            result = super().solve_ik(
+                position,
+                quaternion_wxyz,
+                return_info=return_info,
+            )
+            # Emulate the stateful reduced API leaving its solved configuration
+            # cached for the next call.
+            self.cfg = np.full(8, -7.0, dtype=np.float64)
+            return result
+
+    api = StatefulPyrokiApi()
+    backend = PyrokiMotionBackend(api)
+    target = Pose((0.4, -0.1, 0.2), (1.0, 0.0, 0.0, 0.0))
+
+    backend.preview(target)
+    first_observed = api.joints.copy()
+    api.joints = api.joints + 0.25
+    backend.preview(target)
+
+    np.testing.assert_allclose(api.ik_seeds[0][:7], first_observed)
+    np.testing.assert_allclose(api.ik_seeds[1][:7], api.joints)
+    assert api.ik_seeds[0][7] == 9.0
+    assert api.ik_seeds[1][7] == -7.0
+
+
+def test_far_imagination_target_stays_on_coarse_planner() -> None:
+    coarse = RecordingMotionBackend("coarse")
+    local = RecordingMotionBackend("local")
+    workspace = ContextWorkspace(
+        FakeContextApi(),
+        "task",
+        motion_backend=coarse,
+        local_motion_backend=local,
+    )
+    action_id = _selected_action(workspace)
+    assert coarse.grasp_plans
+    assert not local.grasp_plans
+
+    workspace.begin_refinement("lower by one centimetre", action_id)
+    edited = workspace.execute_imagination(
+        "delta_move",
+        delta_xyz_m=[0.0, 0.0, -0.01],
+        frame="base",
+    )
+    assert edited.ok
+    assert len(coarse.grasp_plans) >= 2
+    assert not local.grasp_plans
+    assert workspace._private.action_artifacts.motion_plan.backend == "coarse"
+    assert edited.trace_diagnostics["motion_route"]["reason"] == "coarse_target"
+    assert workspace.execute_imagination(
+        "finish_imagination",
+        status="ready",
+    ).ok
+
+    committed = workspace.execute("commit", action_id=action_id)
+
+    assert committed.ok
+    assert len(coarse.executions) == 1
+    assert not local.executions
+
+
+def test_near_imagination_target_uses_local_planner_and_executor() -> None:
+    coarse = RecordingMotionBackend("coarse")
+    local = RecordingMotionBackend("local")
+    workspace = ContextWorkspace(
+        FakeContextApi(),
+        "task",
+        motion_backend=coarse,
+        local_motion_backend=local,
+    )
+    action_id = _selected_action(workspace)
+    action = workspace.state.pending_action
+    assert action is not None
+    robot = workspace.state.robot
+    assert robot is not None
+    workspace.state.robot = replace(robot, tcp_pose=action.target.pose)
+
+    workspace.begin_refinement("lower by one centimetre", action_id)
+    edited = workspace.execute_imagination(
+        "delta_move",
+        delta_xyz_m=[0.0, 0.0, -0.01],
+        frame="base",
+    )
+
+    assert edited.ok
+    assert local.grasp_plans
+    assert workspace._private.action_artifacts.motion_plan.backend == "local"
+    assert edited.trace_diagnostics["motion_route"]["reason"] == "local_target"
+    assert workspace.execute_imagination(
+        "finish_imagination",
+        status="ready",
+    ).ok
+    committed = workspace.execute("commit", action_id=action_id)
+    assert committed.ok
+    assert not coarse.executions
+    assert len(local.executions) == 1
+
+
+def test_large_orientation_change_stays_on_coarse_planner() -> None:
+    coarse = RecordingMotionBackend("coarse")
+    local = RecordingMotionBackend("local")
+    workspace = ContextWorkspace(
+        FakeContextApi(),
+        "task",
+        motion_backend=coarse,
+        local_motion_backend=local,
+    )
+    current = workspace.state.robot.tcp_pose
+    assert current is not None
+    target_rotation = Rotation.from_quat(current.quaternion_xyzw) * Rotation.from_euler(
+        "z", 30.0, degrees=True
+    )
+
+    backend, route = workspace.motion_backend_for_target(
+        Pose(current.position_xyz, tuple(target_rotation.as_quat()))
+    )
+
+    assert backend is coarse
+    assert route["reason"] == "coarse_target"
+    assert route["translation_m"] == 0.0
+    assert route["rotation_deg"] == pytest.approx(30.0)
+
+
+def test_main_direct_delta_uses_local_planner_without_curobo_fallback() -> None:
+    coarse = RecordingMotionBackend("coarse")
+    local = RecordingMotionBackend("local")
+    workspace = ContextWorkspace(
+        FakeContextApi(),
+        "task",
+        motion_backend=coarse,
+        local_motion_backend=local,
+    )
+
+    result = workspace.execute(
+        "delta_move",
+        delta_xyz_m=[0.0, 0.0, 0.01],
+        frame="base",
+    )
+
+    assert result.ok
+    assert not coarse.pose_plans and not coarse.executions
+    assert len(local.pose_plans) == 1
+    assert len(local.executions) == 1
 
 
 def test_curobo_retries_exact_final_waypoint_when_reduced_api_is_still_settling() -> None:
@@ -483,20 +670,19 @@ def test_detection_is_idempotent_within_one_observation_revision() -> None:
     }
 
 
-def test_main_gripper_preview_creates_review_without_physical_effect() -> None:
+def test_main_gripper_controls_are_direct_physical_actions() -> None:
     api = FakeContextApi()
     workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
     revision = workspace.state.observation_revision
 
     result = workspace.execute("close_gripper")
 
-    assert result.ok and result.result == {"action_id": "a1"}
-    assert workspace.state.owner == "main"
-    assert workspace.state.imagination is None
-    assert workspace.state.action_review.target.pose is None
-    assert workspace.state.action_review.target.gripper == "closed"
-    assert workspace.state.observation_revision == revision
-    assert api.operation_log == []
+    assert result.ok and "gripper_opening" in result.result
+    assert workspace.state.refinement is None
+    assert workspace.state.pending_action is None
+    assert workspace.state.observation_revision == revision + 1
+    assert api.operation_log == ["gripper:closed"]
+    assert workspace.state.last_physical_action.target_gripper == "closed"
 
 
 def test_detection_privately_requests_exact_semantic_disambiguation() -> None:
@@ -531,6 +717,50 @@ def test_detection_reviews_enlarged_candidates_before_registering_region() -> No
     diagnostics = result.trace_diagnostics["semantic_grounding"]
     assert diagnostics["mode"] == "candidate_review"
     assert diagnostics["selected_candidate"] == 2
+
+
+def test_detection_retries_empty_candidate_and_review_replies_locally() -> None:
+    api = ScriptedSemanticGroundingApi(
+        [
+            "",
+            '[{"box":[16,24,64,84],"evidence":"exact label"}]',
+            "not json",
+            '{"candidate":1}',
+        ]
+    )
+    workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
+
+    result = workspace.execute("detection_and_sam", query="alphabet soup can")
+
+    assert result.ok
+    assert len(api.query_images) == 4
+    diagnostics = result.trace_diagnostics["semantic_grounding"]
+    assert diagnostics["candidate_attempts"][0]["reply_length"] == 0
+    assert diagnostics["candidate_attempts"][1]["reply_length"] > 0
+    assert diagnostics["candidate_attempts"][0]["parse_error"] == (
+        "response contains no valid JSON value"
+    )
+    assert [item["reply"] for item in diagnostics["review_attempts"]] == [
+        "not json",
+        '{"candidate":1}',
+    ]
+
+
+def test_detection_keeps_raw_replies_when_candidate_parsing_exhausts_retries() -> None:
+    api = ScriptedSemanticGroundingApi(["", "still not json", "also not json"])
+    workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
+
+    result = workspace.execute("detection_and_sam", query="alphabet soup can")
+
+    assert not result.ok
+    assert "candidate parsing failed" in result.result["error"]
+    diagnostics = result.trace_diagnostics["semantic_grounding"]
+    assert [item["reply"] for item in diagnostics["candidate_attempts"]] == [
+        "",
+        "still not json",
+        "also not json",
+    ]
+    assert diagnostics["candidate_reply"] == "also not json"
 
 
 def test_detection_uses_private_hires_semantic_view_and_maps_box_back() -> None:
@@ -577,62 +807,91 @@ def test_detection_rejects_ambiguous_semantic_review_without_region() -> None:
     assert workspace.state.regions == {}
 
 
-def test_continuous_imagination_edits_one_target_then_hands_off() -> None:
+def test_continuous_refinement_edits_one_pending_action_then_returns_ready() -> None:
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
-    workspace.set_refinement_goal("把夹爪向下并调正")
-    first = workspace.execute("delta_move", delta_xyz_m=[0.0, 0.0, -0.02], frame="base")
-    target1 = workspace.state.imagination.target.pose
-    second = workspace.execute("rotate", axis="z", angle_deg=10, frame="tool")
-    target2 = workspace.state.imagination.target.pose
+    action_id = _selected_action(workspace)
+    workspace.begin_refinement("把夹爪向下并调正", action_id)
+    first = workspace.execute_imagination(
+        "delta_move", delta_xyz_m=[0.0, 0.0, -0.02], frame="base"
+    )
+    target1 = workspace.state.pending_action.target.pose
+    second = workspace.execute_imagination(
+        "rotate", axis="z", angle_deg=10, frame="tool"
+    )
+    target2 = workspace.state.pending_action.target.pose
 
     assert first.result["preview"] == second.result["preview"] == "updated"
     assert target2.position_xyz == target1.position_xyz
-    assert workspace.state.imagination.target.gripper is None
-    assert workspace.state.imagination.refinement_goal == "把夹爪向下并调正"
+    assert first.result["action_id"] == second.result["action_id"] == action_id
+    assert workspace.state.refinement.instruction == "把夹爪向下并调正"
 
-    handoff = workspace.execute("finish_imagination", status="ready")
-    action_id = handoff.result["action_id"]
-    assert workspace.state.owner == "main"
-    assert workspace.state.action_review.action_id == action_id
-    assert workspace.state.last_handoff.status == "review_required"
-    assert handoff.result == {"status": "review_required", "action_id": action_id}
+    handoff = workspace.execute_imagination("finish_imagination", status="ready")
+    assert workspace.state.refinement is None
+    assert workspace.state.pending_action.action_id == action_id
+    assert workspace.state.pending_action.ready_for_commit is True
+    assert handoff.result == {"status": "ready", "action_id": action_id}
 
 
-def test_gripper_review_cannot_be_spatially_edited_by_imagination() -> None:
+def test_direct_gripper_action_does_not_create_or_replace_spatial_action() -> None:
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
     result = workspace.execute("open_gripper")
-    action_id = result.result["action_id"]
 
-    edited = workspace.execute(
+    assert result.ok
+    assert workspace.state.pending_action is None
+    action_id = _selected_action(workspace)
+    workspace.begin_refinement("向下微调", action_id)
+    edited = workspace.execute_imagination(
         "delta_move",
         delta_xyz_m=[0.0, 0.0, -0.01],
         frame="base",
     )
 
-    assert not edited.ok
-    assert workspace.state.imagination is None
-    assert workspace.state.action_review.action_id == action_id
+    assert edited.ok
+    assert workspace.state.pending_action.action_id == action_id
+    assert workspace.state.pending_action.target.pose is not None
 
 
-def test_gripper_only_review_has_no_private_arm_baseline() -> None:
+def test_coarse_action_cannot_commit_before_imagination_ready() -> None:
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
-    action_id = workspace.execute("close_gripper").result["action_id"]
+    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    seed = workspace.execute("propose_grasps", region_id=region).result["seed_ids"][0]
+    action_id = workspace.execute("select", seed_id=seed).result["action_id"]
 
-    assert workspace.state.action_review.action_id == action_id
-    assert workspace.state.action_review.target.pose is None
-    assert workspace._private.imagination_artifacts is None
-    artifacts = workspace._private.review_artifacts[action_id]
-    assert artifacts.motion_plan is None
-    assert artifacts.edit_summary.initial_target.pose is None
-    assert artifacts.edit_summary.current_target.gripper == "closed"
+    result = workspace.execute("commit", action_id=action_id)
+
+    assert not result.ok
+    assert "coarse proposal" in result.result["error"]
+    assert workspace.state.pending_action.action_id == action_id
+    assert workspace.state.refinement is None
+    assert workspace.state.observation_revision == 1
 
 
-def test_commit_is_only_physical_boundary_and_invalidates_revision_state() -> None:
+def test_main_direct_delta_move_executes_without_pending_action() -> None:
+    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
+    revision = workspace.state.observation_revision
+    result = workspace.execute(
+        "delta_move", delta_xyz_m=[0.0, 0.0, 0.01], frame="base"
+    )
+
+    assert result.ok
+    assert workspace.state.observation_revision == revision + 1
+    assert workspace.state.pending_action is None
+    assert workspace.state.last_physical_action.executed_stages == "arm"
+
+
+def test_refined_commit_invalidates_revision_state() -> None:
     api = FakeContextApi()
     workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
     region_id = workspace.execute("detection_and_sam", query="can").result["region_id"]
-    workspace.execute("delta_move", delta_xyz_m=[0.0, 0.0, 0.02], frame="base")
-    action_id = workspace.execute("finish_imagination", status="ready").result["action_id"]
+    seed = workspace.execute("propose_grasps", region_id=region_id).result["seed_ids"][0]
+    action_id = workspace.execute("select", seed_id=seed).result["action_id"]
+    workspace.begin_refinement("上移 2cm", action_id)
+    workspace.execute_imagination(
+        "delta_move", delta_xyz_m=[0.0, 0.0, 0.02], frame="base"
+    )
+    action_id = workspace.execute_imagination(
+        "finish_imagination", status="ready"
+    ).result["action_id"]
     before = workspace.state.observation_revision
 
     result = workspace.execute("commit", action_id=action_id)
@@ -640,15 +899,13 @@ def test_commit_is_only_physical_boundary_and_invalidates_revision_state() -> No
     assert result.ok
     assert api.operation_log == ["arm"]
     assert workspace.state.observation_revision == before + 1
-    assert workspace.state.action_review is None
+    assert workspace.state.pending_action is None
     assert region_id not in workspace.state.regions
-    assert workspace.state.last_physical_action.intent == "task"
+    assert workspace.state.last_physical_action.intent == "approach can for grasp"
     assert workspace.state.last_physical_action.executed_stages == "arm"
     assert workspace.state.last_physical_action.outcome == "completed"
     assert workspace.state.last_physical_action.target_gripper is None
-    assert workspace.state.last_physical_action.requested_arm_delta_base_m == pytest.approx(
-        (0.0, 0.0, 0.02)
-    )
+    assert workspace.state.last_physical_action.requested_arm_delta_base_m is not None
     assert workspace._private.previous_observation is not None
     assert workspace._private.last_physical_artifacts.focus_pose is not None
 
@@ -656,7 +913,9 @@ def test_commit_is_only_physical_boundary_and_invalidates_revision_state() -> No
 def test_reject_action_explicitly_discards_review_without_physics() -> None:
     api = FakeContextApi()
     workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
-    action_id = workspace.execute("open_gripper").result["action_id"]
+    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    seed = workspace.execute("propose_grasps", region_id=region).result["seed_ids"][0]
+    action_id = workspace.execute("select", seed_id=seed).result["action_id"]
     revision = workspace.state.observation_revision
 
     result = workspace.execute("reject_action", action_id=action_id)
@@ -665,10 +924,10 @@ def test_reject_action_explicitly_discards_review_without_physics() -> None:
     assert result.result == {
         "declined_action_id": action_id,
         "declined_how": "explicit",
-        "declined_intent": "set gripper open",
+        "declined_intent": "approach can for grasp",
     }
-    assert workspace.state.action_review is None
-    assert workspace._private.review_artifacts == {}
+    assert workspace.state.pending_action is None
+    assert workspace._private.action_artifacts is None
     assert workspace.state.observation_revision == revision
     assert api.operation_log == []
 
@@ -677,9 +936,14 @@ def test_commit_records_failed_stage_without_claiming_task_effect() -> None:
     arm_api = FakeContextApi()
     arm_api.move_error = True
     arm_workspace = ContextWorkspace(arm_api, "arm failure", motion_backend="pyroki")
-    arm_workspace.set_refinement_goal("move and close")
-    arm_workspace.execute("delta_move", delta_xyz_m=[0.0, 0.0, 0.01], frame="base")
-    arm_action = arm_workspace.execute("finish_imagination", status="ready").result[
+    arm_action = _selected_action(arm_workspace)
+    arm_workspace.begin_refinement("move", arm_action)
+    arm_workspace.execute_imagination(
+        "delta_move", delta_xyz_m=[0.0, 0.0, 0.01], frame="base"
+    )
+    arm_action = arm_workspace.execute_imagination(
+        "finish_imagination", status="ready"
+    ).result[
         "action_id"
     ]
 
@@ -693,7 +957,7 @@ def test_commit_records_failed_stage_without_claiming_task_effect() -> None:
     assert arm_workspace.state.last_physical_action.evidence_invalidated is True
     assert arm_workspace.state.last_physical_action.recovery_hint
     assert arm_workspace.state.last_physical_action.error_detail
-    assert arm_workspace.state.action_review is None
+    assert arm_workspace.state.pending_action is None
 
     gripper_api = FakeContextApi()
     gripper_api.gripper_error = True
@@ -702,28 +966,26 @@ def test_commit_records_failed_stage_without_claiming_task_effect() -> None:
         "gripper failure",
         motion_backend="pyroki",
     )
-    gripper_action = gripper_workspace.execute("close_gripper").result["action_id"]
-
-    gripper_result = gripper_workspace.execute("commit", action_id=gripper_action)
+    gripper_result = gripper_workspace.execute("close_gripper")
 
     assert not gripper_result.ok
     assert gripper_api.operation_log == ["gripper:closed"]
     assert gripper_workspace.state.last_physical_action.executed_stages == "gripper"
     assert gripper_workspace.state.last_physical_action.outcome == "gripper_failed"
-    assert gripper_workspace.state.last_physical_action.failed_action_id == gripper_action
     assert gripper_workspace.state.last_physical_action.evidence_invalidated is True
-    assert gripper_workspace.state.last_physical_action.recovery_hint
 
 
 def test_failed_grasp_commit_exposes_source_query_for_redetection() -> None:
     api = FakeContextApi()
     api.move_error = True
     workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
-    workspace.set_refinement_goal("grasp the can")
     region = workspace.execute("detection_and_sam", query="can").result["region_id"]
     seed_id = workspace.execute("propose_grasps", region_id=region).result["seed_ids"][0]
-    workspace.execute("select", seed_id=seed_id)
-    action_id = workspace.execute("finish_imagination", status="ready").result["action_id"]
+    action_id = workspace.execute("select", seed_id=seed_id).result["action_id"]
+    workspace.begin_refinement("keep selected grasp", action_id)
+    action_id = workspace.execute_imagination(
+        "finish_imagination", status="ready"
+    ).result["action_id"]
 
     result = workspace.execute("commit", action_id=action_id)
 
@@ -736,7 +998,7 @@ def test_failed_grasp_commit_exposes_source_query_for_redetection() -> None:
     assert last.recovery_hint
     assert "detection_and_sam" in last.recovery_hint
     assert region not in workspace.state.regions
-    assert workspace.state.action_review is None
+    assert workspace.state.pending_action is None
 
 
 def test_grasp_proposal_returns_general_action_seeds() -> None:
@@ -745,11 +1007,58 @@ def test_grasp_proposal_returns_general_action_seeds() -> None:
     result = workspace.execute("propose_grasps", region_id=region)
     seed_id = result.result["seed_ids"][0]
     assert seed_id.startswith("s")
-    assert workspace.state.owner == "main"
-
+    families = {
+        artifact.family
+        for artifact in workspace._private.seed_artifacts.values()
+        if artifact.family
+    }
+    assert families & {"top", "pca", "cgn"}
     selected = workspace.execute("select", seed_id=seed_id)
-    assert selected.ok and workspace.state.owner == "imagination"
-    assert workspace.state.imagination.target.pose is not None
+    assert selected.ok
+    assert workspace.state.pending_action.target.pose is not None
+
+
+def test_propose_grasps_keeps_geometric_families_and_limits_graspnet() -> None:
+    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
+    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+
+    result = workspace.execute("propose_grasps", region_id=region)
+
+    assert result.ok
+    families = [
+        workspace._private.seed_artifacts[seed_id].family
+        for seed_id in result.result["seed_ids"]
+    ]
+    assert "top" in families
+    assert "pca" in families
+    assert families.count("cgn") <= 2
+    selected = result.trace_diagnostics["grasp_candidates"]["selected"]
+    assert {item["family"] for item in selected} == set(families)
+
+
+def test_propose_grasps_omits_ik_mismatch_seeds() -> None:
+    class SelectiveIkApi(FakeContextApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self._reachable_calls = 0
+
+        def seed_ik_matches_target(self, target, prediction):
+            del target, prediction
+            self._reachable_calls += 1
+            return self._reachable_calls != 2
+
+    workspace = ContextWorkspace(SelectiveIkApi(), "task", motion_backend="pyroki")
+    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    result = workspace.execute("propose_grasps", region_id=region)
+
+    assert result.ok
+    dropped = result.trace_diagnostics["grasp_candidates"]["dropped_unreachable"]
+    assert dropped
+    assert dropped[0]["reason"] == "ik_mismatch"
+    assert len(result.result["seed_ids"]) == len(
+        result.trace_diagnostics["grasp_candidates"]["selected"]
+    )
+    assert len(workspace.state.seeds) == len(result.result["seed_ids"])
 
 
 def test_grasp_proposal_rejects_seed_outside_its_source_geometry() -> None:
@@ -762,29 +1071,34 @@ def test_grasp_proposal_rejects_seed_outside_its_source_geometry() -> None:
 
     result = workspace.execute("propose_grasps", region_id=region)
 
-    assert not result.ok
-    assert workspace.state.seeds == {}
-    rejected = result.trace_diagnostics["grasp_candidates"]["attempts"][0][
-        "rejected"
-    ]
+    rejected = result.trace_diagnostics["grasp_candidates"]["attempts"][0]["rejected"]
     assert rejected[0]["reasons"] == ["outside_source_geometry"]
     assert rejected[0]["source_center_distance_m"] > rejected[0]["source_radius_m"]
+    geometric = result.trace_diagnostics["grasp_candidates"]["attempts"][1]
+    assert geometric["source"] == "geometric"
+    if result.ok:
+        assert all(
+            artifact.family != "cgn"
+            for artifact in workspace._private.seed_artifacts.values()
+        )
+    else:
+        assert workspace.state.seeds == {}
 
 
-def test_imagination_limit_fails_without_publishing_an_action() -> None:
+def test_imagination_limit_retires_the_failed_action() -> None:
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
-    workspace.execute("start_imagination")
-    result = workspace.limit_imagination()
+    action_id = _selected_action(workspace)
+    workspace.begin_refinement("test limit", action_id)
+    result = workspace.limit_refinement()
 
-    assert result.result == {"status": "failed"}
-    assert workspace.state.last_handoff.status == "failed"
-    assert workspace.state.action_review is None
-    assert workspace._private.review_artifacts == {}
+    assert result.result["status"] == "failed"
+    assert workspace.state.refinement is None
+    assert workspace.state.pending_action is None
+    assert not workspace.execute("commit", action_id=action_id).ok
     assert (
         result.trace_diagnostics["imagination_handoff"]["termination_reason"]
         == "turn_limit"
     )
-    assert workspace.state.owner == "main"
 
 
 def test_imagination_limit_does_not_publish_unexecutable_review() -> None:
@@ -793,20 +1107,34 @@ def test_imagination_limit_does_not_publish_unexecutable_review() -> None:
         "task",
         motion_backend=FailedMotionBackend(),
     )
-    workspace.execute("delta_move", delta_xyz_m=[0.01, 0.0, 0.0], frame="base")
+    point_id = workspace.execute("locate_point", query="center").result["point_id"]
+    action_id = workspace.execute(
+        "propose_pose",
+        point_id=point_id,
+        offset_xyz=[0.0, 0.0, 0.0],
+    ).result["action_id"]
+    workspace.begin_refinement("unreachable", action_id)
+    workspace.execute_imagination(
+        "delta_move", delta_xyz_m=[0.01, 0.0, 0.0], frame="base"
+    )
 
-    result = workspace.limit_imagination()
+    result = workspace.limit_refinement()
 
-    assert result.result == {"status": "failed"}
-    assert workspace.state.owner == "main"
-    assert workspace.state.action_review is None
-    assert workspace.state.last_handoff.status == "failed"
+    assert result.result["status"] == "failed"
+    assert workspace.state.refinement is None
+    assert workspace.state.pending_action is None
 
 
-def test_review_cannot_return_the_same_target_to_imagination() -> None:
+def test_unknown_legacy_revise_action_is_rejected() -> None:
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
-    workspace.execute("delta_move", delta_xyz_m=[0.01, 0.0, 0.0], frame="base")
-    first_action = workspace.execute("finish_imagination", status="ready").result[
+    action_id = _selected_action(workspace)
+    workspace.begin_refinement("move", action_id)
+    workspace.execute_imagination(
+        "delta_move", delta_xyz_m=[0.01, 0.0, 0.0], frame="base"
+    )
+    first_action = workspace.execute_imagination(
+        "finish_imagination", status="ready"
+    ).result[
         "action_id"
     ]
 
@@ -814,31 +1142,55 @@ def test_review_cannot_return_the_same_target_to_imagination() -> None:
 
     assert not resumed.ok
     assert "unknown function 'revise_action'" in resumed.result["error"]
-    assert workspace.state.owner == "main"
-    assert workspace.state.imagination is None
-    assert workspace.state.action_review.action_id == first_action
+    assert workspace.state.refinement is None
+    assert workspace.state.pending_action.action_id == first_action
 
 
-def test_explicit_current_handoff_keeps_gripper_commands_out_of_imagination() -> None:
+def test_refinement_cannot_implicitly_create_a_current_tcp_action() -> None:
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
     revision = workspace.state.observation_revision
-    workspace.set_refinement_goal("先仅张开真实夹爪")
-
-    started = workspace.execute("start_imagination")
-    assert started.ok and workspace.state.owner == "imagination"
-    assert workspace.state.imagination.target.pose == workspace.state.robot.tcp_pose
-
-    gizmo = workspace.execute("show_rotation_gizmo", frame="tool", axis="y")
-    assert gizmo.result == {
-        "preview": "updated",
-        "rotation_guide": {"frame": "tool", "axis": "y"},
-    }
-    assert workspace._private.imagination_artifacts.rotation_gizmo_frame == "tool"
-    assert workspace._private.imagination_artifacts.rotation_gizmo_axis == "y"
-
-    opened = workspace.execute("open_gripper")
-    assert not opened.ok
-    assert "Main-only" in opened.result["error"]
-    assert workspace.state.imagination.target.pose == workspace.state.robot.tcp_pose
-    assert workspace.state.imagination.target.gripper is None
+    with pytest.raises(ContextFunctionError, match="unknown or expired action_id"):
+        workspace.begin_refinement("微调当前 TCP", "a-missing")
+    assert workspace.state.pending_action is None
     assert workspace.state.observation_revision == revision
+
+
+def test_rotate_rejects_angle_outside_ten_degrees() -> None:
+    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
+    action_id = _selected_action(workspace)
+    workspace.begin_refinement("small rotate only", action_id)
+    start_pose = workspace.state.pending_action.target.pose
+
+    rejected = workspace.execute_imagination(
+        "rotate", axis="x", angle_deg=-90, frame="base"
+    )
+    assert not rejected.ok
+    assert "10" in rejected.result["error"]
+    assert workspace.state.pending_action.target.pose == start_pose
+
+    too_large = workspace.execute_imagination(
+        "rotate", axis="z", angle_deg=10.1, frame="base"
+    )
+    assert not too_large.ok
+    assert "10" in too_large.result["error"]
+
+    accepted = workspace.execute_imagination(
+        "rotate", axis="z", angle_deg=-10, frame="base"
+    )
+    assert accepted.ok
+    assert accepted.result["preview"] == "updated"
+
+
+def test_gizmo_does_not_require_a_following_rotate() -> None:
+    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
+    action_id = _selected_action(workspace)
+    workspace.begin_refinement("inspect then translate", action_id)
+    gizmo = workspace.execute_imagination(
+        "show_rotation_gizmo", frame="base", axis="z"
+    )
+    assert gizmo.ok
+    moved = workspace.execute_imagination(
+        "delta_move", delta_xyz_m=[0.0, 0.0, 0.01], frame="base"
+    )
+    assert moved.ok
+    assert moved.result["preview"] == "updated"

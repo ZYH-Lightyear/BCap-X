@@ -44,8 +44,8 @@ function ObservedLayer({ snapshot }: { snapshot: ContextSnapshot }) {
           <span>AGENTVIEW · CURRENT RGB</span>
         </article>
         <article className="via-raster-card via-observed-cloud">
-          <Raster snapshot={snapshot} id={snapshot.world.observedSceneRasterId} alt="当前稠密 RGB-D 场景" />
-          <span>DENSE RGB-D · CURRENT FK</span>
+          <Raster snapshot={snapshot} id={snapshot.world.observedSceneRasterId} alt="当前反侧真实相机视角" />
+          <span>OPPOSITE VIEW · CURRENT RGB</span>
         </article>
         <RobotStatePanel snapshot={snapshot} />
       </div>
@@ -54,10 +54,11 @@ function ObservedLayer({ snapshot }: { snapshot: ContextSnapshot }) {
 }
 
 function SeedCard({ snapshot, seed }: { snapshot: ContextSnapshot; seed: Seed }) {
+  const family = seed.family ? seed.family.toUpperCase() : null
   return (
     <article className="via-seed-card">
       <strong>
-        <span>{seed.id}</span>
+        <span>{seed.id}{family ? ` · ${family}` : ''}</span>
         <code>APPROACH BASE {fmt(seed.approachVector ?? undefined, 2)}</code>
       </strong>
       <Raster snapshot={snapshot} id={seed.rasterId} alt={`Action Seed ${seed.id}`} />
@@ -97,15 +98,6 @@ function GroundingOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
 
 function EditOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
   const action = snapshot.world.action
-  if (action?.target_role === 'gripper_only') {
-    return (
-      <div className="via-edit-overlay">
-        <FactRow label="GRIP TARGET">{action.target.gripper?.toUpperCase() ?? 'N/A'}</FactRow>
-        <FactRow label="PHYSICAL">NOT EXECUTED</FactRow>
-        <FactRow label="EFFECT">CONTACT / DYNAMICS UNKNOWN</FactRow>
-      </div>
-    )
-  }
   const edit = snapshot.world.action?.latest_edit
   const summary = snapshot.world.action?.edit_summary
   const lastEdit = edit ?? summary?.last_edit
@@ -140,43 +132,22 @@ function ModeOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
   const mode = snapshot.decision.mode
   if (mode === 'seeds') return null
   if (mode === 'grounding') return <GroundingOverlay snapshot={snapshot} />
-  if (mode === 'error') return <div className="via-error-overlay"><strong>FUNCTION ERROR</strong><p>{snapshot.world.latestError}</p></div>
-  if (mode === 'editing' || mode === 'reviewed') return <EditOverlay snapshot={snapshot} />
-  return null
-}
-
-function PhysicalContinuityInset({ snapshot }: { snapshot: ContextSnapshot }) {
-  const action = snapshot.world.lastPhysicalAction
-  const currentId = snapshot.world.postCommitCurrentRasterId
-  if (!action || !currentId) return null
-  const facts: string[] = []
-  if (action.requested_arm_delta_base_m) {
-    facts.push(`ARM Δ ${fmt(action.requested_arm_delta_base_m)} m`)
+  if (mode === 'contact' && snapshot.decision.primaryRasterId) {
+    return <GroundingOverlay snapshot={snapshot} />
   }
-  if (action.target_gripper) facts.push(`GRIP CMD ${action.target_gripper.toUpperCase()}`)
-  return (
-    <aside className="via-continuity-inset">
-      <div className="via-continuity-raster">
-        <Raster snapshot={snapshot} id={currentId} alt="最近 commit 后的当前真实目标区域" />
-        <strong>LAST COMMIT · CURRENT OBSERVED</strong>
-      </div>
-      <div className="via-continuity-facts">
-        <b>SAME OBSERVATION</b>
-        <code>{facts.join(' · ') || action.executed_stages.toUpperCase()}</code>
-      </div>
-    </aside>
-  )
+  if (mode === 'editing' || mode === 'proposal') return <EditOverlay snapshot={snapshot} />
+  return null
 }
 
 function decisionHeader(snapshot: ContextSnapshot, seedHeader: string): string {
   switch (snapshot.decision.mode) {
     case 'seeds': return seedHeader
     case 'editing': return 'IMAGINATION · NOT EXECUTED'
-    case 'reviewed': return snapshot.world.action?.target_role === 'gripper_only'
-      ? 'GRIPPER PREVIEW · NOT EXECUTED'
-      : 'ACTION REVIEW · NOT EXECUTED'
+    case 'proposal': return snapshot.world.action?.status === 'ready'
+      ? 'REFINED ACTION · READY FOR MAIN REVIEW'
+      : 'COARSE ACTION · REFINE OR REJECT'
     case 'grounding': return 'CURRENT EVIDENCE · OBSERVED'
-    case 'error': return 'RECOVERY CONTEXT · OBSERVED'
+    case 'contact': return 'CURRENT CONTACT · REAL WORLD'
     case 'terminal': return 'FINAL OBSERVATION · REAL WORLD'
     default: return 'CURRENT GEOMETRY · OBSERVED'
   }
@@ -185,15 +156,12 @@ function decisionHeader(snapshot: ContextSnapshot, seedHeader: string): string {
 function ImaginationLayer({ snapshot }: { snapshot: ContextSnapshot }) {
   const active = snapshot.world.action !== null
   const selecting = snapshot.decision.mode === 'seeds'
-  const hasContactFocus = active && snapshot.world.contactFocusRasterId !== null
+  const hasContactFocus = snapshot.world.contactFocusRasterId !== null
   const observedGrip = snapshot.world.robot?.gripper_opening
   const seedHeader = observedGrip === undefined
     ? 'ACTION SEEDS · VIRTUAL OPTIONS'
     : `ACTION SEEDS · GRIP ${observedGrip.toFixed(3)} INHERITED`
   const header = decisionHeader(snapshot, seedHeader)
-  const showContinuity = !active
-    && snapshot.world.postCommitCurrentRasterId !== null
-    && ['idle', 'grounding', 'error'].includes(snapshot.decision.mode)
   return (
     <section className={`via-imagination${active ? ' via-imagination--active' : ''}${selecting ? ' via-imagination--seeds' : ''}`}>
       <header><h1>{header}</h1></header>
@@ -215,93 +183,24 @@ function ImaginationLayer({ snapshot }: { snapshot: ContextSnapshot }) {
             : <>
                 <Raster snapshot={snapshot} id={snapshot.world.imaginationSceneRasterId} alt="当前点云上的虚拟 Waypoint" />
                 <ModeOverlay snapshot={snapshot} />
-                {showContinuity && <PhysicalContinuityInset snapshot={snapshot} />}
               </>}
       </div>
     </section>
   )
 }
 
-function PostCommitLayer({ snapshot }: { snapshot: ContextSnapshot }) {
-  const action = snapshot.world.lastPhysicalAction
-  const sourceBefore = snapshot.world.causalSourceBeforeRasterId
-  const sourceCurrent = snapshot.world.causalSourceCurrentRasterId
-  const hasCausalSource = sourceBefore !== null && sourceCurrent !== null
-  const sourceLabel = snapshot.world.causalSourceLabel?.toUpperCase() ?? 'LAST GRASP SOURCE'
-  return (
-    <section className="via-post-commit">
-      <header><h1>POST-COMMIT VERIFY · REAL OBSERVATIONS</h1></header>
-      <div className={`via-post-commit-grid${hasCausalSource ? ' via-post-commit-grid-source' : ''}`}>
-        {hasCausalSource
-          ? <>
-              <article className="via-compare-card via-compare-before">
-                <Raster snapshot={snapshot} id={sourceBefore} alt="最近抓取对象原位置的执行前真实画面" />
-                <strong>SOURCE BEFORE · {sourceLabel}</strong>
-              </article>
-              <div className="via-causal-arrow" aria-hidden="true">→</div>
-              <article className="via-compare-card via-compare-current">
-                <Raster snapshot={snapshot} id={sourceCurrent} alt="同一固定图像位置的当前真实画面" />
-                <strong>FIXED SOURCE CROP · NOW · OCCLUSION POSSIBLE</strong>
-              </article>
-              <article className="via-compare-card via-action-area-current">
-                <Raster
-                  snapshot={snapshot}
-                  id={snapshot.world.postCommitCurrentRasterId}
-                  alt="执行后动作目标附近当前真实画面"
-                />
-                <strong>CURRENT ACTION AREA</strong>
-              </article>
-            </>
-          : <>
-              <article className="via-compare-card via-compare-before">
-                <Raster
-                  snapshot={snapshot}
-                  id={snapshot.world.postCommitBeforeRasterId}
-                  alt="执行前目标附近真实画面"
-                />
-                <strong>BEFORE COMMIT</strong>
-              </article>
-              <div className="via-causal-arrow" aria-hidden="true">→</div>
-              <article className="via-compare-card via-compare-current">
-                <Raster
-                  snapshot={snapshot}
-                  id={snapshot.world.postCommitCurrentRasterId}
-                  alt="执行后目标附近当前真实画面"
-                />
-                <strong>CURRENT OBSERVED</strong>
-              </article>
-            </>}
-        <aside className="via-post-commit-facts">
-          <h2>LAST PHYSICAL ACTION</h2>
-          <FactRow label="REQUESTED">{action?.intent ?? 'N/A'}</FactRow>
-          <FactRow label="EXECUTED">{action?.executed_stages.toUpperCase() ?? 'N/A'}</FactRow>
-          {action?.requested_arm_delta_base_m && (
-            <FactRow label="ARM CMD Δ">{fmt(action.requested_arm_delta_base_m)} m</FactRow>
-          )}
-          {action?.target_gripper && (
-            <FactRow label="GRIP CMD">{action.target_gripper.toUpperCase()}</FactRow>
-          )}
-          {action?.outcome !== 'completed' && <FactRow label="CONTROL ERROR">{action?.outcome.toUpperCase() ?? 'N/A'}</FactRow>}
-          {snapshot.world.physicalVerification
-            ? <p className="via-verification-card">
-                <b>{snapshot.world.physicalVerification.kind.replace('_', ' ').toUpperCase()} EFFECT · UNVERIFIED</b>
-                <span>NEEDED · {snapshot.world.physicalVerification.evidenceNeeded}</span>
-                <small>{snapshot.world.physicalVerification.ambiguity}</small>
-              </p>
-            : <p>TASK EFFECT · VERIFY FROM CURRENT IMAGE</p>}
-        </aside>
-      </div>
-    </section>
-  )
-}
-
 export function ContextApp({ snapshot }: { snapshot: ContextSnapshot }) {
+  if (snapshot.projection === 'imagination') {
+    return (
+      <main className="via-canvas via-canvas--focused">
+        <ImaginationLayer snapshot={snapshot} />
+      </main>
+    )
+  }
   return (
     <main className="via-canvas">
       <ObservedLayer snapshot={snapshot} />
-      {snapshot.decision.mode === 'post_commit'
-        ? <PostCommitLayer snapshot={snapshot} />
-        : <ImaginationLayer snapshot={snapshot} />}
+      <ImaginationLayer snapshot={snapshot} />
     </main>
   )
 }

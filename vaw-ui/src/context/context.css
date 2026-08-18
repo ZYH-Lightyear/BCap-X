@@ -29,9 +29,21 @@ img { display: block; }
   background: #eaf1f8;
 }
 
+.via-canvas--focused {
+  grid-template-rows: minmax(0, 1fr);
+  background: #03070e;
+}
+
+.via-canvas--focused .via-imagination > header {
+  height: 48px;
+}
+
+.via-canvas--focused .via-imagination h1 {
+  font-size: 31px;
+}
+
 .via-observed,
-.via-imagination,
-.via-post-commit {
+.via-imagination {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -47,15 +59,13 @@ img { display: block; }
 }
 
 .via-observed > header,
-.via-imagination > header,
-.via-post-commit > header {
+.via-imagination > header {
   display: flex;
   align-items: center;
 }
 
 .via-observed h1,
-.via-imagination h1,
-.via-post-commit h1 {
+.via-imagination h1 {
   margin: 0;
   font: 900 27px "DejaVu Sans Mono", monospace;
   letter-spacing: .02em;
@@ -199,8 +209,7 @@ img { display: block; }
 }
 
 .via-edit-overlay,
-.via-grounding-overlay,
-.via-error-overlay {
+.via-grounding-overlay {
   position: absolute;
   z-index: 3;
   border: 1px solid #7c3aed;
@@ -282,63 +291,6 @@ img { display: block; }
 .via-grounding-overlay p { margin: 4px 0; font-size: 15px; }
 .via-grounding-overlay code { color: #bfdbfe; font: 13px "DejaVu Sans Mono", monospace; }
 
-.via-error-overlay {
-  left: 4px;
-  bottom: 4px;
-  width: 620px;
-  padding: 4px;
-  border-color: #ef4444;
-}
-.via-error-overlay strong { color: #f87171; }
-.via-error-overlay p { margin: 4px 0 0; color: #fff; }
-
-.via-continuity-inset {
-  position: absolute;
-  z-index: 3;
-  right: 4px;
-  bottom: 4px;
-  width: 560px;
-  height: 170px;
-  display: grid;
-  grid-template-columns: 330px minmax(0, 1fr);
-  overflow: hidden;
-  border: 1px solid #2563eb;
-  border-radius: 4px;
-  color: #f8fafc;
-  background: rgba(3, 7, 14, .94);
-}
-
-.via-continuity-raster { position: relative; min-width: 0; overflow: hidden; }
-.via-continuity-raster img { width: 100%; height: 100%; object-fit: cover; }
-.via-continuity-raster strong {
-  position: absolute;
-  top: 4px;
-  left: 4px;
-  padding: 3px 4px;
-  border-radius: 4px;
-  color: #fff;
-  background: rgba(37, 99, 235, .92);
-  font: 900 12px "DejaVu Sans Mono", monospace;
-}
-
-.via-continuity-facts {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 4px;
-  padding: 4px;
-  border-left: 1px solid #3b82f6;
-}
-.via-continuity-facts b {
-  color: #60a5fa;
-  font: 900 15px "DejaVu Sans Mono", monospace;
-}
-.via-continuity-facts code {
-  color: #fff;
-  font: 13px/1.45 "DejaVu Sans Mono", monospace;
-}
-
 .via-no-raster {
   width: 100%;
   height: 100%;
@@ -347,126 +299,4 @@ img { display: block; }
   color: #64748b;
   background: #e8eef6;
   font: 800 13px "DejaVu Sans Mono", monospace;
-}
-
-.via-post-commit {
-  display: grid;
-  grid-template-rows: 42px minmax(0, 1fr);
-  padding: 0 4px 4px;
-  border-color: #64748b;
-  background: #fff;
-}
-
-.via-post-commit h1 { color: #334155; }
-
-.via-post-commit-grid {
-  min-height: 0;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 48px minmax(0, 1fr) 420px;
-  gap: 4px;
-}
-
-.via-post-commit-grid-source {
-  grid-template-columns:
-    minmax(0, 1fr) 34px minmax(0, 1fr) minmax(0, 1fr) 360px;
-  gap: 4px;
-}
-
-.via-post-commit-grid-source .via-compare-card strong {
-  right: 4px;
-  max-width: calc(100% - 8px);
-  font-size: 13px;
-  line-height: 1.25;
-}
-
-.via-compare-card {
-  position: relative;
-  min-width: 0;
-  min-height: 0;
-  overflow: hidden;
-  border: 1px solid #94a3b8;
-  border-radius: 4px;
-  background: #0b1220;
-}
-
-.via-compare-card img,
-.via-compare-card .via-no-raster {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-
-.via-compare-card strong {
-  position: absolute;
-  top: 4px;
-  left: 4px;
-  padding: 3px 4px;
-  border-radius: 4px;
-  color: #fff;
-  background: rgba(15, 23, 42, .86);
-  font: 900 17px "DejaVu Sans Mono", monospace;
-}
-
-.via-compare-current { border-color: #2563eb; }
-.via-compare-current strong { background: rgba(37, 99, 235, .92); }
-.via-action-area-current { border-color: #0f766e; }
-.via-action-area-current strong { background: rgba(15, 118, 110, .92); }
-
-.via-causal-arrow {
-  display: grid;
-  place-items: center;
-  color: #475569;
-  font: 900 44px "DejaVu Sans Mono", monospace;
-}
-
-.via-post-commit-facts {
-  min-width: 0;
-  overflow: hidden;
-  padding: 4px;
-  border: 1px solid #94a3b8;
-  border-radius: 4px;
-  background: #f8fafc;
-}
-
-.via-post-commit-facts h2 {
-  margin: 0 0 4px;
-  padding-bottom: 4px;
-  border-bottom: 1px solid #cbd5e1;
-  color: #334155;
-  font: 900 21px "DejaVu Sans Mono", monospace;
-}
-
-.via-post-commit-facts .via-fact-row {
-  grid-template-columns: 104px minmax(0, 1fr);
-  min-height: 68px;
-}
-
-.via-post-commit-facts .via-fact-row strong { color: #475569; font-size: 15px; }
-.via-post-commit-facts .via-fact-row code { font-size: 15px; }
-.via-post-commit-facts p {
-  margin: 4px 0 0;
-  padding: 4px;
-  border: 1px solid #f59e0b;
-  border-radius: 4px;
-  color: #92400e;
-  background: #fffbeb;
-  font: 900 15px/1.35 "DejaVu Sans Mono", monospace;
-}
-
-.via-verification-card b,
-.via-verification-card span,
-.via-verification-card small {
-  display: block;
-}
-
-.via-verification-card span {
-  margin-top: 4px;
-  color: #78350f;
-  font-size: 13px;
-}
-
-.via-verification-card small {
-  margin-top: 4px;
-  color: #92400e;
-  font: 12px/1.3 "DejaVu Sans Mono", monospace;
 }

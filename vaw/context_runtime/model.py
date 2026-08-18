@@ -1,4 +1,4 @@
-"""Small semantic state for the dual-agent Visual Action Workspace.
+"""Small semantic state for the Main-ReAct Visual Action Workspace.
 
 The records in this module describe evidence and commands, not execution
 history.  Sensor arrays, planner results and presentation provenance stay in
@@ -10,8 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-GripperTarget = Literal["open", "closed"]
-ImaginationOutcome = Literal["review_required", "failed"]
+from vaw.context_runtime.memory import TaskMemory
 
 
 def _floats(values: tuple[float, ...]) -> list[float]:
@@ -34,22 +33,12 @@ class Pose:
 
 @dataclass(frozen=True)
 class ActionTarget:
-    """One atomic arm or gripper target under visual review."""
+    """One spatial pose under visual review."""
 
-    pose: Pose | None = None
-    gripper: GripperTarget | None = None
-
-    def __post_init__(self) -> None:
-        if (self.pose is None) == (self.gripper is None):
-            raise ValueError("ActionTarget must contain exactly one of pose or gripper")
+    pose: Pose
 
     def summary(self) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        if self.pose is not None:
-            result["pose"] = self.pose.summary()
-        if self.gripper is not None:
-            result["gripper"] = self.gripper
-        return result
+        return {"pose": self.pose.summary()}
 
 
 @dataclass(frozen=True)
@@ -61,43 +50,32 @@ class ActionSeed:
     source_revision: int
 
 
-@dataclass
-class ImaginationState:
-    """The one mutable target owned by the Imagination Agent."""
-
-    target: ActionTarget
-    refinement_goal: str
-
-
 @dataclass(frozen=True)
-class ActionReview:
-    """A final imagination target awaiting an explicit Main-Agent decision."""
+class PendingAction:
+    """One spatial action awaiting optional refinement or physical commit."""
 
     action_id: str
     target: ActionTarget
     intent: str
+    ready_for_commit: bool = False
 
     def summary(self) -> dict[str, Any]:
         return {
             "action_id": self.action_id,
             "target": self.target.summary(),
             "intent": self.intent,
+            "ready_for_commit": self.ready_for_commit,
         }
 
 
 @dataclass(frozen=True)
-class ImaginationHandoff:
-    status: ImaginationOutcome
-    action_id: str | None = None
-    source_ref: str | None = None
+class RefinementSession:
+    """A synchronous, episode-private task delegated by Main to Imagination."""
 
-    def summary(self) -> dict[str, Any]:
-        result: dict[str, Any] = {"status": self.status}
-        if self.action_id is not None:
-            result["action_id"] = self.action_id
-        if self.source_ref is not None:
-            result["source_ref"] = self.source_ref
-        return result
+    action_id: str
+    instruction: str
+    initial_target: ActionTarget
+    created_action: bool = False
 
 
 @dataclass(frozen=True)
@@ -230,20 +208,16 @@ class ActionPrediction:
 @dataclass
 class ContextState:
     task_prompt: str
+    task_memory: TaskMemory = field(default_factory=TaskMemory)
     observation_revision: int = 0
     regions: dict[str, RegionEvidence] = field(default_factory=dict)
     points: dict[str, PointEvidence] = field(default_factory=dict)
     seeds: dict[str, ActionSeed] = field(default_factory=dict)
     robot: RobotState | None = None
-    imagination: ImaginationState | None = None
-    action_review: ActionReview | None = None
-    last_handoff: ImaginationHandoff | None = None
+    pending_action: PendingAction | None = None
+    refinement: RefinementSession | None = None
     last_physical_action: LastPhysicalAction | None = None
     _counters: dict[str, int] = field(default_factory=dict, repr=False)
-
-    @property
-    def owner(self) -> Literal["main", "imagination"]:
-        return "imagination" if self.imagination is not None else "main"
 
     def next_id(self, prefix: str) -> str:
         self._counters[prefix] = self._counters.get(prefix, 0) + 1
@@ -254,45 +228,62 @@ class ContextState:
         self.regions.clear()
         self.points.clear()
         self.seeds.clear()
-        self.imagination = None
-        self.action_review = None
-        self.last_handoff = None
+        self.pending_action = None
+        self.refinement = None
         self.last_physical_action = None
         return self.observation_revision
 
     def manifest(self) -> dict[str, Any]:
         return {
-            "owner": self.owner,
-            "review_action_id": (
-                self.action_review.action_id if self.action_review is not None else None
+            "pending_action": (
+                {
+                    "action_id": self.pending_action.action_id,
+                    "intent": self.pending_action.intent,
+                    "state": (
+                        "ready" if self.pending_action.ready_for_commit else "coarse"
+                    ),
+                }
+                if self.pending_action is not None
+                else None
             ),
-            "valid_region_ids": list(self.regions),
-            "valid_point_ids": list(self.points),
-            "valid_seed_ids": list(self.seeds),
+            "regions": [
+                {"id": region.region_id, "query": region.query}
+                for region in self.regions.values()
+            ],
+            "points": [
+                {
+                    "id": point.point_id,
+                    "query": point.query,
+                    **(
+                        {"within_region_id": point.within_region_id}
+                        if point.within_region_id is not None
+                        else {}
+                    ),
+                }
+                for point in self.points.values()
+            ],
+            "seed_ids": list(self.seeds),
         }
 
     def trace_summary(self) -> dict[str, Any]:
         return {
             "task_prompt": self.task_prompt,
+            "task_memory": self.task_memory.summary(),
             "observation_revision": self.observation_revision,
-            "owner": self.owner,
             "regions": [item.summary() for item in self.regions.values()],
             "points": [item.summary() for item in self.points.values()],
             "seed_ids": list(self.seeds),
             "robot": self.robot.summary() if self.robot is not None else None,
-            "imagination": (
+            "refinement": (
                 {
-                    "target": self.imagination.target.summary(),
-                    "refinement_goal": self.imagination.refinement_goal,
+                    "action_id": self.refinement.action_id,
+                    "instruction": self.refinement.instruction,
                 }
-                if self.imagination is not None
+                if self.refinement is not None
                 else None
             ),
-            "action_review": (
-                self.action_review.summary() if self.action_review is not None else None
-            ),
-            "last_handoff": (
-                self.last_handoff.summary() if self.last_handoff is not None else None
+            "pending_action": (
+                self.pending_action.summary() if self.pending_action is not None else None
             ),
             "last_physical_action": (
                 self.last_physical_action.summary()
@@ -307,13 +298,11 @@ __all__ = [
     "ActionSeed",
     "ActionTarget",
     "ContextState",
-    "GripperTarget",
-    "ImaginationHandoff",
-    "ImaginationState",
     "LastPhysicalAction",
     "PointEvidence",
     "Pose",
-    "ActionReview",
+    "PendingAction",
+    "RefinementSession",
     "RegionEvidence",
     "RobotState",
 ]

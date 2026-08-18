@@ -20,8 +20,9 @@ from vaw.context_runtime.geometry import project_world_to_pixel
 from vaw.context_runtime.gripper_mesh import (
     load_panda_urdf_fk,
     mask_outline,
+    overlay_projected_mesh_outline,
     rasterize_silhouette,
-    thick_mask_outline,
+    semantic_parallel_jaw_triangles,
 )
 from vaw.context_runtime.model import Pose, RobotState
 from vaw.context_runtime.private import VisualEdit
@@ -39,11 +40,11 @@ CONTACT_PANEL_HEIGHT = (NEAR_FIELD_HEIGHT - CONTACT_PANEL_GAP) // 2
 CONTACT_FOCUS_WIDTH = NEAR_FIELD_WIDTH
 CONTACT_FOCUS_HEIGHT = NEAR_FIELD_HEIGHT
 _BACKGROUND = np.array([232, 239, 247], dtype=np.uint8)
-_CURRENT_OUTLINE = np.array([255, 255, 255], dtype=np.uint8)
-_PREVIEW = np.array([124, 58, 237], dtype=np.uint8)
-_PREVIEW_OUTLINE = np.array([76, 29, 149], dtype=np.uint8)
-_PREVIOUS = np.array([71, 180, 196], dtype=np.uint8)
-_PREVIOUS_OUTLINE = np.array([15, 118, 132], dtype=np.uint8)
+_PREVIEW_EDGE = (216, 203, 255)
+_PREVIEW_OCCUPANCY = np.array([167, 139, 250], dtype=np.uint8)
+_PREVIEW_OCCUPANCY_ALPHA = 0.20
+_CARRIED = np.array([245, 158, 11], dtype=np.uint8)
+_CARRIED_OUTLINE = np.array([253, 230, 138], dtype=np.uint8)
 _MOVE = (22, 163, 74, 255)
 _AXIS_COLORS = (
     (220, 38, 38, 255),
@@ -57,6 +58,8 @@ _ROTATION_CORNER_WIDTH = 188
 _ROTATION_CORNER_HEIGHT = 146
 _TRANSLATION_CORNER_WIDTH = 244
 _TRANSLATION_CORNER_HEIGHT = 168
+
+PreviewGripperStyle = Literal["fk-mesh", "semantic-wireframe"]
 
 
 @dataclass(frozen=True)
@@ -81,6 +84,8 @@ class NearFieldPreview:
     target_pose: Pose | None
     joint_positions_rad: tuple[float, ...] | None
     gripper_opening: float | None
+    gripper_style: PreviewGripperStyle = "fk-mesh"
+    realized_tcp_pose: Pose | None = None
     visual_edit: VisualEdit | None = None
     previous_target_pose: Pose | None = None
     previous_gripper_opening: float | None = None
@@ -121,6 +126,7 @@ def render_contact_focus(
     *,
     source_mask: np.ndarray | None = None,
     contact_cameras: ContactCameraPair | None = None,
+    carried_volume_triangles_base: np.ndarray | None = None,
 ) -> np.ndarray | None:
     """Render two gravity-stable, session-locked views around one target.
 
@@ -133,13 +139,19 @@ def render_contact_focus(
     if preview is None:
         return None
     if contact_cameras is not None:
-        return _render_direct_contact_pair(contact_cameras, robot, preview)
+        return _render_direct_contact_pair(
+            contact_cameras,
+            robot,
+            preview,
+            carried_volume_triangles_base=carried_volume_triangles_base,
+        )
     pair = _render_geometry_pair(
         agentview,
         wrist,
         robot,
         preview,
         agentview_emphasis_mask=source_mask,
+        carried_volume_triangles_base=carried_volume_triangles_base,
     )
     if pair is None:
         return None
@@ -153,6 +165,7 @@ def _render_geometry_pair(
     preview: NearFieldPreview | None,
     *,
     agentview_emphasis_mask: np.ndarray | None = None,
+    carried_volume_triangles_base: np.ndarray | None = None,
 ) -> np.ndarray | None:
     if robot.tcp_pose is None or robot.joint_positions_rad is None or robot.gripper_opening is None:
         return None
@@ -196,9 +209,22 @@ def _render_geometry_pair(
         frame_rotation,
     )
     preview_triangles_local = None
-    previous_triangles_local = None
-    preview_is_target_ghost = False
-    if (
+    preview_hand_triangles_local = None
+    if preview is not None and preview.gripper_style == "semantic-wireframe":
+        if (
+            preview.joint_positions_rad is not None
+            and preview.realized_tcp_pose is not None
+            and preview.gripper_opening is not None
+        ):
+            semantic_base = semantic_parallel_jaw_triangles(
+                preview.realized_tcp_pose.position_xyz,
+                preview.realized_tcp_pose.quaternion_xyzw,
+                preview.gripper_opening,
+            )
+            preview_triangles_local = np.ascontiguousarray(
+                (semantic_base - frame_position) @ frame_rotation
+            )
+    elif (
         preview is not None
         and preview.joint_positions_rad is not None
         and preview.gripper_opening is not None
@@ -209,11 +235,25 @@ def _render_geometry_pair(
             frame_position,
             frame_rotation,
         )
+        preview_hand_triangles_local = _gripper_part_triangles_local(
+            preview.joint_positions_rad,
+            preview.gripper_opening,
+            frame_position,
+            frame_rotation,
+            method_name="hand_triangles",
+        )
     elif (
         preview is not None
         and preview.target_pose is not None
         and preview.gripper_opening is not None
     ):
+        target_position = np.asarray(
+            preview.target_pose.position_xyz,
+            dtype=np.float64,
+        )
+        target_rotation = Rotation.from_quat(
+            np.asarray(preview.target_pose.quaternion_xyzw, dtype=np.float64)
+        ).as_matrix()
         target_shape_current_local = _gripper_triangles_local(
             robot.joint_positions_rad,
             preview.gripper_opening,
@@ -221,59 +261,44 @@ def _render_geometry_pair(
             tcp_rotation,
         )
         if target_shape_current_local is not None:
-            target_position = np.asarray(
-                preview.target_pose.position_xyz,
-                dtype=np.float64,
-            )
-            target_rotation = Rotation.from_quat(
-                np.asarray(preview.target_pose.quaternion_xyzw, dtype=np.float64)
-            ).as_matrix()
             target_shape_base = target_shape_current_local @ target_rotation.T + target_position
             preview_triangles_local = (target_shape_base - frame_position) @ frame_rotation
             preview_triangles_local = np.ascontiguousarray(preview_triangles_local)
-            preview_is_target_ghost = True
-    if preview is not None and preview.previous_target_pose is not None:
-        previous_shape_current_local = _gripper_triangles_local(
+        target_hand_current_local = _gripper_part_triangles_local(
             robot.joint_positions_rad,
-            (
-                preview.previous_gripper_opening
-                if preview.previous_gripper_opening is not None
-                else robot.gripper_opening
-            ),
+            preview.gripper_opening,
             tcp_position,
             tcp_rotation,
+            method_name="hand_triangles",
         )
-        if previous_shape_current_local is not None:
-            previous_position = np.asarray(
-                preview.previous_target_pose.position_xyz,
-                dtype=np.float64,
+        if target_hand_current_local is not None:
+            target_hand_base = target_hand_current_local @ target_rotation.T + target_position
+            preview_hand_triangles_local = (
+                target_hand_base - frame_position
+            ) @ frame_rotation
+            preview_hand_triangles_local = np.ascontiguousarray(
+                preview_hand_triangles_local
             )
-            previous_rotation = Rotation.from_quat(
-                np.asarray(
-                    preview.previous_target_pose.quaternion_xyzw,
-                    dtype=np.float64,
-                )
-            ).as_matrix()
-            previous_shape_base = (
-                previous_shape_current_local @ previous_rotation.T + previous_position
-            )
-            previous_triangles_local = (previous_shape_base - frame_position) @ frame_rotation
-            previous_triangles_local = np.ascontiguousarray(previous_triangles_local)
     views = _contact_views(
         "CURRENT + PREVIEW" if preview is not None else "OBSERVED NOW",
         focus_center_local,
     )
+    carried_triangles_local = None
+    if carried_volume_triangles_base is not None:
+        carried_triangles_local = (
+            np.asarray(carried_volume_triangles_base, dtype=np.float64) - frame_position
+        ) @ frame_rotation
     panels = [
         _render_view(
             tuple(surfaces),
             triangles_local,
-            previous_triangles_local,
+            carried_triangles_local,
             preview_triangles_local,
+            preview_hand_triangles_local,
             view,
             current_tcp_position=frame_position,
             current_tcp_rotation=frame_rotation,
             preview=preview,
-            preview_is_target_ghost=preview_is_target_ghost,
         )
         for view in views
     ]
@@ -289,6 +314,8 @@ def _render_direct_contact_pair(
     contact_cameras: ContactCameraPair,
     robot: RobotState | None,
     preview: NearFieldPreview,
+    *,
+    carried_volume_triangles_base: np.ndarray | None = None,
 ) -> np.ndarray | None:
     """Compose MuJoCo-rendered Contact Cameras with deterministic overlays."""
 
@@ -300,6 +327,7 @@ def _render_direct_contact_pair(
             view_name,
             robot,
             preview,
+            carried_volume_triangles_base=carried_volume_triangles_base,
         )
         for view_name, camera in (
             ("front", contact_cameras.front),
@@ -319,6 +347,8 @@ def _render_direct_contact_view(
     view_name: Literal["front", "side"],
     robot: RobotState,
     preview: NearFieldPreview,
+    *,
+    carried_volume_triangles_base: np.ndarray | None = None,
 ) -> np.ndarray:
     image = np.asarray(camera["images"]["rgb"], dtype=np.uint8).copy()
     height, width = image.shape[:2]
@@ -332,36 +362,36 @@ def _render_direct_contact_view(
         )
         height, width = image.shape[:2]
 
-    current_mask = _camera_gripper_mask(
-        robot.joint_positions_rad,
-        robot.gripper_opening,
-        camera,
-        width,
-        height,
-    )
-    if current_mask is not None and np.any(current_mask):
-        image[thick_mask_outline(current_mask, radius=2)] = _CURRENT_OUTLINE
-
-    previous_mask = _direct_target_gripper_mask(
-        robot,
-        preview.previous_target_pose,
-        preview.previous_gripper_opening,
-        camera,
-        width,
-        height,
-    )
-    if previous_mask is not None:
-        _blend_mask(image, previous_mask, _PREVIOUS, _PREVIOUS_OUTLINE, alpha=0.34)
-
-    preview_mask = _preview_gripper_mask(
+    preview_triangles = _preview_gripper_triangles(
         robot,
         preview,
-        camera,
-        width,
-        height,
     )
-    if preview_mask is not None:
-        _blend_mask(image, preview_mask, _PREVIEW, _PREVIEW_OUTLINE, alpha=0.64)
+    preview_hand_triangles = _preview_hand_triangles(robot, preview)
+    if preview_hand_triangles is not None:
+        _overlay_camera_mesh_occupancy(
+            image,
+            preview_hand_triangles,
+            camera,
+        )
+    if preview_triangles is not None:
+        _overlay_camera_mesh_outline(image, preview_triangles, camera)
+
+    carried_mask = None
+    if carried_volume_triangles_base is not None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            carried_mask = _projected_silhouette(
+                carried_volume_triangles_base,
+                camera,
+                width,
+                height,
+            )
+        _blend_mask(
+            image,
+            carried_mask,
+            _CARRIED,
+            _CARRIED_OUTLINE,
+            alpha=0.42,
+        )
 
     guide_active = (
         preview.rotation_gizmo_frame is not None and preview.rotation_gizmo_axis is not None
@@ -389,7 +419,8 @@ def _render_direct_contact_view(
     label = (
         f"CONTACT {view_name.upper()}"
         if guide_active
-        else f"CONTACT {view_name.upper()} · CURRENT + PREVIEW"
+        else f"CONTACT {view_name.upper()} · "
+        + ("CURRENT + PREVIEW" if preview.target_pose is not None else "CURRENT")
     )
     bounds = draw.textbbox((0, 0), label, font=font)
     label_left = _ROTATION_CORNER_WIDTH + 18
@@ -408,11 +439,18 @@ def _render_direct_contact_view(
     if preview.target_pose is not None:
         _draw_direct_adjustment(
             draw,
-            display_camera,
             scene_width,
             height,
             preview,
         )
+        if not guide_active:
+            _draw_target_depth_scale(
+                draw,
+                display_camera,
+                scene_width,
+                height,
+                preview.target_pose,
+            )
     if guide_active:
         _draw_direct_rotation_guide(
             pil,
@@ -424,13 +462,6 @@ def _render_direct_contact_view(
             width,
             height,
         )
-    _draw_direct_legend(
-        draw,
-        scene_width,
-        height,
-        has_preview=preview_mask is not None,
-        has_previous=previous_mask is not None,
-    )
     return np.asarray(pil, dtype=np.uint8)
 
 
@@ -865,38 +896,44 @@ def _draw_direct_rotation_guide(
         axis,
         _ROTATION_GUIDE_ANGLE_DEG,
     )
-    masks = (
-        _direct_target_gripper_mask(
+    guide_triangles = (
+        _direct_target_gripper_triangles(
             robot,
             negative,
             opening,
-            camera,
-            rgb.shape[1],
-            rgb.shape[0],
         ),
-        _direct_target_gripper_mask(
+        _direct_target_gripper_triangles(
             robot,
             positive,
             opening,
+        ),
+    )
+    masks = tuple(
+        None
+        if triangles is None
+        else _projected_silhouette(
+            triangles,
             camera,
             rgb.shape[1],
             rgb.shape[0],
-        ),
+        )
+        for triangles in guide_triangles
     )
     crop_box = _rotation_guide_crop(masks, camera, target, rgb.shape[1], rgb.shape[0])
     card_width = width - rail_left - 16
     card_height = 126
-    for index, (angle, mask) in enumerate(
+    for index, (angle, triangles) in enumerate(
         zip(
             (-_ROTATION_GUIDE_ANGLE_DEG, _ROTATION_GUIDE_ANGLE_DEG),
-            masks,
+            guide_triangles,
             strict=True,
         )
     ):
         top = 51 + index * 143
         card = _rotation_guide_card(
             rgb,
-            mask,
+            triangles,
+            camera,
             crop_box,
             card_width,
             card_height,
@@ -991,14 +1028,15 @@ def _fit_interval(start: int, end: int, limit: int) -> tuple[int, int]:
 
 def _rotation_guide_card(
     rgb: np.ndarray,
-    mask: np.ndarray | None,
+    triangles: np.ndarray | None,
+    camera: dict,
     crop_box: tuple[int, int, int, int],
     width: int,
     height: int,
 ) -> np.ndarray:
     image = np.asarray(rgb, dtype=np.uint8).copy()
-    if mask is not None:
-        _blend_mask(image, mask, _PREVIEW, _PREVIEW_OUTLINE, alpha=0.72)
+    if triangles is not None:
+        _overlay_camera_mesh_outline(image, triangles, camera)
     left, top, right, bottom = crop_box
     return np.asarray(
         Image.fromarray(image[top:bottom, left:right]).resize(
@@ -1009,55 +1047,100 @@ def _rotation_guide_card(
     )
 
 
-def _camera_gripper_mask(
+def _camera_gripper_triangles(
     joints: tuple[float, ...],
     opening: float,
-    camera: dict,
-    width: int,
-    height: int,
 ) -> np.ndarray | None:
     fk = load_panda_urdf_fk()
     if fk is None:
         return None
     try:
-        triangles = fk.triangles(np.asarray(joints, dtype=np.float64), float(opening))
-        return _projected_silhouette(triangles, camera, width, height)
+        return fk.triangles(np.asarray(joints, dtype=np.float64), float(opening))
     except (KeyError, RuntimeError, ValueError, np.linalg.LinAlgError):
         return None
 
 
-def _preview_gripper_mask(
+def _preview_gripper_triangles(
     robot: RobotState,
     preview: NearFieldPreview,
-    camera: dict,
-    width: int,
-    height: int,
 ) -> np.ndarray | None:
+    if preview.gripper_style == "semantic-wireframe":
+        if (
+            preview.joint_positions_rad is None
+            or preview.realized_tcp_pose is None
+            or preview.gripper_opening is None
+        ):
+            return None
+        return semantic_parallel_jaw_triangles(
+            preview.realized_tcp_pose.position_xyz,
+            preview.realized_tcp_pose.quaternion_xyzw,
+            preview.gripper_opening,
+        )
     if preview.joint_positions_rad is not None and preview.gripper_opening is not None:
-        return _camera_gripper_mask(
+        return _camera_gripper_triangles(
             preview.joint_positions_rad,
             preview.gripper_opening,
-            camera,
-            width,
-            height,
         )
-    return _direct_target_gripper_mask(
+    return _direct_target_gripper_triangles(
         robot,
         preview.target_pose,
         preview.gripper_opening,
-        camera,
-        width,
-        height,
     )
 
 
-def _direct_target_gripper_mask(
+def _preview_hand_triangles(
+    robot: RobotState,
+    preview: NearFieldPreview,
+) -> np.ndarray | None:
+    if preview.gripper_style == "semantic-wireframe":
+        return None
+    if preview.joint_positions_rad is not None and preview.gripper_opening is not None:
+        return _camera_hand_triangles(
+            preview.joint_positions_rad,
+            preview.gripper_opening,
+        )
+    return _direct_target_hand_triangles(
+        robot,
+        preview.target_pose,
+        preview.gripper_opening,
+    )
+
+
+def _camera_hand_triangles(
+    joints: tuple[float, ...],
+    opening: float,
+) -> np.ndarray | None:
+    fk = load_panda_urdf_fk()
+    hand_triangles = getattr(fk, "hand_triangles", None) if fk is not None else None
+    if not callable(hand_triangles):
+        return None
+    try:
+        return hand_triangles(np.asarray(joints, dtype=np.float64), float(opening))
+    except (KeyError, RuntimeError, ValueError, np.linalg.LinAlgError):
+        return None
+
+
+def _direct_target_gripper_triangles(
     robot: RobotState,
     pose: Pose | None,
     opening: float | None,
-    camera: dict,
-    width: int,
-    height: int,
+) -> np.ndarray | None:
+    return _direct_target_part_triangles(robot, pose, opening, "triangles")
+
+
+def _direct_target_hand_triangles(
+    robot: RobotState,
+    pose: Pose | None,
+    opening: float | None,
+) -> np.ndarray | None:
+    return _direct_target_part_triangles(robot, pose, opening, "hand_triangles")
+
+
+def _direct_target_part_triangles(
+    robot: RobotState,
+    pose: Pose | None,
+    opening: float | None,
+    method_name: str,
 ) -> np.ndarray | None:
     if (
         pose is None
@@ -1069,23 +1152,43 @@ def _direct_target_gripper_mask(
     fk = load_panda_urdf_fk()
     if fk is None:
         return None
+    triangles_for_part = getattr(fk, method_name, None)
+    if not callable(triangles_for_part):
+        return None
     try:
         current_tcp_position = np.asarray(robot.tcp_pose.position_xyz, dtype=np.float64)
         current_tcp_rotation = Rotation.from_quat(
             np.asarray(robot.tcp_pose.quaternion_xyzw, dtype=np.float64)
         ).as_matrix()
         local = (
-            fk.triangles(np.asarray(robot.joint_positions_rad), float(opening))
+            triangles_for_part(np.asarray(robot.joint_positions_rad), float(opening))
             - current_tcp_position
         ) @ current_tcp_rotation
         target_position = np.asarray(pose.position_xyz, dtype=np.float64)
         target_rotation = Rotation.from_quat(
             np.asarray(pose.quaternion_xyzw, dtype=np.float64)
         ).as_matrix()
-        triangles = local @ target_rotation.T + target_position
-        return _projected_silhouette(triangles, camera, width, height)
+        return local @ target_rotation.T + target_position
     except (KeyError, RuntimeError, ValueError, np.linalg.LinAlgError):
         return None
+
+
+def _direct_target_gripper_mask(
+    robot: RobotState,
+    pose: Pose | None,
+    opening: float | None,
+    camera: dict,
+    width: int,
+    height: int,
+) -> np.ndarray | None:
+    """Compatibility helper for target cropping; rendering uses 3-D lines."""
+
+    triangles = _direct_target_gripper_triangles(robot, pose, opening)
+    return (
+        None
+        if triangles is None
+        else _projected_silhouette(triangles, camera, width, height)
+    )
 
 
 def _projected_silhouette(
@@ -1104,6 +1207,52 @@ def _projected_silhouette(
         projected[..., 2],
         width,
         height,
+    )
+
+
+def _overlay_camera_mesh_outline(
+    image: np.ndarray,
+    triangles: np.ndarray,
+    camera: dict,
+) -> None:
+    """Overlay transparent lavender 3-D line art in one camera raster."""
+
+    projected = project_world_to_pixel(
+        np.asarray(triangles, dtype=np.float64).reshape(-1, 3),
+        np.asarray(camera["intrinsics"], dtype=np.float64),
+        np.asarray(camera["pose_mat"], dtype=np.float64),
+    ).reshape(-1, 3, 3)
+    overlay_projected_mesh_outline(
+        image,
+        triangles,
+        projected[..., :2],
+        projected[..., 2],
+        color=_PREVIEW_EDGE,
+        camera_position_base=np.asarray(camera["pose_mat"], dtype=np.float64)[:3, 3],
+    )
+
+
+def _overlay_camera_mesh_occupancy(
+    image: np.ndarray,
+    triangles: np.ndarray,
+    camera: dict,
+) -> None:
+    """Faintly fill only the rigid palm body; fingers remain line art."""
+
+    mask = _projected_silhouette(
+        triangles,
+        camera,
+        image.shape[1],
+        image.shape[0],
+    )
+    if not np.any(mask):
+        return
+    image[mask] = np.asarray(
+        np.round(
+            image[mask].astype(np.float64) * (1.0 - _PREVIEW_OCCUPANCY_ALPHA)
+            + _PREVIEW_OCCUPANCY.astype(np.float64) * _PREVIEW_OCCUPANCY_ALPHA
+        ),
+        dtype=np.uint8,
     )
 
 
@@ -1126,7 +1275,6 @@ def _blend_mask(
 
 def _draw_direct_adjustment(
     draw: ImageDraw.ImageDraw,
-    camera: dict,
     width: int,
     height: int,
     preview: NearFieldPreview,
@@ -1143,21 +1291,8 @@ def _draw_direct_adjustment(
         )
         _draw_adjustment_label(draw, label, width, height, color)
         return
-    if edit.kind != "delta_move" or edit.reference_pose is None:
+    if edit.kind != "delta_move" or edit.delta_xyz_m is None:
         return
-    projected = project_world_to_pixel(
-        np.asarray(
-            [edit.reference_pose.position_xyz, target.position_xyz],
-            dtype=np.float64,
-        ),
-        camera["intrinsics"],
-        camera["pose_mat"],
-    )
-    if np.isfinite(projected).all() and np.all(projected[:, 2] > 0.0):
-        start = tuple(float(value) for value in projected[0, :2])
-        end = tuple(float(value) for value in projected[1, :2])
-        draw.line((*start, *end), fill=color, width=6)
-        _draw_arrow_head(draw, start, end, color, size=11.0)
     delta_cm = np.asarray(edit.delta_xyz_m, dtype=np.float64) * 100.0
     label = (
         f"MOVE {str(edit.frame).upper()} "
@@ -1166,15 +1301,46 @@ def _draw_direct_adjustment(
     _draw_adjustment_label(draw, label, width, height, color)
 
 
-def _draw_direct_legend(
+def _draw_target_depth_scale(
     draw: ImageDraw.ImageDraw,
+    camera: dict,
     width: int,
     height: int,
-    *,
-    has_preview: bool,
-    has_previous: bool,
+    target_pose: Pose,
 ) -> None:
-    _draw_legend(draw, width, height, has_preview, has_previous)
+    """Draw one uncluttered, perspective-correct 5 cm reference bar."""
+
+    projected = project_world_to_pixel(
+        np.asarray(target_pose.position_xyz, dtype=np.float64).reshape(1, 3),
+        np.asarray(camera["intrinsics"], dtype=np.float64),
+        np.asarray(camera["pose_mat"], dtype=np.float64),
+    )[0]
+    depth = float(projected[2])
+    focal_px = float(np.asarray(camera["intrinsics"], dtype=np.float64)[0, 0])
+    if not np.isfinite((depth, focal_px)).all() or depth <= 0.01 or focal_px <= 0.0:
+        return
+    five_cm_px = focal_px * 0.05 / depth
+    if not 20.0 <= five_cm_px <= 280.0:
+        return
+    right = float(width - 10)
+    left = right - five_cm_px
+    bottom = float(height - 27)
+    top = bottom - 24.0
+    draw.text(
+        (left, top - 1),
+        "5 cm",
+        fill=(30, 64, 175, 255),
+        font=_label_font(),
+        stroke_width=2,
+        stroke_fill=(255, 255, 255, 245),
+    )
+    x0 = left
+    y = bottom
+    draw.line((x0, y, right, y), fill=(255, 255, 255, 245), width=7)
+    draw.line((x0, y, right, y), fill=(30, 64, 175, 255), width=3)
+    for x in (x0, right):
+        draw.line((x, y - 7, x, y + 5), fill=(255, 255, 255, 245), width=6)
+        draw.line((x, y - 6, x, y + 4), fill=(30, 64, 175, 255), width=2)
 
 
 def _contact_render_frame(
@@ -1206,11 +1372,31 @@ def _gripper_triangles_local(
     tcp_position: np.ndarray,
     tcp_rotation: np.ndarray,
 ) -> np.ndarray | None:
+    return _gripper_part_triangles_local(
+        joints_rad,
+        opening,
+        tcp_position,
+        tcp_rotation,
+        method_name="triangles",
+    )
+
+
+def _gripper_part_triangles_local(
+    joints_rad: tuple[float, ...],
+    opening: float,
+    tcp_position: np.ndarray,
+    tcp_rotation: np.ndarray,
+    *,
+    method_name: str,
+) -> np.ndarray | None:
     fk = load_panda_urdf_fk()
     if fk is None:
         return None
+    triangles_for_part = getattr(fk, method_name, None)
+    if not callable(triangles_for_part):
+        return None
     try:
-        triangles = fk.triangles(
+        triangles = triangles_for_part(
             np.asarray(joints_rad, dtype=np.float64),
             float(opening),
         )
@@ -1264,14 +1450,14 @@ def _contact_views(
 def _render_view(
     surfaces: tuple[RgbdSurface, ...],
     current_triangles: np.ndarray | None,
-    previous_triangles: np.ndarray | None,
+    carried_triangles: np.ndarray | None,
     preview_triangles: np.ndarray | None,
+    preview_hand_triangles: np.ndarray | None,
     view: _View,
     *,
     current_tcp_position: np.ndarray,
     current_tcp_rotation: np.ndarray,
     preview: NearFieldPreview | None,
-    preview_is_target_ghost: bool,
 ) -> np.ndarray:
     height, width = CONTACT_PANEL_HEIGHT, NEAR_FIELD_WIDTH
     image = np.full((height, width, 3), _BACKGROUND, dtype=np.uint8)
@@ -1287,25 +1473,29 @@ def _render_view(
         half_height_m=view.half_height_m,
     )
 
-    if current_triangles is not None and len(current_triangles):
-        _overlay_current_outline(image, current_triangles, view)
-    if previous_triangles is not None and len(previous_triangles):
-        _overlay_triangles(
-            image,
-            previous_triangles,
-            view,
-            _PREVIOUS,
-            _PREVIOUS_OUTLINE,
-            alpha=0.38,
-        )
     if preview_triangles is not None and len(preview_triangles):
-        _overlay_triangles(
+        if preview_hand_triangles is not None and len(preview_hand_triangles):
+            _overlay_triangles(
+                image,
+                preview_hand_triangles,
+                view,
+                _PREVIEW_OCCUPANCY,
+                np.asarray(_PREVIEW_EDGE, dtype=np.uint8),
+                alpha=_PREVIEW_OCCUPANCY_ALPHA,
+            )
+        _overlay_preview_outline(
             image,
             preview_triangles,
             view,
-            _PREVIEW,
-            _PREVIEW_OUTLINE,
-            alpha=0.52 if preview_is_target_ghost else 0.76,
+        )
+    if carried_triangles is not None and len(carried_triangles):
+        _overlay_triangles(
+            image,
+            carried_triangles,
+            view,
+            _CARRIED,
+            _CARRIED_OUTLINE,
+            alpha=0.42,
         )
 
     pil = Image.fromarray(image)
@@ -1340,13 +1530,6 @@ def _render_view(
                 current_tcp_position,
                 current_tcp_rotation,
             )
-    _draw_legend(
-        draw,
-        width,
-        height,
-        preview is not None,
-        previous_triangles is not None,
-    )
     _draw_scale_bar(draw, view, width, height)
     return np.asarray(pil, dtype=np.uint8)
 
@@ -1380,24 +1563,25 @@ def _overlay_triangles(
             image[mask_outline(mask)] = outline_color
 
 
-def _overlay_current_outline(
+def _overlay_preview_outline(
     image: np.ndarray,
     triangles: np.ndarray,
     view: _View,
 ) -> None:
-    """Draw the observed robot as geometry context, not an opaque evidence mask."""
+    """Draw the orthographic Preview without covering current RGB-D points."""
 
-    flat = np.asarray(triangles, dtype=np.float64).reshape(-1, 3)
+    values = np.asarray(triangles, dtype=np.float64).reshape(-1, 3, 3)
+    flat = values.reshape(-1, 3)
     height, width = image.shape[:2]
     u, v, depth = _project(flat, view, width, height)
-    mask = rasterize_silhouette(
+    overlay_projected_mesh_outline(
+        image,
+        values,
         np.column_stack((u, v)).reshape(-1, 3, 2),
         depth.reshape(-1, 3),
-        width,
-        height,
+        color=_PREVIEW_EDGE,
+        view_forward_base=view.forward,
     )
-    if np.any(mask):
-        image[thick_mask_outline(mask, radius=2)] = _CURRENT_OUTLINE
 
 
 def _project(
@@ -1436,28 +1620,22 @@ def _draw_scale_bar(
     width: int,
     height: int,
 ) -> None:
-    length_px = int(round(0.05 * width * 0.5 / view.half_width_m))
+    one_cm_px = 0.01 * width * 0.5 / view.half_width_m
+    length_px = int(round(3.0 * one_cm_px))
     right = width - 14
     left = right - length_px
     y = height - 17
     draw.line((left, y, right, y), fill=(30, 41, 59, 230), width=3)
-    draw.line((left, y - 4, left, y + 4), fill=(30, 41, 59, 230), width=2)
-    draw.line((right, y - 4, right, y + 4), fill=(30, 41, 59, 230), width=2)
-    draw.text((left, y - 18), "5 cm", fill=(30, 41, 59, 255), font=_label_font())
-
-
-def _pose_in_current_tcp(
-    pose: Pose,
-    current_tcp_position: np.ndarray,
-    current_tcp_rotation: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    target_position = np.asarray(pose.position_xyz, dtype=np.float64)
-    target_rotation = Rotation.from_quat(
-        np.asarray(pose.quaternion_xyzw, dtype=np.float64)
-    ).as_matrix()
-    position_local = (target_position - current_tcp_position) @ current_tcp_rotation
-    rotation_local = current_tcp_rotation.T @ target_rotation
-    return position_local, rotation_local
+    for centimetre in range(4):
+        x = left + centimetre * one_cm_px
+        draw.line((x, y - 4, x, y + 4), fill=(30, 41, 59, 230), width=2)
+        draw.text(
+            (x - 3, y - 18),
+            str(centimetre),
+            fill=(30, 41, 59, 255),
+            font=_label_font(),
+        )
+    draw.text((left - 25, y - 18), "cm", fill=(30, 41, 59, 255), font=_label_font())
 
 
 def _draw_contact_axis_key(
@@ -1603,33 +1781,12 @@ def _draw_adjustment(
     current_tcp_position: np.ndarray,
     current_tcp_rotation: np.ndarray,
 ) -> None:
+    del view, current_tcp_position, current_tcp_rotation
     edit = preview.visual_edit
     target = preview.target_pose
-    if (
-        edit is None
-        or target is None
-        or edit.kind not in {"delta_move", "rotate"}
-        or edit.reference_pose is None
-    ):
+    if edit is None or target is None or edit.kind not in {"delta_move", "rotate"}:
         return
-    reference_position_local, _ = _pose_in_current_tcp(
-        edit.reference_pose,
-        current_tcp_position,
-        current_tcp_rotation,
-    )
-    target_position_local, _ = _pose_in_current_tcp(
-        target,
-        current_tcp_position,
-        current_tcp_rotation,
-    )
     if edit.kind == "delta_move" and edit.delta_xyz_m is not None:
-        points = np.vstack([reference_position_local, target_position_local])
-        u, v, _ = _project(points, view, width, height)
-        if np.isfinite(np.column_stack((u, v))).all():
-            start = (float(u[0]), float(v[0]))
-            end = (float(u[1]), float(v[1]))
-            draw.line((*start, *end), fill=_MOVE, width=6)
-            _draw_arrow_head(draw, start, end, _MOVE, size=11.0)
         delta_cm = np.asarray(edit.delta_xyz_m, dtype=np.float64) * 100.0
         label = (
             f"MOVE {edit.frame.upper()}  "
@@ -1639,35 +1796,7 @@ def _draw_adjustment(
         return
     if edit.kind != "rotate" or edit.axis is None or edit.angle_deg is None:
         return
-
-    axis_index = "xyz".index(edit.axis)
-    axis_unit = np.eye(3, dtype=np.float64)[axis_index]
-    reference_rotation = Rotation.from_quat(
-        np.asarray(edit.reference_pose.quaternion_xyzw, dtype=np.float64)
-    ).as_matrix()
-    axis_base = axis_unit if edit.frame == "base" else reference_rotation @ axis_unit
-    radial_base = (
-        np.eye(3, dtype=np.float64)[(axis_index + 1) % 3]
-        if edit.frame == "base"
-        else reference_rotation[:, (axis_index + 1) % 3]
-    )
-    center_base = np.asarray(edit.reference_pose.position_xyz, dtype=np.float64)
-    radians = np.deg2rad(float(edit.angle_deg))
-    samples = np.linspace(0.0, radians, num=25, dtype=np.float64)
-    arc_base = np.vstack(
-        [
-            center_base + Rotation.from_rotvec(axis_base * angle).apply(radial_base * 0.045)
-            for angle in samples
-        ]
-    )
-    arc_local = (arc_base - current_tcp_position) @ current_tcp_rotation
-    u, v, _ = _project(arc_local, view, width, height)
-    finite = np.isfinite(u) & np.isfinite(v)
-    arc_2d = [(float(x), float(y)) for x, y in zip(u[finite], v[finite], strict=True)]
-    axis_color = _AXIS_COLORS[axis_index]
-    if len(arc_2d) >= 2:
-        draw.line(arc_2d, fill=axis_color, width=6, joint="curve")
-        _draw_arrow_head(draw, arc_2d[-2], arc_2d[-1], axis_color, size=11.0)
+    axis_color = _AXIS_COLORS["xyz".index(edit.axis)]
     label = f"ROTATE {edit.frame.upper()}  {edit.axis.upper()} {edit.angle_deg:+.1f} deg"
     _draw_adjustment_label(draw, label, width, height, axis_color)
 
@@ -1726,32 +1855,6 @@ def _draw_rotation_gizmo(
         width=2,
     )
     draw.text((18, 46), label, fill=color, font=font)
-
-
-def _draw_legend(
-    draw: ImageDraw.ImageDraw,
-    width: int,
-    height: int,
-    has_preview: bool,
-    has_previous: bool,
-) -> None:
-    labels = [((255, 255, 255, 255), "WHITE CURRENT OUTLINE")]
-    if has_previous:
-        labels.append(((71, 180, 196, 215), "CYAN PREVIOUS"))
-    if has_preview:
-        labels.append(((124, 58, 237, 235), "PURPLE PREVIEW"))
-    x = 10
-    y = height - 20
-    for color, label in labels:
-        draw.rectangle(
-            (x, y - 1, x + 12, y + 11),
-            fill=color,
-            outline=(30, 41, 59, 230) if color[:3] == (255, 255, 255) else None,
-            width=1,
-        )
-        draw.text((x + 17, y - 3), label, fill=(30, 41, 59, 255), font=_label_font())
-        box = draw.textbbox((0, 0), label, font=_label_font())
-        x += 31 + box[2] - box[0]
 
 
 def _draw_arrow_head(
