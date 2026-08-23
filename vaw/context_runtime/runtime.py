@@ -20,6 +20,7 @@ from vaw.agents.contracts import (
 )
 from vaw.agents.providers.base import ModelProvider
 from vaw.context_runtime.memory import FunctionEvent, project_function_event
+from vaw.context_runtime.model import LastPhysicalAction
 from vaw.context_runtime.packet import (
     CONTEXT_SCHEMA,
     ContextCompiler,
@@ -41,7 +42,13 @@ from vaw.context_runtime.workspace import ContextStepResult, ContextWorkspace
 
 NO_CALL_FEEDBACK = "未执行：本轮必须且只能调用一个 Function。"
 MULTI_CALL_ERROR = "未执行：一轮只能调用一个 Function。"
-_NOTICE_LABEL = {"protocol": "上轮协议错误", "function": "上一轮执行失败"}
+_NOTICE_LABEL = {
+    "protocol": "上轮协议错误",
+    "function": "上一轮执行失败",
+    "advisory": "上一轮编辑未生效，Preview 未改变",
+}
+
+MAX_MAIN_TURNS = 32
 
 
 class ContextRenderer(Protocol):
@@ -54,15 +61,24 @@ class ContextRenderer(Protocol):
 
 @dataclass
 class ContextRunConfig:
-    max_main_turns: int = 32
+    max_main_turns: int = MAX_MAIN_TURNS
     max_imagination_turns: int = 6
     max_time_s: float = 1800.0
     max_physical_ops: int = 30
+    # How many extra model queries share one Main turn after a missing or
+    # multi Function call.  0 restores the old "silence burns a turn" rule.
+    max_no_call_retries: int = 2
     on_turn: Callable[[int, StepRecord], None] | None = None
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.max_main_turns <= MAX_MAIN_TURNS:
+            raise ValueError(f"max_main_turns must be in [1, {MAX_MAIN_TURNS}]")
+        if not 0 <= self.max_no_call_retries <= 3:
+            raise ValueError("max_no_call_retries must be in [0, 3]")
 
 
 @dataclass(frozen=True)
-class RefinementResult:
+class ImaginationResult:
     status: str
     action_id: str | None
     turns: int
@@ -92,11 +108,11 @@ class ImaginationRunner:
         self.tools = imagination_function_definitions()
         self.usage_callback = usage_callback
 
-    def run(self, instruction: str, action_id: str) -> RefinementResult:
+    def run(self, instruction: str, action_id: str) -> ImaginationResult:
         try:
-            self.workspace.begin_refinement(instruction, action_id)
+            self.workspace.begin_imagination(instruction, action_id)
         except Exception as exc:
-            return RefinementResult("failed", action_id, 0, {"error": str(exc)})
+            return self._close(ImaginationResult("failed", action_id, 0, {"error": str(exc)}))
 
         feedback: tuple[str, str] | None = None
         for turn in range(1, self.max_turns + 1):
@@ -107,10 +123,25 @@ class ImaginationRunner:
             try:
                 response = self.provider.generate(messages, self.tools)
             except Exception as exc:
-                step = self.workspace.limit_refinement()
-                result = {"error": f"{type(exc).__name__}: {exc}", **step.result}
-                self._log(turn, image, packet, None, step, "", result)
-                return RefinementResult("failed", None, turn, result)
+                step = self.workspace.fail_imagination("subagent_error")
+                result = dict(step.result)
+                self._log(
+                    turn,
+                    image,
+                    packet,
+                    None,
+                    step,
+                    "",
+                    {"error": f"{type(exc).__name__}: {exc}", **result},
+                )
+                return self._close(
+                    ImaginationResult(
+                        "failed",
+                        str(result["action_id"]) if "action_id" in result else None,
+                        turn,
+                        result,
+                    )
+                )
             if self.usage_callback is not None:
                 self.usage_callback(response, "imagination")
             call, error = _single_call(response)
@@ -126,19 +157,34 @@ class ImaginationRunner:
                 continue
             if call.name == "finish_imagination":
                 status = str(step.result.get("status", "failed"))
-                return RefinementResult(
-                    status,
-                    str(step.result["action_id"]) if "action_id" in step.result else None,
-                    turn,
-                    dict(step.result),
+                return self._close(
+                    ImaginationResult(
+                        status,
+                        str(step.result["action_id"]) if "action_id" in step.result else None,
+                        turn,
+                        dict(step.result),
+                    )
                 )
-            feedback = None
+            # A call can succeed as a transaction and still leave the target
+            # untouched.  Such a step carries a reason instead of an error;
+            # without it the next turn would edit on from an unchanged Canvas
+            # believing the previous edit landed.
+            advisory = step.result.get("reason")
+            feedback = ("advisory", str(advisory)) if advisory else None
 
-        step = self.workspace.limit_refinement()
-        # The limit call rolls the private edit back before returning.  The
-        # last focused turn is already logged above; do not fabricate another
-        # Imagination image from Main-owned post-rollback state.
-        return RefinementResult("failed", None, self.max_turns, dict(step.result))
+        step = self.workspace.limit_imagination()
+        # Budget exhaustion hands the last planner-checked edit back to Main
+        # as a partial refinement; only a session with nothing executable
+        # rolls back.  The last focused turn is already logged above; do not
+        # fabricate another Imagination image from Main-owned state.
+        return self._close(
+            ImaginationResult(
+                str(step.result.get("status", "failed")),
+                str(step.result["action_id"]) if "action_id" in step.result else None,
+                self.max_turns,
+                dict(step.result),
+            )
+        )
 
     def _dispatch(self, call: ToolCall) -> ContextStepResult:
         if call.parse_error:
@@ -152,14 +198,25 @@ class ImaginationRunner:
             return self.workspace.reject(call.name, call.args, str(exc))
         return self.workspace.execute_imagination(name, **arguments)
 
+    def _close(self, result: ImaginationResult) -> ImaginationResult:
+        if self.trace is not None:
+            meta: dict[str, Any] = {"status": result.status}
+            if result.action_id is not None:
+                meta["action_id"] = result.action_id
+            reason = result.result.get("reason")
+            if isinstance(reason, str):
+                meta["reason"] = reason
+            self.trace.log_meta(meta)
+        return result
+
     def _messages(
         self,
         packet: ContextPacket,
         image: np.ndarray,
         feedback: tuple[str, str] | None,
     ) -> list[Message]:
-        session = self.workspace.state.refinement
-        action = self.workspace.state.pending_action
+        session = self.workspace.state.imagination
+        action = self.workspace.state.action_proposal
         assert session is not None and action is not None
         summary = build_edit_summary(action.target, self.workspace._private.action_artifacts)
         artifacts = self.workspace._private.action_artifacts
@@ -171,7 +228,7 @@ class ImaginationRunner:
             else "unavailable_use_gripper_only_fallback"
         )
         text = (
-            f"Refinement Instruction：{session.instruction}\n"
+            f"Imagination Task：{session.instruction}\n"
             f"Target Basis：{target_basis}\n"
             f"Carried Geometry：{carried_geometry}\n"
             "Current Edit Summary："
@@ -272,22 +329,15 @@ class ContextRuntime:
             self.main_turns += 1
             turn = self.main_turns
             try:
-                response = self.main_provider.generate(messages, self.main_tools)
+                call, response = self._solicit_single_call(
+                    packet, image, messages, turn
+                )
             except KeyboardInterrupt:
                 return self._finish(TerminateMode.CANCELLED, steps, "interrupted by user")
             except Exception as exc:
                 return self._finish(TerminateMode.ERROR, steps, f"{type(exc).__name__}: {exc}")
-            self._accumulate_usage(response, "main")
-            call, error = _single_call(response)
-            if error is not None:
-                self._current_event = FunctionEvent(
-                    function="protocol",
-                    status="failed",
-                    message=error,
-                )
-                self._log(turn, image, packet, None, None, response)
+            if call is None:
                 continue
-            assert call is not None
             requested_physical = call.name in self.workspace.PHYSICAL_FUNCTIONS
             if (
                 requested_physical
@@ -299,8 +349,8 @@ class ContextRuntime:
                     "physical operation limit reached",
                 )
 
-            if call.name == "refine_action":
-                step = self._run_refinement(call)
+            if call.name == "call_imagination":
+                step = self._call_imagination(call)
             else:
                 step = self._dispatch_main(call)
             physical = requested_physical and step.revision_after > step.revision_before
@@ -311,17 +361,21 @@ class ContextRuntime:
             record = _step_record(turn, "main", step, response.text, physical=physical)
             steps.append(record)
             self._log(turn, image, packet, _call_summary(call), step, response)
-            self._current_event = project_function_event(call.name, step.result)
+            self._current_event = project_function_event(
+                call.name,
+                step.result,
+                world_changed=step.revision_after > step.revision_before,
+            )
             self._notify(turn, record)
             if physical and self._environment_terminated():
                 return self._result(TerminateMode.ENV_TERMINATED, steps, "environment terminated")
 
-    def _run_refinement(self, call: ToolCall) -> ContextStepResult:
+    def _call_imagination(self, call: ToolCall) -> ContextStepResult:
         if call.parse_error:
             return self.workspace.reject(call.name, call.args, call.parse_error)
         try:
             _name, arguments = parse_action(
-                {"name": call.name, "arguments": call.args}, allowed=("refine_action",)
+                {"name": call.name, "arguments": call.args}, allowed=("call_imagination",)
             )
             instruction = str(arguments["instruction"])
             action_id = str(arguments["action_id"])
@@ -346,7 +400,13 @@ class ContextRuntime:
         payload: dict[str, Any] = {"status": result.status}
         if result.action_id is not None:
             payload["action_id"] = result.action_id
-        if "error" in result.result:
+        reason = result.result.get("reason")
+        if isinstance(reason, str):
+            payload["reason"] = reason
+        advisory = result.result.get("advisory")
+        if isinstance(advisory, str):
+            payload["advisory"] = advisory
+        if result.turns == 0 and "error" in result.result:
             payload["error"] = result.result["error"]
         diagnostics: dict[str, Any] = {
             "turns": result.turns,
@@ -355,7 +415,7 @@ class ContextRuntime:
         if subtrace_rel is not None:
             diagnostics["trace"] = subtrace_rel
         return ContextStepResult(
-            function_name="refine_action",
+            function_name="call_imagination",
             arguments=dict(call.args),
             result=payload,
             revision_before=before,
@@ -375,7 +435,54 @@ class ContextRuntime:
             return self.workspace.reject(call.name, call.args, str(exc))
         return self.workspace.execute(name, **arguments)
 
-    def _main_messages(self, packet: ContextPacket, image: np.ndarray) -> list[Message]:
+    def _solicit_single_call(
+        self,
+        packet: ContextPacket,
+        image: np.ndarray,
+        messages: list[Message],
+        turn: int,
+    ) -> tuple[ToolCall | None, ModelResponse]:
+        """Query Main until one Function call arrives or the retry budget ends.
+
+        Intermediate misses do not write a Context turn.  They stay in the
+        runtime event log so a later formal turn can still consume the slot.
+        """
+
+        attempts = 0
+        while True:
+            response = self.main_provider.generate(messages, self.main_tools)
+            self._accumulate_usage(response, "main")
+            call, error = _single_call(response)
+            if error is None:
+                assert call is not None
+                return call, response
+            attempts += 1
+            if self.trace is not None:
+                self.trace.log_event(
+                    "no_call_retry",
+                    {
+                        "turn": turn,
+                        "attempt": attempts,
+                        "error": error,
+                        "text": response.text[:2000],
+                    },
+                )
+            if attempts > self.config.max_no_call_retries:
+                self._current_event = FunctionEvent(
+                    function="protocol",
+                    status="failed",
+                    message=error,
+                )
+                self._log(turn, image, packet, None, None, response)
+                return None, response
+            messages = self._main_messages(packet, image, feedback=error)
+
+    def _main_messages(
+        self,
+        packet: ContextPacket,
+        image: np.ndarray,
+        feedback: str | None = None,
+    ) -> list[Message]:
         text = (
             f"User Task：{self.workspace.state.task_prompt}\n"
             "Task Memory："
@@ -387,12 +494,25 @@ class ContextRuntime:
             + "\nLive References："
             + json.dumps(packet.manifest(), ensure_ascii=False, separators=(",", ":"))
         )
+        attachment = self.workspace._private.attachment_hypothesis
+        continuity = _control_continuity(
+            self.workspace.state.last_physical_action,
+            manipulation_subject=(attachment.query if attachment is not None else None),
+        )
+        if continuity is not None:
+            text += "\nControl Continuity：" + json.dumps(
+                continuity,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
         if self._current_event is not None:
             text += "\nCurrent Function Event：" + json.dumps(
                 self._current_event.summary(),
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
+        if feedback is not None:
+            text += f"\n{_NOTICE_LABEL['protocol']}：{feedback}"
         return _image_messages(SYSTEM_PROMPT, text, image, label="CURRENT MAIN CONTEXT CANVAS")
 
     def _finish(self, mode: TerminateMode, steps: list[StepRecord], detail: str) -> EpisodeResult:
@@ -451,8 +571,15 @@ class ContextRuntime:
             )
 
     def _notify(self, turn: int, record: StepRecord) -> None:
-        if self.config.on_turn is not None:
+        if self.config.on_turn is None:
+            return
+        # The observer runs after the transaction committed and the trace was
+        # written; it must never be able to kill an episode (a real crash was
+        # a BlockingIOError from a print into a non-blocking stdout pipe).
+        try:
             self.config.on_turn(turn, record)
+        except Exception:
+            pass
 
     def _accumulate_usage(self, response: ModelResponse, scope: str) -> None:
         for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
@@ -500,6 +627,39 @@ def _target_basis(artifacts: Any | None) -> str:
     if context.source_kind == "grasp":
         return "coarse grasp seed; verify and refine visible contact geometry"
     return f"coarse {context.source_kind} seed"
+
+
+def _control_continuity(
+    action: LastPhysicalAction | None,
+    *,
+    manipulation_subject: str | None = None,
+) -> dict[str, Any] | None:
+    """Expose only the causal focus of the latest physical command.
+
+    This deliberately omits controller telemetry and does not assert that the
+    intended grasp/place relation became true.  Its purpose is to keep a
+    revision change from erasing which manipulation problem Main was solving.
+    """
+
+    if action is None and manipulation_subject is None:
+        return None
+    result: dict[str, Any] = {}
+    if manipulation_subject:
+        result["manipulation_subject"] = manipulation_subject
+        result["subject_relation"] = "intended_attachment_unverified"
+    if action is not None:
+        result.update(
+            {
+                "last_intent": action.intent,
+                "executed_stage": action.executed_stages,
+                "command_status": action.outcome,
+            }
+        )
+        if action.source_query:
+            result["control_subject"] = action.source_query
+        if action.target_gripper is not None:
+            result["target_gripper"] = action.target_gripper
+    return result
 
 
 def _image_messages(system_prompt: str, text: str, image: np.ndarray, *, label: str) -> list[Message]:
@@ -574,6 +734,6 @@ __all__ = [
     "ContextRunConfig",
     "ContextRuntime",
     "ImaginationRunner",
-    "RefinementResult",
+    "ImaginationResult",
     "run_context_episode",
 ]

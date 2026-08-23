@@ -15,6 +15,11 @@ from vaw.context_runtime.attached_object import (
     fit_gravity_stable_proxy,
 )
 from vaw.context_runtime.errors import ContextFunctionError
+from vaw.context_runtime.evidence import (
+    POINT_WINDOW_HALF_PX,
+    archive_window,
+    change_summary,
+)
 from vaw.context_runtime.geometry import (
     GRASP_POSE_TO_CONTACT_M,
     graspnet_pose_to_panda_hand,
@@ -25,13 +30,12 @@ from vaw.context_runtime.geometry import (
 )
 from vaw.context_runtime.model import (
     ActionPrediction,
+    ActionProposal,
     ActionSeed,
     ActionTarget,
     LastPhysicalAction,
-    PendingAction,
     PointEvidence,
     Pose,
-    RefinementSession,
     RegionEvidence,
 )
 from vaw.context_runtime.motion import MotionBackendError, MotionPlan
@@ -67,18 +71,26 @@ class _PreparedGrasp:
     family: str = "cgn"
 
 
-_LIBERO_TOP_QUAT_XYZW = (1.0, 0.0, 0.0, 0.0)
 _TOP_GRASP_OFFSET_M = 0.04
 _MAX_TOP_GRASPS = 1
 _MAX_PCA_GRASPS = 2
 _MAX_CGN_GRASPS = 2
 _SEMANTIC_QUERY_RETRIES = 2
 
+# Parallel-jaw feasibility gate for the top-down family: the Panda fingers
+# open 8 cm at most, and a top-down grasp must clear the object's narrower
+# horizontal OBB edge plus a safety margin to descend around it.
+_GRIPPER_MAX_OPENING_M = 0.08
+_TOP_WIDTH_MARGIN_M = 0.008
+# Below this narrow/wide extent ratio the minimum-area yaw is meaningful;
+# above it the footprint is near-square or round and the yaw is noise.
+_TOP_DEGENERATE_RATIO = 0.8
+
 
 _COMMIT_FAILURE_RECOVERY_HINT = (
     "region/seed/action_id 已随新观测作废，不能再 commit 该 id。"
     "若仍操作同一物体，请重新 detection_and_sam（优先使用 source_query）；"
-    "若从当前真实 TCP 继续靠近，由 Main 调用 refine_action。"
+    "若从当前真实 TCP 继续靠近，由 Main 调用 call_imagination。"
 )
 
 
@@ -176,6 +188,14 @@ class ContextFunctions:
             source_revision=self.ws.state.observation_revision,
         )
         self.ws._private.region_masks[region_id] = global_mask
+        archive = archive_window(
+            camera,
+            global_box,
+            mask=global_mask,
+            revision=self.ws.state.observation_revision,
+        )
+        if archive is not None:
+            self.ws._private.evidence_archives[region_id] = archive
         geometry = self._build_region_geometry(
             str(query),
             global_mask,
@@ -309,7 +329,32 @@ class ContextFunctions:
         self,
         query: str,
         within_region_id: str | None = None,
+        force_refresh: bool = False,
     ) -> dict[str, Any]:
+        # A point whose window was re-verified against the current image is
+        # still exact (fixed camera, unchanged pixels).  Reusing it saves a
+        # grounding call and keeps the reference id stable across actions.
+        # ``force_refresh`` is the escape hatch for when the caller has
+        # multi-view evidence contradicting a reused anchor.
+        normalized_query = " ".join(str(query).casefold().split())
+        for point in () if force_refresh else reversed(tuple(self.ws.state.points.values())):
+            if (
+                " ".join(point.query.casefold().split()) == normalized_query
+                and point.within_region_id == within_region_id
+                and point.status == "verified"
+            ):
+                self.ws._private.trace_diagnostics["point_grounding"] = {
+                    "mode": "verified_point_cache",
+                    "point_id": point.point_id,
+                }
+                return {
+                    "point_id": point.point_id,
+                    "pixel_xy": [round(value, 3) for value in point.pixel_xy],
+                    "position_xyz": [
+                        round(float(value), 6) for value in point.position_xyz
+                    ],
+                    "reused": True,
+                }
         camera = self.ws._camera()
         rgb = _camera_image(camera, "rgb")
         crop_rgb, origin = self.ws._crop_rgb(rgb, within_region_id)
@@ -344,6 +389,19 @@ class ContextFunctions:
             position_xyz=tuple(float(value) for value in position),
             source_revision=self.ws.state.observation_revision,
         )
+        archive = archive_window(
+            camera,
+            (
+                pixel[0] - POINT_WINDOW_HALF_PX,
+                pixel[1] - POINT_WINDOW_HALF_PX,
+                pixel[0] + POINT_WINDOW_HALF_PX,
+                pixel[1] + POINT_WINDOW_HALF_PX,
+            ),
+            mask=None,
+            revision=self.ws.state.observation_revision,
+        )
+        if archive is not None:
+            self.ws._private.evidence_archives[point_id] = archive
         return {
             "point_id": point_id,
             "pixel_xy": [round(value, 3) for value in pixel],
@@ -368,25 +426,25 @@ class ContextFunctions:
             base_from_camera = np.asarray(camera["pose_mat"], dtype=np.float64).reshape(4, 4)
         except (KeyError, ValueError) as exc:
             raise ContextFunctionError(f"invalid camera pose: {exc}") from exc
-        object_points = (
-            geometry.filtered_object_points_base if geometry is not None else None
+        object_points = geometry.filtered_object_points_base if geometry is not None else None
+        reference_quaternion = (
+            self.ws.state.robot.ee_pose.quaternion_xyzw
+            if self.ws.state.robot is not None and self.ws.state.robot.ee_pose is not None
+            else None
         )
         prepared, diagnostic = _prepare_grasps(
             planned,
             poses_are_base_frame=False,
             base_from_camera=base_from_camera,
-            reference_quaternion_xyzw=(
-                self.ws.state.robot.ee_pose.quaternion_xyzw
-                if self.ws.state.robot is not None and self.ws.state.robot.ee_pose is not None
-                else None
-            ),
+            reference_quaternion_xyzw=reference_quaternion,
             object_points_base=object_points,
         )
-        geometric, geometric_diagnostic = _geometric_grasps(object_points)
-        pool = [*geometric, *prepared]
-        ranked = _select_grasp_mixture(
-            pool, limit=max(len(pool), self.ws.MAX_GRASP_CANDIDATES)
+        geometric, geometric_diagnostic = _geometric_grasps(
+            object_points,
+            reference_quaternion_xyzw=reference_quaternion,
         )
+        pool = [*geometric, *prepared]
+        ranked = _select_grasp_mixture(pool, limit=max(len(pool), self.ws.MAX_GRASP_CANDIDATES))
         reachable: list[tuple[_PreparedGrasp, ActionPrediction]] = []
         dropped: list[dict[str, Any]] = []
         for item in ranked:
@@ -399,9 +457,7 @@ class ContextFunctions:
                         "family": item.family,
                         "solve_ik": prediction.solve_ik,
                         "reason": (
-                            "ik_error"
-                            if prediction.solve_ik != "returned"
-                            else "ik_mismatch"
+                            "ik_error" if prediction.solve_ik != "returned" else "ik_mismatch"
                         ),
                         "target_xyz": _rounded_vector(item.target.position_xyz),
                     }
@@ -430,6 +486,13 @@ class ContextFunctions:
                 f"grasp planner returned no kinematically reachable candidates for '{region_id}'"
             )
 
+        # One proposal call defines one current comparison set.  Replacing
+        # the catalogue here prevents stale alternatives from accumulating
+        # across repeated planning calls in the same observation revision.
+        # Do this only after a new set succeeds, so a failed proposal leaves
+        # the previous candidates usable.
+        self.ws.state.seeds.clear()
+        self.ws._private.seed_artifacts.clear()
         ids: list[str] = []
         for item, prediction in reachable:
             seed_id = self.ws.state.next_id("s")
@@ -447,7 +510,11 @@ class ContextFunctions:
                 family=item.family,
             )
             ids.append(seed_id)
-        return {"seed_ids": ids}
+        result: dict[str, Any] = {"seed_ids": ids}
+        width_advisory = _top_width_advisory(geometric_diagnostic)
+        if width_advisory is not None:
+            result["advisory"] = width_advisory
+        return result
 
     def _build_region_geometry(
         self,
@@ -556,7 +623,7 @@ class ContextFunctions:
             tuple(float(value) for value in np.asarray(point.position_xyz) + offset),
             quaternion,
         )
-        return self._create_pending_action(
+        return self._create_action_proposal(
             ActionTarget(pose=target),
             ActionArtifacts(
                 planning_context=PlanningContext(
@@ -574,14 +641,23 @@ class ContextFunctions:
         artifacts = self.ws._private.seed_artifacts.get(seed_id)
         if artifacts is None:
             raise ContextFunctionError(f"seed '{seed_id}' has no private artifacts")
-        plan = self._plan_target(seed.target, artifacts.planning_context)
+        plan_reused = artifacts.motion_plan is not None
+        plan = (
+            artifacts.motion_plan
+            if plan_reused
+            else self._plan_target(seed.target, artifacts.planning_context)
+        )
+        if not plan_reused:
+            self.ws._private.seed_artifacts[seed_id] = replace(
+                artifacts, motion_plan=plan
+            )
         region = (
             self.ws.state.regions.get(artifacts.planning_context.region_id)
             if artifacts.planning_context is not None
             and artifacts.planning_context.region_id is not None
             else None
         )
-        return self._create_pending_action(
+        result = self._create_action_proposal(
             seed.target,
             ActionArtifacts(
                 planning_context=artifacts.planning_context,
@@ -593,6 +669,9 @@ class ContextFunctions:
                 else "execute selected spatial approach"
             ),
         )
+        if plan_reused:
+            result["plan_reused"] = True
+        return result
 
     def delta_move(
         self,
@@ -622,7 +701,7 @@ class ContextFunctions:
         )
         planning_context = artifacts.planning_context
         plan = self._plan_adjusted_pose(target, planning_context)
-        return self._store_pending_action(
+        return self._store_action_proposal(
             ActionTarget(pose=target),
             ActionArtifacts(
                 planning_context=planning_context,
@@ -678,7 +757,7 @@ class ContextFunctions:
         )
         planning_context = artifacts.planning_context
         plan = self._plan_adjusted_pose(target, planning_context)
-        return self._store_pending_action(
+        return self._store_action_proposal(
             ActionTarget(pose=target),
             ActionArtifacts(
                 planning_context=planning_context,
@@ -693,7 +772,7 @@ class ContextFunctions:
         )
 
     def _adjustment_reference(self) -> tuple[Pose, ActionArtifacts]:
-        action = self.ws.state.pending_action
+        action = self.ws.state.action_proposal
         if action is not None:
             reference_rotation = _pose_rotation(action.target.pose)
             reference = Pose(
@@ -739,7 +818,7 @@ class ContextFunctions:
             )
         return backend.plan_pose(target)
 
-    def _create_pending_action(
+    def _create_action_proposal(
         self,
         target: ActionTarget,
         artifacts: ActionArtifacts,
@@ -757,20 +836,21 @@ class ContextFunctions:
             rotation_gizmo_axis=None,
             turn_count=0,
         )
-        self.ws.state.pending_action = PendingAction(action_id, target, intent)
+        self.ws.state.action_proposal = ActionProposal(action_id, target, intent)
         self.ws._private.action_artifacts = artifacts
         self.ws._private.clear_contact_camera_lock()
         return _preview_result(action_id, target, artifacts)
 
-    def _store_pending_action(
+    def _store_action_proposal(
         self, target: ActionTarget, artifacts: ActionArtifacts
     ) -> dict[str, Any]:
-        action = self.ws.state.pending_action
+        action = self.ws.state.action_proposal
         if action is None:
             raise ContextFunctionError("there is no pending action to edit")
-        before_target = (
-            action.target.summary()
-        )
+        plan = artifacts.motion_plan
+        if plan is None or plan.prediction.solve_ik != "returned":
+            return self._reject_action_edit(action, target, plan)
+        before_target = action.target.summary()
         previous = self.ws._private.action_artifacts
         turn_count = previous.turn_count if previous is not None else 0
         initial_target = (
@@ -800,11 +880,11 @@ class ContextFunctions:
             if previous is not None
             else None
         )
-        self.ws.state.pending_action = PendingAction(
+        self.ws.state.action_proposal = ActionProposal(
             action.action_id,
             target,
             action.intent,
-            ready_for_commit=False,
+            refined=False,
         )
         self.ws._private.action_artifacts = ActionArtifacts(
             planning_context=artifacts.planning_context,
@@ -820,8 +900,8 @@ class ContextFunctions:
             "target_before": before_target,
             "target_after": target.summary(),
             "refinement_instruction": (
-                self.ws.state.refinement.instruction
-                if self.ws.state.refinement is not None
+                self.ws.state.imagination.instruction
+                if self.ws.state.imagination is not None
                 else None
             ),
             "turn_count": turn_count,
@@ -841,6 +921,36 @@ class ContextFunctions:
         }
         return _preview_result(action.action_id, target, self.ws._private.action_artifacts)
 
+    def _reject_action_edit(
+        self,
+        action: ActionProposal,
+        target: ActionTarget,
+        plan: MotionPlan | None,
+    ) -> dict[str, Any]:
+        """Keep the last executable proposal when one edit fails to plan.
+
+        An edit is atomic: the working proposal and its cached plan are
+        replaced together or not at all.  Leaving an unplannable target in
+        place would move the Canvas and the next edit's reference onto a
+        target that can never be committed.
+        """
+
+        detail = plan.prediction.detail if plan is not None else None
+        self.ws._private.trace_diagnostics["imagination_edit_rejected"] = {
+            "kept_target": action.target.summary(),
+            "rejected_target": target.summary(),
+            "solve_ik": plan.prediction.solve_ik if plan is not None else "unavailable",
+            "detail": detail,
+        }
+        result: dict[str, Any] = {
+            "action_id": action.action_id,
+            "preview": "unchanged",
+            "reason": "plan_unavailable",
+        }
+        if detail:
+            result["detail"] = detail
+        return result
+
     def _plan_target(
         self, target: ActionTarget, context: PlanningContext | None
     ) -> MotionPlan | None:
@@ -848,9 +958,7 @@ class ContextFunctions:
             region = self.ws.state.regions.get(context.region_id)
             mask = self.ws._private.region_masks.get(context.region_id)
             if region is None or mask is None:
-                raise ContextFunctionError(
-                    f"grasp source '{context.source_ref}' is unavailable"
-                )
+                raise ContextFunctionError(f"grasp source '{context.source_ref}' is unavailable")
             return self.ws.motion.plan_grasp(
                 target.pose,
                 object_name=region.query,
@@ -908,8 +1016,7 @@ class ContextFunctions:
         target = Pose(
             tuple(
                 float(value)
-                for value in np.asarray(reference.position_xyz, dtype=np.float64)
-                + displacement
+                for value in np.asarray(reference.position_xyz, dtype=np.float64) + displacement
             ),
             tuple(float(value) for value in rotation.as_quat()),
         )
@@ -939,22 +1046,21 @@ class ContextFunctions:
             outcome="completed" if execution_error is None else "arm_failed",
             requested_arm_delta_base_m=displacement_base,
             error_detail=str(execution_error) if execution_error is not None else None,
-            evidence_invalidated=True,
-            recovery_hint=(
-                _COMMIT_FAILURE_RECOVERY_HINT if execution_error is not None else None
-            ),
-        )
-        self.ws._private.last_physical_artifacts = LastPhysicalArtifacts(
-            focus_pose=target,
-            subject_query=(
+            source_query=(
                 previous_physical.subject_query
                 if previous_physical is not None
                 else None
             ),
+            evidence_invalidated=True,
+            recovery_hint=(_COMMIT_FAILURE_RECOVERY_HINT if execution_error is not None else None),
+        )
+        self.ws._private.last_physical_artifacts = LastPhysicalArtifacts(
+            focus_pose=target,
+            subject_query=(
+                previous_physical.subject_query if previous_physical is not None else None
+            ),
             subject_points_base=(
-                previous_physical.subject_points_base
-                if previous_physical is not None
-                else None
+                previous_physical.subject_points_base if previous_physical is not None else None
             ),
         )
         self.ws._private.trace_diagnostics["direct_delta_move"] = {
@@ -977,16 +1083,15 @@ class ContextFunctions:
                 ),
                 6,
             )
+        changes = change_summary(self.ws.last_evidence_report)
+        if changes:
+            result["world_changes"] = changes
         return result
 
     def commit(self, action_id: str) -> dict[str, Any]:
-        action = self.ws.state.pending_action
+        action = self.ws.state.action_proposal
         if action is None or action.action_id != action_id:
             raise ContextFunctionError(f"unknown or expired action_id '{action_id}'")
-        if not action.ready_for_commit:
-            raise ContextFunctionError(
-                f"action '{action_id}' is a coarse proposal; call refine_action before commit"
-            )
         start_tcp = self.ws.state.robot.tcp_pose if self.ws.state.robot is not None else None
         requested_arm_delta = (
             tuple(
@@ -1005,12 +1110,13 @@ class ContextFunctions:
         # failures.  Keep the current observation/revision intact and expose
         # the problem only as the current FunctionEvent.
         if artifacts is None:
-            raise ContextFunctionError(
-                f"active action '{action_id}' has no private artifacts"
-            )
+            raise ContextFunctionError(f"active action '{action_id}' has no private artifacts")
         if artifacts.motion_plan is None:
+            raise ContextFunctionError(f"active action '{action_id}' has no cached motion plan")
+        if artifacts.motion_plan.prediction.solve_ik != "returned":
             raise ContextFunctionError(
-                f"active action '{action_id}' has no cached motion plan"
+                f"active action '{action_id}' has no executable cached plan; "
+                "adjust the target or delegate it to call_imagination"
             )
 
         execution_error: ContextFunctionError | None = None
@@ -1019,9 +1125,7 @@ class ContextFunctions:
         previous_physical = self.ws._private.last_physical_artifacts
         subject_query = previous_physical.subject_query if previous_physical is not None else None
         subject_points = (
-            previous_physical.subject_points_base
-            if previous_physical is not None
-            else None
+            previous_physical.subject_points_base if previous_physical is not None else None
         )
         planning_context = artifacts.planning_context if artifacts is not None else None
         object_proxy = None
@@ -1058,13 +1162,25 @@ class ContextFunctions:
                 if geometry is not None:
                     subject_points = geometry.filtered_object_points_base
                     object_proxy = geometry.volume_proxy
+        # The grasp-source region is the contact target of this motion; the
+        # action's purpose is to change it, so it is retired without waiting
+        # for a pixel vote.  Placement destinations stay subject to the
+        # regular revalidation: putting an object inside a basket changes the
+        # basket's interior pixels, not our confidence in the basket itself.
+        contact_region_ids = (
+            (planning_context.region_id,)
+            if planning_context is not None
+            and planning_context.source_kind == "grasp"
+            and planning_context.region_id is not None
+            else ()
+        )
         try:
             self.ws.execute_motion_plan(artifacts.motion_plan, action.target.pose)
             failed_stage = None
         except MotionBackendError as exc:
             execution_error = ContextFunctionError(str(exc))
         finally:
-            self.ws.refresh_observation()
+            self.ws.refresh_observation(invalidate_region_ids=contact_region_ids)
 
         stage_summary = "arm"
         if execution_error is None:
@@ -1133,6 +1249,9 @@ class ContextFunctions:
         result: dict[str, Any] = {}
         if position_error is not None:
             result["position_error_m"] = round(position_error, 6)
+        changes = change_summary(self.ws.last_evidence_report)
+        if changes:
+            result["world_changes"] = changes
         return result
 
     def open_gripper(self) -> dict[str, Any]:
@@ -1148,7 +1267,7 @@ class ContextFunctions:
         normalized_axis = str(axis).lower()
         if normalized_axis not in {"x", "y", "z"}:
             raise ContextFunctionError("axis must be one of 'x', 'y', or 'z'")
-        action = self.ws.state.pending_action
+        action = self.ws.state.action_proposal
         if action is None:
             raise ContextFunctionError("there is no pending action")
         artifacts = self.ws._private.action_artifacts or ActionArtifacts()
@@ -1174,9 +1293,7 @@ class ContextFunctions:
         """Execute a simple Main-owned gripper command immediately."""
 
         normalized_target = _gripper_target(target)
-        backend_function = (
-            "open_gripper" if normalized_target == "open" else "close_gripper"
-        )
+        backend_function = "open_gripper" if normalized_target == "open" else "close_gripper"
         focus_pose = self.ws.state.robot.tcp_pose if self.ws.state.robot is not None else None
         previous_physical = self.ws._private.last_physical_artifacts
         candidate = self.ws._private.object_proxy_candidate
@@ -1193,28 +1310,27 @@ class ContextFunctions:
             outcome="completed" if execution_error is None else "gripper_failed",
             target_gripper=normalized_target,
             error_detail=str(execution_error) if execution_error is not None else None,
+            source_query=(
+                previous_physical.subject_query
+                if previous_physical is not None
+                else None
+            ),
             evidence_invalidated=True,
         )
         self.ws._private.last_physical_artifacts = LastPhysicalArtifacts(
             focus_pose=focus_pose,
             subject_query=(
-                previous_physical.subject_query
-                if previous_physical is not None
-                else None
+                previous_physical.subject_query if previous_physical is not None else None
             ),
             subject_points_base=(
-                previous_physical.subject_points_base
-                if previous_physical is not None
-                else None
+                previous_physical.subject_points_base if previous_physical is not None else None
             ),
         )
         if execution_error is None and normalized_target == "open":
             self.ws._private.object_proxy_candidate = None
             self.ws._private.attachment_hypothesis = None
         elif execution_error is None and normalized_target == "closed" and candidate is not None:
-            observed_tcp = (
-                self.ws.state.robot.tcp_pose if self.ws.state.robot is not None else None
-            )
+            observed_tcp = self.ws.state.robot.tcp_pose if self.ws.state.robot is not None else None
             if observed_tcp is not None:
                 self.ws._private.attachment_hypothesis = bind_proxy_to_tcp(
                     candidate,
@@ -1224,76 +1340,144 @@ class ContextFunctions:
         self.ws._private.trace_diagnostics["attachment_preview"] = {
             "command": normalized_target,
             "candidate_available_before": candidate is not None,
-            "hypothesis_available_after": (
-                self.ws._private.attachment_hypothesis is not None
-            ),
+            "hypothesis_available_after": (self.ws._private.attachment_hypothesis is not None),
         }
         if execution_error is not None:
             raise execution_error
         opening = self.ws.state.robot.gripper_opening if self.ws.state.robot is not None else None
-        return (
-            {"gripper_opening": round(float(opening), 6)}
-            if opening is not None
-            else {}
-        )
+        result = {"gripper_opening": round(float(opening), 6)} if opening is not None else {}
+        if normalized_target == "closed":
+            self.ws.state.gripper_close_count += 1
+            count = self.ws.state.gripper_close_count
+            if count >= 2:
+                subject = (
+                    previous_physical.subject_query
+                    if previous_physical is not None and previous_physical.subject_query
+                    else None
+                )
+                near = f" near '{subject}'" if subject else ""
+                result["advisory"] = (
+                    f"this is close_gripper attempt #{count} this episode{near}; "
+                    "check the gripper opening and Contact views before releasing again"
+                )
+        changes = change_summary(self.ws.last_evidence_report)
+        if changes:
+            result["world_changes"] = changes
+        return result
 
     def finish_imagination(self, status: str) -> dict[str, Any]:
         if status not in {"ready", "failed"}:
             raise ContextFunctionError("status must be 'ready' or 'failed'")
         if status == "failed":
             return self._fail_imagination("agent_failed")
-        return self._finish_refinement("agent_ready")
+        return self._finish_imagination("agent_ready")
 
     def reject_action(self, action_id: str) -> dict[str, Any]:
         """Decline a reviewed virtual target without changing the world."""
 
-        action = self.ws.state.pending_action
+        action = self.ws.state.action_proposal
         if action is None or action.action_id != action_id:
             raise ContextFunctionError(f"unknown or expired action_id '{action_id}'")
-        self.ws.discard_pending_action()
+        self.ws.discard_action_proposal()
         return {
             "declined_action_id": action_id,
             "declined_how": "explicit",
             "declined_intent": action.intent,
         }
 
-    def limit_imagination(self) -> dict[str, Any]:
-        """Fail a refinement session that did not converge within its budget."""
+    def fail_imagination(self, termination_reason: str) -> dict[str, Any]:
+        """Fail the active Imagination session with a classified reason."""
 
-        return self._fail_imagination("turn_limit")
+        return self._fail_imagination(termination_reason)
+
+    def limit_imagination(self) -> dict[str, Any]:
+        """Hand a budget-exhausted session back to Main as a partial refinement.
+
+        Budget exhaustion is not a quality verdict: every accepted edit already
+        passed the planner transaction, so the last edited target is executable
+        and worth Main's Preview review.  Rollback stays reserved for semantic
+        failures (the subagent judged the goal unreachable) and internal errors
+        whose state cannot be trusted.
+        """
+
+        session = self.ws.state.imagination
+        if session is None:
+            raise ContextFunctionError("there is no active imagination session")
+        action = self.ws.state.action_proposal
+        artifacts = self.ws._private.action_artifacts
+        plan = artifacts.motion_plan if artifacts is not None else None
+        if action is None or plan is None or plan.prediction.solve_ik != "returned":
+            return self._fail_imagination("turn_limit_without_executable_plan")
+        self.ws.state.action_proposal = replace(action, refined=True)
+        self.ws.state.imagination = None
+        self.ws._private.imagination_checkpoint = None
+        self.ws.state.imagination_attempts.record(failed=False)
+        self.ws._private.trace_diagnostics["imagination_handoff"] = {
+            "status": "partial",
+            "termination_reason": "turn_limit",
+            "action_id": action.action_id,
+            "source_ref": _planning_source_ref(artifacts),
+            "target": action.target.summary(),
+            "intent": action.intent,
+        }
+        return {
+            "status": "partial",
+            "action_id": action.action_id,
+            "reason": "turn_limit",
+            "advisory": (
+                "imagination spent its turn budget without declaring ready; "
+                "the action keeps its last planner-checked edit — review the "
+                "Preview, then commit, re-delegate with a sharper instruction, "
+                "or reject"
+            ),
+        }
 
     def _fail_imagination(self, termination_reason: str) -> dict[str, Any]:
-        session = self.ws.state.refinement
+        session = self.ws.state.imagination
         if session is None:
-            raise ContextFunctionError("there is no active refinement session")
-        source_ref = _planning_source_ref(self.ws._private.action_artifacts)
+            raise ContextFunctionError("there is no active imagination session")
+        checkpoint = self.ws._private.imagination_checkpoint
+        source_artifacts = self.ws._private.action_artifacts
+        if source_artifacts is None and checkpoint is not None:
+            source_artifacts = checkpoint[1]
+        source_ref = _planning_source_ref(source_artifacts)
         failed_action_id = session.action_id
-        # A failed refinement is not a deliverable action.  Keeping the coarse
-        # target live caused Main to re-dispatch the same impossible local task
-        # indefinitely.  Seeds/evidence remain valid so Main can choose a new
-        # source, but the failed action itself is retired.
-        self.ws.discard_pending_action()
+        reason = _policy_fail_reason(termination_reason)
+        self.ws.restore_imagination_checkpoint()
+        self.ws.state.imagination_attempts.record(
+            failed=True,
+            reason=reason,
+            source_ref=source_ref,
+        )
         self.ws._private.trace_diagnostics["imagination_handoff"] = {
             "status": "failed",
             "termination_reason": termination_reason,
+            "reason": reason,
             "source_ref": source_ref,
             "failed_action_id": failed_action_id,
         }
-        return {"status": "failed", "source_ref": source_ref}
+        result: dict[str, Any] = {
+            "status": "failed",
+            "action_id": failed_action_id,
+            "reason": reason,
+        }
+        if source_ref is not None:
+            result["source_ref"] = source_ref
+        return result
 
-    def _finish_refinement(self, termination_reason: str) -> dict[str, Any]:
-        session = self.ws.state.refinement
-        action = self.ws.state.pending_action
+    def _finish_imagination(self, termination_reason: str) -> dict[str, Any]:
+        session = self.ws.state.imagination
+        action = self.ws.state.action_proposal
         if session is None or action is None:
-            raise ContextFunctionError("there is no active refinement session")
+            raise ContextFunctionError("there is no active imagination session")
         artifacts = self.ws._private.action_artifacts or ActionArtifacts()
         plan = artifacts.motion_plan
         if plan is None or plan.prediction.solve_ik != "returned":
-            return self._fail_imagination(
-                f"{termination_reason}_without_executable_plan"
-            )
-        self.ws.state.pending_action = replace(action, ready_for_commit=True)
-        self.ws.state.refinement = None
+            return self._fail_imagination(f"{termination_reason}_without_executable_plan")
+        self.ws.state.action_proposal = replace(action, refined=True)
+        self.ws.state.imagination = None
+        self.ws._private.imagination_checkpoint = None
+        self.ws.state.imagination_attempts.record(failed=False)
         self.ws._private.trace_diagnostics["imagination_handoff"] = {
             "status": "ready",
             "termination_reason": termination_reason,
@@ -1324,6 +1508,18 @@ def _planning_source_ref(artifacts: ActionArtifacts | None) -> str | None:
     return artifacts.planning_context.source_ref
 
 
+def _policy_fail_reason(termination_reason: str) -> str:
+    if termination_reason.endswith("_without_executable_plan"):
+        return "plan_unavailable"
+    if termination_reason == "agent_failed":
+        return "geometry_unresolved"
+    if termination_reason == "turn_limit":
+        return "turn_limit"
+    if termination_reason == "subagent_error":
+        return "subagent_error"
+    return "geometry_unresolved"
+
+
 def _preview_result(
     action_id: str,
     target: ActionTarget,
@@ -1340,6 +1536,8 @@ def _preview_result(
                 "collision_checked": prediction.collision_checked,
             }
         )
+        if prediction.detail:
+            result["detail"] = prediction.detail
     return result
 
 
@@ -1499,8 +1697,7 @@ def _near_duplicate_approach(
         return False
     approach = _approach_vector(item)
     return any(
-        float(np.dot(approach, _approach_vector(existing))) >= threshold
-        for existing in chosen
+        float(np.dot(approach, _approach_vector(existing))) >= threshold for existing in chosen
     )
 
 
@@ -1518,8 +1715,10 @@ def _prepared_from_contact(
     if not np.isfinite(position_xyz).all() or not np.isfinite(quaternion_xyzw).all():
         return None
     approach_z = float(rotation[2, 2])
-    if approach_z > 0.0:
+    if approach_z > 1e-6:
         return None
+    if abs(approach_z) < 1e-8:
+        approach_z = 0.0
     contact = np.asarray(position_xyz, dtype=np.float64).reshape(3)
     if (
         source_center is not None
@@ -1539,24 +1738,154 @@ def _prepared_from_contact(
     )
 
 
-def _side_quaternion_xyzw(approach_axis: np.ndarray) -> tuple[float, float, float, float] | None:
-    z_axis = np.asarray(approach_axis, dtype=np.float64)
-    norm = float(np.linalg.norm(z_axis))
-    if norm < 1e-8:
-        return None
-    z_axis = z_axis / norm
-    y_axis = np.cross(z_axis, np.array([0.0, 0.0, 1.0]))
+def _grasp_quaternion_xyzw(
+    *,
+    closing_axis: np.ndarray,
+    approach_axis: np.ndarray,
+    reference_quaternion_xyzw: tuple[float, float, float, float] | None = None,
+) -> tuple[float, float, float, float] | None:
+    """Build a Panda grasp frame from its closing and approach directions.
+
+    Public grasp poses use local Y as the parallel-jaw closing axis and local
+    Z as the approach axis.  Constructing both explicitly prevents a PCA body
+    axis from being accidentally reused as the closing direction.
+
+    The closing axis comes from PCA/OBB fits whose sign is a numerical
+    accident, yet a parallel-jaw grasp is unchanged by a local-Z half turn.
+    When a reference orientation (the observed hand) is given, the half-turn
+    representative closer to it is returned, mirroring the Contact-GraspNet
+    conversion, so top-down/PCA seeds stop demanding a needless ~180-degree
+    wrist spin.
+    """
+
+    y_axis = np.asarray(closing_axis, dtype=np.float64)
     y_norm = float(np.linalg.norm(y_axis))
     if y_norm < 1e-8:
         return None
     y_axis = y_axis / y_norm
+
+    z_axis = np.asarray(approach_axis, dtype=np.float64)
+    z_axis = z_axis - y_axis * float(np.dot(z_axis, y_axis))
+    z_norm = float(np.linalg.norm(z_axis))
+    if z_norm < 1e-8:
+        return None
+    z_axis = z_axis / z_norm
+
     x_axis = np.cross(y_axis, z_axis)
-    quaternion = Rotation.from_matrix(np.column_stack([x_axis, y_axis, z_axis])).as_quat()
+    x_norm = float(np.linalg.norm(x_axis))
+    if x_norm < 1e-8:
+        return None
+    x_axis = x_axis / x_norm
+    z_axis = np.cross(x_axis, y_axis)
+    rotation = Rotation.from_matrix(np.column_stack([x_axis, y_axis, z_axis]))
+    if reference_quaternion_xyzw is not None:
+        reference = np.asarray(reference_quaternion_xyzw, dtype=np.float64).reshape(4)
+        if np.isfinite(reference).all() and float(np.linalg.norm(reference)) > 1e-12:
+            reference_rotation = Rotation.from_quat(reference / np.linalg.norm(reference))
+            flipped = Rotation.from_matrix(np.column_stack([-x_axis, -y_axis, z_axis]))
+            original_distance = (reference_rotation.inv() * rotation).magnitude()
+            flipped_distance = (reference_rotation.inv() * flipped).magnitude()
+            if flipped_distance + 1e-9 < original_distance:
+                rotation = flipped
+    quaternion = rotation.as_quat()
     return tuple(float(value) for value in quaternion)
+
+
+def _top_width_advisory(diagnostic: dict[str, Any]) -> str | None:
+    """Explain a width-gated top-down family to the agent, with numbers."""
+
+    for entry in diagnostic.get("rejected", ()):
+        if entry.get("family") != "top":
+            continue
+        if "narrow_extent_exceeds_gripper_opening" not in entry.get("reasons", ()):
+            continue
+        narrow = entry.get("narrow_extent_m")
+        if not isinstance(narrow, (int, float)):
+            return None
+        return (
+            "no top-down candidate: the object's narrowest horizontal extent "
+            f"{narrow * 100:.1f} cm plus clearance exceeds the "
+            f"{_GRIPPER_MAX_OPENING_M * 100:.0f} cm gripper opening; "
+            "only side/end-on approaches were proposed"
+        )
+    return None
+
+
+def _top_grasp_from_obb(
+    object_points: np.ndarray,
+    *,
+    source_center: np.ndarray | None,
+    source_radius_m: float | None,
+    reference_quaternion_xyzw: tuple[float, float, float, float] | None = None,
+) -> tuple[_PreparedGrasp | None, dict[str, Any] | None]:
+    """Build the TOP candidate from a gravity-stable OBB fit.
+
+    The yaw follows the minimum-area box so the fingers close across the
+    narrower horizontal edge; the box width decides up front whether the jaws
+    can physically span the object, and the box top face gives a contact
+    depth that is robust to label/noise outliers in the raw cloud.  Fitted
+    with zero padding so the width gate compares bare geometry against the
+    explicit margin.
+    """
+
+    proxy = fit_gravity_stable_proxy("top-grasp", 0, object_points, padding_m=0.0)
+    if proxy is None:
+        return None, {"index": 0, "family": "top", "reasons": ["obb_fit_failed"]}
+    rotation = np.asarray(proxy.rotation_base_from_obb, dtype=np.float64)
+    extent = np.asarray(proxy.extent_xyz_m, dtype=np.float64)
+    obb_center = np.asarray(proxy.center_base_xyz, dtype=np.float64)
+    narrow_index = int(np.argmin(extent[:2]))
+    narrow_extent = float(extent[narrow_index])
+    wide_extent = float(extent[1 - narrow_index])
+    if narrow_extent + _TOP_WIDTH_MARGIN_M >= _GRIPPER_MAX_OPENING_M:
+        return None, {
+            "index": 0,
+            "family": "top",
+            "reasons": ["narrow_extent_exceeds_gripper_opening"],
+            "narrow_extent_m": round(narrow_extent, 4),
+            "wide_extent_m": round(wide_extent, 4),
+            "width_margin_m": _TOP_WIDTH_MARGIN_M,
+            "max_opening_m": _GRIPPER_MAX_OPENING_M,
+        }
+    if narrow_extent >= _TOP_DEGENERATE_RATIO * wide_extent:
+        # Near-square or round footprint: the minimum-area yaw is noise, so
+        # close tangentially to the base-to-object direction instead, which
+        # keeps the wrist in its most natural top-down configuration.
+        radial = obb_center[:2].copy()
+        norm = float(np.linalg.norm(radial))
+        unit = radial / norm if norm > 1e-8 else np.array([1.0, 0.0])
+        closing_axis = np.array([-unit[1], unit[0], 0.0])
+    else:
+        closing_axis = rotation[:, narrow_index]
+    # Descend a fixed offset from the OBB top face, but never target below
+    # the box vertical midpoint on thin objects.
+    top_face_z = float(obb_center[2] + 0.5 * extent[2])
+    top_contact_z = max(top_face_z - _TOP_GRASP_OFFSET_M, float(obb_center[2]))
+    quaternion = _grasp_quaternion_xyzw(
+        closing_axis=closing_axis,
+        approach_axis=np.array([0.0, 0.0, -1.0]),
+        reference_quaternion_xyzw=reference_quaternion_xyzw,
+    )
+    if quaternion is None:
+        return None, {"index": 0, "family": "top", "reasons": ["invalid_rotation"]}
+    item = _prepared_from_contact(
+        np.array([obb_center[0], obb_center[1], top_contact_z]),
+        quaternion,
+        family="top",
+        score=0.6,
+        raw_index=0,
+        source_center=source_center,
+        source_radius_m=source_radius_m,
+    )
+    if item is None:
+        return None, {"index": 0, "family": "top", "reasons": ["filtered"]}
+    return item, None
 
 
 def _geometric_grasps(
     object_points_base: np.ndarray | None,
+    *,
+    reference_quaternion_xyzw: tuple[float, float, float, float] | None = None,
 ) -> tuple[list[_PreparedGrasp], dict[str, Any]]:
     object_points = (
         _points_array(object_points_base)
@@ -1570,21 +1899,6 @@ def _geometric_grasps(
         return prepared, {"raw_count": 0, "accepted_count": 0, "rejected": rejected}
 
     center = np.median(object_points, axis=0)
-    top_z = float(np.percentile(object_points[:, 2], 95))
-    top = _prepared_from_contact(
-        np.array([center[0], center[1], top_z - _TOP_GRASP_OFFSET_M]),
-        _LIBERO_TOP_QUAT_XYZW,
-        family="top",
-        score=0.6,
-        raw_index=0,
-        source_center=source_center,
-        source_radius_m=source_radius_m,
-    )
-    if top is None:
-        rejected.append({"index": 0, "family": "top", "reasons": ["filtered"]})
-    else:
-        prepared.append(top)
-
     covariance = np.cov((object_points - center).T)
     eigenvalues, eigenvectors = np.linalg.eigh(covariance)
     body_axis = eigenvectors[:, int(np.argmax(eigenvalues))].copy()
@@ -1592,13 +1906,64 @@ def _geometric_grasps(
     if float(np.linalg.norm(body_axis)) < 1e-8:
         body_axis = np.array([1.0, 0.0, 0.0])
     body_axis = body_axis / np.linalg.norm(body_axis)
-    side_axis = np.array([-body_axis[1], body_axis[0], 0.0])
+    closing_axis = np.array([-body_axis[1], body_axis[0], 0.0])
+
+    # TOP is OBB-driven (yaw, width feasibility, contact depth); the PCA
+    # candidates below keep their covariance-based construction unchanged.
+    top, top_rejection = _top_grasp_from_obb(
+        object_points,
+        source_center=source_center,
+        source_radius_m=source_radius_m,
+        reference_quaternion_xyzw=reference_quaternion_xyzw,
+    )
+    if (
+        top is None
+        and top_rejection is not None
+        and "obb_fit_failed" in top_rejection.get("reasons", ())
+    ):
+        # Near-planar clouds (single visible face) cannot support the OBB
+        # gate; keep the legacy PCA-yaw construction rather than silently
+        # losing the whole top-down family.
+        bottom_z = float(np.percentile(object_points[:, 2], 5))
+        top_z = float(np.percentile(object_points[:, 2], 95))
+        top_contact_z = max(top_z - _TOP_GRASP_OFFSET_M, 0.5 * (bottom_z + top_z))
+        top_quaternion = _grasp_quaternion_xyzw(
+            closing_axis=closing_axis,
+            approach_axis=np.array([0.0, 0.0, -1.0]),
+            reference_quaternion_xyzw=reference_quaternion_xyzw,
+        )
+        if top_quaternion is not None:
+            top = _prepared_from_contact(
+                np.array([center[0], center[1], top_contact_z]),
+                top_quaternion,
+                family="top",
+                score=0.6,
+                raw_index=0,
+                source_center=source_center,
+                source_radius_m=source_radius_m,
+            )
+    if top is None:
+        rejected.append(top_rejection or {"index": 0, "family": "top", "reasons": ["filtered"]})
+    else:
+        prepared.append(top)
+
     grasp_z = float(
-        np.clip(center[2], np.percentile(object_points[:, 2], 30), np.percentile(object_points[:, 2], 70))
+        np.clip(
+            center[2],
+            np.percentile(object_points[:, 2], 30),
+            np.percentile(object_points[:, 2], 70),
+        )
     )
     grasp = np.array([center[0], center[1], grasp_z])
+    # PCA also contributes non-top-down, end-on approaches from both ends of
+    # the long axis.  Their closing axis is still perpendicular to the body;
+    # unlike the previous construction, they never close along the long axis.
     for offset, sign in enumerate((1.0, -1.0), start=1):
-        quaternion = _side_quaternion_xyzw(sign * side_axis)
+        quaternion = _grasp_quaternion_xyzw(
+            closing_axis=closing_axis,
+            approach_axis=sign * body_axis,
+            reference_quaternion_xyzw=reference_quaternion_xyzw,
+        )
         if quaternion is None:
             rejected.append({"index": offset, "family": "pca", "reasons": ["invalid_rotation"]})
             continue

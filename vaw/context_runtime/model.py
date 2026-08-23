@@ -51,32 +51,71 @@ class ActionSeed:
 
 
 @dataclass(frozen=True)
-class PendingAction:
-    """One spatial action awaiting optional refinement or physical commit."""
+class ActionProposal:
+    """One Main-owned spatial action that has not been executed.
+
+    ``refined`` records provenance only: whether an Imagination session
+    delivered the current target.  It is not a commit qualification; commit
+    eligibility is decided by the executable cached plan alone.
+    """
 
     action_id: str
     target: ActionTarget
     intent: str
-    ready_for_commit: bool = False
+    refined: bool = False
 
     def summary(self) -> dict[str, Any]:
         return {
             "action_id": self.action_id,
             "target": self.target.summary(),
             "intent": self.intent,
-            "ready_for_commit": self.ready_for_commit,
+            "refined": self.refined,
         }
 
 
 @dataclass(frozen=True)
-class RefinementSession:
+class ImaginationSession:
     """A synchronous, episode-private task delegated by Main to Imagination."""
 
     action_id: str
     instruction: str
     initial_target: ActionTarget
-    created_action: bool = False
 
+
+@dataclass
+class ImaginationAttempts:
+    """Revision-local Imagination session ledger, never a transcript."""
+
+    total: int = 0
+    failed: int = 0
+    last_reason: str | None = None
+    failed_source_refs: list[str] = field(default_factory=list)
+
+    def record(
+        self,
+        *,
+        failed: bool,
+        reason: str | None = None,
+        source_ref: str | None = None,
+    ) -> None:
+        self.total += 1
+        if not failed:
+            return
+        self.failed += 1
+        if reason:
+            self.last_reason = reason
+        if source_ref and source_ref not in self.failed_source_refs:
+            self.failed_source_refs.append(source_ref)
+
+    def summary(self) -> dict[str, Any] | None:
+        if self.total == 0:
+            return None
+        result: dict[str, Any] = {"total": self.total, "failed": self.failed}
+        if self.last_reason:
+            result["last_reason"] = self.last_reason
+        if self.failed_source_refs:
+            result["failed_source_refs"] = list(self.failed_source_refs)
+        return result
 
 @dataclass(frozen=True)
 class LastPhysicalAction:
@@ -121,6 +160,13 @@ class LastPhysicalAction:
             result["recovery_hint"] = self.recovery_hint
         return result
 
+# Grounded evidence is retained across physical actions and revalidated
+# against each new observation.  ``verified`` means the archived appearance
+# still matches the current image; ``occluded`` means the robot body (or a
+# closer surface) currently blocks the check, so the entry is kept but its
+# geometry could not be re-confirmed.  Evidence with positive proof of change
+# is deleted rather than flagged.
+EvidenceStatus = Literal["verified", "occluded"]
 
 @dataclass(frozen=True)
 class RegionEvidence:
@@ -129,6 +175,7 @@ class RegionEvidence:
     bbox_xyxy_px: tuple[float, float, float, float]
     source_revision: int
     within_region_id: str | None = None
+    status: EvidenceStatus = "verified"
 
     def summary(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -138,6 +185,8 @@ class RegionEvidence:
         }
         if self.within_region_id is not None:
             result["within_region_id"] = self.within_region_id
+        if self.status != "verified":
+            result["status"] = self.status
         return result
 
 
@@ -149,6 +198,7 @@ class PointEvidence:
     position_xyz: tuple[float, float, float]
     source_revision: int
     within_region_id: str | None = None
+    status: EvidenceStatus = "verified"
 
     def summary(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -159,8 +209,9 @@ class PointEvidence:
         }
         if self.within_region_id is not None:
             result["within_region_id"] = self.within_region_id
+        if self.status != "verified":
+            result["status"] = self.status
         return result
-
 
 @dataclass(frozen=True)
 class RobotState:
@@ -182,9 +233,7 @@ class RobotState:
             result["gripper_opening"] = round(float(self.gripper_opening), 6)
         return result
 
-
 SolveIKStatus = Literal["returned", "error", "unavailable"]
-
 
 @dataclass(frozen=True)
 class ActionPrediction:
@@ -204,7 +253,6 @@ class ActionPrediction:
             result["detail"] = self.detail
         return result
 
-
 @dataclass
 class ContextState:
     task_prompt: str
@@ -214,9 +262,13 @@ class ContextState:
     points: dict[str, PointEvidence] = field(default_factory=dict)
     seeds: dict[str, ActionSeed] = field(default_factory=dict)
     robot: RobotState | None = None
-    pending_action: PendingAction | None = None
-    refinement: RefinementSession | None = None
+    action_proposal: ActionProposal | None = None
+    imagination: ImaginationSession | None = None
     last_physical_action: LastPhysicalAction | None = None
+    imagination_attempts: ImaginationAttempts = field(default_factory=ImaginationAttempts)
+    # Episode-level behaviour ledger: repeated grasp closures surface as an
+    # advisory in the Function Event, never as a gate.
+    gripper_close_count: int = 0
     _counters: dict[str, int] = field(default_factory=dict, repr=False)
 
     def next_id(self, prefix: str) -> str:
@@ -224,30 +276,42 @@ class ContextState:
         return f"{prefix}{self._counters[prefix]}"
 
     def begin_revision(self) -> int:
+        # Grounded regions/points survive the revision boundary; the workspace
+        # revalidates them against the fresh observation immediately after and
+        # deletes only entries with positive evidence of change.  Seeds and the
+        # proposal stay revision-local: their cached plans start from a robot
+        # state that no longer exists.
         self.observation_revision += 1
-        self.regions.clear()
-        self.points.clear()
         self.seeds.clear()
-        self.pending_action = None
-        self.refinement = None
+        self.action_proposal = None
+        self.imagination = None
         self.last_physical_action = None
+        self.imagination_attempts = ImaginationAttempts()
         return self.observation_revision
 
     def manifest(self) -> dict[str, Any]:
-        return {
-            "pending_action": (
+        result: dict[str, Any] = {
+            "action_proposal": (
                 {
-                    "action_id": self.pending_action.action_id,
-                    "intent": self.pending_action.intent,
+                    "action_id": self.action_proposal.action_id,
+                    "intent": self.action_proposal.intent,
                     "state": (
-                        "ready" if self.pending_action.ready_for_commit else "coarse"
+                        "refined" if self.action_proposal.refined else "planned"
                     ),
                 }
-                if self.pending_action is not None
+                if self.action_proposal is not None
                 else None
             ),
             "regions": [
-                {"id": region.region_id, "query": region.query}
+                {
+                    "id": region.region_id,
+                    "query": region.query,
+                    **(
+                        {"status": region.status}
+                        if region.status != "verified"
+                        else {}
+                    ),
+                }
                 for region in self.regions.values()
             ],
             "points": [
@@ -259,11 +323,20 @@ class ContextState:
                         if point.within_region_id is not None
                         else {}
                     ),
+                    **(
+                        {"status": point.status}
+                        if point.status != "verified"
+                        else {}
+                    ),
                 }
                 for point in self.points.values()
             ],
             "seed_ids": list(self.seeds),
         }
+        attempts = self.imagination_attempts.summary()
+        if attempts is not None:
+            result["imagination_attempts"] = attempts
+        return result
 
     def trace_summary(self) -> dict[str, Any]:
         return {
@@ -274,16 +347,16 @@ class ContextState:
             "points": [item.summary() for item in self.points.values()],
             "seed_ids": list(self.seeds),
             "robot": self.robot.summary() if self.robot is not None else None,
-            "refinement": (
+            "imagination": (
                 {
-                    "action_id": self.refinement.action_id,
-                    "instruction": self.refinement.instruction,
+                    "action_id": self.imagination.action_id,
+                    "instruction": self.imagination.instruction,
                 }
-                if self.refinement is not None
+                if self.imagination is not None
                 else None
             ),
-            "pending_action": (
-                self.pending_action.summary() if self.pending_action is not None else None
+            "action_proposal": (
+                self.action_proposal.summary() if self.action_proposal is not None else None
             ),
             "last_physical_action": (
                 self.last_physical_action.summary()
@@ -295,14 +368,15 @@ class ContextState:
 
 __all__ = [
     "ActionPrediction",
+    "ActionProposal",
     "ActionSeed",
     "ActionTarget",
     "ContextState",
+    "ImaginationAttempts",
+    "ImaginationSession",
     "LastPhysicalAction",
     "PointEvidence",
     "Pose",
-    "PendingAction",
-    "RefinementSession",
     "RegionEvidence",
     "RobotState",
 ]

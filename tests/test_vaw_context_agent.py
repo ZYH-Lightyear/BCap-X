@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from tests.test_vaw_context_runtime import FakeContextApi
 from vaw.agents.contracts import ModelResponse, ToolCall
@@ -11,7 +12,13 @@ from vaw.context_runtime.protocol import (
     IMAGINATION_FUNCTION_NAMES,
     MAIN_FUNCTION_NAMES,
 )
-from vaw.context_runtime.runtime import ContextRunConfig, ContextRuntime
+from vaw.context_runtime.model import LastPhysicalAction
+from vaw.context_runtime.runtime import (
+    ContextRunConfig,
+    ContextRuntime,
+    NO_CALL_FEEDBACK,
+    _control_continuity,
+)
 from vaw.context_runtime.trace import ContextTraceLogger
 from vaw.context_runtime.workspace import ContextWorkspace
 
@@ -20,6 +27,14 @@ def _response(index: int, name: str, **arguments) -> ModelResponse:
     return ModelResponse(
         text=f"reason {index}",
         tool_calls=(ToolCall(id=f"call-{index}", name=name, args=arguments),),
+        usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    )
+
+
+def _empty_response(text: str = "thinking") -> ModelResponse:
+    return ModelResponse(
+        text=text,
+        usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
     )
 
 
@@ -75,7 +90,7 @@ def test_main_react_calls_imagination_as_one_nested_function(tmp_path: Path) -> 
             _response(3, "select", seed_id="s1"),
             _response(
                 4,
-                "refine_action",
+                "call_imagination",
                 action_id="a1",
                 instruction="两指对称包夹罐体，保持张开",
             ),
@@ -125,7 +140,7 @@ def test_main_react_calls_imagination_as_one_nested_function(tmp_path: Path) -> 
         "detection_and_sam",
         "propose_grasps",
         "select",
-        "refine_action",
+        "call_imagination",
         "commit",
         "done",
     ]
@@ -138,6 +153,10 @@ def test_main_react_calls_imagination_as_one_nested_function(tmp_path: Path) -> 
     refine_result = rows[3]["function_result"]
     assert refine_result == {"status": "ready", "action_id": "a1"}
     assert "subtrace" not in _user_text(main.messages[4])
+    post_commit = _user_text(main.messages[5])
+    assert 'Control Continuity：{"last_intent":"approach can for grasp"' in post_commit
+    assert '"control_subject":"can"' in post_commit
+    assert "position_error_m" not in post_commit
 
 
 def test_refinement_requires_an_explicit_live_action() -> None:
@@ -145,7 +164,7 @@ def test_refinement_requires_an_explicit_live_action() -> None:
         [
             _response(
                 1,
-                "refine_action",
+                "call_imagination",
                 instruction="从当前 TCP 向上移动 1cm",
             ),
             _response(2, "done", success=False),
@@ -162,7 +181,7 @@ def test_refinement_requires_an_explicit_live_action() -> None:
     ).run()
 
     assert [step.op for step in result.steps] == [
-        "main:refine_action",
+        "main:call_imagination",
         "main:done",
     ]
     assert not result.steps[0].ok
@@ -170,10 +189,38 @@ def test_refinement_requires_an_explicit_live_action() -> None:
     assert api.operation_log == []
 
 
-def test_imagination_limit_retires_action_and_returns_one_clean_failure(tmp_path: Path) -> None:
+def test_a_crashing_turn_observer_cannot_kill_the_episode() -> None:
     main = RecordingProvider(
         [
-            _response(1, "refine_action", instruction="检查旋转方向"),
+            _response(1, "detection_and_sam", query="can"),
+            _response(2, "done", success=False),
+        ]
+    )
+    seen: list[int] = []
+
+    def exploding_observer(turn: int, record: Any) -> None:
+        seen.append(turn)
+        # A print into a non-blocking stdout pipe raises exactly this.
+        raise BlockingIOError(11, "write could not complete without blocking")
+
+    result = ContextRuntime(
+        main,
+        ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki"),
+        RecordingRenderer(),
+        config=ContextRunConfig(max_main_turns=4, on_turn=exploding_observer),
+    ).run()
+
+    assert [step.op for step in result.steps] == [
+        "main:detection_and_sam",
+        "main:done",
+    ]
+    assert seen == [1, 2]
+
+
+def test_imagination_limit_hands_the_partial_state_back_to_main(tmp_path: Path) -> None:
+    main = RecordingProvider(
+        [
+            _response(1, "call_imagination", instruction="检查旋转方向"),
             _response(2, "done", success=False),
         ]
     )
@@ -189,7 +236,7 @@ def test_imagination_limit_retires_action_and_returns_one_clean_failure(tmp_path
     action_id = workspace.execute("select", seed_id=seed).result["action_id"]
     main.responses[0] = _response(
         1,
-        "refine_action",
+        "call_imagination",
         action_id=action_id,
         instruction="检查旋转方向",
     )
@@ -203,10 +250,21 @@ def test_imagination_limit_retires_action_and_returns_one_clean_failure(tmp_path
         trace=ContextTraceLogger(tmp_path),
     ).run()
 
-    assert workspace.state.refinement is None
-    assert workspace.state.pending_action is None
-    assert '"status":"failed"' in _user_text(main.messages[1])
+    assert workspace.state.imagination is None
+    # The budget-exhausted session hands its planner-checked state back for
+    # Main's Preview review instead of rolling the proposal back.
+    assert workspace.state.action_proposal.action_id == action_id
+    assert workspace.state.action_proposal.refined is True
+    assert '"status":"partial"' in _user_text(main.messages[1])
+    assert '"reason":"turn_limit"' in _user_text(main.messages[1])
+    assert "review the Preview" in _user_text(main.messages[1])
     assert "show_rotation_gizmo" not in _user_text(main.messages[1])
+    meta = json.loads(
+        (tmp_path / "subagents" / "imagination_0001" / "meta.json").read_text()
+    )
+    assert meta["status"] == "partial"
+    assert meta["reason"] == "turn_limit"
+    assert meta["instruction"] == "检查旋转方向"
 
 
 def test_main_context_is_rebuilt_without_transcript_history() -> None:
@@ -286,3 +344,174 @@ def test_runtime_stops_after_environment_terminates_during_direct_gripper_action
     assert result.terminate_mode.value == "env_terminated"
     assert result.turns == 1
     assert [step.op for step in result.steps] == ["main:open_gripper"]
+
+
+def test_imagination_provider_error_is_classified_as_subagent_error(tmp_path: Path) -> None:
+    class ExplodingProvider:
+        def generate(self, messages, tools=None):
+            del messages, tools
+            raise RuntimeError("provider down")
+
+    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
+    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    seed = workspace.execute("propose_grasps", region_id=region).result["seed_ids"][0]
+    action_id = workspace.execute("select", seed_id=seed).result["action_id"]
+    original = workspace.state.action_proposal
+    main = RecordingProvider(
+        [
+            _response(1, "call_imagination", action_id=action_id, instruction="检查"),
+            _response(2, "done", success=False),
+        ]
+    )
+
+    ContextRuntime(
+        main,
+        workspace,
+        RecordingRenderer(),
+        imagination_provider=ExplodingProvider(),
+        config=ContextRunConfig(max_main_turns=4, max_imagination_turns=2),
+        trace=ContextTraceLogger(tmp_path),
+    ).run()
+
+    assert workspace.state.action_proposal is original
+    assert "reason=subagent_error" in _user_text(main.messages[1])
+    meta = json.loads(
+        (tmp_path / "subagents" / "imagination_0001" / "meta.json").read_text()
+    )
+    assert meta["status"] == "failed"
+    assert meta["reason"] == "subagent_error"
+    assert "RuntimeError" not in _user_text(main.messages[1])
+
+def test_main_turn_budget_is_hard_capped_at_32() -> None:
+    assert ContextRunConfig().max_main_turns == 32
+    with pytest.raises(ValueError, match=r"\[1, 32\]"):
+        ContextRunConfig(max_main_turns=33)
+    assert ContextRunConfig().max_no_call_retries == 2
+    with pytest.raises(ValueError, match=r"\[0, 3\]"):
+        ContextRunConfig(max_no_call_retries=4)
+
+
+def test_no_call_retries_share_one_main_turn(tmp_path: Path) -> None:
+    main = RecordingProvider(
+        [
+            _empty_response("hesitate 1"),
+            _empty_response("hesitate 2"),
+            _response(1, "detection_and_sam", query="can"),
+            _response(2, "done", success=False),
+        ]
+    )
+
+    result = ContextRuntime(
+        main,
+        ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki"),
+        RecordingRenderer(),
+        config=ContextRunConfig(max_main_turns=4),
+        trace=ContextTraceLogger(tmp_path),
+    ).run()
+
+    assert result.turns == 2
+    assert [step.op for step in result.steps] == [
+        "main:detection_and_sam",
+        "main:done",
+    ]
+    assert len(main.messages) == 4
+    assert "上轮协议错误" not in _user_text(main.messages[0])
+    assert f"上轮协议错误：{NO_CALL_FEEDBACK}" in _user_text(main.messages[1])
+    assert f"上轮协议错误：{NO_CALL_FEEDBACK}" in _user_text(main.messages[2])
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "steps.jsonl").read_text().splitlines()
+    ]
+    assert [row["function_call"]["name"] for row in rows] == [
+        "detection_and_sam",
+        "done",
+    ]
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "runtime_events.jsonl").read_text().splitlines()
+    ]
+    retries = [event for event in events if event["event_type"] == "no_call_retry"]
+    assert [event["attempt"] for event in retries] == [1, 2]
+    assert all(event["turn"] == 1 for event in retries)
+    assert result.usage["main_total_tokens"] == 8
+
+
+def test_exhausted_no_call_retries_consume_one_failed_turn(tmp_path: Path) -> None:
+    main = RecordingProvider(
+        [
+            _empty_response("a"),
+            _empty_response("b"),
+            _empty_response("c"),
+            _response(1, "done", success=False),
+        ]
+    )
+
+    result = ContextRuntime(
+        main,
+        ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki"),
+        RecordingRenderer(),
+        config=ContextRunConfig(max_main_turns=4),
+        trace=ContextTraceLogger(tmp_path),
+    ).run()
+
+    assert result.turns == 2
+    assert [step.op for step in result.steps] == ["main:done"]
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "steps.jsonl").read_text().splitlines()
+    ]
+    assert rows[0]["function_call"] is None
+    assert rows[0]["turn"] == 1
+    assert rows[1]["function_call"]["name"] == "done"
+    assert '"function":"protocol"' in _user_text(main.messages[3])
+    assert '"status":"failed"' in _user_text(main.messages[3])
+
+
+def test_zero_no_call_retries_keeps_legacy_burn(tmp_path: Path) -> None:
+    main = RecordingProvider(
+        [
+            _empty_response("silence"),
+            _response(1, "done", success=False),
+        ]
+    )
+
+    result = ContextRuntime(
+        main,
+        ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki"),
+        RecordingRenderer(),
+        config=ContextRunConfig(max_main_turns=4, max_no_call_retries=0),
+        trace=ContextTraceLogger(tmp_path),
+    ).run()
+
+    assert result.turns == 2
+    assert len(main.messages) == 2
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "steps.jsonl").read_text().splitlines()
+    ]
+    assert rows[0]["function_call"] is None
+    assert rows[1]["function_call"]["name"] == "done"
+    events = (tmp_path / "runtime_events.jsonl").read_text().strip()
+    assert events
+    assert json.loads(events.splitlines()[0])["event_type"] == "no_call_retry"
+
+
+def test_control_continuity_separates_manipulation_subject_from_destination() -> None:
+    summary = _control_continuity(
+        LastPhysicalAction(
+            intent="move above basket opening",
+            executed_stages="arm",
+            outcome="completed",
+            source_query="basket",
+        ),
+        manipulation_subject="alphabet soup can",
+    )
+
+    assert summary == {
+        "manipulation_subject": "alphabet soup can",
+        "subject_relation": "intended_attachment_unverified",
+        "last_intent": "move above basket opening",
+        "executed_stage": "arm",
+        "command_status": "completed",
+        "control_subject": "basket",
+    }

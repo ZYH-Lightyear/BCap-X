@@ -31,8 +31,8 @@ function Root() {
   useEffect(() => {
     window.__VAW_RENDER__ = async (next) => {
       if (
-        next.schemaVersion !== 38
-        || next.schema !== 'vaw-context-v37-working-memory'
+        next.schemaVersion !== 46
+        || next.schema !== 'vaw-context-v46-oblique-contact'
         || next.viewport.width !== 2048
         || next.viewport.height !== 1280
       ) {

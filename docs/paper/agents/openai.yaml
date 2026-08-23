@@ -1,0 +1,4 @@
+interface:
+  display_name: "Zexi Academic Writing"
+  short_description: "Write AI/ML papers in Zexi Li’s argument and prose style"
+  default_prompt: "Use $zexi-academic-writing to formulate or write this AI/ML paper in my established style."

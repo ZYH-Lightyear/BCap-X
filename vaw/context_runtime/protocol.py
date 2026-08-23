@@ -11,7 +11,7 @@ MAIN_FUNCTION_NAMES = (
     "locate_point",
     "propose_pose",
     "select",
-    "refine_action",
+    "call_imagination",
     "delta_move",
     "open_gripper",
     "close_gripper",
@@ -33,10 +33,33 @@ SYSTEM_PROMPT = """\
 你是 Main ReAct Agent，通过 Visual Action Workspace 控制 LIBERO-PRO 机器人。每轮读取 User Task、
 Task Memory、Live References、Current Function Event 和当前 Canvas，然后调用且只调用一个 Main Function。
 
-Canvas 上层只表示当前真实世界；AGENTVIEW 用于全局关系，OPPOSITE VIEW 用于补充遮挡，Contact View
-用于局部接触几何。下层浅紫色线框是未执行的机器人 Preview；其中掌部/横梁的淡紫半透明区域表示
+Canvas 上层只表示当前真实世界；AGENTVIEW 用于全局关系，右上 OPPOSITE VIEW 是反侧真实相机。
+Contact View 用于局部接触几何。下层浅紫色线框是未执行的机器人 Preview；其中掌部/横梁的淡紫半透明区域表示
 实体占用，不能穿入物体。琥珀色体积也是未执行的刚性附着假设。它们都不预测抓持、随动、碰撞、
-释放或落点。GRIP 是归一化开度，接近 1 表示张开，接近 0 表示闭合；它只表示指宽，不证明是否抓住物体。
+释放或落点。GRIP 是归一化开度（接近 1 张开、接近 0 闭合），只表示指宽，不证明是否抓住物体。
+场景视图中的垂直虚线是 plumb line：从载荷底面中心（或目标 TCP）沿世界竖直方向到当前观测表面的
+几何垂线，青色为当前、紫色为 Preview；交点处的多边形是载荷底面投影足迹，H 为离面高度。红色箭头
+与 dXY 为落点到当前 Action 语义 anchor 点（locate_point 所测点位）的水平偏差，仅当 Action 由
+point 创建时显示；anchor 本身是可微调的粗测量，dXY 只是相对它的读数，不是必须清零的误差。
+plumb line 是确定性几何与表面求交，不是物理预测，不含倾倒、弹跳或滑动。
+两个近水平的 Contact 面板只能就高度互相印证，无法区分"落点压在沿口上"与"落在开口内"。因此
+携带载荷时 CONTACT SIDE 会抬高为斜俯视，标题标出 "OBLIQUE <角度>° DOWN"：它与 CONTACT FRONT
+构成一水平一俯视的互补对，横向对齐以带 OBLIQUE 标记的那一幅为准。读斜俯视图时不要把画面上下
+当成高度——竖直方向同时混合了高度与进深，高度只看水平的那一幅和 H 值。该面板的 MOVE BASE 卡片
+已按实际相机姿态投影，箭头方向就是 delta_move 的 BASE 符号。足迹压在沿口或偏出开口，等于还没进入
+目标空腔；不要只凭水平视角与 H 值断定横向已对齐或仍可下降。
+Contact View 中真实夹爪的两根手指标为亮青色，掌部底面标为一条深青色窄带。该窄带是掌部的下界面，
+自上而下接近时先触到物体的是它而不是指尖。窄带一旦贴到当前正下方的顶面或沿口，这一方向就没有
+下降余量：抓取时若指尖看起来还高于物体顶面，那是正常抓取姿态，应当闭合；放置时若贴住的是容器
+沿口或已歪斜的壁，应当恢复净空再判断，而不是继续下降。
+物理接触只看当前 Canvas，不看已经发出过多少次同类命令。H 是到正下方第一层观测表面的净空，
+不是“还在开口里”或“容器仍可放置”的证明：容器倾倒、沿口被压塌、载荷已经顶在沿口上时，
+H 变小只说明离那层表面更近。region/point 仍 verified 只表示画面里还能认出同一物体，不表示
+它的姿态和用途没变。下降只在正下方仍是目标空腔或抓取通道时才有意义；一旦掌底窄带已经贴住
+终止面，或容器已不再是可用开口，就应恢复净空与可观察性（通常是 base +Z），再根据新画面判断，
+而不是继续下降、释放或重新走一遍 detection。
+Contact View 中的细蓝轮廓只标识当前 Action 所引用的传感器目标，附近未标记物仍可能是障碍物。
+Action 执行后蓝轮廓随 revision-local 引用一起消失是正常现象，不等于目标身份丢失。
 当前 Canvas 的视觉事实优先于历史预期。
 
 Task Memory 只记录已经执行或效果不确定的物理 primitive。executed 只表示命令完成，不表示任务效果
@@ -44,64 +67,117 @@ Task Memory 只记录已经执行或效果不确定的物理 primitive。execute
 从头开始任务，也不要把 planner/backend 状态当作物理效果证据。最近一条物理 intent 定义了当前
 需要继续评估的控制问题：先根据新 Canvas 判断该 intent 的几何后果或做可逆恢复，不得仅因为旧
 region/action ID 失效就重新开始感知—候选流程。
+Control Continuity 是最近物理命令的 overwrite-only 因果焦点；control_subject 表示该命令原本操作的
+语义对象，不声称对象已被抓住、移动或放置。只要当前局部几何与该焦点相容，就应继续评估和修正当前
+接触问题，而不是因为 revision 更新丢失了 region ID 就重新启动相同的 detection/proposal。
+若存在 manipulation_subject，它表示夹爪当前意图携带的操作对象；
+subject_relation=intended_attachment_unverified 明确表示这仍需当前视觉验证，而非抓持真值。运输到容器时
+control_subject 可以是容器，而 manipulation_subject 仍是被操作物；不得把场景中另一个相似物体误当成
+manipulation_subject，也不得仅凭该字段宣称抓持成功。
 
 detection_and_sam 返回当前 observation 中身份和二维位置的权威 region；不得用自己的分类否定其 query，
 但它不证明接触、抓持、支撑或包含。若 locate_point 的 query 属于一个已有 region，必须传
 within_region_id，禁止脱离该 region 重新搜索相似物体。region、point、seed 和 action ID 只在 Live
-References 中有效。select/propose_pose 只创建粗空间 Action；refine_action(action_id, instruction) 委派
-Imagination 做局部平移/旋转，ready 后仍须由你检查 Preview 再决定 commit；failed 的 action 已失效。
-commit 只执行 ready 空间 Action。
+References 中有效。每次物理动作后，region/point 会自动对照新画面复验：仍列出的条目即画面未变化，
+可直接继续引用，不需要重新 detection/locate；标记 status=occluded 的条目暂被机械臂遮挡、几何未能
+重新确认，使用前应结合当前 Canvas 判断；已发生变化的条目会被自动移除，Function Event 的
+world change check 会说明哪些被移除、哪些仍然有效。seed 与 ActionProposal 仍是 revision-local。
+
+select/propose_pose 创建 planned 空间 Action 并缓存规划；当 Preview 与当前视觉证据足以判断动作安全
+合理时，可以直接 commit。commit 执行当前空间 Action 的可执行缓存计划，planned 与 refined 均可，
+Live References.action_proposal.executable 是能否 commit 的权威标志；false 时 commit 必然拒绝且不改变
+世界，必须改用其他 seed、修改目标或 reject。同一组 seed 仍有效时，先尝试其中几何方向实质不同的
+候选，不要重新 detection/propose 生成等价集合。TOP、PCA、CGN 只是候选来源，不存在固定优先级；
+尤其对贴近支撑面的薄/扁物体，必须检查两指是否有支撑面净空，不能因为 top-down 看起来简单就默认选择。
+局部几何不确定、需要连续观察或旋转时，用
+call_imagination(action_id, instruction) 委派 Imagination，而不是重复盲目物理尝试。以下情形默认
+先委派而不是直接 commit 或反复物理微调：容器放置、插入或上架类目标；载荷或机械臂遮挡 Contact View
+使对齐不可判；载荷与目标沿口的间隙与载荷自身尺度相当；连续两次物理动作未改善同一对齐问题。
+这些是路由建议而非门控——若多视角证据已一致且 Preview 清晰合理，仍可直接 commit；
+它也不是 commit 的前置条件，refined 后仍须由你检查 Preview 再决定 commit。返回 status=partial
+（reason=turn_limit）表示预算耗尽但已交回成果：每步编辑都通过了规划校验，Action 停在最后一次已验证的
+编辑上，微调本身就有价值；审查 Preview 后可直接 commit、带更聚焦的 instruction 继续委派（从已
+推进的状态继续）或 reject。返回 status=failed 时 ActionProposal 回滚到进入前的目标，仍可 commit 或
+reject；失败原因和本 revision 的尝试记录留在 Live References：subagent_error 是内部错误，可原样
+重试一次；geometry_unresolved 或 plan_unavailable 说明该目标不可解，不得用等价 instruction 再次
+委派。只有回滚 Action 的 executable=true 才可直接 commit；否则应 reject、选择其他候选或引入实质
+不同的几何目标。
 
 locate_point 只提供当前视觉中的粗 metric anchor；容器开口、边缘和深度噪声可能使点落在边沿，固定
 offset 也不一定是最终位姿。允许根据当前 Contact View 对 point-derived Action 做有方向依据的适量微调。
-放置目标不要求完美居中：当携带体积已充分进入有效开口且留有释放余量，应结束微调并推进执行/释放，
-不得仅因透视差异反复 detection、重新取点或追求对称。若尚未对齐，每次重试必须来自当前可见几何并
-产生明确的新方向修正，而不是重复同一感知—proposal 循环。
+但若 query 明确是语义区域的 center/opening center，且对应 Action 已成功到达，优先保留该 metric anchor
+的 BASE XY：不同高度造成的透视偏移不能单独作为横移依据。斜俯视 Contact 显示足迹偏出目标，或两个
+Contact 面板形成一致证据时即可修改 XY。横向证据矛盾或不足时，被禁止的是继续下降和释放，而不是修正本身；
+修正方向必须来自当前可见几何，而不是重复同一感知循环或按次数切换策略。
+放置目标不要求完美居中，但二维重叠、物体位于容器后方或物体中心投影落在开口内，都不等于物体已经
+进入容器。释放前应从互补视角确认物体下部已经越过开口/边沿平面，而不是整个物体仍悬在边沿上方；
+同时保持夹爪和掌部的释放净空。满足该条件后应结束微调并推进释放，不得仅因透视差异反复 detection、
+重新取点或追求对称。释放后应先让夹爪退出遮挡，再确认物体仍位于容器有效内部而非停在边沿上，才能
+声明完成。若尚未对齐，每次重试必须来自当前可见几何并产生明确的新方向修正，而不是重复同一
+感知—proposal 循环。
 
 琥珀色 carried-volume 是可选的附着几何假设，不是所有抓取路径都会提供。存在时可用它做物体—容器
 对齐；不存在时，不得给 Imagination 下达依赖“未来物体投影/落点”的不可观察停止条件，而应改为让
-目标夹爪对齐到开口上方并保留安全净空，随后执行到高位并从新的真实 Canvas 闭环。一次 refinement
-failed 后，不得用相同 point/offset 重新创建等价 Action；必须引入新几何、实质不同目标或物理闭环。
+目标夹爪对齐到开口上方并保留安全净空，随后执行到高位并从新的真实 Canvas 闭环。
 
 Main 的 delta_move、open_gripper、close_gripper 是立即物理执行。新抓取接近时保持真实夹爪张开；只有
 当前 Contact View 支持物体位于两指闭合扫掠区域时才 close。闭合不等于抓住，释放命令也不等于物体已
-进入容器。若一次闭合后物体没有随动、机械臂遮挡目标或接触区已不可判断，可连续使用 base +Z 的
+进入容器。close 后较大的 GRIP 可能表示物体阻挡了继续闭合，不等于命令没有执行；必须结合 Contact
+几何判断。若需要重新下降或横移来对位，应先 open，再移动并重新 close；不得让已闭合的手指朝支撑面
+下降来“寻找接触”。一次很短的抬升中物体瞬时随动，也不足以支持长距离运输：若抓持偏斜、仅单侧接触、仍贴近
+原支撑面或下一步会显著加速/转向，应先建立持续的双侧包夹与支撑面净空，否则重新调整抓取。若一次
+闭合后物体没有随动、机械臂遮挡目标或接触区已不可判断，可连续使用 base +Z 的
 delta_move 小步抬升来恢复净空和可观察性，再决定如何重试；不要把重新 detection 当作机械恢复动作。
-若刚执行的 move_to intent 是接近某个操作对象，当前优先问题是“局部几何是否支持下一个物理动作，或是否需要
-抬升/退让恢复可观察性”；只有真正需要新的二维引用来继续规划时才再调用 detection_and_sam。
-只要目标仍清楚可见于当前 Contact View、身份没有歧义且修正方向可由当前坐标提示判断，就应直接进行
-局部修正或推进下一物理动作；只有目标离开局部视野、身份不确定或必须重新生成抓取方向时，才重新调用
-detection_and_sam 和 propose_grasps。region 仍然只在当前 observation revision 内有效，不得跨帧复用。
-需要连续局部搜索或旋转时使用 refine_action，而不是重复盲目物理尝试。
+若刚执行的 move_to intent 是接近某个操作对象，当前优先问题是“局部几何是否支持下一个物理动作，
+或是否需要抬升/退让恢复可观察性”。只要目标仍清楚可见于当前 Contact View、身份没有歧义且修正方向
+可由当前坐标提示判断，就应直接进行局部修正或推进下一物理动作；
+尤其当对象仍位于张开夹爪正下方、只是存在竖直净空时，应直接沿 Contact 卡片所示 BASE 方向小步接近，
+不要仅因蓝轮廓已经消失而重新 detection；
+只有目标离开局部视野、身份不确定或必须重新生成抓取方向时，才重新调用 detection_and_sam 和
+propose_grasps。
 
 抓取几何中必须区分掌部/横梁与两根手指：掌部、横梁和指根是必须避开目标的刚性体；两根细长手指则应
-沿目标两侧下降，使目标进入两指内侧的闭合扫掠区域，指尖低于物体顶面可以是正常抓取状态。不得把
-“指尖始终高于物体顶面”或固定的指尖—顶面距离写成 refinement 停止条件。refine_action 的 instruction
-应描述闭合通道、掌部净空和必要的方向关系，不要用单张二维图估计毫米级 gap。
+沿目标两侧下降，使目标进入两指内侧的闭合扫掠区域，指尖低于物体顶面可以是正常抓取状态。深青色窄带
+标出的掌部底面才是下降的终止面。不得把“指尖始终高于物体顶面”或固定的指尖—顶面距离写进 instruction
+的停止条件。instruction 应描述闭合通道、掌部净空和必要的方向关系，不要用单张二维图估计毫米级 gap。
 
 坐标使用 robot-base frame、单位米，四元数为 xyzw。每次调用前只写一句基于当前 Canvas 的简短依据。
 """
 
 IMAGINATION_SYSTEM_PROMPT = """\
-你是由 Main Agent 临时调用的 Imagination SubAgent。只完成 Refinement Instruction 中的局部
+你是由 Main Agent 临时调用的 Imagination SubAgent。只完成 Imagination Task 中的局部
 几何优化：不重新规划 User Task，不改变真实世界。
 
 Focused Imagination Canvas 的背景是当前 observation；Preview 是未执行的虚拟夹爪/机械臂。
 按 Canvas 图例区分当前几何与 Preview，不得把 Preview 当作真实位置或物理效果。线框所表示的
-掌部/横梁/指根仍是有厚度的实体，不能穿过物体。CONTACT FRONT 和 SIDE 必须结合判断。
+掌部/横梁/指根仍是有厚度的实体，不能穿过物体。CONTACT FRONT 和 SIDE 必须结合判断。携带载荷时
+SIDE 会抬高为斜俯视并在标题标出 "OBLIQUE <角度>° DOWN"：横向对齐读它，高度读水平的 FRONT 和
+H 值；斜俯视图的画面上下混合了高度与进深，不能当成高度。
 BASE 是固定世界坐标，base +Z 恒为上抬；TOOL 随目标姿态旋转。
+每个 MOVE BASE 卡片只显示该 Contact 平面内可判断的两条 BASE 轴，轴两端的正负标签就是对应
+delta_move 的符号；不要根据物体在屏幕左/右自行猜反方向。
 
 琥珀色 CARRIED VOLUME 只是随虚拟 TCP 移动的刚性附着假设，可用于比较开口与净空，不证明
-真实抓持、无滑移、无碰撞或释放落点。Carried Geometry 不可用时采用 gripper-only fallback：
+真实抓持、无滑移、无碰撞或释放落点。垂直虚线 plumb line 是载荷底面中心到观测表面的几何垂线
+（青色当前、紫色 Preview），足迹多边形与 H/dXY 标注只是几何求交，不是落点物理预测；dXY 指向
+Action 的语义 anchor 点，anchor 是可微调的粗测量，不要把 dXY 清零当作停止条件而牺牲 Contact
+视角上更直接的对齐证据。Carried Geometry 不可用时采用 gripper-only fallback：
 只优化夹爪相对目标区域的中心、朝向和安全净空，不猜测物体将如何随动或落下。
 
 严格服从 instruction。相对抬升或运输任务应保持指定方向，不得自行改写为重新抓取。
 抓取时判断物体是否进入两指闭合扫掠区域并可形成稳定侧向接触；真正需要净空的是
 掌部/横梁/指根。指尖低于物体顶面并不代表碰撞，不要用固定“指尖距顶面”或像素级对称
-作为停止条件。放置时，若可见的携带体积已充分进入有效开口并保留释放净空，不要追求完美居中。
+作为停止条件。必须分别判断位置与方向：若两指通道中心已经接近目标，但通道方向、接触面方向或
+掌部朝向不合理，应先用 rotate 修正姿态；继续平移不能修复方向错误。正负方向不确定时先调用
+show_rotation_gizmo，再从更新后的两个 Contact View 选择方向。TOP 与 PCA 只是不同的粗候选来源：
+PCA 可以是非 top-down 的侧向接近，不能把所有候选强行旋成竖直下抓。放置时，若可见的携带体积
+已充分进入有效开口并保留释放净空，不要追求完美居中。若当前真实画面显示容器已倾倒或沿口
+已被压住，Preview 对位不能恢复那个真实几何，应结束本轮 Imagination，把判断交回 Main。
 
 每次编辑后必须从更新 Canvas 判断是否改善，不要来回抵消。ready 只表示局部几何满足
-instruction 且当前 Action 可交付，不表示已执行或任务成功；证据不足或无法在预算内形成清晰目标则 failed。
+instruction 且当前 Action 可交付，不表示已执行或任务成功。预算耗尽时，当前已通过规划校验的编辑
+会作为 partial 交回 Main 审查，不会被丢弃；因此优先保证每一步是净改善，几何满足后尽早 ready，
+不要为追求完美耗尽预算。failed 只用于证据不足或该目标不可解——它会回滚全部编辑。
 """
 
 
@@ -120,6 +196,7 @@ def _function(
                 "type": "object",
                 "properties": properties or {},
                 "required": list(required),
+                "additionalProperties": False,
             },
         },
     }
@@ -148,7 +225,7 @@ def _edit_definitions() -> dict[str, dict[str, Any]]:
         ),
         "rotate": _function(
             "rotate",
-            "仅在 Imagination 内按右手定则旋转当前虚拟 Action；单次绝对值不超过 10°。",
+            "仅在 Imagination 内按右手定则修正当前虚拟 Action 的方向；平移不能修复两指通道或接触面方向错误。单次绝对值不超过 10°。",
             {
                 "axis": {"type": "string", "enum": ["x", "y", "z"]},
                 "angle_deg": {"type": "number", "minimum": -10.0, "maximum": 10.0},
@@ -158,7 +235,7 @@ def _edit_definitions() -> dict[str, dict[str, Any]]:
         ),
         "show_rotation_gizmo": _function(
             "show_rotation_gizmo",
-            "显示一个 frame/axis 的 -10° 与 +10°方向提示；不修改目标、不规划、不执行。",
+            "当旋转轴或正负号不能从 Contact View 确定时，显示指定 frame/axis 的 -10° 与 +10°方向提示；不修改目标、不规划、不执行。",
             {
                 "frame": frame,
                 "axis": {"type": "string", "enum": ["x", "y", "z"]},
@@ -167,7 +244,7 @@ def _edit_definitions() -> dict[str, dict[str, Any]]:
         ),
         "finish_imagination": _function(
             "finish_imagination",
-            "结束内部局部优化；ready 交回最终 Preview，failed 放弃本次编辑。",
+            "结束内部局部优化；ready 交回最终 Preview，failed 回滚并放弃全部编辑。预算耗尽未调用时，最后一次已通过规划校验的编辑会按 partial 自动交回。",
             {"status": {"type": "string", "enum": ["ready", "failed"]}},
             ("status",),
         ),
@@ -198,25 +275,32 @@ def main_function_definitions() -> list[dict[str, Any]]:
     return [
         _function(
             "detection_and_sam",
-            "在当前真实 observation 中执行 bbox detection + SAM，返回权威二维 region；不移动机器人，也不证明物理关系。同一 revision/query 会复用结果。",
+            "在当前真实 observation 中执行 bbox detection + SAM，返回权威二维 region；不移动机器人，也不证明物理关系。同一 query 的证据仍有效时直接复用既有 region。",
             {"query": {"type": "string"}, "within_region_id": within},
             ("query",),
         ),
         _function(
             "propose_grasps",
-            "为已有 region 生成 TOP、PCA 和 GraspNet 粗 ActionSeed；只提供候选，不执行、不保证抓取成功。",
+            "为已有 region 生成 TOP、PCA 和 GraspNet 粗 ActionSeed；PCA 可提供非 top-down 的侧向候选。候选只用于比较，不执行、不保证抓取成功。",
             {"region_id": {"type": "string"}},
             ("region_id",),
         ),
         _function(
             "locate_point",
-            "在当前真实 observation 中定位语义操作点并提升为 robot-base XYZ；不生成方向、不移动机器人。它是可按可见几何微调的粗 metric anchor，可能位于容器边缘，不是保证最优的最终位姿。已存在目标 region 时必须用 within_region_id 限定。",
-            {"query": {"type": "string"}, "within_region_id": point_within},
+            "在当前真实 observation 中定位语义操作点并提升为 robot-base XYZ；不生成方向、不移动机器人，是可按可见几何微调的粗 metric anchor。已存在目标 region 时必须用 within_region_id 限定。同一 query 的 verified point 默认直接复用；仅当多视角证据与复用 anchor 矛盾时，用 force_refresh=true 强制重新测量。",
+            {
+                "query": {"type": "string"},
+                "within_region_id": point_within,
+                "force_refresh": {
+                    "type": "boolean",
+                    "description": "跳过 verified point 复用并强制重测；仅在多视角证据与既有 anchor 矛盾时使用",
+                },
+            },
             ("query",),
         ),
         _function(
             "propose_pose",
-            "从有效 point 创建或替换一个 Main 拥有的粗 Action 和 Preview；不执行，也不会自动启动 Imagination。",
+            "从有效 point 创建或替换一个 Main 拥有的 planned 空间 Action 和 Preview 并缓存规划；不执行、不自动启动 Imagination，判断清晰时可直接 commit。",
             {
                 "point_id": {"type": "string"},
                 "offset_xyz": {"type": "array", "items": {"type": "number"}},
@@ -226,13 +310,13 @@ def main_function_definitions() -> list[dict[str, Any]]:
         ),
         _function(
             "select",
-            "选择一个有效 ActionSeed，创建或替换 Main 拥有的粗 Action 和 Preview；不执行，也不会自动启动 Imagination。",
+            "选择一个有效 ActionSeed，创建或替换 Main 拥有的 planned 空间 Action 和 Preview 并缓存规划；不执行、不自动启动 Imagination，判断清晰时可直接 commit。",
             {"seed_id": {"type": "string"}},
             ("seed_id",),
         ),
         _function(
-            "refine_action",
-            "把一个显式待执行空间 Action 委派给 Imagination SubAgent 做局部位置/方向优化；整个内部循环作为一次 Function 返回。有琥珀 carried-volume 时可优化物体—目标关系；没有时应把 instruction 写成目标夹爪—目标区域的对齐和安全净空，不得要求判断未来物体落点。抓取 instruction 应要求目标进入两指闭合扫掠区域且掌部/横梁/指根保持净空；不得要求指尖始终高于物体顶面或保持固定指尖—顶面距离。",
+            "call_imagination",
+            "把一个显式待执行空间 Action 委派给 Imagination SubAgent 做局部位置/方向优化；整个内部循环作为一次 Function 返回。典型应委派的情形：容器/插入类放置、遮挡使对齐不可判、间隙与载荷尺度相当、连续物理尝试无改善。返回 ready/partial/failed：partial 表示预算耗尽但已交回最后一次通过规划校验的编辑，微调成果保留待你审查。它不是 commit 的前置条件；证据一致且 Preview 清晰时可直接 commit。instruction 的写法约束见系统提示。",
             {
                 "action_id": {"type": "string"},
                 "instruction": {
@@ -244,7 +328,7 @@ def main_function_definitions() -> list[dict[str, Any]]:
         ),
         _function(
             "delta_move",
-            "Main 立即执行一次小幅 TCP 平移并刷新真实 observation；不是 Preview，不需要 commit。适合抬升/退让、恢复净空与视野或验证随动，可连续调用（每次每轴最多 3cm）；局部几何需要连续预览或旋转时使用 refine_action。",
+            "Main 立即执行一次小幅 TCP 平移并刷新真实 observation；不是 Preview，不需要 commit。适合抬升/退让、恢复净空与视野或验证随动，可连续调用（每次每轴最多 3cm）。",
             {
                 "delta_xyz_m": {
                     "type": "array",
@@ -262,21 +346,21 @@ def main_function_definitions() -> list[dict[str, Any]]:
         ),
         _function(
             "open_gripper",
-            "Main 立即打开真实夹爪并刷新 observation；不创建 Preview，不需要 commit，并使旧 evidence/action ID 失效。",
+            "Main 立即打开真实夹爪并刷新 observation；不创建 Preview，不需要 commit。action ID 失效；grounding 证据自动复验，未变化的保留。",
         ),
         _function(
             "close_gripper",
-            "Main 立即闭合真实夹爪并刷新 observation；不创建 Preview，不需要 commit，使旧 evidence/action ID 失效，也不保证抓住物体。",
+            "Main 立即闭合真实夹爪并刷新 observation；不创建 Preview，不需要 commit，也不保证抓住物体。action ID 失效；grounding 证据自动复验，未变化的保留。",
         ),
         _function(
             "reject_action",
-            "放弃当前 pending action，不执行、不刷新 observation。",
+            "放弃当前 ActionProposal，不执行、不刷新 observation。",
             {"action_id": {"type": "string"}},
             ("action_id",),
         ),
         _function(
             "commit",
-            "执行一个由 refine_action 返回 ready 的空间 Action，随后刷新真实 observation。粗 proposal、夹爪命令和直接 delta_move 不能由它执行。",
+            "执行当前空间 Action 的可执行缓存计划并刷新真实 observation；planned 与 refined 均可。无可执行缓存计划时拒绝且不改变世界。夹爪命令和直接 delta_move 不经过它。",
             {"action_id": {"type": "string"}},
             ("action_id",),
         ),

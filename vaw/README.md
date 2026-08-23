@@ -2,7 +2,7 @@
 
 VAW 是面向 LIBERO-PRO 的 Main-owned Visual ReAct Runtime。Main Agent 始终读取当前完整 Canvas
 并负责语义感知、任务规划、动作批准与结束判断；需要局部 6-DoF 微调时，它通过
-`refine_action` 同步委派给一个只看 Focused Canvas 的 Imagination SubAgent。
+`call_imagination` 同步委派给一个只看 Focused Canvas 的 Imagination SubAgent。
 
 当前契约见 [`CURRENT_ARCHITECTURE.md`](CURRENT_ARCHITECTURE.md)，Context/Memory 的唯一规范见
 [`AGENTIC_CONTEXT_OS.md`](AGENTIC_CONTEXT_OS.md)。
@@ -17,7 +17,7 @@ propose_grasps(region_id)
 locate_point(query, within_region_id?)
 propose_pose(point_id, offset_xyz, quaternion_xyzw?)
 select(seed_id)
-refine_action(action_id, instruction)
+call_imagination(action_id, instruction)
 delta_move(delta_xyz_m, frame)
 open_gripper()
 close_gripper()
@@ -26,7 +26,7 @@ commit(action_id)
 done(success)
 ```
 
-Imagination（只存在于 `refine_action` 内部）：
+Imagination（只存在于 `call_imagination` 内部）：
 
 ```text
 delta_move(delta_xyz_m, frame)
@@ -35,8 +35,9 @@ show_rotation_gizmo(frame, axis)
 finish_imagination(status="ready" | "failed")
 ```
 
-`select/propose_pose` 只创建粗空间 Preview，不能直接 commit。`refine_action` 可连续编辑该空间
-动作；只有返回 `ready` 后，Main 才能选择 `commit`。Main 的 `delta_move/open_gripper/
+`select/propose_pose` 创建 planned 空间 Preview 并缓存规划；当 Preview 与当前视觉证据足以判断时，
+Main 可以直接 `commit`。`call_imagination` 是可选的局部空间推理工具，不是 commit 的前置条件。
+failed 时回滚到进入前的 ActionProposal。Main 的 `delta_move/open_gripper/
 close_gripper` 是立即执行的简单物理控制，不经过 Imagination，也不需要 commit。Imagination 内
 同名 `delta_move` 仍只编辑虚拟动作。
 

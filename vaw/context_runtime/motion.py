@@ -105,7 +105,12 @@ class PyrokiMotionBackend:
         )
 
     def preview(self, target: Pose) -> ActionPrediction:
-        return _solve_ik_prediction(self.api, self._api_target(target))
+        # The reduced PyRoki objective also penalises joint velocity.  One
+        # solve can therefore stop roughly a centimetre short of a small
+        # Cartesian target.  A second solver pass continues from the cached
+        # solution without moving the real robot and materially reduces that
+        # endpoint bias while preserving the current-joint branch seed.
+        return _solve_ik_prediction(self.api, self._api_target(target), solve_passes=2)
 
     def plan_pose(
         self,
@@ -181,7 +186,7 @@ class CuroboMotionBackend:
         waypoint_tolerance_rad: float = 0.025,
         max_steps_per_waypoint: int = 15,
         final_joint_tolerance_rad: float = 0.02,
-        final_settle_max_steps: int = 120,
+        final_settle_max_steps: int = 240,
     ) -> None:
         if trajectory_subsample < 1:
             raise ValueError("trajectory_subsample must be at least one")
@@ -317,7 +322,15 @@ class CuroboMotionBackend:
                 "execute_joint_trajectory",
                 trajectory[-1:].copy(),
                 subsample=1,
-                tolerance=self.waypoint_tolerance_rad,
+                # The endpoint controller must not stop at a looser tolerance
+                # than the acceptance check immediately below.  The shared
+                # Full API uses an adaptive budget with a 240-step floor for
+                # this final settle; mirror that budget for Reduced API rather
+                # than declaring a partially reached grasp to be successful.
+                tolerance=min(
+                    self.waypoint_tolerance_rad,
+                    self.final_joint_tolerance_rad,
+                ),
                 max_steps=self.final_settle_max_steps,
             )
             max_joint_error = self._final_joint_max_error(trajectory[-1])
@@ -358,30 +371,40 @@ def create_motion_backend(name: str, api: Any) -> MotionBackend:
     raise ValueError(f"unknown motion backend '{name}'")
 
 
-def _solve_ik_prediction(api: Any, target: Pose) -> ActionPrediction:
+def _solve_ik_prediction(
+    api: Any,
+    target: Pose,
+    *,
+    solve_passes: int = 1,
+) -> ActionPrediction:
     try:
         _seed_pyroki_from_current_observation(api)
-        solved = _call(
-            api,
-            "solve_ik",
-            np.asarray(target.position_xyz, dtype=np.float64),
-            _xyzw_to_wxyz(target.quaternion_xyzw),
-            return_info=True,
-        )
-        if not isinstance(solved, tuple) or len(solved) != 2:
-            raise MotionBackendError(
-                "solve_ik did not report whether the requested orientation was used"
+        if solve_passes < 1:
+            raise MotionBackendError("solve_passes must be positive")
+        values: tuple[float, ...] | None = None
+        for _ in range(solve_passes):
+            solved = _call(
+                api,
+                "solve_ik",
+                np.asarray(target.position_xyz, dtype=np.float64),
+                _xyzw_to_wxyz(target.quaternion_xyzw),
+                return_info=True,
             )
-        joints, info = solved
-        if not isinstance(info, dict):
-            raise MotionBackendError("solve_ik returned invalid orientation metadata")
-        orientation_used = str(info.get("orientation_used", ""))
-        if orientation_used != "requested":
-            raise MotionBackendError(
-                "solve_ik substituted orientation "
-                f"'{orientation_used or 'unknown'}' for the requested candidate pose"
-            )
-        values = _joint_tuple(joints)
+            if not isinstance(solved, tuple) or len(solved) != 2:
+                raise MotionBackendError(
+                    "solve_ik did not report whether the requested orientation was used"
+                )
+            joints, info = solved
+            if not isinstance(info, dict):
+                raise MotionBackendError("solve_ik returned invalid orientation metadata")
+            orientation_used = str(info.get("orientation_used", ""))
+            if orientation_used != "requested":
+                raise MotionBackendError(
+                    "solve_ik substituted orientation "
+                    f"'{orientation_used or 'unknown'}' for the requested candidate pose"
+                )
+            values = _joint_tuple(joints)
+        assert values is not None
     except MotionBackendError as exc:
         return ActionPrediction(solve_ik="error", detail=str(exc))
     return ActionPrediction(solve_ik="returned", joint_positions_rad=values)

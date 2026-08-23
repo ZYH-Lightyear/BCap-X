@@ -30,8 +30,8 @@ def compile_active_presentation(
     """Select the one virtual target currently visible to the policy."""
 
     state = workspace.state
-    if state.pending_action is not None:
-        action = state.pending_action
+    if state.action_proposal is not None:
+        action = state.action_proposal
         artifacts = workspace._private.action_artifacts
         return (
             action.target,
@@ -42,10 +42,10 @@ def compile_active_presentation(
                 artifacts,
                 status=(
                     "refining"
-                    if state.refinement is not None
-                    else "ready"
-                    if action.ready_for_commit
-                    else "coarse"
+                    if state.imagination is not None
+                    else "refined"
+                    if action.refined
+                    else "planned"
                 ),
                 action_id=action.action_id,
                 intent=action.intent,

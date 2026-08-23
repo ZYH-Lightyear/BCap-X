@@ -13,7 +13,11 @@ from vaw.context_runtime.attached_object import (
     volume_triangles_base,
 )
 from vaw.context_runtime.model import Pose
-from vaw.context_runtime.packet import ContextCompiler
+from vaw.context_runtime.packet import (
+    IMAGINATION_CONTACT_HEIGHT,
+    IMAGINATION_CONTACT_WIDTH,
+    ContextCompiler,
+)
 from vaw.context_runtime.workspace import ContextWorkspace
 
 
@@ -76,7 +80,7 @@ def test_grasp_close_preview_lifecycle_and_no_numeric_packet_leak() -> None:
     assert geometry.volume_proxy is not None
     seed_id = workspace.execute("propose_grasps", region_id=region_id).result["seed_ids"][0]
     action_id = workspace.execute("select", seed_id=seed_id).result["action_id"]
-    workspace.begin_refinement("accept coarse fixture", action_id)
+    workspace.begin_imagination("accept coarse fixture", action_id)
     workspace.execute_imagination("finish_imagination", status="ready")
 
     assert workspace.execute("commit", action_id=action_id).ok
@@ -99,23 +103,36 @@ def test_grasp_close_preview_lifecycle_and_no_numeric_packet_leak() -> None:
         point_id=point_id,
         offset_xyz=[0.0, 0.0, 0.05],
     ).result["action_id"]
-    workspace.begin_refinement("transport preview", transport_action)
+    workspace.begin_imagination("transport preview", transport_action)
     packet = ContextCompiler().compile_imagination(workspace)
     serialized = json.dumps(packet.summary(), ensure_ascii=False).lower()
     assert "extent_xyz_m" not in serialized
     assert "tcp_from_obb" not in serialized
-    assert packet.rasters["imagination_scene"].shape == (720, 1200, 3)
-    assert packet.rasters["contact_focus"].shape == (720, 832, 3)
+    assert packet.rasters["imagination_scene"].shape == (120, 160, 3)
+    assert packet.rasters["contact_front"].shape == (
+        IMAGINATION_CONTACT_HEIGHT,
+        IMAGINATION_CONTACT_WIDTH,
+        3,
+    )
+    assert packet.rasters["contact_side"].shape == (
+        IMAGINATION_CONTACT_HEIGHT,
+        IMAGINATION_CONTACT_WIDTH,
+        3,
+    )
     workspace._private.attachment_hypothesis = None
     without_proxy = ContextCompiler().compile_imagination(workspace)
     workspace._private.attachment_hypothesis = attachment
-    assert not np.array_equal(
+    assert np.array_equal(
         packet.rasters["imagination_scene"],
         without_proxy.rasters["imagination_scene"],
     )
     assert not np.array_equal(
-        packet.rasters["contact_focus"],
-        without_proxy.rasters["contact_focus"],
+        packet.rasters["contact_front"],
+        without_proxy.rasters["contact_front"],
+    )
+    assert not np.array_equal(
+        packet.rasters["contact_side"],
+        without_proxy.rasters["contact_side"],
     )
 
     workspace.execute_imagination("finish_imagination", status="failed")
@@ -138,7 +155,7 @@ def test_point_anchored_object_approach_can_create_attachment_proxy() -> None:
         point_id=point_id,
         offset_xyz=[0.0, 0.0, 0.05],
     ).result["action_id"]
-    workspace.begin_refinement("keep point-anchored approach", action_id)
+    workspace.begin_imagination("keep point-anchored approach", action_id)
     workspace.execute_imagination("finish_imagination", status="ready")
 
     assert workspace.execute("commit", action_id=action_id).ok

@@ -49,7 +49,7 @@ class TaskMemory:
 
         if self.physical_primitives:
             previous = self.physical_primitives[-1]
-            if _same_move_intent(previous, primitive):
+            if _supersedes_previous_move(previous, primitive):
                 self.physical_primitives[-1] = primitive
                 return
             if _same_gripper_command(previous, primitive):
@@ -74,7 +74,7 @@ class FunctionEvent:
     """One policy-visible projection of the latest Function transaction."""
 
     function: str
-    status: Literal["ok", "failed"]
+    status: Literal["ok", "partial", "failed"]
     references: dict[str, Any] | None = None
     message: str | None = None
 
@@ -90,37 +90,68 @@ class FunctionEvent:
         return result
 
 
+_PHYSICAL_FUNCTIONS = frozenset(
+    {"commit", "delta_move", "open_gripper", "close_gripper"}
+)
 _FAILURE_MESSAGES = {
     "detection_and_sam": "target could not be grounded in the current observation",
     "locate_point": "operation point could not be grounded in the current observation",
     "propose_grasps": "no usable grasp seeds were produced",
-    "propose_pose": "a pending spatial action could not be created",
-    "select": "the selected seed did not create a pending spatial action",
-    "refine_action": (
-        "local refinement did not produce a ready action; do not recreate the same "
-        "point/offset task without new geometry or a materially different target"
-    ),
+    "propose_pose": "a spatial action proposal could not be created",
+    "select": "the selected seed did not create a spatial action proposal",
+    "call_imagination": "local imagination did not deliver a refined action",
     "delta_move": "the physical TCP adjustment did not complete; its effect is uncertain",
     "commit": "the spatial command did not complete; its effect is uncertain",
     "open_gripper": "the gripper command did not complete; its effect is uncertain",
     "close_gripper": "the gripper command did not complete; its effect is uncertain",
-    "reject_action": "the pending action could not be rejected",
+    "reject_action": "the action proposal could not be rejected",
     "done": "the termination declaration was rejected",
 }
 
 
-def project_function_event(function_name: str, result: dict[str, Any]) -> FunctionEvent:
+def project_function_event(
+    function_name: str,
+    result: dict[str, Any],
+    *,
+    world_changed: bool | None = None,
+) -> FunctionEvent:
     """Project raw handler output without leaking controller diagnostics."""
 
     failed = "error" in result or result.get("status") == "failed"
     if failed:
+        reason = result.get("reason")
+        if not isinstance(reason, str):
+            reason = None
+        references: dict[str, Any] = {}
+        action_id = result.get("action_id")
+        if isinstance(action_id, str):
+            references["action_id"] = action_id
+        if reason:
+            references["reason"] = reason
         return FunctionEvent(
             function=function_name,
             status="failed",
-            message=_FAILURE_MESSAGES.get(function_name, "function call was rejected"),
+            references=references or None,
+            message=_failure_message(function_name, result, world_changed),
         )
 
-    references: dict[str, Any] = {}
+    if result.get("status") == "partial":
+        references = {}
+        action_id = result.get("action_id")
+        if isinstance(action_id, str):
+            references["action_id"] = action_id
+        reason = result.get("reason")
+        if isinstance(reason, str):
+            references["reason"] = reason
+        advisory = result.get("advisory")
+        return FunctionEvent(
+            function=function_name,
+            status="partial",
+            references=references or None,
+            message=advisory if isinstance(advisory, str) else None,
+        )
+
+    references = {}
     for key in ("region_id", "point_id", "action_id"):
         value = result.get(key)
         if isinstance(value, str):
@@ -132,7 +163,70 @@ def project_function_event(function_name: str, result: dict[str, Any]) -> Functi
         function=function_name,
         status="ok",
         references=references or None,
+        message=_success_message(result),
     )
+
+
+def _success_message(result: dict[str, Any]) -> str | None:
+    """Measured facts worth one line: change checks, reuse, advisories."""
+
+    parts: list[str] = []
+    changes = result.get("world_changes")
+    if isinstance(changes, dict):
+        formatted = _format_world_changes(changes)
+        if formatted:
+            parts.append(formatted)
+    if result.get("reused") is True:
+        parts.append(
+            "reused an existing verified grounding; that spot is unchanged "
+            "since it was last measured"
+        )
+    if result.get("plan_reused") is True:
+        parts.append(
+            "returned this seed's already-measured plan; the trajectory result "
+            "is unchanged"
+        )
+    detail = result.get("detail")
+    if isinstance(detail, str) and detail:
+        parts.append(detail)
+    advisory = result.get("advisory")
+    if isinstance(advisory, str) and advisory:
+        parts.append(advisory)
+    return "; ".join(parts) or None
+
+
+def _format_world_changes(changes: dict[str, Any]) -> str | None:
+    parts: list[str] = []
+    removed = changes.get("removed")
+    if isinstance(removed, (list, tuple)) and removed:
+        parts.append("changed and dropped: " + ", ".join(str(v) for v in removed))
+    occluded = changes.get("occluded")
+    if isinstance(occluded, (list, tuple)) and occluded:
+        parts.append("occluded, kept unverified: " + ", ".join(str(v) for v in occluded))
+    verified = changes.get("verified")
+    if isinstance(verified, (list, tuple)) and verified:
+        parts.append("verified unchanged: " + ", ".join(str(v) for v in verified))
+    if not parts:
+        return None
+    return "world change check — " + "; ".join(parts)
+
+
+def _failure_message(
+    function_name: str,
+    result: dict[str, Any],
+    world_changed: bool | None,
+) -> str:
+    if function_name in _PHYSICAL_FUNCTIONS and world_changed is False:
+        detail = result.get("error")
+        suffix = f": {detail}" if isinstance(detail, str) and detail else ""
+        return f"rejected before dispatch; the real world is unchanged{suffix}"
+    if function_name == "call_imagination":
+        reason = result.get("reason")
+        base = _FAILURE_MESSAGES["call_imagination"]
+        if isinstance(reason, str):
+            return f"{base}; reason={reason}"
+        return base
+    return _FAILURE_MESSAGES.get(function_name, "function call was rejected")
 
 
 def record_physical_transaction(
@@ -194,14 +288,21 @@ def _same_gripper_command(
     )
 
 
-def _same_move_intent(
+def _supersedes_previous_move(
     previous: PhysicalPrimitive,
     current: PhysicalPrimitive,
 ) -> bool:
+    """Keep only the latest consecutive absolute arm target.
+
+    A later ``move_to`` supersedes the arm pose established by the preceding
+    ``move_to`` even when their natural-language intents differ.  Keeping both
+    made the policy reason over stale approach descriptions although the live
+    robot pose already encodes the only current arm state.  Gripper operations
+    and deltas still form explicit causal boundaries and are not removed.
+    """
+
     return (
         previous.op == current.op == "move_to"
-        and previous.intent is not None
-        and previous.intent == current.intent
         and current.status == "executed"
     )
 

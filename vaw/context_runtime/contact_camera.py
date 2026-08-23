@@ -15,6 +15,10 @@ from typing import Any, Literal
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+# How far a Contact camera may back off to fit tall geometry, as a multiple of
+# its close-up distance.  Beyond this the panel stops being a contact view.
+_MAX_FRAMING_DISTANCE_RATIO = 4.6
+
 
 @dataclass(frozen=True)
 class ContactCameraRequest:
@@ -32,6 +36,15 @@ class ContactCameraRequest:
     # later as a line-art overlay, but it participates in camera centering and
     # zoom so a missing carried-object proxy cannot clip the target gripper.
     required_points_base: np.ndarray | None = None
+    # Keep left/right semantics stable across physical revisions.  When set,
+    # visibility scoring is bypassed and this previously selected end of each
+    # orthogonal axis is rendered again around the new current geometry.
+    preferred_signs: tuple[int, int] | None = None
+    # Tilt the SIDE camera above the horizon while keeping it on the same
+    # gripper-locked azimuth.  Two horizontal panels resolve height but leave
+    # lateral placement unobservable, so carrying a payload trades the
+    # redundant second elevation readout for an oblique XY readout.
+    side_elevation_deg: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -44,6 +57,7 @@ class ContactCameraSelection:
     front_visibility: float
     side_visibility: float
     azimuth_offset_deg: float = 0.0
+    side_elevation_deg: float = 0.0
 
     def summary(self) -> dict[str, float | int]:
         return {
@@ -53,6 +67,7 @@ class ContactCameraSelection:
             "front_visibility": round(float(self.front_visibility), 6),
             "side_visibility": round(float(self.side_visibility), 6),
             "azimuth_offset_deg": round(float(self.azimuth_offset_deg), 3),
+            "side_elevation_deg": round(float(self.side_elevation_deg), 3),
         }
 
 
@@ -180,8 +195,14 @@ class LiberoContactCameraProvider:
         self,
         env: Any,
         *,
-        distance_m: float = 0.26,
-        fovy_deg: float = 48.0,
+        # A wide close-up exaggerates whatever is nearest the lens, so a
+        # foreground object reads as taller than the gripper and the two panels
+        # disagree about clearance.  Standing back with a narrower FOV flattens
+        # that.  It cannot go much further: past roughly 0.45 m the camera
+        # leaves the cluster of tabletop objects it is currently inside and
+        # neighbouring items start occluding the subject on both azimuths.
+        distance_m: float = 0.38,
+        fovy_deg: float = 34.0,
         framing_padding_m: float = 0.035,
     ) -> None:
         self._env = env
@@ -209,6 +230,9 @@ class LiberoContactCameraProvider:
         height = int(request.panel_height)
         if width <= 0 or height <= 0:
             raise ValueError("contact camera dimensions must be positive")
+        side_elevation_deg = float(request.side_elevation_deg)
+        if not np.isfinite(side_elevation_deg) or not 0.0 <= side_elevation_deg <= 80.0:
+            raise ValueError("side_elevation_deg must be in [0, 80]")
 
         base_position_world, base_rotation_world = _base_pose_world(self._env, sim)
         center_world = base_position_world + base_rotation_world @ center_base
@@ -247,40 +271,54 @@ class LiberoContactCameraProvider:
                 frame_rotation_world[:, 0], up_world, "contact front"
             )
             side_zero = _unit(np.cross(up_world, front_zero), "contact side")
-            # FRONT and SIDE are geometric invariants. FRONT looks exactly
-            # along the session-locked gripper-normal axis and SIDE exactly
-            # along its orthogonal closing axis. Visibility may choose only
-            # which end of either axis to observe from; it must not rotate the
-            # views away from the gripper and make them oblique.
+            # FRONT and SIDE azimuths are geometric invariants. FRONT looks
+            # along the session-locked gripper-normal axis and SIDE along its
+            # orthogonal closing axis. Visibility may choose only which end of
+            # either axis to observe from; it must never rotate the azimuths
+            # away from the gripper. Elevation is the one degree of freedom the
+            # caller may add, and only on SIDE, so the pair keeps a level panel
+            # for height and gains an oblique panel for lateral placement.
             front_axis = front_zero
             side_axis = side_zero
-            for front_sign, side_sign in (
-                (1, 1),
-                (1, -1),
-                (-1, 1),
-                (-1, -1),
-            ):
+            sign_pairs = (
+                (request.preferred_signs,)
+                if request.preferred_signs is not None
+                else ((1, 1), (1, -1), (-1, 1), (-1, -1))
+            )
+            for front_sign, side_sign in sign_pairs:
+                if front_sign not in {-1, 1} or side_sign not in {-1, 1}:
+                    raise ValueError("preferred_signs must contain only -1 or 1")
                 front_world = float(front_sign) * front_axis
                 side_world = float(side_sign) * side_axis
                 rendered: dict[str, dict[str, Any]] = {}
                 scores: dict[str, float] = {}
                 for (
-                    view_name,
-                    camera_name,
-                    _forward_index,
-                ), horizontal_forward in zip(
+                    (view_name, camera_name, _forward_index),
+                    horizontal_forward,
+                    view_elevation_deg,
+                ) in zip(
                     self._CAMERAS,
                     (front_world, side_world),
+                    (0.0, side_elevation_deg),
                     strict=True,
                 ):
+                    tilt = np.radians(view_elevation_deg)
+                    # Frame against the tilted optical axis so an oblique panel
+                    # crops the same geometry a level panel would.
+                    forward_tilted = (
+                        np.cos(tilt) * horizontal_forward - np.sin(tilt) * up_world
+                    )
+                    up_tilted = (
+                        np.sin(tilt) * horizontal_forward + np.cos(tilt) * up_world
+                    )
                     distance_m = _framing_distance(
                         subject_points,
                         required_points,
                         center_base,
                         horizontal_forward_base=(
-                            base_rotation_world.T @ horizontal_forward
+                            base_rotation_world.T @ forward_tilted
                         ),
-                        up_base=(base_rotation_world.T @ up_world),
+                        up_base=(base_rotation_world.T @ up_tilted),
                         width=width,
                         height=height,
                         fovy_deg=self._fovy_deg,
@@ -299,6 +337,7 @@ class LiberoContactCameraProvider:
                         width=width,
                         height=height,
                         distance_m=distance_m,
+                        elevation_deg=view_elevation_deg,
                     )
                     rendered[view_name] = camera
                     scores[view_name] = _visibility_score(
@@ -349,6 +388,13 @@ class LiberoContactCameraProvider:
             candidates,
             key=lambda item: item[0],
         )
+        _attach_current_gripper_masks(
+            sim,
+            rendered,
+            saved_cameras=saved,
+            width=width,
+            height=height,
+        )
         return ContactCameraPair(
             front=rendered["front"],
             side=rendered["side"],
@@ -359,6 +405,7 @@ class LiberoContactCameraProvider:
                 front_visibility=front_score,
                 side_visibility=side_score,
                 azimuth_offset_deg=azimuth_offset_deg,
+                side_elevation_deg=side_elevation_deg,
             ),
         )
 
@@ -376,7 +423,12 @@ class LiberoContactCameraProvider:
         width: int,
         height: int,
         distance_m: float,
+        elevation_deg: float,
     ) -> tuple[dict[str, Any], np.ndarray]:
+        # Tilt around the framed centre so the panel keeps its zoom: the
+        # camera slides along a sphere of radius ``distance_m`` instead of
+        # simply rising and drifting away from the subject.
+        tilt = np.radians(float(elevation_deg))
         return _render_rgbd_camera(
             sim,
             camera_name=camera_name,
@@ -388,8 +440,8 @@ class LiberoContactCameraProvider:
             base_rotation_world=base_rotation_world,
             width=width,
             height=height,
-            distance_m=distance_m,
-            elevation_m=0.0,
+            distance_m=float(distance_m) * float(np.cos(tilt)),
+            elevation_m=float(distance_m) * float(np.sin(tilt)),
             fovy_deg=self._fovy_deg,
         )
 
@@ -456,8 +508,138 @@ def _render_rgbd_camera(
         "intrinsics": intrinsics,
         "pose_mat": base_from_camera,
         "view_name": view_name,
+        # Kept only until the provider renders the matching MuJoCo
+        # segmentation.  These values are removed before ContactCameraPair is
+        # returned and never enter a ContextPacket.
+        "_mujoco_camera_name": camera_name,
+        "_mujoco_position_world": camera_position_world.copy(),
+        "_mujoco_quaternion_wxyz": np.roll(camera_quaternion_xyzw, 1),
+        "_mujoco_fovy_deg": float(fovy_deg),
     }
     return camera, depth_metric
+
+
+def _attach_current_gripper_masks(
+    sim: Any,
+    rendered: dict[str, dict[str, Any]],
+    *,
+    saved_cameras: list[tuple[int, np.ndarray, np.ndarray, float]],
+    width: int,
+    height: int,
+) -> None:
+    """Attach pixel-exact current-gripper masks from the same MuJoCo camera.
+
+    Contact RGB comes from robosuite's MuJoCo Panda model.  Projecting a
+    separate Panda URDF onto that image is not exact: the two descriptions use
+    different finger origins and visual meshes.  Element segmentation instead
+    shares the RGB camera, geometry, FK and occlusion buffer, so its visible
+    pixels align by construction.
+
+    Two masks are produced.  ``finger_mask`` covers the visible fingers.
+    ``palm_floor_mask`` is a thin band on the palm's lower silhouette edge:
+    during a top-down approach the palm underside, not the fingertips, is what
+    first touches the object, and leaving it unmarked draws attention to the
+    highlighted fingers instead.  Only the band is marked, because the rest of
+    the palm is not a contact surface and a full mask would bury the fingers.
+
+    The raw segmentation is private presenter state.  Only the composited
+    raster is policy-visible.
+    """
+
+    finger_geom_ids = _visual_geom_ids(sim.model, ("finger1_visual", "finger2_visual"))
+    palm_geom_ids = _visual_geom_ids(sim.model, ("hand_visual",))
+    cameras = tuple(rendered.values())
+    if not finger_geom_ids:
+        for camera in cameras:
+            camera.pop("_mujoco_camera_name", None)
+            camera.pop("_mujoco_position_world", None)
+            camera.pop("_mujoco_quaternion_wxyz", None)
+            camera.pop("_mujoco_fovy_deg", None)
+        return
+    try:
+        try:
+            import mujoco
+        except ImportError as exc:  # pragma: no cover - LIBERO requires MuJoCo
+            raise RuntimeError("MuJoCo segmentation is unavailable") from exc
+        geom_object_type = int(mujoco.mjtObj.mjOBJ_GEOM)
+        for camera in cameras:
+            camera_name = str(camera["_mujoco_camera_name"])
+            camera_id = int(sim.model.camera_name2id(camera_name))
+            sim.model.cam_pos[camera_id] = np.asarray(
+                camera["_mujoco_position_world"],
+                dtype=np.float64,
+            )
+            sim.model.cam_quat[camera_id] = np.asarray(
+                camera["_mujoco_quaternion_wxyz"],
+                dtype=np.float64,
+            )
+            sim.model.cam_fovy[camera_id] = float(camera["_mujoco_fovy_deg"])
+            sim.forward()
+            raw = sim.render(
+                camera_name=camera_name,
+                width=width,
+                height=height,
+                depth=False,
+                segmentation=True,
+            )
+            segmentation = np.asarray(raw, dtype=np.int32)
+            if segmentation.shape != (height, width, 2):
+                raise RuntimeError(
+                    "MuJoCo camera returned invalid element segmentation"
+                )
+            segmentation = segmentation[::-1]
+            is_geom = segmentation[..., 0] == geom_object_type
+            camera["finger_mask"] = np.ascontiguousarray(
+                is_geom & np.isin(segmentation[..., 1], finger_geom_ids)
+            )
+            if palm_geom_ids:
+                palm = is_geom & np.isin(segmentation[..., 1], palm_geom_ids)
+                camera["palm_floor_mask"] = _lower_edge_band(palm, height)
+    finally:
+        for camera in cameras:
+            camera.pop("_mujoco_camera_name", None)
+            camera.pop("_mujoco_position_world", None)
+            camera.pop("_mujoco_quaternion_wxyz", None)
+            camera.pop("_mujoco_fovy_deg", None)
+        # The RGB candidate search already restored these cameras once.  The
+        # selected-pair segmentation temporarily reused them, so restore them
+        # again without advancing physics.
+        for camera_id, position, quaternion, fovy in saved_cameras:
+            sim.model.cam_pos[camera_id] = position
+            sim.model.cam_quat[camera_id] = quaternion
+            sim.model.cam_fovy[camera_id] = fovy
+        if saved_cameras:
+            sim.forward()
+
+
+def _visual_geom_ids(model: Any, suffixes: tuple[str, ...]) -> tuple[int, ...]:
+    """Return robosuite Panda visual geom IDs, independent of model prefix."""
+
+    names = getattr(model, "geom_names", ())
+    ids = [
+        int(model.geom_name2id(str(name)))
+        for name in names
+        if name is not None and str(name).endswith(suffixes)
+    ]
+    return tuple(sorted(set(ids)))
+
+
+def _lower_edge_band(mask: np.ndarray, height: int) -> np.ndarray:
+    """Keep a thin band along the bottom-most visible run of every column.
+
+    On a gravity-stable panel this traces the palm's lower boundary, which is
+    the surface that ends a descent.  A band rather than an outline keeps it
+    legible after the panel is rescaled for the canvas.
+    """
+
+    thickness = max(5, int(round(0.028 * float(height))))
+    rows = np.arange(mask.shape[0], dtype=np.int64)[:, None]
+    occupied = mask.any(axis=0)
+    # ``argmax`` on the row-reversed mask finds the first True from the bottom.
+    bottom = (mask.shape[0] - 1) - np.argmax(mask[::-1], axis=0)
+    bottom = np.where(occupied, bottom, -1)
+    band = (rows <= bottom) & (rows > bottom - thickness)
+    return np.ascontiguousarray(band)
 
 
 def _base_pose_world(env: Any, sim: Any) -> tuple[np.ndarray, np.ndarray]:
@@ -646,7 +828,10 @@ def _framing_distance(
     fit_horizontal = horizontal_half / max(tangent * aspect, 1e-6)
     fit_depth = max(depth_limits, default=0.0)
     required = 1.08 * max(fit_vertical, fit_horizontal, fit_depth)
-    return float(np.clip(max(float(minimum_m), required), minimum_m, 1.2))
+    # The ceiling is expressed as a multiple of the close-up distance so that
+    # changing the FOV rescales the whole framing envelope with it.
+    maximum_m = _MAX_FRAMING_DISTANCE_RATIO * float(minimum_m)
+    return float(np.clip(max(float(minimum_m), required), minimum_m, maximum_m))
 
 
 def _horizontal_axis(value: Any, up: np.ndarray, name: str) -> np.ndarray:

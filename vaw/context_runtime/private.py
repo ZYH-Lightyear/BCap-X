@@ -17,6 +17,7 @@ from vaw.context_runtime.model import ActionTarget, Pose
 
 if TYPE_CHECKING:
     from vaw.context_runtime.contact_camera import ContactCameraPair
+    from vaw.context_runtime.evidence import EvidenceArchive
     from vaw.context_runtime.motion import MotionPlan
 
 
@@ -72,6 +73,10 @@ class VisualEdit:
 class SeedArtifacts:
     planning_context: PlanningContext | None = None
     preview_plan: MotionPlan | None = None
+    # Last ``select`` plan for this seed in the current revision.  Success and
+    # failure are both kept so a later select can return the same measurement
+    # without calling the trajectory planner again.
+    motion_plan: MotionPlan | None = None
     family: str | None = None
 
 
@@ -184,8 +189,12 @@ class PrivateEnvContext:
     semantic_rgb: np.ndarray | None = None
     region_masks: dict[str, np.ndarray] = field(default_factory=dict)
     region_geometry: dict[str, RegionGeometryArtifact] = field(default_factory=dict)
+    # Grounding-time appearance snapshots keyed by evidence id.  They anchor
+    # cross-action revalidation and are pruned together with their evidence.
+    evidence_archives: dict[str, EvidenceArchive] = field(default_factory=dict)
     seed_artifacts: dict[str, SeedArtifacts] = field(default_factory=dict)
     action_artifacts: ActionArtifacts | None = None
+    imagination_checkpoint: tuple[Any, ActionArtifacts | None] | None = None
     last_physical_artifacts: LastPhysicalArtifacts | None = None
     # These two artifacts intentionally survive observation revisions.  A
     # successful object approach promotes a revision-local region proxy to a
@@ -201,6 +210,8 @@ class PrivateEnvContext:
     contact_camera_provider: Any | None = None
     contact_camera_pair: ContactCameraPair | None = None
     contact_camera_action_id: str | None = None
+    contact_camera_signs: tuple[int, int] | None = None
+    contact_camera_side_elevation_deg: float = 0.0
     opposite_scene_camera_provider: Any | None = None
     opposite_scene_camera: dict[str, Any] | None = None
     opposite_scene_camera_revision: int | None = None
@@ -217,10 +228,12 @@ class PrivateEnvContext:
         self.previous_observation = self.observation
         self.observation = observation
         self.semantic_rgb = None
-        self.region_masks.clear()
-        self.region_geometry.clear()
+        # region_masks / region_geometry / evidence_archives survive here;
+        # the evidence revalidation pass prunes them together with the
+        # regions and points that fail against the new observation.
         self.seed_artifacts.clear()
         self.action_artifacts = None
+        self.imagination_checkpoint = None
         self.last_physical_artifacts = None
         self.presentation_event = None
         self.trace_diagnostics.clear()

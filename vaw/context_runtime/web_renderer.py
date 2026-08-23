@@ -15,7 +15,7 @@ from vaw.context_runtime.packet import (
 
 
 class ContextWebRenderer:
-    name = "context-web-v37-working-memory"
+    name = "context-web-v46-oblique-contact"
     width = CONTEXT_WIDTH
     height = CONTEXT_HEIGHT
 

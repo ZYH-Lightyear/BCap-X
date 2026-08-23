@@ -16,6 +16,7 @@ import argparse
 import os
 import pathlib
 import re
+import sys
 from typing import Any
 
 os.environ.setdefault("MUJOCO_GL", "egl")
@@ -41,7 +42,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--protocol", choices=("native", "text"), default="text")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=4096)
-    parser.add_argument("--max-turns", type=int, default=32)
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        choices=range(1, 33),
+        default=32,
+        metavar="1..32",
+    )
     parser.add_argument("--max-time-s", type=float, default=1800.0)
     parser.add_argument("--max-physical-ops", type=int, default=30)
     parser.add_argument("--max-imagination-turns", type=int, default=6)
@@ -143,6 +150,11 @@ def main() -> int:
     trace = ContextTraceLogger(trace_dir)
     trace.log_meta(
         {
+            "suite": args.suite,
+            "task_id": args.task_id,
+            "seed": args.seed,
+            "model": args.model,
+            "imagination_model": args.imagination_model or args.model,
             "semantic_render_scale": args.semantic_render_scale,
             "contact_camera": "mujoco-direct-simulation-only",
             "opposite_scene_camera": "mujoco-direct-simulation-only",
@@ -258,9 +270,16 @@ def _run_agent(
 
     def on_turn(turn: int, record: Any) -> None:
         flag = "ok" if record.ok else "ERROR"
-        if record.thought:
-            print(f"[basis {turn:02d}] {record.thought}")
-        print(f"[turn {turn:02d}] {flag:<5} {record.op} {record.args} -> {record.result}")
+        try:
+            # ffmpeg children flip the shared stdout/stderr fds to
+            # non-blocking; restore before printing so a full tee pipe
+            # blocks instead of raising BlockingIOError.
+            os.set_blocking(sys.stdout.fileno(), True)
+            if record.thought:
+                print(f"[basis {turn:02d}] {record.thought}")
+            print(f"[turn {turn:02d}] {flag:<5} {record.op} {record.args} -> {record.result}")
+        except OSError:
+            pass
 
     runtime = ContextRuntime(
         provider,
@@ -340,7 +359,7 @@ def _run_scripted(
         nonlocal turn
         packet = (
             compiler.compile_imagination(workspace)
-            if workspace.state.refinement is not None
+            if workspace.state.imagination is not None
             else compiler.compile(workspace)
         )
         image = renderer.render(packet)
@@ -379,7 +398,7 @@ def _run_scripted(
     if not seed_ids:
         raise RuntimeError("scripted smoke received no grasp candidates")
     action_id = step("select", seed_id=seed_ids[0])["action_id"]
-    workspace.begin_refinement(
+    workspace.begin_imagination(
         f"使两指围绕 {object_query} 形成可审查的对称接触几何",
         action_id,
     )

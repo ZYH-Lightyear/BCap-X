@@ -93,6 +93,24 @@ class PandaUrdfGripperFK:
             ("panda_hand",),
         )
 
+    def finger_triangles(
+        self,
+        joint_positions_rad: np.ndarray,
+        gripper_opening: float,
+    ) -> np.ndarray:
+        """Return only the two moving finger links.
+
+        Contact views use this exact FK subset as a light visual cue for the
+        real closing channel.  Keeping the palm out of the mask avoids hiding
+        the object and does not turn the whole robot into a coloured blob.
+        """
+
+        return self._triangles_for_links(
+            joint_positions_rad,
+            gripper_opening,
+            ("panda_leftfinger", "panda_rightfinger"),
+        )
+
     def robot_triangles(
         self,
         joint_positions_rad: np.ndarray,

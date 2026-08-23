@@ -22,32 +22,27 @@ function FactRow({ label, children }: { label: string; children: ReactNode }) {
   return <div className="via-fact-row"><strong>{label}</strong><code>{children}</code></div>
 }
 
-function RobotStatePanel({ snapshot }: { snapshot: ContextSnapshot }) {
-  const robot = snapshot.world.robot
-  const tcp = robot?.tcp_pose ?? robot?.ee_pose
-  return (
-    <aside className="via-robot-state">
-      <FactRow label="GRIP">{robot?.gripper_opening?.toFixed(3) ?? 'N/A'}</FactRow>
-      <FactRow label="TCP XYZ">{fmt(tcp?.position_xyz)}</FactRow>
-      <FactRow label="JOINTS">{fmt(robot?.joint_positions_rad, 2)}</FactRow>
-    </aside>
-  )
-}
-
 function ObservedLayer({ snapshot }: { snapshot: ContextSnapshot }) {
+  const opening = snapshot.world.robot?.gripper_opening
   return (
     <section className="via-observed">
-      <header><h1>OBSERVED NOW · REAL WORLD</h1></header>
+      <header>
+        <h1>OBSERVED NOW · REAL WORLD</h1>
+        <div className="via-observed-grip"><strong>GRIP</strong><code>{opening?.toFixed(3) ?? 'N/A'}</code></div>
+      </header>
       <div className="via-observed-grid">
         <article className="via-raster-card via-agentview">
           <Raster snapshot={snapshot} id={snapshot.world.agentviewRasterId} alt="当前 LIBERO-PRO 主视角" />
           <span>AGENTVIEW · CURRENT RGB</span>
         </article>
         <article className="via-raster-card via-observed-cloud">
-          <Raster snapshot={snapshot} id={snapshot.world.observedSceneRasterId} alt="当前反侧真实相机视角" />
+          <Raster
+            snapshot={snapshot}
+            id={snapshot.world.observedSceneRasterId}
+            alt="当前反侧真实相机视角"
+          />
           <span>OPPOSITE VIEW · CURRENT RGB</span>
         </article>
-        <RobotStatePanel snapshot={snapshot} />
       </div>
     </section>
   )
@@ -131,8 +126,7 @@ function EditOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
 function ModeOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
   const mode = snapshot.decision.mode
   if (mode === 'seeds') return null
-  if (mode === 'grounding') return <GroundingOverlay snapshot={snapshot} />
-  if (mode === 'contact' && snapshot.decision.primaryRasterId) {
+  if (mode === 'grounding' || snapshot.decision.primaryRasterId) {
     return <GroundingOverlay snapshot={snapshot} />
   }
   if (mode === 'editing' || mode === 'proposal') return <EditOverlay snapshot={snapshot} />
@@ -143,9 +137,9 @@ function decisionHeader(snapshot: ContextSnapshot, seedHeader: string): string {
   switch (snapshot.decision.mode) {
     case 'seeds': return seedHeader
     case 'editing': return 'IMAGINATION · NOT EXECUTED'
-    case 'proposal': return snapshot.world.action?.status === 'ready'
-      ? 'REFINED ACTION · READY FOR MAIN REVIEW'
-      : 'COARSE ACTION · REFINE OR REJECT'
+    case 'proposal': return snapshot.world.action?.status === 'refined'
+      ? 'REFINED ACTION · MAIN REVIEW'
+      : 'PLANNED ACTION · MAIN REVIEW'
     case 'grounding': return 'CURRENT EVIDENCE · OBSERVED'
     case 'contact': return 'CURRENT CONTACT · REAL WORLD'
     case 'terminal': return 'FINAL OBSERVATION · REAL WORLD'
@@ -156,34 +150,32 @@ function decisionHeader(snapshot: ContextSnapshot, seedHeader: string): string {
 function ImaginationLayer({ snapshot }: { snapshot: ContextSnapshot }) {
   const active = snapshot.world.action !== null
   const selecting = snapshot.decision.mode === 'seeds'
-  const hasContactFocus = snapshot.world.contactFocusRasterId !== null
+  const hasContactFocus = (
+    snapshot.world.contactFrontRasterId !== null
+    && snapshot.world.contactSideRasterId !== null
+  )
   const observedGrip = snapshot.world.robot?.gripper_opening
   const seedHeader = observedGrip === undefined
     ? 'ACTION SEEDS · VIRTUAL OPTIONS'
     : `ACTION SEEDS · GRIP ${observedGrip.toFixed(3)} INHERITED`
   const header = decisionHeader(snapshot, seedHeader)
   return (
-    <section className={`via-imagination${active ? ' via-imagination--active' : ''}${selecting ? ' via-imagination--seeds' : ''}`}>
+    <section className={`via-imagination${active ? ' via-imagination--active' : ''}${selecting ? ' via-imagination--seeds' : ''}${hasContactFocus ? ' via-imagination--contact' : ''}`}>
       <header><h1>{header}</h1></header>
       <div className="via-imagination-stage">
         {selecting
           ? <SeedGallery snapshot={snapshot} />
           : hasContactFocus
             ? <div className="via-imagination-visuals">
-                <div className="via-imagination-global">
-                  <Raster snapshot={snapshot} id={snapshot.world.imaginationSceneRasterId} alt="当前点云上的虚拟 Waypoint" />
-                  <ModeOverlay snapshot={snapshot} />
+                <div className="via-contact-panel via-contact-panel--front">
+                  <Raster snapshot={snapshot} id={snapshot.world.contactFrontRasterId} alt="目标夹爪正面接触视图" />
                 </div>
-                <aside className="via-contact-rail">
-                  <div className="via-contact-focus">
-                    <Raster snapshot={snapshot} id={snapshot.world.contactFocusRasterId} alt="目标夹爪双正交接触视图" />
-                  </div>
-                </aside>
+                <div className="via-contact-panel via-contact-panel--side">
+                  <Raster snapshot={snapshot} id={snapshot.world.contactSideRasterId} alt="目标夹爪侧面接触视图" />
+                </div>
               </div>
-            : <>
-                <Raster snapshot={snapshot} id={snapshot.world.imaginationSceneRasterId} alt="当前点云上的虚拟 Waypoint" />
-                <ModeOverlay snapshot={snapshot} />
-              </>}
+            : <Raster snapshot={snapshot} id={snapshot.world.imaginationSceneRasterId} alt="当前点云上的虚拟 Waypoint" />}
+        {!selecting && <ModeOverlay snapshot={snapshot} />}
       </div>
     </section>
   )

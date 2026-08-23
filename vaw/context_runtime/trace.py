@@ -134,6 +134,15 @@ class SubagentTraceLogger:
         )
         self.index = 0
 
+    def log_meta(self, values: dict[str, Any]) -> None:
+        current: dict[str, Any] = {}
+        if self.meta_path.exists():
+            current = json.loads(self.meta_path.read_text(encoding="utf-8"))
+        current.update(values)
+        self.meta_path.write_text(
+            json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
     def log_turn(
         self,
         *,

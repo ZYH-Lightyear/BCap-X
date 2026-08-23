@@ -11,6 +11,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from vaw.context_runtime.errors import ContextFunctionError
+from vaw.context_runtime.evidence import revalidate_evidence
 from vaw.context_runtime.functions import ContextFunctions
 from vaw.context_runtime.geometry import (
     DEFAULT_TCP_TO_HAND_LOCAL_XYZ,
@@ -20,9 +21,9 @@ from vaw.context_runtime.memory import record_physical_transaction
 from vaw.context_runtime.model import (
     ActionSeed,
     ContextState,
+    ImaginationSession,
     PointEvidence,
     Pose,
-    RefinementSession,
     RegionEvidence,
     RobotState,
 )
@@ -61,8 +62,8 @@ class ContextWorkspace:
     # on the collision-aware coarse planner.
     LOCAL_TRANSLATION_LIMIT_M = 0.06
     LOCAL_ROTATION_LIMIT_DEG = 20.0
-    # Main may execute simple local controls directly.  ``commit`` is reserved
-    # for a spatial action that Imagination explicitly returned as ready.
+    # Main may execute simple local controls directly.  ``commit`` executes the
+    # current ActionProposal's cached plan whether it is planned or refined.
     PHYSICAL_FUNCTIONS = frozenset(
         {"delta_move", "open_gripper", "close_gripper", "commit"}
     )
@@ -193,38 +194,57 @@ class ContextWorkspace:
             "reason": "local_target" if use_local else "coarse_target",
         }
 
-    def begin_refinement(self, instruction: str, action_id: str) -> str:
+    def begin_imagination(self, instruction: str, action_id: str) -> str:
         """Open one synchronous Imagination task without yielding Main ownership."""
 
-        if self.state.refinement is not None:
-            raise ContextFunctionError("a refinement task is already active")
+        if self.state.imagination is not None:
+            raise ContextFunctionError("an imagination session is already active")
         normalized = " ".join(str(instruction).split())
         if not normalized:
             raise ContextFunctionError("instruction must not be empty")
-        action = self.state.pending_action
+        action = self.state.action_proposal
         if action is None or action.action_id != action_id:
             raise ContextFunctionError(f"unknown or expired action_id '{action_id}'")
-        # A Contact Camera pair is selected once at refinement entry and then
+        # A Contact Camera pair is selected once at session entry and then
         # remains fixed while Imagination edits the virtual target.  Re-entering
-        # refinement intentionally performs a fresh visibility selection.
+        # Imagination intentionally performs a fresh visibility selection.
         self._private.clear_contact_camera_lock()
-        self.state.refinement = RefinementSession(
+        self._private.imagination_checkpoint = (action, self._private.action_artifacts)
+        self.state.imagination = ImaginationSession(
             action_id=action.action_id,
             instruction=normalized,
             initial_target=action.target,
-            created_action=False,
         )
         return action.action_id
 
-    def discard_pending_action(self) -> None:
+    def discard_action_proposal(self) -> None:
         """Discard the current virtual action without changing the real world."""
 
-        self.state.pending_action = None
-        self.state.refinement = None
+        self.state.action_proposal = None
+        self.state.imagination = None
         self._private.action_artifacts = None
+        self._private.imagination_checkpoint = None
         self._private.clear_contact_camera_lock()
 
-    def refresh_observation(self) -> dict[str, Any]:
+    def restore_imagination_checkpoint(self) -> None:
+        """Roll the working proposal back to the Imagination entry snapshot."""
+
+        checkpoint = self._private.imagination_checkpoint
+        if checkpoint is None:
+            self.discard_action_proposal()
+            return
+        proposal, artifacts = checkpoint
+        self.state.action_proposal = proposal
+        self.state.imagination = None
+        self._private.action_artifacts = artifacts
+        self._private.imagination_checkpoint = None
+
+    def refresh_observation(
+        self,
+        *,
+        invalidate_region_ids: tuple[str, ...] = (),
+        invalidate_queries: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
         observation = self._call_backend("get_observation")
         if not isinstance(observation, dict):
             raise ContextFunctionError("get_observation did not return a mapping")
@@ -235,13 +255,25 @@ class ContextWorkspace:
             revision,
             self._tcp_to_hand_local_xyz,
         )
+        # Carried regions/points are re-checked against the fresh image before
+        # anything downstream can reference them.  Anchors passed by physical
+        # handlers (grasped object, contact target) are removed without a
+        # pixel vote because the action itself implies their change.
+        self.last_evidence_report = revalidate_evidence(
+            self.state,
+            self._private,
+            self._private.camera(self.camera_name),
+            invalidate_region_ids=invalidate_region_ids,
+            invalidate_queries=invalidate_queries,
+        )
         return observation
 
     def execute(self, function_name: str, **arguments: Any) -> ContextStepResult:
         before = self.state.observation_revision
+        dispatched_arguments = dict(arguments)
         pending_intent = (
-            self.state.pending_action.intent
-            if self.state.pending_action is not None
+            self.state.action_proposal.intent
+            if self.state.action_proposal is not None
             else None
         )
         previous_physical = self.state.last_physical_action
@@ -253,17 +285,17 @@ class ContextWorkspace:
             result = {"error": "episode already ended"}
         else:
             try:
-                inspect.signature(handler).bind(**arguments)
+                dispatched_arguments = _accepted_handler_arguments(handler, arguments)
             except TypeError as exc:
                 result = {"error": str(exc)}
             else:
                 try:
-                    result = handler(**arguments)
+                    result = handler(**dispatched_arguments)
                 except ContextFunctionError as exc:
                     result = {"error": str(exc)}
         return self._record(
             function_name,
-            arguments,
+            dispatched_arguments,
             result,
             before,
             pending_intent=pending_intent,
@@ -276,6 +308,7 @@ class ContextWorkspace:
         """Dispatch one editor on the private Imagination tool surface."""
 
         before = self.state.observation_revision
+        dispatched_arguments = dict(arguments)
         self._private.begin_function_call()
         handler = self._functions.imagination_handlers.get(function_name)
         if handler is None:
@@ -286,15 +319,15 @@ class ContextWorkspace:
             result = {"error": "episode already ended"}
         else:
             try:
-                inspect.signature(handler).bind(**arguments)
+                dispatched_arguments = _accepted_handler_arguments(handler, arguments)
             except TypeError as exc:
                 result = {"error": str(exc)}
             else:
                 try:
-                    result = handler(**arguments)
+                    result = handler(**dispatched_arguments)
                 except ContextFunctionError as exc:
                     result = {"error": str(exc)}
-        return self._record(function_name, arguments, result, before)
+        return self._record(function_name, dispatched_arguments, result, before)
 
     def execute_action(self, payload: str | dict[str, Any]) -> ContextStepResult:
         try:
@@ -304,8 +337,12 @@ class ContextWorkspace:
             return self.reject("invalid", {"payload": shown_payload}, str(exc))
         return self.execute(name, **arguments)
 
-    def limit_refinement(self) -> ContextStepResult:
-        """Fail the active Imagination task when its private budget is spent."""
+    def limit_imagination(self) -> ContextStepResult:
+        """Close a budget-exhausted Imagination task with a partial handback.
+
+        The last planner-checked edit stays on the proposal for Main's review;
+        only a session with nothing executable to hand back rolls back.
+        """
 
         before = self.state.observation_revision
         self._private.begin_function_call()
@@ -313,7 +350,23 @@ class ContextWorkspace:
             result = self._functions.limit_imagination()
         except ContextFunctionError as exc:
             result = {"error": str(exc)}
-        return self._record("refinement_limit", {}, result, before)
+        name = (
+            "imagination_partial"
+            if result.get("status") == "partial"
+            else "imagination_failed"
+        )
+        return self._record(name, {}, result, before)
+
+    def fail_imagination(self, termination_reason: str) -> ContextStepResult:
+        """Fail the active Imagination task with a classified termination reason."""
+
+        before = self.state.observation_revision
+        self._private.begin_function_call()
+        try:
+            result = self._functions.fail_imagination(termination_reason)
+        except ContextFunctionError as exc:
+            result = {"error": str(exc)}
+        return self._record("imagination_failed", {}, result, before)
 
     def reject(
         self,
@@ -471,6 +524,37 @@ class ContextWorkspace:
         if seed is None or seed.source_revision != self.state.observation_revision:
             raise ContextFunctionError(f"unknown or expired seed_id '{seed_id}'")
         return seed
+
+
+def _accepted_handler_arguments(
+    handler: Callable[..., dict[str, Any]],
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind the public handler while tolerating harmless provider extras.
+
+    The published tool schema remains authoritative.  Some OpenAI-compatible
+    providers nevertheless append a synonym next to the correct required
+    field (for example ``text`` beside ``query``).  Dropping only unknown keys
+    keeps that noise from consuming a full control turn; a typo that leaves a
+    required field missing still fails ``Signature.bind`` normally.
+    """
+
+    signature = inspect.signature(handler)
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    accepted = (
+        dict(arguments)
+        if accepts_kwargs
+        else {
+            key: value
+            for key, value in arguments.items()
+            if key in signature.parameters
+        }
+    )
+    signature.bind(**accepted)
+    return accepted
 
 
 def _robot_state(

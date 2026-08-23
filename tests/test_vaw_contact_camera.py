@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from scipy.spatial.transform import Rotation
 
 from vaw.context_runtime.contact_camera import (
@@ -67,6 +68,58 @@ class _FakeSim:
         return rgb, normalized_depth
 
 
+class _SegmentationModel(_FakeModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.geom_names = (
+            "floor",
+            "gripper0_finger1_visual",
+            "gripper0_finger2_visual",
+            "gripper0_finger1_collision",
+            "gripper0_hand_visual",
+        )
+
+    def geom_name2id(self, name: str) -> int:
+        return self.geom_names.index(name)
+
+
+class _SegmentationSim(_FakeSim):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = _SegmentationModel()
+
+    def render(
+        self,
+        *,
+        camera_name: str,
+        width: int,
+        height: int,
+        depth: bool,
+        segmentation: bool = False,
+    ):
+        if not segmentation:
+            return super().render(
+                camera_name=camera_name,
+                width=width,
+                height=height,
+                depth=depth,
+            )
+        result = np.full((height, width, 2), -1, dtype=np.int32)
+        # robosuite segmentation stores (MuJoCo object type, object id) and is
+        # returned in OpenGL's bottom-up row order.
+        result[4:12, 10:18, 0] = 5
+        result[4:12, 10:18, 1] = 1
+        result[4:12, 24:32, 0] = 5
+        result[4:12, 24:32, 1] = 2
+        # A collision geom must not enter the visual finger mask.
+        result[15:20, 40:48, 0] = 5
+        result[15:20, 40:48, 1] = 3
+        # The palm sits directly above the fingers once the rows are flipped.
+        result[12:21, 10:40, 0] = 5
+        result[12:21, 10:40, 1] = 4
+        return result
+
+
 class _FakeEnv:
     def __init__(self, sim: _FakeSim) -> None:
         self.base_link_idx = 0
@@ -128,7 +181,169 @@ def test_libero_contact_camera_renders_dense_orthogonal_views_and_restores() -> 
     assert sim.forward_calls == 9
     assert pair.selection.front_sign == 1
     assert pair.selection.side_sign == 1
+
+
+def test_contact_camera_attaches_pixel_exact_visual_finger_segmentation() -> None:
+    sim = _SegmentationSim()
+
+    pair = LiberoContactCameraProvider(_FakeEnv(sim))(_request())
+
+    for camera in (pair.front, pair.side):
+        mask = camera["finger_mask"]
+        assert mask.dtype == np.bool_
+        assert mask.shape == (48, 80)
+        assert np.all(mask[36:44, 10:18])
+        assert np.all(mask[36:44, 24:32])
+        assert not np.any(mask[28:33, 40:48])
+        assert set(camera["images"]) == {"rgb"}
+        assert not any(str(key).startswith("_mujoco") for key in camera)
+
+
+def test_contact_camera_marks_only_a_thin_band_on_the_palm_underside() -> None:
+    sim = _SegmentationSim()
+
+    pair = LiberoContactCameraProvider(_FakeEnv(sim))(_request())
+
+    for camera in (pair.front, pair.side):
+        band = camera["palm_floor_mask"]
+        assert band.dtype == np.bool_
+        assert band.shape == (48, 80)
+        columns = np.flatnonzero(band.any(axis=0))
+        assert columns.size > 0
+        # The palm geom spans rows 27-35 after the vertical flip; only its
+        # lowest few rows are marked, because the rest is not a contact face.
+        rows = np.flatnonzero(band.any(axis=1))
+        assert int(rows.max()) == 35
+        assert int(rows.max() - rows.min()) < 8
+        palm = np.zeros((48, 80), dtype=bool)
+        palm[27:36, 10:40] = True
+        assert not np.any(band & ~palm)
+        # Marking the palm must not have eaten into the finger mask.
+        assert not np.any(band & camera["finger_mask"])
+
+
+def test_palm_band_follows_a_stepped_lower_contour() -> None:
+    from vaw.context_runtime.contact_camera import _lower_edge_band
+
+    mask = np.zeros((40, 6), dtype=bool)
+    mask[10:20, 0:3] = True
+    mask[10:31, 3:6] = True
+    mask[:, 5] = False
+
+    band = _lower_edge_band(mask, height=40)
+
+    assert np.flatnonzero(band[:, 0]).max() == 19
+    assert np.flatnonzero(band[:, 3]).max() == 30
+    assert not band[:, 5].any()
+    assert int(band[:, 0].sum()) == 5
+
+
+def test_contact_framing_ceiling_scales_with_the_close_up_distance() -> None:
+    from vaw.context_runtime.contact_camera import _framing_distance
+
+    # Geometry far too tall to fit; the returned distance must saturate at the
+    # ceiling, and that ceiling has to follow the configured close-up distance
+    # so a narrower FOV does not silently clip the subject.
+    tall = np.array([[0.0, 0.0, -4.0], [0.0, 0.0, 4.0]], dtype=np.float64)
+    kwargs = {
+        "horizontal_forward_base": np.array([1.0, 0.0, 0.0]),
+        "up_base": np.array([0.0, 0.0, 1.0]),
+        "width": 80,
+        "height": 48,
+        "fovy_deg": 34.0,
+        "padding_m": 0.035,
+    }
+    near = _framing_distance(tall, None, np.zeros(3), minimum_m=0.26, **kwargs)
+    far = _framing_distance(tall, None, np.zeros(3), minimum_m=0.38, **kwargs)
+    assert far > near
+    assert np.isclose(far / near, 0.38 / 0.26)
+
+
+def test_contact_camera_reuses_requested_axis_ends_without_rescoring() -> None:
+    sim = _FakeSim()
+    request = ContactCameraRequest(
+        center_base_xyz=(0.4, -0.08, 0.06),
+        frame_quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+        width=80,
+        panel_height=48,
+        preferred_signs=(-1, 1),
+    )
+
+    pair = LiberoContactCameraProvider(_FakeEnv(sim))(request)
+
+    assert pair.selection.front_sign == -1
+    assert pair.selection.side_sign == 1
+    assert len(sim.render_poses) == 2
     assert pair.selection.azimuth_offset_deg == 0.0
+
+
+def test_side_elevation_tilts_only_the_side_camera_and_keeps_its_azimuth() -> None:
+    sim = _FakeSim()
+    locked_rotation = Rotation.from_euler("z", 37.0, degrees=True).as_matrix()
+    request = ContactCameraRequest(
+        center_base_xyz=(0.4, -0.08, 0.06),
+        frame_quaternion_xyzw=tuple(Rotation.from_matrix(locked_rotation).as_quat()),
+        width=80,
+        panel_height=48,
+        preferred_signs=(1, 1),
+        side_elevation_deg=55.0,
+    )
+
+    pair = LiberoContactCameraProvider(_FakeEnv(sim))(request)
+
+    front_forward = np.asarray(pair.front["pose_mat"], dtype=np.float64)[:3, 2]
+    side_forward = np.asarray(pair.side["pose_mat"], dtype=np.float64)[:3, 2]
+    assert np.isclose(front_forward[2], 0.0, atol=1e-8)
+    # The SIDE optical axis dips exactly 55 degrees below the horizon.
+    assert np.isclose(
+        np.degrees(np.arcsin(-side_forward[2])),
+        55.0,
+        atol=1e-6,
+    )
+    # Tilting must not swing the azimuth off the locked closing axis.
+    horizontal = side_forward[:2] / np.linalg.norm(side_forward[:2])
+    assert np.allclose(horizontal, locked_rotation[:2, 1], atol=1e-8)
+    assert pair.selection.side_elevation_deg == 55.0
+    assert pair.selection.summary()["side_elevation_deg"] == 55.0
+
+
+def test_side_elevation_keeps_the_camera_on_the_framing_sphere() -> None:
+    center = np.array([0.4, -0.08, 0.06])
+    request_kwargs = {
+        "center_base_xyz": tuple(center),
+        "frame_quaternion_xyzw": (0.0, 0.0, 0.0, 1.0),
+        "width": 80,
+        "panel_height": 48,
+        "preferred_signs": (1, 1),
+    }
+    level = LiberoContactCameraProvider(_FakeEnv(_FakeSim()))(
+        ContactCameraRequest(**request_kwargs)
+    )
+    tilted = LiberoContactCameraProvider(_FakeEnv(_FakeSim()))(
+        ContactCameraRequest(**request_kwargs, side_elevation_deg=55.0)
+    )
+
+    def radius(camera: dict) -> float:
+        position = np.asarray(camera["pose_mat"], dtype=np.float64)[:3, 3]
+        return float(np.linalg.norm(position - center))
+
+    # Tilting orbits the subject rather than climbing away from it, so the
+    # oblique panel keeps the zoom of the level one.
+    assert np.isclose(radius(tilted.side), radius(level.side), rtol=1e-6)
+    assert radius(level.side) > 0.0
+
+
+def test_side_elevation_rejects_out_of_range_tilts() -> None:
+    with pytest.raises(ValueError, match="side_elevation_deg"):
+        LiberoContactCameraProvider(_FakeEnv(_FakeSim()))(
+            ContactCameraRequest(
+                center_base_xyz=(0.4, -0.08, 0.06),
+                frame_quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+                width=80,
+                panel_height=48,
+                side_elevation_deg=95.0,
+            )
+        )
 
 
 def test_contact_camera_axes_are_exactly_parallel_and_orthogonal_to_locked_frame() -> None:

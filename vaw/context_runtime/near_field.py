@@ -9,10 +9,11 @@ matrices and geometry remain inside the trusted presenter.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from scipy.ndimage import binary_closing, binary_dilation
 from scipy.spatial.transform import Rotation
 
 from vaw.context_runtime.contact_camera import ContactCameraPair
@@ -25,6 +26,7 @@ from vaw.context_runtime.gripper_mesh import (
     semantic_parallel_jaw_triangles,
 )
 from vaw.context_runtime.model import Pose, RobotState
+from vaw.context_runtime.plumb_line import PlumbLine, draw_plumb_overlays
 from vaw.context_runtime.private import VisualEdit
 from vaw.context_runtime.rgbd_surface import (
     RgbdSurface,
@@ -40,6 +42,14 @@ CONTACT_PANEL_HEIGHT = (NEAR_FIELD_HEIGHT - CONTACT_PANEL_GAP) // 2
 CONTACT_FOCUS_WIDTH = NEAR_FIELD_WIDTH
 CONTACT_FOCUS_HEIGHT = NEAR_FIELD_HEIGHT
 _BACKGROUND = np.array([232, 239, 247], dtype=np.uint8)
+_SOURCE_FILL = np.array([245, 158, 11], dtype=np.uint8)
+_SOURCE_EDGE = np.array([253, 230, 138], dtype=np.uint8)
+_CURRENT_FINGER_FILL = np.array([34, 211, 238], dtype=np.uint8)
+_CURRENT_FINGER_EDGE = np.array([165, 243, 252], dtype=np.uint8)
+# Same cyan family as the fingers because both are current real robot surface,
+# but darker so the palm floor reads as a separate part, not more finger.
+_PALM_FLOOR_FILL = np.array([14, 116, 144], dtype=np.uint8)
+_PALM_FLOOR_EDGE = np.array([8, 74, 92], dtype=np.uint8)
 _PREVIEW_EDGE = (216, 203, 255)
 _PREVIEW_OCCUPANCY = np.array([167, 139, 250], dtype=np.uint8)
 _PREVIEW_OCCUPANCY_ALPHA = 0.20
@@ -56,8 +66,12 @@ _ROTATION_GUIDE_WIDTH = 236
 _ROTATION_GUIDE_ANGLE_DEG = 10.0
 _ROTATION_CORNER_WIDTH = 188
 _ROTATION_CORNER_HEIGHT = 146
-_TRANSLATION_CORNER_WIDTH = 244
-_TRANSLATION_CORNER_HEIGHT = 168
+# 20% larger than the original 244×168 plate so the projected BASE signs
+# stay readable after Contact panels are packed into the canvas.
+_TRANSLATION_CORNER_WIDTH = 293
+_TRANSLATION_CORNER_HEIGHT = 202
+# Below this the panel is level for reading purposes and the badge is noise.
+_MIN_OBLIQUE_LABEL_DEG = 5.0
 
 PreviewGripperStyle = Literal["fk-mesh", "semantic-wireframe"]
 
@@ -99,25 +113,6 @@ class NearFieldPreview:
     contact_frame_position_xyz: tuple[float, float, float] | None = None
 
 
-def render_near_field(
-    agentview: dict,
-    wrist: dict | None,
-    robot: RobotState | None,
-    preview: NearFieldPreview | None = None,
-) -> np.ndarray | None:
-    """Render current fused RGB-D around the contact TCP from two fixed views."""
-
-    if (
-        robot is None
-        or robot.tcp_pose is None
-        or robot.joint_positions_rad is None
-        or robot.gripper_opening is None
-    ):
-        return None
-
-    return _render_geometry_pair(agentview, wrist, robot, preview)
-
-
 def render_contact_focus(
     agentview: dict,
     wrist: dict | None,
@@ -125,8 +120,12 @@ def render_contact_focus(
     preview: NearFieldPreview | None,
     *,
     source_mask: np.ndarray | None = None,
+    source_points_base: np.ndarray | None = None,
     contact_cameras: ContactCameraPair | None = None,
     carried_volume_triangles_base: np.ndarray | None = None,
+    plumb_lines: list[PlumbLine] | None = None,
+    output_width: int = CONTACT_FOCUS_WIDTH,
+    panel_height: int = CONTACT_PANEL_HEIGHT,
 ) -> np.ndarray | None:
     """Render two gravity-stable, session-locked views around one target.
 
@@ -143,7 +142,11 @@ def render_contact_focus(
             contact_cameras,
             robot,
             preview,
+            source_points_base=source_points_base,
             carried_volume_triangles_base=carried_volume_triangles_base,
+            plumb_lines=plumb_lines,
+            output_width=output_width,
+            panel_height=panel_height,
         )
     pair = _render_geometry_pair(
         agentview,
@@ -155,7 +158,11 @@ def render_contact_focus(
     )
     if pair is None:
         return None
-    return np.ascontiguousarray(pair)
+    return _resize_contact_pair(
+        pair,
+        output_width=output_width,
+        panel_height=panel_height,
+    )
 
 
 def _render_geometry_pair(
@@ -315,7 +322,11 @@ def _render_direct_contact_pair(
     robot: RobotState | None,
     preview: NearFieldPreview,
     *,
+    source_points_base: np.ndarray | None = None,
     carried_volume_triangles_base: np.ndarray | None = None,
+    plumb_lines: list[PlumbLine] | None = None,
+    output_width: int = CONTACT_FOCUS_WIDTH,
+    panel_height: int = CONTACT_PANEL_HEIGHT,
 ) -> np.ndarray | None:
     """Compose MuJoCo-rendered Contact Cameras with deterministic overlays."""
 
@@ -327,18 +338,57 @@ def _render_direct_contact_pair(
             view_name,
             robot,
             preview,
+            source_points_base=source_points_base,
             carried_volume_triangles_base=carried_volume_triangles_base,
+            plumb_lines=plumb_lines,
+            output_width=output_width,
+            panel_height=panel_height,
         )
         for view_name, camera in (
             ("front", contact_cameras.front),
             ("side", contact_cameras.side),
         )
     ]
-    canvas = np.full((NEAR_FIELD_HEIGHT, NEAR_FIELD_WIDTH, 3), _BACKGROUND, dtype=np.uint8)
-    canvas[:CONTACT_PANEL_HEIGHT] = panels[0]
-    second_top = CONTACT_PANEL_HEIGHT + CONTACT_PANEL_GAP
-    canvas[second_top : second_top + CONTACT_PANEL_HEIGHT] = panels[1]
-    canvas[CONTACT_PANEL_HEIGHT:second_top] = np.array([207, 217, 231], dtype=np.uint8)
+    canvas_height = 2 * panel_height + CONTACT_PANEL_GAP
+    canvas = np.full((canvas_height, output_width, 3), _BACKGROUND, dtype=np.uint8)
+    canvas[:panel_height] = panels[0]
+    second_top = panel_height + CONTACT_PANEL_GAP
+    canvas[second_top : second_top + panel_height] = panels[1]
+    canvas[panel_height:second_top] = np.array([207, 217, 231], dtype=np.uint8)
+    return np.ascontiguousarray(canvas)
+
+
+def _resize_contact_pair(
+    pair: np.ndarray,
+    *,
+    output_width: int,
+    panel_height: int,
+) -> np.ndarray:
+    """Resize fallback panels independently instead of stretching their gap."""
+
+    source = np.asarray(pair, dtype=np.uint8)
+    source_front = source[:CONTACT_PANEL_HEIGHT]
+    source_side_top = CONTACT_PANEL_HEIGHT + CONTACT_PANEL_GAP
+    source_side = source[source_side_top : source_side_top + CONTACT_PANEL_HEIGHT]
+    panels = [
+        np.asarray(
+            Image.fromarray(panel).resize(
+                (output_width, panel_height),
+                resample=Image.Resampling.BILINEAR,
+            ),
+            dtype=np.uint8,
+        )
+        for panel in (source_front, source_side)
+    ]
+    canvas = np.full(
+        (2 * panel_height + CONTACT_PANEL_GAP, output_width, 3),
+        _BACKGROUND,
+        dtype=np.uint8,
+    )
+    canvas[:panel_height] = panels[0]
+    side_top = panel_height + CONTACT_PANEL_GAP
+    canvas[side_top : side_top + panel_height] = panels[1]
+    canvas[panel_height:side_top] = np.array([207, 217, 231], dtype=np.uint8)
     return np.ascontiguousarray(canvas)
 
 
@@ -348,19 +398,53 @@ def _render_direct_contact_view(
     robot: RobotState,
     preview: NearFieldPreview,
     *,
+    source_points_base: np.ndarray | None = None,
     carried_volume_triangles_base: np.ndarray | None = None,
+    plumb_lines: list[PlumbLine] | None = None,
+    output_width: int = CONTACT_FOCUS_WIDTH,
+    panel_height: int = CONTACT_PANEL_HEIGHT,
 ) -> np.ndarray:
     image = np.asarray(camera["images"]["rgb"], dtype=np.uint8).copy()
     height, width = image.shape[:2]
-    if image.shape != (CONTACT_PANEL_HEIGHT, NEAR_FIELD_WIDTH, 3):
+    if image.shape != (panel_height, output_width, 3):
         image = np.asarray(
             Image.fromarray(image).resize(
-                (NEAR_FIELD_WIDTH, CONTACT_PANEL_HEIGHT),
+                (output_width, panel_height),
                 resample=Image.Resampling.BILINEAR,
             ),
             dtype=np.uint8,
-        )
+        ).copy()
         height, width = image.shape[:2]
+    render_camera = _scaled_camera(camera, width, height)
+
+    # Both cues are presenter overlays on the current MuJoCo RGB.  The amber
+    # surface comes only from current-revision sensor geometry; when that
+    # evidence expires no object mask is invented.  The cyan mask is the
+    # element segmentation rendered by the exact same MuJoCo camera, not a
+    # second robot model projected onto the image.
+    if source_points_base is not None:
+        _overlay_camera_source_mask(image, source_points_base, render_camera)
+    current_finger_mask = camera.get("finger_mask")
+    if current_finger_mask is not None:
+        _blend_mask(
+            image,
+            _fit_mask(current_finger_mask, width, height),
+            _CURRENT_FINGER_FILL,
+            _CURRENT_FINGER_EDGE,
+            alpha=0.26,
+        )
+    # Marked after the fingers and opaquely: on a top-down approach the palm
+    # underside runs out of clearance first, and a translucent band would be
+    # lost against the pale gripper body it sits on.
+    palm_floor_mask = camera.get("palm_floor_mask")
+    if palm_floor_mask is not None:
+        _blend_mask(
+            image,
+            _fit_mask(palm_floor_mask, width, height),
+            _PALM_FLOOR_FILL,
+            _PALM_FLOOR_EDGE,
+            alpha=0.85,
+        )
 
     preview_triangles = _preview_gripper_triangles(
         robot,
@@ -371,17 +455,17 @@ def _render_direct_contact_view(
         _overlay_camera_mesh_occupancy(
             image,
             preview_hand_triangles,
-            camera,
+            render_camera,
         )
     if preview_triangles is not None:
-        _overlay_camera_mesh_outline(image, preview_triangles, camera)
+        _overlay_camera_mesh_outline(image, preview_triangles, render_camera)
 
     carried_mask = None
     if carried_volume_triangles_base is not None:
         with np.errstate(divide="ignore", invalid="ignore"):
             carried_mask = _projected_silhouette(
                 carried_volume_triangles_base,
-                camera,
+                render_camera,
                 width,
                 height,
             )
@@ -392,6 +476,11 @@ def _render_direct_contact_view(
             _CARRIED_OUTLINE,
             alpha=0.42,
         )
+
+    # The plumb line is drawn before the optional rotation-guide resize so
+    # its metric geometry follows the same camera as the other overlays.
+    if plumb_lines:
+        draw_plumb_overlays(image, render_camera, plumb_lines)
 
     guide_active = (
         preview.rotation_gizmo_frame is not None and preview.rotation_gizmo_axis is not None
@@ -413,17 +502,24 @@ def _render_direct_contact_view(
     draw = ImageDraw.Draw(pil, "RGBA")
     font = _label_font()
     display_camera = _scaled_camera(camera, scene_width, height)
-    _draw_direct_rotation_axes(draw)
+    # The persistent ROTATE BASE gimbal is intentionally hidden for the
+    # current visual ablation.  Keep the renderer implementation below so it
+    # can be restored without changing rotate semantics or trace data.
+    # _draw_direct_rotation_axes(draw)
     _draw_direct_translation_axes(draw, display_camera, scene_width)
 
+    # A tilted panel must say so. Read as level, an oblique image makes the
+    # payload look laterally centred whenever it is merely nearer the camera.
+    tilt_deg = _camera_tilt_deg(camera)
     label = (
         f"CONTACT {view_name.upper()}"
         if guide_active
         else f"CONTACT {view_name.upper()} · "
+        + (f"OBLIQUE {tilt_deg:.0f}° DOWN · " if tilt_deg >= _MIN_OBLIQUE_LABEL_DEG else "")
         + ("CURRENT + PREVIEW" if preview.target_pose is not None else "CURRENT")
     )
     bounds = draw.textbbox((0, 0), label, font=font)
-    label_left = _ROTATION_CORNER_WIDTH + 18
+    label_left = 8
     label_right = min(
         scene_width - _TRANSLATION_CORNER_WIDTH - 18,
         label_left + bounds[2] - bounds[0] + 28,
@@ -465,6 +561,64 @@ def _render_direct_contact_view(
     return np.asarray(pil, dtype=np.uint8)
 
 
+def _overlay_camera_source_mask(
+    image: np.ndarray,
+    points_base: np.ndarray,
+    camera: dict,
+) -> None:
+    """Highlight current sensor-derived object surfaces without filling holes."""
+
+    points = np.asarray(points_base, dtype=np.float64).reshape(-1, 3)
+    points = points[np.isfinite(points).all(axis=1)]
+    if len(points) < 3:
+        return
+    if len(points) > 1024:
+        indices = np.linspace(0, len(points) - 1, 1024, dtype=np.int64)
+        points = points[indices]
+    projected = project_world_to_pixel(
+        points,
+        np.asarray(camera["intrinsics"], dtype=np.float64),
+        np.asarray(camera["pose_mat"], dtype=np.float64),
+    )
+    height, width = image.shape[:2]
+    valid = (
+        np.isfinite(projected).all(axis=1)
+        & (projected[:, 2] > 0.01)
+        & (projected[:, 0] >= 0.0)
+        & (projected[:, 0] < width)
+        & (projected[:, 1] >= 0.0)
+        & (projected[:, 1] < height)
+    )
+    pixels = projected[valid, :2]
+    if len(pixels) < 3:
+        return
+    lower = np.quantile(pixels, 0.02, axis=0)
+    upper = np.quantile(pixels, 0.98, axis=0)
+    pixels = pixels[
+        (pixels[:, 0] >= lower[0])
+        & (pixels[:, 0] <= upper[0])
+        & (pixels[:, 1] >= lower[1])
+        & (pixels[:, 1] <= upper[1])
+    ]
+    if len(pixels) < 3 or np.any(np.ptp(pixels, axis=0) < 2.0):
+        return
+    pixel_indices = np.rint(pixels).astype(np.int64)
+    pixel_indices[:, 0] = np.clip(pixel_indices[:, 0], 0, width - 1)
+    pixel_indices[:, 1] = np.clip(pixel_indices[:, 1], 0, height - 1)
+    mask = np.zeros((height, width), dtype=bool)
+    mask[pixel_indices[:, 1], pixel_indices[:, 0]] = True
+    radius = max(2, int(round(min(width, height) / 220.0)))
+    mask = binary_dilation(mask, iterations=radius)
+    mask = binary_closing(mask, iterations=max(1, radius // 2))
+    _blend_mask(
+        image,
+        mask,
+        _SOURCE_FILL,
+        _SOURCE_EDGE,
+        alpha=0.24,
+    )
+
+
 def _base_axis_screen_directions(camera: dict) -> np.ndarray:
     """Return calibrated image-plane directions for BASE +X/+Y/+Z.
 
@@ -494,26 +648,36 @@ def _draw_direct_translation_axes(
     camera: dict,
     scene_width: int,
 ) -> None:
-    """Draw an uncluttered, calibrated BASE translation guide.
+    """Draw only the two BASE axes observable in this Contact image plane.
 
-    A 2-D Contact Camera cannot faithfully show three projected BASE axes at
-    one origin when one axis is close to the optical direction.  The old
-    pseudo-perspective diagonal for that axis caused arrows and labels to
-    overlap.  Keep the two most screen-visible axes in a large shared triad
-    and show the most depth-aligned axis in its own card instead.  The depth
-    card preserves both its residual image-plane direction and whether BASE+
-    points into the scene (cross) or toward the viewer (dot).
+    The view-normal axis cannot be judged directly from one 2-D RGB panel.
+    Showing it as an ``IN/OUT`` control mixed image evidence with an inferred
+    depth command and encouraged models to edit the hidden dimension.  The
+    orthogonal Contact panel exposes that remaining BASE axis in its own image
+    plane, so each panel deliberately presents only its two visible controls.
     """
 
     left = scene_width - _TRANSLATION_CORNER_WIDTH - 8
     top = 8
     right = scene_width - 8
     bottom = top + _TRANSLATION_CORNER_HEIGHT
-    _draw_gizmo_plate(draw, (left, top, right, bottom), "MOVE BASE")
+    _draw_gizmo_plate(
+        draw,
+        (left, top, right, bottom),
+        "MOVE BASE",
+        title_font=_translation_title_font(),
+    )
 
-    origin = np.array([left + 79.0, top + 102.0], dtype=np.float64)
+    origin = np.array(
+        [
+            left + 0.5 * _TRANSLATION_CORNER_WIDTH,
+            top + 0.57 * _TRANSLATION_CORNER_HEIGHT,
+        ],
+        dtype=np.float64,
+    )
     camera_directions = _base_axis_camera_directions(camera)
     depth_axis_index = int(np.argmax(np.abs(camera_directions[:, 2])))
+    arm_px = 64.0
     for axis_index in range(3):
         if axis_index == depth_axis_index:
             continue
@@ -525,37 +689,37 @@ def _draw_direct_translation_axes(
         if norm <= 1e-9:
             continue
         unit_direction = direction / norm
-        endpoint = origin + unit_direction * 46.0
+        endpoint = origin + unit_direction * arm_px
+        reverse_endpoint = origin - unit_direction * arm_px
         start = tuple(float(value) for value in origin)
         end = tuple(float(value) for value in endpoint)
-        draw.line((*start, *end), fill=(2, 6, 23, 238), width=10)
-        draw.line((*start, *end), fill=color, width=6)
-        _draw_arrow_head(draw, start, end, color, size=12.0)
+        reverse_end = tuple(float(value) for value in reverse_endpoint)
+        draw.line((*reverse_end, *end), fill=(2, 6, 23, 238), width=17)
+        draw.line((*reverse_end, *end), fill=color, width=11)
+        _draw_arrow_head(draw, start, end, color, size=22.0)
+        _draw_arrow_head(draw, start, reverse_end, color, size=22.0)
         _draw_centered_dark_axis_label(
             draw,
-            tuple(float(value) for value in endpoint + unit_direction * 16.0),
+            tuple(float(value) for value in endpoint + unit_direction * 20.0),
             f"+{axis}",
             color,
-            bounds=(left + 7, top + 31, left + 158, bottom - 8),
+            bounds=(left + 8, top + 42, right - 8, bottom - 8),
+            font=_translation_axis_font(),
+        )
+        _draw_centered_dark_axis_label(
+            draw,
+            tuple(float(value) for value in reverse_endpoint - unit_direction * 20.0),
+            f"−{axis}",
+            color,
+            bounds=(left + 8, top + 42, right - 8, bottom - 8),
+            font=_translation_axis_font(),
         )
 
     draw.ellipse(
-        (origin[0] - 5, origin[1] - 5, origin[0] + 5, origin[1] + 5),
+        (origin[0] - 8, origin[1] - 8, origin[0] + 8, origin[1] + 8),
         fill=(248, 250, 252, 255),
         outline=(15, 23, 42, 255),
-        width=2,
-    )
-    _draw_depth_axis_card(
-        draw,
-        box=(left + 164, top + 38, right - 9, bottom - 27),
-        axis_index=depth_axis_index,
-        camera_direction=camera_directions[depth_axis_index],
-    )
-    draw.text(
-        (left + 13, bottom - 20),
-        "− MOVE = REVERSE",
-        fill=(226, 232, 240, 255),
-        font=_label_font(),
+        width=3,
     )
 
 
@@ -689,6 +853,8 @@ def _draw_gizmo_plate(
     draw: ImageDraw.ImageDraw,
     box: tuple[int, int, int, int],
     title: str,
+    *,
+    title_font: ImageFont.ImageFont | None = None,
 ) -> None:
     draw.rounded_rectangle(
         box,
@@ -701,7 +867,7 @@ def _draw_gizmo_plate(
         (box[0] + 8, box[1] + 6),
         title,
         fill=(248, 250, 252, 255),
-        font=_label_font(),
+        font=title_font or _label_font(),
     )
 
 
@@ -739,10 +905,11 @@ def _draw_centered_dark_axis_label(
     color: tuple[int, int, int, int],
     *,
     bounds: tuple[float, float, float, float],
+    font: ImageFont.ImageFont | None = None,
 ) -> None:
     """Draw a centered axis label clamped to a reserved non-overlap area."""
 
-    font = _label_font()
+    font = font or _label_font()
     text_bounds = draw.textbbox((0, 0), label, font=font)
     width = text_bounds[2] - text_bounds[0] + 10
     height = text_bounds[3] - text_bounds[1] + 6
@@ -760,69 +927,6 @@ def _draw_centered_dark_axis_label(
         label,
         fill=color,
         font=font,
-    )
-
-
-def _draw_depth_axis_card(
-    draw: ImageDraw.ImageDraw,
-    *,
-    box: tuple[float, float, float, float],
-    axis_index: int,
-    camera_direction: np.ndarray,
-) -> None:
-    """Put the view-normal BASE axis in a dedicated, unambiguous card."""
-
-    left, top, right, bottom = box
-    axis = "XYZ"[axis_index]
-    color = _AXIS_COLORS[axis_index]
-    toward_camera = float(camera_direction[2]) < 0.0
-    center = (0.5 * (left + right), top + 48.0)
-    draw.rounded_rectangle(
-        box,
-        radius=5,
-        fill=(9, 15, 30, 236),
-        outline=(100, 116, 139, 245),
-        width=2,
-    )
-    draw.text(
-        (left + 8, top + 6),
-        "DEPTH",
-        fill=(203, 213, 225, 255),
-        font=_label_font(),
-    )
-    draw.ellipse(
-        (center[0] - 18, center[1] - 18, center[0] + 18, center[1] + 18),
-        fill=(3, 7, 18, 236),
-        outline=color,
-        width=4,
-    )
-    draw.ellipse(
-        (center[0] - 11, center[1] - 11, center[0] + 11, center[1] + 11),
-        outline=(*color[:3], 115),
-        width=2,
-    )
-    if toward_camera:
-        draw.ellipse(
-            (center[0] - 5, center[1] - 5, center[0] + 5, center[1] + 5),
-            fill=color,
-        )
-    else:
-        draw.line(
-            (center[0] - 7, center[1] - 7, center[0] + 7, center[1] + 7),
-            fill=color,
-            width=4,
-        )
-        draw.line(
-            (center[0] - 7, center[1] + 7, center[0] + 7, center[1] - 7),
-            fill=color,
-            width=4,
-        )
-    _draw_centered_dark_axis_label(
-        draw,
-        (center[0], bottom - 14.0),
-        f"+{axis} {'OUT' if toward_camera else 'IN'}",
-        color,
-        bounds=(left + 4, top + 4, right - 4, bottom - 4),
     )
 
 
@@ -1256,6 +1360,39 @@ def _overlay_camera_mesh_occupancy(
     )
 
 
+def _overlay_camera_mesh_mask(
+    image: np.ndarray,
+    triangles: np.ndarray,
+    camera: dict,
+    *,
+    color: np.ndarray,
+    outline: np.ndarray,
+    alpha: float,
+) -> None:
+    """Blend one projected FK part while preserving the underlying RGB."""
+
+    mask = _projected_silhouette(
+        triangles,
+        camera,
+        image.shape[1],
+        image.shape[0],
+    )
+    _blend_mask(image, mask, color, outline, alpha=alpha)
+
+
+def _fit_mask(mask: Any, width: int, height: int) -> np.ndarray:
+    """Resample a segmentation mask onto the panel it is composited into."""
+
+    resolved = np.asarray(mask, dtype=bool)
+    if resolved.shape == (height, width):
+        return resolved
+    resized = Image.fromarray(resolved.astype(np.uint8) * 255).resize(
+        (width, height),
+        resample=Image.Resampling.NEAREST,
+    )
+    return np.asarray(resized, dtype=np.uint8) > 0
+
+
 def _blend_mask(
     image: np.ndarray,
     mask: np.ndarray,
@@ -1403,6 +1540,20 @@ def _gripper_part_triangles_local(
     except (RuntimeError, ValueError):
         return None
     return (triangles - tcp_position) @ tcp_rotation
+
+
+def _camera_tilt_deg(camera: dict[str, Any]) -> float:
+    """Degrees the optical axis points below the robot-base horizon."""
+
+    try:
+        pose_mat = np.asarray(camera["pose_mat"], dtype=np.float64).reshape(4, 4)
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    forward = pose_mat[:3, 2]
+    norm = float(np.linalg.norm(forward))
+    if not np.isfinite(norm) or norm < 1e-9:
+        return 0.0
+    return float(np.degrees(np.arcsin(np.clip(-forward[2] / norm, -1.0, 1.0))))
 
 
 def _contact_views(
@@ -1886,6 +2037,20 @@ def _label_font() -> ImageFont.ImageFont:
         return ImageFont.load_default()
 
 
+def _translation_title_font() -> ImageFont.ImageFont:
+    try:
+        return ImageFont.truetype("DejaVuSansMono-Bold.ttf", 23)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def _translation_axis_font() -> ImageFont.ImageFont:
+    try:
+        return ImageFont.truetype("DejaVuSansMono-Bold.ttf", 26)
+    except OSError:
+        return ImageFont.load_default()
+
+
 def _unit(vector: np.ndarray) -> np.ndarray:
     norm = float(np.linalg.norm(vector))
     if norm <= 1e-12:
@@ -1901,5 +2066,4 @@ __all__ = [
     "NearFieldPreview",
     "gravity_stable_contact_frame_quaternion",
     "render_contact_focus",
-    "render_near_field",
 ]

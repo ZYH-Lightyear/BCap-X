@@ -7,8 +7,8 @@ export interface VisualEditSummary {
 }
 
 export interface ContextSnapshot {
-  schemaVersion: 38
-  schema: 'vaw-context-v37-working-memory'
+  schemaVersion: 46
+  schema: 'vaw-context-v46-oblique-contact'
   projection: 'main' | 'imagination'
   renderId: string
   revision: number
@@ -19,7 +19,9 @@ export interface ContextSnapshot {
     agentviewRasterId: string
     observedSceneRasterId: string
     imaginationSceneRasterId: string
-    contactFocusRasterId: string | null
+    contactFrontRasterId: string | null
+    contactSideRasterId: string | null
+    contactSideElevationDeg: number
     refinementGoal: string | null
     robot: {
       ee_pose?: { position_xyz: number[]; quaternion_xyzw: number[] }
@@ -28,7 +30,7 @@ export interface ContextSnapshot {
       gripper_opening?: number
     } | null
     action: {
-      status: 'refining' | 'coarse' | 'ready'
+      status: 'refining' | 'planned' | 'refined'
       action_id?: string
       intent?: string
       target_role: 'grasp_contact' | 'point_pose' | 'relative_pose'
@@ -61,6 +63,7 @@ export interface ContextSnapshot {
       sourceRevision: number
       rasterId: string
       withinRegionId?: string
+      status?: 'occluded'
     }>
     points: Array<{
       id: string
@@ -70,6 +73,7 @@ export interface ContextSnapshot {
       sourceRevision: number
       rasterId: string
       withinRegionId?: string
+      status?: 'occluded'
     }>
     seeds: Array<{
       id: string

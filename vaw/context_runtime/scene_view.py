@@ -140,9 +140,14 @@ def render_scene_view(
                 alpha=0.42,
             )
     output = Image.fromarray(output_array)
-    draw = ImageDraw.Draw(output, "RGBA")
-    if dark:
-        _draw_world_axes(draw, camera, mapping)
+    # Temporarily hide the BASE / WORLD compass from the large Main Review /
+    # Imagination scene.  Its camera projection differs from the two calibrated
+    # Contact panels and can make a model transfer a screen direction from one
+    # view into another.  The Contact Front/Side MOVE cards remain the sole
+    # policy-visible translation references for now.
+    # if dark:
+    #     draw = ImageDraw.Draw(output, "RGBA")
+    #     _draw_world_axes(draw, camera, mapping)
     return np.asarray(output, dtype=np.uint8)
 
 

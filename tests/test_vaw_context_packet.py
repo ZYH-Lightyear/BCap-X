@@ -5,7 +5,7 @@ import json
 import numpy as np
 import pytest
 
-from tests.test_vaw_context_runtime import FakeContextApi
+from tests.test_vaw_context_runtime import FailedMotionBackend, FakeContextApi
 from vaw.context_runtime.contact_camera import ContactCameraPair, ContactCameraSelection
 from vaw.context_runtime.packet import (
     CONTEXT_HEIGHT,
@@ -98,7 +98,7 @@ def test_live_opposite_scene_camera_is_fixed_per_episode_and_refreshed_per_revis
     assert np.all(refreshed.rasters["observed_scene"] == 70)
 
 
-def test_pending_action_is_main_owned_until_explicit_refinement() -> None:
+def test_action_proposal_is_main_owned_until_explicit_refinement() -> None:
     workspace = _workspace()
     compiler = ContextCompiler()
     region = workspace.execute("detection_and_sam", query="can").result["region_id"]
@@ -108,18 +108,19 @@ def test_pending_action_is_main_owned_until_explicit_refinement() -> None:
     main_packet = compiler.compile(workspace)
     assert main_packet.projection == "main"
     assert main_packet.decision.mode == "proposal"
-    assert main_packet.manifest()["pending_action"] == {
+    assert main_packet.manifest()["action_proposal"] == {
         "action_id": selected.result["action_id"],
         "intent": "approach can for grasp",
-        "state": "coarse",
+        "state": "planned",
+        "executable": True,
     }
     assert main_packet.manifest()["regions"] == [
         {"id": region, "query": "can"}
     ]
     assert main_packet.manifest()["seed_ids"]
-    assert main_packet.world.action["status"] == "coarse"
+    assert main_packet.world.action["status"] == "planned"
 
-    workspace.begin_refinement("下移直到罐体处于两指扫掠区域", selected.result["action_id"])
+    workspace.begin_imagination("下移直到罐体处于两指扫掠区域", selected.result["action_id"])
     focused = compiler.compile_imagination(workspace)
     assert focused.projection == "imagination"
     assert focused.decision.mode == "editing"
@@ -129,13 +130,32 @@ def test_pending_action_is_main_owned_until_explicit_refinement() -> None:
     workspace.execute_imagination("finish_imagination", status="ready")
     reviewed = compiler.compile(workspace)
     assert reviewed.decision.mode == "proposal"
-    assert reviewed.world.action["status"] == "ready"
+    assert reviewed.world.action["status"] == "refined"
 
 
-def test_focused_projection_uses_same_revision_and_sensor_rasters() -> None:
+def test_manifest_marks_unplanned_action_as_not_executable() -> None:
+    workspace = ContextWorkspace(
+        FakeContextApi(),
+        "task",
+        motion_backend=FailedMotionBackend(),
+    )
+    point_id = workspace.execute("locate_point", query="center").result["point_id"]
+    workspace.execute(
+        "propose_pose",
+        point_id=point_id,
+        offset_xyz=[0.0, 0.0, 0.0],
+    )
+
+    proposal = ContextCompiler().compile(workspace).manifest()["action_proposal"]
+
+    assert proposal is not None
+    assert proposal["executable"] is False
+
+
+def test_focused_projection_uses_same_revision_and_native_contact_rasters() -> None:
     workspace = _workspace()
     action_id = _selected_action(workspace)
-    workspace.begin_refinement("向上 1cm", action_id)
+    workspace.begin_imagination("向上 1cm", action_id)
     compiler = ContextCompiler()
 
     main = compiler.compile(workspace)
@@ -145,7 +165,10 @@ def test_focused_projection_uses_same_revision_and_sensor_rasters() -> None:
     assert main.manifest() == focused.manifest()
     assert set(main.rasters) == set(focused.rasters)
     for raster_id in main.rasters:
-        assert np.array_equal(main.rasters[raster_id], focused.rasters[raster_id])
+        if raster_id.startswith("contact_"):
+            assert main.rasters[raster_id].shape != focused.rasters[raster_id].shape
+        else:
+            assert np.array_equal(main.rasters[raster_id], focused.rasters[raster_id])
 
 
 def test_contact_camera_pair_is_locked_per_refinement_and_reselected_on_reentry() -> None:
@@ -179,7 +202,7 @@ def test_contact_camera_pair_is_locked_per_refinement_and_reselected_on_reentry(
     )
     compiler = ContextCompiler()
     action_id = _selected_action(workspace)
-    workspace.begin_refinement("向下微调", action_id)
+    workspace.begin_imagination("向下微调", action_id)
 
     compiler.compile_imagination(workspace)
     compiler.compile_imagination(workspace)
@@ -192,11 +215,68 @@ def test_contact_camera_pair_is_locked_per_refinement_and_reselected_on_reentry(
     )
     workspace.execute_imagination("finish_imagination", status="ready")
     compiler.compile(workspace)
-    assert len(calls) == 1
-
-    workspace.begin_refinement("再次检查", action_id)
-    compiler.compile_imagination(workspace)
     assert len(calls) == 2
+    assert calls[1].preferred_signs == (1, 1)
+    assert calls[1].width != calls[0].width
+
+    workspace.begin_imagination("再次检查", action_id)
+    compiler.compile_imagination(workspace)
+    assert len(calls) == 3
+
+
+def test_carrying_a_payload_tilts_the_side_contact_panel() -> None:
+    calls: list[object] = []
+
+    def provider(request):
+        calls.append(request)
+        camera = {
+            "images": {"rgb": np.zeros((358, 832, 3), dtype=np.uint8)},
+            "intrinsics": np.array(
+                [[360.0, 0.0, 456.0], [0.0, 360.0, 146.0], [0.0, 0.0, 1.0]],
+                dtype=np.float64,
+            ),
+            "pose_mat": np.eye(4, dtype=np.float64),
+            "view_name": "front",
+        }
+        return ContactCameraPair(
+            front=camera,
+            side={**camera, "view_name": "side"},
+            selection=ContactCameraSelection(
+                1,
+                1,
+                1.0,
+                1.0,
+                1.0,
+                side_elevation_deg=float(request.side_elevation_deg),
+            ),
+        )
+
+    workspace = ContextWorkspace(
+        FakeContextApi(),
+        "place the can in the basket",
+        motion_backend="pyroki",
+        contact_camera_provider=provider,
+    )
+    compiler = ContextCompiler()
+    action_id = _selected_action(workspace)
+
+    # Approaching a grasp keeps both panels level: finger clearance against the
+    # support surface is only measurable from the horizon.
+    assert compiler.compile(workspace).world.contact_side_elevation_deg == 0.0
+    assert calls[-1].side_elevation_deg == 0.0
+
+    assert workspace.execute("commit", action_id=action_id).ok
+    assert workspace.execute("close_gripper").ok
+    assert workspace._private.attachment_hypothesis is not None
+
+    packet = compiler.compile(workspace)
+
+    assert packet.world.contact_side_elevation_deg == 55.0
+    assert packet.world.summary()["contactSideElevationDeg"] == 55.0
+    assert calls[-1].side_elevation_deg == 55.0
+    # The occluded azimuth changes with the tilt, so the session sign lock is
+    # re-earned instead of being carried over from the level pair.
+    assert calls[-1].preferred_signs is None
 
 
 def test_point_pose_contact_framing_uses_parent_destination_region() -> None:
@@ -219,7 +299,7 @@ def test_point_pose_contact_framing_uses_parent_destination_region() -> None:
     assert _presentation_region_ref(workspace.state, artifacts) == region_id
 
     geometry = workspace._private.region_geometry[region_id]
-    target = workspace.state.pending_action.target.pose.position_xyz
+    target = workspace.state.action_proposal.target.pose.position_xyz
     center = np.asarray(
         _contact_camera_center(target, geometry.filtered_object_points_base)
     )
@@ -251,7 +331,7 @@ def test_point_pose_commit_replaces_stale_grasp_points_with_destination_geometry
         point_id=point_id,
         offset_xyz=[0.0, 0.0, 0.18],
     ).result["action_id"]
-    workspace.begin_refinement("align with the visible opening", action_id)
+    workspace.begin_imagination("align with the visible opening", action_id)
     workspace.execute_imagination("finish_imagination", status="ready")
 
     result = workspace.execute("commit", action_id=action_id)
@@ -319,11 +399,11 @@ def test_context_compiler_preview_gripper_style_is_explicit_and_validated() -> N
         ContextCompiler(preview_gripper_style="unknown")
 
 
-def test_commit_refreshes_revision_and_clears_pending_action() -> None:
+def test_commit_refreshes_revision_and_clears_action_proposal() -> None:
     workspace = _workspace()
     compiler = ContextCompiler()
     action_id = _selected_action(workspace)
-    workspace.begin_refinement("向上 1cm", action_id)
+    workspace.begin_imagination("向上 1cm", action_id)
     workspace.execute_imagination(
         "delta_move", delta_xyz_m=[0.0, 0.0, 0.01], frame="base"
     )
@@ -337,12 +417,13 @@ def test_commit_refreshes_revision_and_clears_pending_action() -> None:
 
     assert result.ok
     assert workspace.state.observation_revision == before + 1
-    assert workspace.state.pending_action is None
-    assert packet.manifest()["pending_action"] is None
+    assert workspace.state.action_proposal is None
+    assert packet.manifest()["action_proposal"] is None
     assert packet.decision.mode == "contact"
     assert workspace.state.last_physical_action is not None
     assert workspace._private.last_physical_artifacts is not None
-    assert packet.world.contact_focus_raster_id == "contact_focus"
+    assert packet.world.contact_front_raster_id == "contact_front"
+    assert packet.world.contact_side_raster_id == "contact_side"
 
     # Perception may add a small evidence inset, but it must not erase current
     # post-physical contact continuity.
@@ -350,3 +431,24 @@ def test_commit_refreshes_revision_and_clears_pending_action() -> None:
     grounded = compiler.compile(workspace)
     assert grounded.decision.mode == "contact"
     assert grounded.decision.primary_raster_id is not None
+    assert grounded.decision.primary_raster_id in grounded.rasters
+
+    point_id = workspace.execute("locate_point", query="basket opening").result["point_id"]
+    located = compiler.compile(workspace)
+    assert located.decision.mode == "contact"
+    assert located.decision.primary_raster_id == f"point:{point_id}"
+    assert point_id in located.decision.point_ids
+    assert located.decision.primary_raster_id in located.rasters
+
+
+def test_locate_point_keeps_evidence_when_a_proposal_is_already_open() -> None:
+    workspace = _workspace()
+    compiler = ContextCompiler()
+    _selected_action(workspace)
+    point_id = workspace.execute("locate_point", query="basket opening").result["point_id"]
+    packet = compiler.compile(workspace)
+
+    assert packet.decision.mode == "proposal"
+    assert packet.decision.primary_raster_id == f"point:{point_id}"
+    assert point_id in packet.decision.point_ids
+    assert packet.decision.primary_raster_id in packet.rasters
