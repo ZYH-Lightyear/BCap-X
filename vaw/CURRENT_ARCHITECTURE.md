@@ -1,7 +1,7 @@
 # VAW 当前架构契约
 
-> 当前基线：Web schema 41 / `vaw-context-v41-evidence-lifecycle` /
-> renderer `context-web-v41-evidence-lifecycle` / 固定 `2048×1280`。
+> 当前基线：Web schema 46 / `vaw-context-v46-oblique-contact` /
+> renderer `context-web-v46-oblique-contact` / 固定 `2048×1280`。
 
 Context 与 Memory 的完整规范见 [`AGENTIC_CONTEXT_OS.md`](AGENTIC_CONTEXT_OS.md)。本文只描述
 当前控制架构与代码映射；历史 Milestone 文档不再作为接口依据。
@@ -119,8 +119,9 @@ Imagination 只接收局部 instruction、edit summary、剩余预算和当前 F
 - 实体占用只帮助识别局部穿插，不声称路径或碰撞已经检查；
 - attachment OBB 只是假设几何，不是抓持、滑移、碰撞或释放真值；它可来自 grasp seed 或 region
   内 point。OBB 缺失时 Imagination 降级为 gripper-only 对齐，不伪造物体体积，也不因缺失本身失败；
-- Contact Front/Side 分别沿夹爪闭合方向的正交/平行水平视轴，动态选择无遮挡的正反侧；画面内不
-  放位移箭头，只保留 5 cm 标尺；
+- Contact Front/Side 分别沿夹爪闭合方向的正交/平行视轴，动态选择无遮挡的正反侧；携带载荷时
+  SIDE 抬升为斜俯视（默认 55°），标题标出 `OBLIQUE <角度>° DOWN`，横向对齐以该幅为准；
+  画面内不放位移箭头，只保留 5 cm 标尺；
 - 不存在 post-commit 报告页、before/current 旧图或 Canvas error 报告。
 
 ## 5. Trace
@@ -150,7 +151,8 @@ evidence.py       grounding 存档 + FK 剪影 + 深度/像素复验 verdicts
 private.py        sensors / plans / evidence archives / presentation artifacts / imagination checkpoint
 functions.py      handlers and physical dispatch boundary
 workspace.py      revision lifecycle + evidence revalidation + memory reduction
-protocol.py       scoped prompts and Function definitions
+protocol.py       Function definitions and frozen contract prompt
+playbook.py       phase-indexed strategy text (injected into Main system prompt)
 runtime.py        Main ReAct + synchronous ImaginationRunner
 packet.py         trusted Canvas compiler
 trace.py          top-level and nested audit traces

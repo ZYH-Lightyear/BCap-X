@@ -3,8 +3,8 @@
 > **历史基线，不是当前接口。** 本文保留最初双 Agent 拆分时的状态、预算耗尽和
 > `open/close` Imagination 语义，供复现设计演进。当前实现已改为 Main-owned ReAct，
 > Imagination 只作为 `refine_action` 内同步 SubAgent，并使用 `2048×1280` Direct Contact
-> Camera Canvas。现行契约见 [`CURRENT_ARCHITECTURE.md`](CURRENT_ARCHITECTURE.md)，
-> 当前 Milestone 见 [`M1_5_AGENTIC_SYSTEM_COMPLETION.md`](M1_5_AGENTIC_SYSTEM_COMPLETION.md)。
+> Camera Canvas。现行契约见 [`CURRENT_ARCHITECTURE.md`](../CURRENT_ARCHITECTURE.md)，
+> 当前 Milestone 见 [`M1_5_AGENTIC_SYSTEM_COMPLETION.md`](../M1_5_AGENTIC_SYSTEM_COMPLETION.md)。
 
 ## 目标
 
@@ -84,4 +84,4 @@ commit 后的第一个 Main 请求额外获得一张明确标注的 previous-obs
 
 本版本作为 M1.4.3 的固定对照组。真实 trace `dual_agent_review_v7_t0_s1` 没有在 20 个总
 Function turn 内抓起目标：arm-only commit 后缺少可见的动作因果信息，Main 重新启动 detection
-与 grasp proposal。后续优化与逐版本结果记录在 `M1_4_3_GRASP_CONTEXT_OPTIMIZATION.md`。
+与 grasp proposal。后续优化与逐版本结果记录在 `M1_4_3_GRASP_CONTEXT_OPTIMIZATION.md`（同目录）。

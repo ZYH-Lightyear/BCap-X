@@ -14,7 +14,10 @@ from vaw.context_runtime.packet import (
     CONTEXT_WIDTH,
     ContextCompiler,
     _contact_camera_center,
+    _current_gripper_contact_points,
+    _preview_contact_points,
     _presentation_region_ref,
+    _required_contact_points,
 )
 from vaw.context_runtime.private import LastPhysicalArtifacts
 from vaw.context_runtime.model import Pose
@@ -341,6 +344,78 @@ def test_point_pose_commit_replaces_stale_grasp_points_with_destination_geometry
     assert physical is not None
     assert physical.subject_query == "basket"
     assert np.array_equal(physical.subject_points_base, destination_points)
+
+
+def test_current_only_contact_preview_does_not_count_as_planned_gripper() -> None:
+    workspace = _workspace()
+    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    seed = workspace.execute("propose_grasps", region_id=region).result["seed_ids"][0]
+    action_id = workspace.execute("select", seed_id=seed).result["action_id"]
+    workspace.execute("commit", action_id=action_id)
+
+    from vaw.context_runtime.packet import _current_physical_contact_preview
+
+    preview = _current_physical_contact_preview(workspace)
+    assert preview is not None
+    assert preview.gripper_opening is None
+    assert _preview_contact_points(workspace.state.robot, preview) is None
+    live = _current_gripper_contact_points(workspace.state.robot)
+    assert live is not None and len(live) > 0
+    required = _required_contact_points(workspace.state.robot, preview)
+    assert required is not None
+    assert required[:, 2].max() >= live[:, 2].max() - 1e-9
+
+
+def test_post_commit_contact_framing_requires_the_live_gripper_above_the_basket() -> None:
+    calls: list[object] = []
+
+    def provider(request):
+        calls.append(request)
+        camera = {
+            "images": {"rgb": np.zeros((358, 832, 3), dtype=np.uint8)},
+            "intrinsics": np.array(
+                [[360.0, 0.0, 456.0], [0.0, 360.0, 146.0], [0.0, 0.0, 1.0]],
+                dtype=np.float64,
+            ),
+            "pose_mat": np.eye(4, dtype=np.float64),
+            "view_name": "front",
+        }
+        return ContactCameraPair(
+            front=camera,
+            side={**camera, "view_name": "side"},
+            selection=ContactCameraSelection(1, 1, 1.0, 1.0, 1.0),
+        )
+
+    workspace = ContextWorkspace(
+        FakeContextApi(),
+        "place the can in the basket",
+        motion_backend="pyroki",
+        contact_camera_provider=provider,
+    )
+    region_id = workspace.execute(
+        "detection_and_sam", query="basket"
+    ).result["region_id"]
+    basket = workspace._private.region_geometry[region_id].filtered_object_points_base
+    point_id = workspace.execute(
+        "locate_point",
+        query="basket opening center",
+        within_region_id=region_id,
+    ).result["point_id"]
+    action_id = workspace.execute(
+        "propose_pose",
+        point_id=point_id,
+        offset_xyz=[0.0, 0.0, 0.18],
+    ).result["action_id"]
+    workspace.execute("commit", action_id=action_id)
+
+    ContextCompiler().compile(workspace)
+
+    assert calls
+    required = np.asarray(calls[-1].required_points_base, dtype=np.float64)
+    assert required.ndim == 2 and required.shape[1] == 3
+    assert required[:, 2].max() > float(np.quantile(basket[:, 2], 0.98)) + 0.04
+    span = float(np.linalg.norm(required.max(axis=0) - required.min(axis=0)))
+    assert span <= 0.16 + 1e-6
 
 
 def test_packet_modes_are_result_driven_without_owner_state() -> None:

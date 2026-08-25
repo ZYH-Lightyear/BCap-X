@@ -1,6 +1,11 @@
 # M1.6 计划：修 bug → Canvas 完备化 → RSI-ready 版本
 
-> 状态：**实施中（2026-08-20 起）**
+> **§1 诊断与阶段 A 已被 [`EVAL_FAILURE_TAXONOMY.md`](EVAL_FAILURE_TAXONOMY.md) 取代
+> （2026-08-23）。** 原文保留作历史：当时的问题是「从不委派 Imagination」；
+> m16y/m16z/m17a 证明该问题已解决，当前头号杀手是 F4 seed select 死循环。
+> 阶段 C 的工程落地以 C1–C3 实施为准，不再以本节时间表为进度依据。
+>
+> 状态：**部分落地 / 诊断过期（2026-08-20 起稿）**
 > 已落地（schema `vaw-context-v42-routing-advisories`，renderer `context-web-v42-plumb-line`，
 > 154 项 VAW 测试通过）：
 > - 阶段 A 全部四项：A1 释放判据改写（矛盾时禁降/禁释放而非禁修正，配 force_refresh）、

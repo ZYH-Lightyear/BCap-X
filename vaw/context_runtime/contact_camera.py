@@ -195,13 +195,10 @@ class LiberoContactCameraProvider:
         self,
         env: Any,
         *,
-        # A wide close-up exaggerates whatever is nearest the lens, so a
-        # foreground object reads as taller than the gripper and the two panels
-        # disagree about clearance.  Standing back with a narrower FOV flattens
-        # that.  It cannot go much further: past roughly 0.45 m the camera
-        # leaves the cluster of tabletop objects it is currently inside and
-        # neighbouring items start occluding the subject on both azimuths.
-        distance_m: float = 0.38,
+        # Sit in front of neighbouring table objects (a tomato can is ~12 cm
+        # off the cream-cheese box).  16 cm still covers fingers + the local
+        # object at 34°; 26–38 cm puts the can between the lens and the hand.
+        distance_m: float = 0.16,
         fovy_deg: float = 34.0,
         framing_padding_m: float = 0.035,
     ) -> None:

@@ -5,7 +5,7 @@
 > 当前运行入口以 [`vaw/README.md`](../vaw/README.md) 为准，当前实现契约见
 > [`vaw/CURRENT_ARCHITECTURE.md`](../vaw/CURRENT_ARCHITECTURE.md)，研究目标和 Milestone 见
 > [`vaw/M1_5_AGENTIC_SYSTEM_COMPLETION.md`](../vaw/M1_5_AGENTIC_SYSTEM_COMPLETION.md)。
-> `vaw/CONTEXT_RUNTIME_MILESTONES.md` 现为 M0–M1.4 历史记录；删除前代码保存在 Git checkpoint
+> `vaw/archive/CONTEXT_RUNTIME_MILESTONES.md` 现为 M0–M1.4 历史记录；删除前代码保存在 Git checkpoint
 > `fd8d89a`。论文故事与训练目标仍见 `docs/gui_as_policy_v2_cvpr_plan.md`。
 
 ## 1. 系统架构

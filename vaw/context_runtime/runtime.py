@@ -32,7 +32,6 @@ from vaw.context_runtime.protocol import (
     IMAGINATION_FUNCTION_NAMES,
     IMAGINATION_SYSTEM_PROMPT,
     MAIN_FUNCTION_NAMES,
-    SYSTEM_PROMPT,
     imagination_function_definitions,
     main_function_definitions,
     parse_action,
@@ -48,7 +47,7 @@ _NOTICE_LABEL = {
     "advisory": "上一轮编辑未生效，Preview 未改变",
 }
 
-MAX_MAIN_TURNS = 32
+MAX_MAIN_TURNS = 64
 
 
 class ContextRenderer(Protocol):
@@ -61,7 +60,7 @@ class ContextRenderer(Protocol):
 
 @dataclass
 class ContextRunConfig:
-    max_main_turns: int = MAX_MAIN_TURNS
+    max_main_turns: int = 32
     max_imagination_turns: int = 6
     max_time_s: float = 1800.0
     max_physical_ops: int = 30
@@ -281,7 +280,12 @@ class ContextRuntime:
         trace: ContextTraceLogger | None = None,
         env_check: Callable[[], bool] | None = None,
         env_terminal_check: Callable[[], bool] | None = None,
+        playbook_dir: str | None = None,
+        playbook_injection: str = "all",
+        playbook_phase: str | None = None,
     ) -> None:
+        from vaw.context_runtime.playbook import compose_default_main_prompt, default_playbook_dir
+
         self.main_provider = main_provider
         self.imagination_provider = imagination_provider or main_provider
         self.workspace = workspace
@@ -298,6 +302,15 @@ class ContextRuntime:
         self.main_turns = 0
         self._current_event: FunctionEvent | None = None
         self._subagent_index = 0
+        resolved_playbook_dir = playbook_dir or str(default_playbook_dir())
+        self.playbook_dir = resolved_playbook_dir
+        self.playbook_injection = playbook_injection
+        self.playbook_phase = playbook_phase
+        self._system_prompt = compose_default_main_prompt(
+            resolved_playbook_dir,
+            injection=playbook_injection,  # type: ignore[arg-type]
+            phase=playbook_phase,
+        )
         if trace is not None:
             trace.log_meta(
                 {
@@ -309,6 +322,9 @@ class ContextRuntime:
                     "motion_backend": workspace.motion_backend_name,
                     "local_motion_backend": workspace.local_motion_backend_name,
                     "preview_gripper": self.compiler.preview_gripper_style,
+                    "playbook_dir": resolved_playbook_dir,
+                    "playbook_injection": playbook_injection,
+                    "playbook_phase": playbook_phase,
                 }
             )
 
@@ -513,7 +529,7 @@ class ContextRuntime:
             )
         if feedback is not None:
             text += f"\n{_NOTICE_LABEL['protocol']}：{feedback}"
-        return _image_messages(SYSTEM_PROMPT, text, image, label="CURRENT MAIN CONTEXT CANVAS")
+        return _image_messages(self._system_prompt, text, image, label="CURRENT MAIN CONTEXT CANVAS")
 
     def _finish(self, mode: TerminateMode, steps: list[StepRecord], detail: str) -> EpisodeResult:
         if not self.workspace.finished:
@@ -688,6 +704,9 @@ def run_context_episode(
     env_check: Callable[[], bool] | None = None,
     env_terminal_check: Callable[[], bool] | None = None,
     motion_backend: str = "curobo",
+    playbook_dir: str | None = None,
+    playbook_injection: str = "all",
+    playbook_phase: str | None = None,
 ) -> EpisodeResult:
     workspace = ContextWorkspace(api, task_prompt, motion_backend=motion_backend)
     trace = ContextTraceLogger(trace_dir) if trace_dir is not None else None
@@ -701,6 +720,9 @@ def run_context_episode(
             trace=trace,
             env_check=env_check,
             env_terminal_check=env_terminal_check,
+            playbook_dir=playbook_dir,
+            playbook_injection=playbook_injection,
+            playbook_phase=playbook_phase,
         ).run()
     finally:
         renderer.close()

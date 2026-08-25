@@ -5,7 +5,9 @@ VAW 是面向 LIBERO-PRO 的 Main-owned Visual ReAct Runtime。Main Agent 始终
 `call_imagination` 同步委派给一个只看 Focused Canvas 的 Imagination SubAgent。
 
 当前契约见 [`CURRENT_ARCHITECTURE.md`](CURRENT_ARCHITECTURE.md)，Context/Memory 的唯一规范见
-[`AGENTIC_CONTEXT_OS.md`](AGENTIC_CONTEXT_OS.md)。
+[`AGENTIC_CONTEXT_OS.md`](AGENTIC_CONTEXT_OS.md)。Main 策略文本在 [`playbooks/`](playbooks/CONTENT_CONTRACT.md)。
+历史里程碑已迁入 [`archive/`](archive/README.md)。评测失败分类见
+[`EVAL_FAILURE_TAXONOMY.md`](EVAL_FAILURE_TAXONOMY.md)。
 
 ## Function space
 
@@ -95,7 +97,17 @@ python -m vaw.scripts.run_context_agent \
 ```
 
 省略 `--imagination-model` 时两个角色复用同一模型配置，但 provider request、Canvas projection
-和 trace 仍互相隔离。
+和 trace 仍互相隔离。`--playbook-dir` 默认 `vaw/playbooks`，`--playbook-injection all`
+与拆分前系统提示逐字节相同。
+
+批量评测与相位 fitness：
+
+```bash
+python -m vaw.evolution.sweep --tag gen0 --seeds 1,2,3 --resume --workers 1
+python -m vaw.evolution.compare \
+  --baseline vaw/out/sweeps/gen0/sweep_summary.json \
+  --candidate vaw/out/sweeps/<tag>/sweep_summary.json
+```
 
 ## 验证
 
@@ -109,7 +121,13 @@ MPLCONFIGDIR=/tmp/vaw-mpl python -m pytest -q \
   tests/test_vaw_near_field.py \
   tests/test_vaw_gripper_fk.py \
   tests/test_vaw_contact_camera.py \
-  tests/test_vaw_semantic_grounding.py
+  tests/test_vaw_semantic_grounding.py \
+  tests/test_vaw_schema_docs.py \
+  tests/test_vaw_playbook.py \
+  tests/test_vaw_fitness.py \
+  tests/test_vaw_compare.py \
+  tests/test_vaw_sweep.py \
+  tests/test_vaw_serve_trace.py
 ```
 
 当前实现不修改 CaP-X、RoboMEx、`capx_skill_rl` 或已有输出 trace。

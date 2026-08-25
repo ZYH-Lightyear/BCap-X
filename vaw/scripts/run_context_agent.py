@@ -45,9 +45,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-turns",
         type=int,
-        choices=range(1, 33),
+        choices=range(1, 65),
         default=32,
-        metavar="1..32",
+        metavar="1..64",
     )
     parser.add_argument("--max-time-s", type=float, default=1800.0)
     parser.add_argument("--max-physical-ops", type=int, default=30)
@@ -90,6 +90,18 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--trace-dir", type=pathlib.Path, default=None)
+    parser.add_argument(
+        "--playbook-dir",
+        type=pathlib.Path,
+        default=None,
+        help="phase-indexed playbook directory (default: vaw/playbooks)",
+    )
+    parser.add_argument(
+        "--playbook-injection",
+        choices=("all", "phase"),
+        default="all",
+        help="gen-0 uses all; phase gating is reserved for later ablation",
+    )
     parser.add_argument("--object-query", default="the alphabet soup can")
     parser.add_argument("--point-query", default="the center of the alphabet soup can")
     parser.add_argument(
@@ -294,6 +306,8 @@ def _run_agent(
         renderer,
         imagination_provider=imagination_provider,
         compiler=ContextCompiler(preview_gripper_style=args.preview_gripper),
+        playbook_dir=str(args.playbook_dir) if args.playbook_dir is not None else None,
+        playbook_injection=args.playbook_injection,
         config=ContextRunConfig(
             max_main_turns=args.max_turns,
             max_imagination_turns=args.max_imagination_turns,

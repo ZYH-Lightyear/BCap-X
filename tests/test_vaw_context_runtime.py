@@ -31,7 +31,6 @@ from vaw.context_runtime.protocol import (
     IMAGINATION_FUNCTION_NAMES,
     IMAGINATION_SYSTEM_PROMPT,
     MAIN_FUNCTION_NAMES,
-    SYSTEM_PROMPT,
     imagination_function_definitions,
     main_function_definitions,
 )
@@ -459,71 +458,23 @@ def test_main_and_imagination_function_contracts_are_disjoint_and_small() -> Non
     assert "base +Z 恒为上抬" in IMAGINATION_SYSTEM_PROMPT
     assert "CONTACT FRONT 和 SIDE" in IMAGINATION_SYSTEM_PROMPT
     assert "gripper-only fallback" in IMAGINATION_SYSTEM_PROMPT
-    assert "琥珀色 carried-volume 是可选" in SYSTEM_PROMPT
-    assert "Main ReAct Agent" in SYSTEM_PROMPT
-    assert "call_imagination" in SYSTEM_PROMPT
-    assert "Task Memory" in SYSTEM_PROMPT
-    assert "executed 只表示命令完成" in SYSTEM_PROMPT
-    assert "Current Function Event" in SYSTEM_PROMPT
-    assert "action_proposal.executable 是能否 commit 的权威标志" in SYSTEM_PROMPT
-    assert "只有回滚 Action 的 executable=true 才可直接 commit" in SYSTEM_PROMPT
-    assert "不要重新 detection/propose 生成等价集合" in SYSTEM_PROMPT
-    assert "薄/扁物体" in SYSTEM_PROMPT
-    assert "只有目标离开局部视野、身份不确定或必须重新生成抓取方向时" in SYSTEM_PROMPT
-    assert "Action 执行后蓝轮廓" in SYSTEM_PROMPT
-    assert "不要仅因蓝轮廓已经消失而重新 detection" in SYSTEM_PROMPT
-    assert "优先保留该 metric anchor" in SYSTEM_PROMPT
-    # A1 (v42): contradictory lateral evidence forbids descending/releasing,
-    # not correction itself. Read the current geometry; do not switch strategy
-    # by counting similar commands.
-    assert "被禁止的是继续下降和释放，而不是修正本身" in SYSTEM_PROMPT
-    assert "而不是重复同一感知循环或按次数切换策略" in SYSTEM_PROMPT
-    assert "物理接触只看当前 Canvas，不看已经发出过多少次同类命令" in SYSTEM_PROMPT
-    assert "region/point 仍 verified 只表示画面里还能认出同一物体" in SYSTEM_PROMPT
-    assert "容器已不再是可用开口" in SYSTEM_PROMPT
-    assert "descending delta_move #" not in SYSTEM_PROMPT
-    # v46: two level panels cannot separate "on the rim" from "in the opening",
-    # so carrying tilts SIDE and the prompt has to say how to read the pair.
-    assert 'CONTACT SIDE 会抬高为斜俯视，标题标出 "OBLIQUE <角度>° DOWN"' in SYSTEM_PROMPT
-    assert "横向对齐以带 OBLIQUE 标记的那一幅为准" in SYSTEM_PROMPT
-    assert "竖直方向同时混合了高度与进深" in SYSTEM_PROMPT
-    assert "VIRTUAL TOP" not in SYSTEM_PROMPT
-    # A3 (v42): positive routing triggers for call_imagination.
-    assert "以下情形默认\n先委派" in SYSTEM_PROMPT
-    assert "这些是路由建议而非门控" in SYSTEM_PROMPT
-    assert "二维重叠" in SYSTEM_PROMPT
-    assert "物体下部已经越过开口/边沿平面" in SYSTEM_PROMPT
-    assert "而非停在边沿上" in SYSTEM_PROMPT
-    assert "region/point 会自动对照新画面复验" in SYSTEM_PROMPT
-    assert "status=occluded" in SYSTEM_PROMPT
-    assert "world change check" in SYSTEM_PROMPT
-    assert "seed 与 ActionProposal 仍是 revision-local" in SYSTEM_PROMPT
-    assert "指尖低于物体顶面可以是正常抓取状态" in SYSTEM_PROMPT
-    assert "掌部底面标为一条深青色窄带" in SYSTEM_PROMPT
-    assert "窄带一旦贴到当前正下方的顶面或沿口" in SYSTEM_PROMPT
     assert "Preview 对位不能恢复那个真实几何" in IMAGINATION_SYSTEM_PROMPT
-    assert "不得把" in SYSTEM_PROMPT and "指尖—顶面距离" in SYSTEM_PROMPT
     assert "指尖低于物体顶面并不代表碰撞" in IMAGINATION_SYSTEM_PROMPT
     assert "真正需要净空" in IMAGINATION_SYSTEM_PROMPT
     assert "掌部/横梁/指根" in IMAGINATION_SYSTEM_PROMPT
     assert "必须分别判断位置与方向" in IMAGINATION_SYSTEM_PROMPT
     assert "继续平移不能修复方向错误" in IMAGINATION_SYSTEM_PROMPT
     assert "PCA 可以是非 top-down" in IMAGINATION_SYSTEM_PROMPT
-    assert "较大的 GRIP 可能表示物体阻挡" in SYSTEM_PROMPT
-    assert "不得让已闭合的手指朝支撑面" in SYSTEM_PROMPT
     assert "open_gripper" not in [
         item["function"]["name"] for item in imagination
     ]
     refine = next(x["function"] for x in standard if x["function"]["name"] == "call_imagination")
     assert refine["parameters"]["required"] == ["action_id", "instruction"]
     assert "不是 commit 的前置条件" in refine["description"]
-    for reason in ("geometry_unresolved", "plan_unavailable", "turn_limit", "subagent_error"):
-        assert reason in SYSTEM_PROMPT
     commit_definition = next(
         x["function"] for x in standard if x["function"]["name"] == "commit"
     )
     assert "planned 与 refined 均可" in commit_definition["description"]
-    assert "不是 commit 的前置" in SYSTEM_PROMPT
     for definition in imagination:
         assert "refinement_goal" not in definition["function"]["parameters"]["properties"]
 

@@ -71,6 +71,9 @@ CONTEXT_WEB_SCHEMA_VERSION = 46
 CONTACT_CARRY_SIDE_ELEVATION_DEG = 55.0
 CONTEXT_WIDTH = 2048
 CONTEXT_HEIGHT = 1280
+# Required live-hand points farther than this from TCP only inflate the
+# Contact distance; fingers and palm stay inside this radius.
+_LIVE_GRIPPER_FRAMING_RADIUS_M = 0.08
 
 # Native raster sizes match their fixed CSS slots.  Main places the two
 # Contact views side by side; the focused Imagination projection stacks two
@@ -435,7 +438,7 @@ class ContextCompiler:
                 private.contact_camera_pair is None
                 or private.contact_camera_action_id != camera_cache_key
             ):
-                required_preview_points = _preview_contact_points(
+                required_preview_points = _required_contact_points(
                     state.robot,
                     contact_preview,
                 )
@@ -809,11 +812,109 @@ def _contact_camera_center(
     return tuple(float(value) for value in center)
 
 
+def _stack_contact_points(*groups: np.ndarray | None) -> np.ndarray | None:
+    chunks: list[np.ndarray] = []
+    for group in groups:
+        if group is None:
+            continue
+        points = np.asarray(group, dtype=np.float64).reshape(-1, 3)
+        points = points[np.isfinite(points).all(axis=1)]
+        if len(points):
+            chunks.append(points)
+    if not chunks:
+        return None
+    return np.ascontiguousarray(np.vstack(chunks))
+
+
+def _current_gripper_contact_points(robot: RobotState | None) -> np.ndarray | None:
+    """Live finger/palm vertices that every Contact panel must keep in frame.
+
+    Destination clouds (a basket opening, a table patch) are much denser than
+    the hand.  If the current gripper is only mixed into that subject and then
+    robust-quantiled, FRONT looks at the container face and clips the real
+    hand.  Required points use min/max, so the gripper has to enter that set
+    on its own.  This is framing only: it does not draw a Preview ghost.
+    """
+
+    if robot is None or robot.gripper_opening is None:
+        return None
+    if robot.joint_positions_rad is not None:
+        fk = load_panda_urdf_fk()
+        if fk is not None:
+            try:
+                triangles = fk.triangles(
+                    np.asarray(robot.joint_positions_rad, dtype=np.float64),
+                    float(robot.gripper_opening),
+                )
+            except (KeyError, RuntimeError, ValueError, np.linalg.LinAlgError):
+                triangles = None
+            else:
+                points = np.asarray(triangles, dtype=np.float64).reshape(-1, 3)
+                points = points[np.isfinite(points).all(axis=1)]
+                if len(points):
+                    origin = (
+                        None
+                        if robot.tcp_pose is None
+                        else np.asarray(
+                            robot.tcp_pose.position_xyz, dtype=np.float64
+                        ).reshape(3)
+                    )
+                    return _clip_points_near_origin(points, origin)
+    if robot.tcp_pose is None:
+        return None
+    origin = np.asarray(robot.tcp_pose.position_xyz, dtype=np.float64).reshape(3)
+    extents = np.array(
+        [
+            [sx, sy, sz]
+            for sx in (-0.04, 0.04)
+            for sy in (-0.04, 0.04)
+            for sz in (-0.02, 0.06)
+        ],
+        dtype=np.float64,
+    )
+    return np.ascontiguousarray(origin + extents)
+
+
+def _clip_points_near_origin(
+    points: np.ndarray,
+    origin: np.ndarray | None,
+) -> np.ndarray:
+    """Keep a hand-scale cluster.  Never fall back to the forearm mesh."""
+
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if origin is not None:
+        origin = np.asarray(origin, dtype=np.float64).reshape(3)
+        keep = np.linalg.norm(points - origin, axis=1) <= _LIVE_GRIPPER_FRAMING_RADIUS_M
+        if np.any(keep):
+            return np.ascontiguousarray(points[keep])
+        nearest = points[int(np.argmin(np.linalg.norm(points - origin, axis=1)))]
+    else:
+        nearest = np.median(points, axis=0)
+    keep = np.linalg.norm(points - nearest, axis=1) <= _LIVE_GRIPPER_FRAMING_RADIUS_M
+    if not np.any(keep):
+        return np.ascontiguousarray(points[int(np.argmin(
+            np.linalg.norm(points - nearest, axis=1)
+        ))].reshape(1, 3))
+    return np.ascontiguousarray(points[keep])
+
+
+def _required_contact_points(
+    robot: RobotState | None,
+    preview: NearFieldPreview | None,
+) -> np.ndarray | None:
+    """Keep the live gripper, and any planned Preview gripper, inside Contact."""
+
+    return _stack_contact_points(
+        _current_gripper_contact_points(robot),
+        _preview_contact_points(robot, preview),
+    )
+
+
 def _preview_contact_points(
     robot: RobotState | None,
     preview: NearFieldPreview | None,
 ) -> np.ndarray | None:
-    """Return private target-gripper vertices that must remain in frame."""
+    """Return private *planned* gripper vertices that must remain in frame."""
 
     if robot is None or preview is None or preview.gripper_opening is None:
         return None
@@ -838,13 +939,25 @@ def _preview_contact_points(
         return None
     points = np.asarray(triangles, dtype=np.float64).reshape(-1, 3)
     points = points[np.isfinite(points).all(axis=1)]
-    return np.ascontiguousarray(points) if len(points) else None
+    if not len(points):
+        return None
+    origin = (
+        None
+        if preview.target_pose is None
+        else np.asarray(preview.target_pose.position_xyz, dtype=np.float64).reshape(3)
+    )
+    return _clip_points_near_origin(points, origin)
 
 
 def _current_physical_contact_preview(
     workspace: ContextWorkspace,
 ) -> NearFieldPreview | None:
-    """Anchor current-only Contact Views at the latest physical target."""
+    """Anchor current-only Contact Views at the latest physical target.
+
+    ``gripper_opening`` stays unset on purpose: a filled Preview would draw a
+    ghost on top of the live hand.  The live gripper enters framing through
+    ``_current_gripper_contact_points`` instead.
+    """
 
     if workspace.state.action_proposal is not None:
         return None

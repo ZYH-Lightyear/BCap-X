@@ -421,7 +421,7 @@ def test_contact_camera_uses_close_gravity_stable_horizontal_views() -> None:
     center_world = sim.data.xpos[0] + np.asarray(request.center_base_xyz)
     for _name, position, _quaternion in sim.render_poses:
         horizontal_distance = float(np.linalg.norm((position - center_world)[:2]))
-        assert horizontal_distance >= 0.26
+        assert np.isclose(horizontal_distance, 0.16)
         assert position[2] == center_world[2]
 
 

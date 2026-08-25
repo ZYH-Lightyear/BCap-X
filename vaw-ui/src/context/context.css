@@ -214,16 +214,16 @@ img { display: block; }
 .via-edit-overlay {
   left: 4px;
   bottom: 4px;
-  width: 610px;
-  padding: 4px;
+  width: 305px;
+  padding: 3px;
 }
 .via-edit-overlay .via-fact-row {
-  grid-template-columns: 148px minmax(0, 1fr);
-  min-height: 43px;
+  grid-template-columns: 92px minmax(0, 1fr);
+  min-height: 28px;
   border-color: #4b5563;
 }
-.via-edit-overlay .via-fact-row strong { color: #a78bfa; font-size: 16px; }
-.via-edit-overlay .via-fact-row code { color: #fff; font-size: 16px; }
+.via-edit-overlay .via-fact-row strong { color: #a78bfa; font-size: 12px; }
+.via-edit-overlay .via-fact-row code { color: #fff; font-size: 12px; }
 
 .via-seed-gallery {
   position: absolute;

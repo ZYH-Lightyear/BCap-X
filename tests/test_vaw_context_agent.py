@@ -382,10 +382,11 @@ def test_imagination_provider_error_is_classified_as_subagent_error(tmp_path: Pa
     assert meta["reason"] == "subagent_error"
     assert "RuntimeError" not in _user_text(main.messages[1])
 
-def test_main_turn_budget_is_hard_capped_at_32() -> None:
+def test_main_turn_budget_is_hard_capped_at_64() -> None:
     assert ContextRunConfig().max_main_turns == 32
-    with pytest.raises(ValueError, match=r"\[1, 32\]"):
-        ContextRunConfig(max_main_turns=33)
+    assert ContextRunConfig(max_main_turns=50).max_main_turns == 50
+    with pytest.raises(ValueError, match=r"\[1, 64\]"):
+        ContextRunConfig(max_main_turns=65)
     assert ContextRunConfig().max_no_call_retries == 2
     with pytest.raises(ValueError, match=r"\[0, 3\]"):
         ContextRunConfig(max_no_call_retries=4)

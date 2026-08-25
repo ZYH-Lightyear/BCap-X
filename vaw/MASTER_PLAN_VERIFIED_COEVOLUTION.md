@@ -1,10 +1,18 @@
 # Verified Co-Evolution 总体实施方案（Master Plan）
 
-> 状态：实施蓝图 v1（2026-08-20 定案）
-> 决议：先 A 后 B、日夜联进化、讲 B 的故事（`proposals/PROPOSAL_B_VERIFIED_COEVOLUTION.md` §4.5）
-> 上游：`M1_6_RSI_READINESS_PLAN.md`（bug 修复 + Canvas 冻结，本方案的 M1.6）、
-> `RSI_METHOD_DESIGN.md`（方法论）、`ICRA_PAPER_PROPOSAL.md`（第一、二幕不变）
-> 本文档覆盖：里程碑 M1.6 → M2.0、系统架构、工程实现、实验矩阵、时间表、风险登记
+> 状态：实施蓝图 **v2（2026-08-24）**
+> 决议：先 A 后 B、日夜联进化、讲 B 的故事（`proposals/PROPOSAL_B_VERIFIED_COEVOLUTION.md`）
+> 论文故事：`proposals/PROPOSAL_B_VERIFIED_COEVOLUTION.md`
+> 工程本文：里程碑、模块、信号纪律、立即行动
+> 已删除：`RSI_METHOD_DESIGN.md`（串行「先文本后权重」外壳）
+>
+> **v2 相对 v1 的方法修订（2026-08-24）**
+> 1. 内核与领域插件分离；LIBERO-PRO 是第一个实例，不是方法本体。
+> 2. 案卷 = Trace + Video + Cost + 进展叙述。**诊断综合，选择不综合。**
+> 3. **分析 / 归因 / 改稿由 VLM 自主完成**；人只冻契约、案卷格式与采纳公式。
+> 4. 选择只认同 `(task, seed)` 的 `env_success` 配对净增。Cost 入案卷，不作否决闸。
+> 5. planner / TCP、手写相位位、F1–F5 **不进选择、不进 proposer**。
+>    planner 只留给夜班语料过滤（训练岗）。
 
 ---
 
@@ -14,199 +22,197 @@
 
 | 层级 | 内容 | 判断 | 依据 |
 | --- | --- | --- | --- |
-| T1 | 文本旋钮 held-out 赢过预算对等 TTS | 高置信 | 每个环节都是已验证机制的延伸；路由缺陷是已知低垂果实 |
-| T3 | 蒸馏 7B 恢复教师大部分 Imagination 表现、成本降一个量级 | 高置信 | 窄接口+密集验证反馈+有界上下文，是小模型最易学的题型；语料由 planner 天然过滤 |
-| T2 | W+H 端到端优于 H-only | 真研究不确定性 | SIA 在三个领域成立，但具身域无先例；失败不毁论文（优雅降级结构自带） |
+| T1 | 文本旋钮 held-out 赢过预算对等 TTS | 中高 | 环本身是已验证机制；收益取决于诊断质量与任务划分，不再押「路由是低垂果实」 |
+| T3 | 蒸馏 7B 恢复教师大部分 Imagination 表现、成本降一个量级 | 高 | 窄接口 + 有界上下文；语料用 planner 逐步过滤（训练岗，不是选择岗） |
+| T2 | W+H 端到端优于 H-only | 不确定 | SIA 在其它域成立，具身无先例；失败则优雅降级为纯文本旋钮 |
 
-**成立前提（必须先满足，按序检查）：**
+**成立前提：**
 
-1. **GPU**：一台可训 Qwen2.5-VL-7B LoRA 的机器（A100/H100 单卡；QLoRA 则 48G 可行）。
-   唯一外部硬依赖。
-2. **gen-0 成功率下限**：M1.6 修复后 object suite 扰动设置 zero-shot ≥ 50%。
-   低于此值说明 harness 本身仍有结构缺陷，进化没有健康的起点，先回去修。
-3. **sweep 吞吐下限**：单 episode ≤ 15 分钟、可 4 路以上并行。
-   否则每代评估周期过长，四周窗口跑不满 3 代。
+1. **GPU（夜班）**：可训 Qwen2.5-VL-7B LoRA 的卡。白班不依赖此项。
+2. **gen-0 噪声底已入库**：`vaw/out/sweeps/gen0/` 跑完即可转白班。
+   不再设 50% 硬门槛；成功率低说明第一刀该打恢复/抓取，不说明不能进化。
+3. **sweep 能按题并行 seed**：现默认单题 3 seed。吞吐不够时先缩小 train 集，不阻塞建环。
 
 ---
 
-## 1. 论文 claim ↔ 里程碑映射
+## 1. 论文 claim ↔ 里程碑
 
 ```text
-第一幕 诊断（probe 集）          ← ICRA 提案 B 线，独立推进，不在本文档展开
-第二幕 干预（harness zero-shot） ← M1.6（bug + canvas 冻结 + gen-0 sweep）
-第三幕 联合进化（本文核心）
-    T1 文本旋钮 vs TTS           ← M1.7（基建）+ M1.8（循环）
-    T3 蒸馏可行性 + 成本          ← M1.9（语料 + 训练 + 门控）
-    T2 W+H vs H-only             ← M2.0（联合运行 + 消融矩阵）
+第一幕 诊断（probe 集）          ← ICRA 提案，独立，本文不展开
+第二幕 干预（harness zero-shot） ← M1.6 已基本落地（v46 + gen-0）
+第三幕 联合进化（本文 + Proposal B）
+    T1 文本旋钮 vs TTS           ← M1.7 剩余 + M1.8
+    T3 蒸馏可行性 + 成本          ← M1.9
+    T2 W+H vs H-only             ← M2.0
 ```
 
 ---
 
-## 2. 系统总体架构
+## 2. 模块化架构（内核 vs 插件）
 
-### 2.1 分层视图
-
-```text
-┌─────────────────────────────────────────────────────────────────┐
-│ 契约层（冻结）——现有代码                                          │
-│   vaw/scripts/run_context_agent.py      单 episode 入口           │
-│   vaw/context_runtime/*.py              Runtime/Canvas/验证器      │
-│   vaw/agents/providers/*                模型后端                   │
-│   tests/test_vaw_*.py                   144 项回归 + contract hash │
-├─────────────────────────────────────────────────────────────────┤
-│ 知识层（唯一进化面）——新增                                        │
-│   vaw/playbooks/*.md                    相位索引 playbook（git 管理）│
-│   vaw/context_runtime/playbook.py       加载 + 相位确定性注入        │
-├─────────────────────────────────────────────────────────────────┤
-│ 进化层（白班）——新增 vaw/evolution/                               │
-│   fitness.py    trace → 相位 fitness（确定性提取）                 │
-│   sweep.py      批量评测编排（并行、崩溃隔离、预算记账）             │
-│   propose.py    mutation proposer（读失败三元组 → 单点变异）        │
-│   loop.py       代管理：对比、采纳、git commit、代日志              │
-│   attribution.py 知识失败/能力失败归因统计                          │
-│   baselines.py  预算对等 TTS（parallel sampling / seq refinement） │
-│   budget.py     episodes / tokens / GPU-hours 记账                │
-├─────────────────────────────────────────────────────────────────┤
-│ 训练层（夜班）——新增 vaw/train/                                   │
-│   corpus.py         imagination session → SFT 语料（JSONL）        │
-│   distill_lora.py   Qwen2.5-VL-7B LoRA 蒸馏                       │
-│   replay_gate.py    清晨门控：离线重放快测                          │
-│   serve_imagination.py  本地 vLLM 服务 7B checkpoint               │
-├─────────────────────────────────────────────────────────────────┤
-│ 产物存储                                                          │
-│   vaw/playbooks/          当前代 playbook（git 历史 = 进化史）      │
-│   vaw/out/sweeps/<gen>/   每代 sweep 产物 + sweep_summary.json     │
-│   vaw/out/corpus/         verified session 语料（累积）            │
-│   checkpoints/imagination_7b/<date>/    每晚 checkpoint + 门控记录  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 2.2 日夜数据流
+知识内容可以域特化（那正是被进化的东西）。**机制不能焊死在 LIBERO 上。**
+审计标准：换成任何「有终局判定 + 可录像/可审计轨迹」的 agent 域，内核五层一行不改。
 
 ```text
-白天：playbooks/ ──注入──► run_context_agent ──trace──► fitness.py
-        ▲                                                │
-        │ 采纳(严格提升)                                   ▼
-      loop.py ◄──候选 sweep──◄ propose.py ◄──失败三元组──sweep_summary
-                                                          │
-      （旁路，无条件）imagination sessions ──corpus.py──► out/corpus/
-夜里：out/corpus/ ──distill_lora.py──► candidate checkpoint
-清晨：replay_gate.py(candidate vs 现役) ──胜──► serve_imagination 切换
-                                        ──负──► 弃，白天继续用现役
+领域插件（可替换）
+  Environment          任务源 + 观测          ← 现：LIBERO-PRO
+  Observation Encoder  观测 → Agent 工作区    ← 现：Context OS / Canvas v46
+  Terminal Check       终局成功与否           ← 现：env_success；真机=脚本/抽检
+  （可选）Geometry      逐步运动学合规         ← 现：planner / TCP；只服务训练岗
+
+Agent 系统（被进化对象所在）
+  Executor             Main，权重冻结
+  Specialist           Imagination，窄接口，可替换/可训
+  Knowledge Store      playbooks/*.md，唯一文本进化面
+
+评测基座（内核）
+  Episode Runner       sweep.py：隔离进程 + 落盘
+  Trace Store          steps.jsonl / video / meta
+  Paired Comparator    compare.py：同 (task, seed)
+  Ledger               成本记账（turns / tokens / 物理动作）；不作选择闸
+
+进化引擎（内核 · 白班）
+  Case Builder         失败 episode → 匿名案卷（抹任务 ID）
+  Diagnose VLM         读案卷 → 进展 + 失败叙事（不打采纳分、不给 diff）
+  Propose VLM          叙事 + 当前 K + 内容契约 → 单文件单处 diff
+  Selector             配对 env_success 净增 → git commit / 归档
+  Archive              代日志、被拒 diff、生命周期
+
+训练引擎（内核 · 夜班）
+  Corpus Builder       verified Imagination 序列 → SFT
+  Trainer              7B LoRA
+  Deployment Gate      重放不劣于现役才上岗
+
+治理（横切）
+  Task Split           train / val / held-out 冻结
+  Content Contract     知识可写什么
+  Budget + TTS         预算对等对照（报告用，不进选择公式）
 ```
 
-关键性质：两条线通过"语料落盘"单向耦合，训练侧任何失败都不影响进化主线。
+### 2.1 代码对照（2026-08-24）
+
+```text
+已有
+  run_context_agent.py / context_runtime/* / playbooks/*
+  evolution/fitness.py     事后标签表（F1–F5、相位位）；非正式选择依据
+  evolution/sweep.py       批量评测
+  evolution/compare.py     配对比较（采纳应走这里的 env_success 位）
+  --imagination-model      Main / Imagination 已解耦
+
+未写
+  evolution/task_split.json
+  evolution/diagnose.py    Case Builder + 诊断 VLM
+  evolution/propose.py
+  evolution/loop.py
+  evolution/baselines.py / budget.py
+  train/ 整层
+  --force-imagination
+```
+
+`attribution.py` **v1 不建**。知识 vs 能力调度是 v2 以后的事；v1 固定日夜交替。
+
+### 2.2 验证信号（瘦身，方法核心）
+
+执行 Agent 靠 harness 释放能力；进化 Agent 靠读 episode 案卷。两边同一哲学。
+
+```text
+案卷 = Trace + Video + Cost + 诊断 VLM 写的进展/失败叙事
+
+诊断（综合，允许软）
+  冻结指令的 VLM 读案卷
+  → 走到哪、哪一步开始错、为什么
+  → 只喂 proposer；不打分、不建议 diff
+
+选择（不综合，防 Goodhart）
+  同 (task, seed)：候选 env_success 净增 > 0 则采纳
+  否则拒绝
+  Cost / 叙事 / 相位标签 / planner 均不投票
+
+训练过滤（夜班另岗）
+  planner 逐步通过 且 session ready → 可入语料
+```
+
+诊断与提案必须拆成两次调用（可同一模型）：先叙事、再改稿，禁止边看边改。
+
+### 2.3 日夜数据流
+
+```text
+白天：Knowledge ──注入──► Runner ──案卷──► diagnose.py
+        ▲                                      │
+        │ 配对 env_success 净增                  ▼
+      loop.py ◄──候选 sweep──◄ propose.py ◄── 失败叙事
+        │
+        └──（旁路）Imagination session ──corpus──► out/corpus/
+
+夜里：out/corpus/ ──distill──► candidate θ
+清晨：replay_gate（胜）──► Specialist 上岗
+                   （负）──► 白天继续用现役
+```
+
+两条线只通过语料单向耦合。夜班失败不影响白班。
 
 ---
 
 ## 3. 里程碑
 
-### M1.6 契约收尾 + Canvas 冻结 + gen-0（≈1.5 周，细节见 M1_6_RSI_READINESS_PLAN.md）
+### M1.6 契约收尾 + Canvas 冻结 + gen-0（大部分已完成）
 
-内容不重复，此处只列出口判据：
+已落地：阶段 A 修复、plumb line、schema **v46**、playbook 拆分（gen-0 为 `injection=all`）、
+fitness / sweep / compare、gen-0 10×3  sweep。
 
-- 阶段 A 四项修复落地（释放判据 prompt、盲降 advisory、routing 正向触发、locate 逃生口文档）；
-- Canvas B1（plumb line + XY 偏差标注）、B2–B4 视图、B5 图例/schema v42，审计矩阵全绿后冻结；
-- **gen-0 baseline sweep**：object suite 全任务 × 3 seeds，产出成功率与相位 fitness 基线。
-- 出口判据：全量测试通过；gen-0 object suite ≥ 50%（§0 前提 2）。
+不再要求 B2–B4 全绿；冻结点就是 v46。相位机注入仍是可选项，不是开环前置。
 
-### M1.7 进化基建（≈4 天，与 M1.6 后半并行）
+### M1.7 剩余基建
 
-**7.1 Prompt 因子化**
+- **7.1 已完成**：playbook 文件 + `CONTENT_CONTRACT.md` + contract hash。
+- **7.2 降级**：`fitness.py` 保留作出事后对照表，**从选择公式移除**。
+- **7.3 未完成**：冻结 `evolution/task_split.json`；sweep 已可用。
+- **7.4 新增**：`diagnose.py`（匿名案卷 + 诊断 VLM）。
 
-- `protocol.py` 的 SYSTEM_PROMPT 拆为：contract 段（工具/事件/图例语义）留在
-  `protocol.py`；策略性内容迁出为 `vaw/playbooks/{grasp,transport,align,place,recover,routing}.md`。
-- 新增 `context_runtime/playbook.py`：加载 playbook 目录、按相位拼装注入。
-  相位由 ContextState 确定性推断（无载荷+无接触=grasp；attached+远离目标=transport；
-  attached+目标邻域=align/place；连续失败恢复=recover）。
-- 内容契约（禁 offset，三类知识）写为 `playbooks/CONTENT_CONTRACT.md`，
-  同时作为 propose.py 指令的一部分。
-- 测试：contract 段 hash 守护（改动即测试失败）；playbook 注入的快照测试；
-  gen-0 playbook（现 prompt 策略内容的忠实迁移）跑单任务与迁移前行为一致。
+### M1.8 文本旋钮循环
 
-**7.2 相位 fitness（`evolution/fitness.py`）**
+**8.1 诊断（`diagnose.py`）**
 
-- 输入：episode trace 目录（events + meta.json）。输出：
-  `{pick: 0/1, transport: 0/1, place: 0/1, turns, physical_ops, main_tokens, imag_tokens}`。
-- 判定全确定性：pick = attached 事件且载荷离开支撑面；transport = 载荷 OBB 进入
-  目标 region 邻域（bbox 外扩）；place = env_success。
-- 测试：对 m16l/m16q/m16r 三条已有 trace 断言已知标签。
+- 输入：失败 episode 的 `steps.jsonl`、`video_*.mp4`（或抽帧）、成本字段。
+- 抹掉任务 ID / held-out 信息，编号为 `case_1..N`。
+- 输出：进展一句话 + 失败叙事。禁止输出分数、禁止输出 playbook diff。
 
-**7.3 Sweep 编排（`evolution/sweep.py`）**
+**8.2 提案（`propose.py`）**
 
-- 子进程调用 `run_context_agent.py`（每 episode 独立进程，MuJoCo 崩溃隔离），
-  参数矩阵 = 任务 × seeds × playbook 版本 × imagination 模型；
-- 并行度可配（默认 4）；输出 `out/sweeps/<tag>/sweep_summary.json`
-  （成功率、相位 fitness 汇总、budget.py 记账、失败 episode 索引）；
-- 任务划分在此冻结：`evolution/task_split.json`（train/val/held-out，第 0 天写死，git 锁定）。
-- 出口判据：同一 playbook 两次 sweep（同 seeds）结果一致；吞吐满足 §0 前提 3。
+- 输入：本代诊断叙事 + 当前全部 playbook + `CONTENT_CONTRACT.md`。
+- 输出：恰好一个文件、一处 diff + 一句理由。
+- 硬校验：只落在 `vaw:slot` 内；无绝对量值 / 物体名 / 任务 ID；contract hash 不变。
+- 不可见：held-out 列表、任务 ID、任何选择分数。
 
-### M1.8 文本旋钮循环（=Proposal A 主体，≈1 周运行期）
-
-**8.1 Mutation proposer（`evolution/propose.py`）**
-
-- 输入：上一代 sweep 的失败 episode 三元组（相位 fitness、事件流摘要、关键 canvas 截图）
-  + 当前 playbook + 内容契约；
-- 输出：对单个 playbook 文件的一处 diff + 一句改动理由（进代日志，可读的进化史）；
-- proposer 不可见：held-out 任务列表、任务 ID、val/held-out 分数。
-
-**8.2 代循环（`evolution/loop.py`）**
+**8.3 代循环（`loop.py`）**
 
 ```text
 while 代数 < N:
-  candidate = propose(P_i, 失败三元组)
-  F_cand = sweep(candidate, train)
-  if F_cand 严格优于 F_i（先 place 相位，再总成功率，再成本）:
-      val 复核通过 → git commit 采纳，P_{i+1} = candidate
-  else: 归档拒绝记录
-  attribution.py 输出本代知识/能力失败占比
+  叙事 = diagnose(失败案卷)
+  candidate = propose(K_i, 叙事)
+  sweep(candidate, train)
+  if 配对 env_success 净增 > 0:     # compare.py，只看终局位
+      val 上 env_success 无净退步 → git commit，K_{i+1} = candidate
+  else:
+      归档拒绝（diff + 叙事 + 配对表）
 ```
 
-**8.3 TTS 对照（`evolution/baselines.py`）**
+预期采纳率低。McNemar 只记录，不作门槛。
 
-- parallel sampling：gen-0 playbook，同任务多 seed 取最好；
-- sequential refinement：gen-0 playbook，失败后同任务重试至预算耗尽；
-- 预算对等以 episodes 与 total tokens 双轴对齐（budget.py 出表）。
+**8.4 TTS（`baselines.py`）**
 
-出口判据：≥3 代完成；每代采纳/拒绝记录与理由完整；
-**showcase 检查**：routing playbook 是否进化出委派规则（定性结果，论文用）。
+预算对等的平行采样 / 顺序重试，只上报告，不进采纳。
 
-### M1.9 权重旋钮基建（≈1 周，与 M1.8 白班并行推进）
+出口：≥3 代有完整代日志；held-out 只在代末记录、不参与选择。
 
-**9.1 语料（`train/corpus.py` + 采数据模式）**
+### M1.9 权重旋钮（与白班并行，可晚一周）
 
-- `run_context_agent.py` 加 `--force-imagination` 旗标：commit 前强制委派
-  （仅用于采数据 episode，产物只进语料库、不进任何对比表）；
-- session → SFT 样本：输入 =（聚焦 canvas 图像、instruction、当前状态文本），
-  目标 = 下一步 edit 函数调用 JSON；只保留 planner 全通过且 session ready 的序列；
-- 冷启动目标量：≥ 200 条 verified session（约数百个采数据 episode）。
+- `--force-imagination`：只进语料，不进对比表。
+- `corpus.py`：planner 全过且 `ready` 的 edit 序列。
+- `distill_lora.py` / `replay_gate.py` / 本地服务 7B。
+- `--imagination-model` 已存在。
 
-**9.2 蒸馏（`train/distill_lora.py`）**
-
-- 基模 Qwen2.5-VL-7B，LoRA（r=16 起步），多模态 SFT 标准配方；
-- 每晚在**累积**语料上重训/续训，产出 `checkpoints/imagination_7b/<date>/`。
-
-**9.3 清晨门控（`train/replay_gate.py`）**
-
-- 从语料库留出的重放集（不参与训练）上离线快测：
-  edit 合规率（planner 通过率）、session ready 率、与教师选择一致率；
-- candidate 全指标不劣于现役才切换 `serve_imagination.py` 指向；
-- **第一次运行即 go/no-go 探针**：7B zero-shot 分数落盘——
-  显著非零 → 蒸馏起点好；接近零 → 必须蒸馏（也是论文数据点）。
-
-**9.4 Runtime 接入**
-
-- `run_context_agent.py` 加 `--imagination-model`（默认与 --model 相同），
-  `agents/providers` 增加本地 vLLM 后端；Main 与 Imagination 模型解耦。
-
-出口判据：蒸馏 v0 checkpoint 走通"训练→门控→上岗/拒绝"全流程；
-replay 曲线（zero-shot vs 蒸馏 v0 vs 教师）成图。
-
-### M2.0 联合运行 + 论文实验（≈1.5 周）
-
-- 日夜排班连续运行：白班 M1.8 循环继续，夜班蒸馏，清晨门控；
-  归因统计每日出表（v1 固定日夜交替，归因作分析）；
-- **主消融矩阵**（train 上进化、held-out 上报告，每格 ≥10 seeds）：
+### M2.0 联合运行 + 消融
 
 | 行 | Main | Imagination | Playbook |
 | --- | --- | --- | --- |
@@ -214,80 +220,62 @@ replay 曲线（zero-shot vs 蒸馏 v0 vs 教师）成图。
 | H-only | 大模型 | 大模型 | 进化后 |
 | W-only | 大模型 | 蒸馏 7B | v0 |
 | W+H | 大模型 | 蒸馏 7B | 进化后 |
-| TTS ×2 | 大模型 | 大模型 | v0 + 预算对等采样/重试 |
+| TTS ×2 | 大模型 | 大模型 | v0 + 预算对等 |
 
-- 成本表：每行 token/episode、GPU-hours、wall-clock；
-- 冻结 probe（若 ICRA B 线产出）同步测进化前后通用空间判断；
-- 论文写作与实验并行（W3 起 draft，写作规范走 `docs/paper/SKILL.md`）。
-
-出口判据：claim 阶梯着地层级判定（T1/T3 必须，T2 如实报告）；
-所有表格可由 out/sweeps/ 产物脚本再生。
+v1 固定日夜交替。归因调度（知识失败 vs 能力失败决定次日侧重）标为 v2，不做本窗口交付。
 
 ---
 
-## 4. 实验矩阵与 claim 对应
+## 4. 实验矩阵
 
 ```text
-KE-A（T1）：进化代数 × {train fitness, held-out 成功率, TTS 水平线}
-            通过标准：held-out 上进化线显著高于 TTS 线
-KE-B（T3）：replay 三点曲线（7B zero-shot / 蒸馏 v0..vk / 教师）
-            + 部署成本对比（大模型 Imagination vs 7B Imagination）
-            通过标准：蒸馏恢复教师 ≥70% ready 率，成本 ≤1/5
-KE-C（T2）：主消融矩阵 W+H vs H-only vs W-only vs gen-0
-            通过标准：W+H ≥ H-only（显著则头条，持平则如实报告并分析归因）
-KE-D（定性）：进化史展示——被采纳 mutation 的全文 + 理由 + 前后行为对比
-            （routing 从不委派 → 学会委派是首选素材）
+KE-A（T1）：代数 × {train 终局成功率, held-out 终局成功率, TTS 线}
+            通过：held-out 进化线高于 TTS
+KE-B（T3）：replay（7B zero-shot / 蒸馏 / 教师）+ 部署成本
+KE-C（T2）：W+H vs H-only vs W-only vs gen-0
+KE-D：被采纳 diff 全文 + 诊断叙事 + 前后行为（定性）
 ```
 
 ---
 
-## 5. 时间表（2026-08-20 → 09-15，假设 ICRA 截稿）
+## 5. 时间表
 
-```text
-W1  8/20–8/26   M1.6 阶段 A 修复 + Canvas B0/B1；M1.7.1 因子化并行起步
-W2  8/27–9/02   Canvas B2–B5 + 冻结；gen-0 sweep；M1.7.2/7.3 完成；
-                采数据模式 + 7B zero-shot replay 探针（go/no-go 落盘）
-W3  9/03–9/09   白班：M1.8 循环跑 3–5 代 + TTS 对照
-                夜班：蒸馏 v0/v1 + 清晨门控
-                周中 checkpoint（9/6）：T2 有无初步信号 → 定标题与 claim 措辞
-W4  9/10–9/15   M2.0 主消融矩阵冻结实验；写作冲刺；adversarial self-review
-```
+v1 的 8/20–9/15 四周日历**作废**（M1.6 已滑期）。里程碑名保留，按「白班一周建环、夜班可并行」重排，不以截稿倒推。
 
-诚实预期：四周内 T1+T3 有完整证据，T2 大概率只有初步信号
-（联合运行代数有限）。若 T2 未着地：论文仍讲 co-evolution 框架，
-T2 作为 preliminary + 完整版投下一档期（CoRL/RSS 2027）——
-决定点在 9/6，不拖到最后一周。
+诚实预期：先交付可转的文本旋钮环 + 案卷诊断；7B 上岗视 GPU 与语料量，允许只落到 T1。
 
 ---
 
-## 6. 风险登记表
+## 6. 风险
 
-| # | 风险 | 触发信号 | 对策 |
-| --- | --- | --- | --- |
-| R1 | GPU 训练环境不可用 | W2 前未确认 | T3 降级为 replay 探针 + 语料统计；故事回退 A+teaser |
-| R2 | gen-0 成功率 < 50% | M1.6 出口 | 停止进化排期，回修 harness（进化救不了结构缺陷） |
-| R3 | sweep 吞吐不足 | W2 实测 | 缩小训练任务集；提高并行；episode 提前终止规则 |
-| R4 | 路由进化不出委派 | M1.8 前 2 代 | 检查 advisory 是否进入失败三元组；proposer 提示加强失败归因可见性 |
-| R5 | 7B zero-shot ≈ 0 且蒸馏 v0 也差 | W3 门控 | 检查 SFT 样本格式/图像分辨率；换 2B→7B 对照排查；最坏 T3 改讲"语料贡献" |
-| R6 | 进化在 train 涨 held-out 不涨 | KE-A | 按 cut line 降级；本身也是可发表的负结果分析 |
-| R7 | MuJoCo/环境崩溃传染 | sweep 期 | 每 episode 独立进程 + 超时杀进程（sweep.py 内建） |
-| R8 | 预算对等被质疑 | 写作期 | budget.py 全程记账，附录公开逐代账单 |
+| # | 风险 | 对策 |
+| --- | --- | --- |
+| R1 | 无训练 GPU | 夜班降级；白班故事不受影响 |
+| R2 | gen-0 终局偏低 | 照开白班；诊断会自然偏向恢复/抓取 |
+| R3 | sweep 慢 | 缩小 train；保持单题多 seed |
+| R4 | 诊断编造原因 | 选择仍只看终局；浪费的是一代提案 |
+| R5 | 提案违反契约 | 硬校验拒绝，本代跳过或重试 ≤2 |
+| R6 | train 涨 held-out 不涨 | cut line：降级为 harness analysis |
+| R7 | 进程崩溃 | sweep 已按 episode 隔离 |
+| R8 | 「这就是 LLM-judge 进化」 | 选择公式不含 VLM 分；附录公开代账单 |
 
 ---
 
 ## 7. 非目标
 
-- 进化 Canvas、验证器、Function schema、Main 权重（契约/验证层冻结）；
-- 种群搜索（只做轨迹局部自比较）；
-- LLM-judge 参与任何采纳决策；
-- Proposal C（在线技能自著述）——本轮不做，档期错开独立推进；
-- 真实机器人实验（limitation 说明输入可得性）。
+- 进化 Canvas、终局判定器、Function schema、Main 权重。
+- 种群搜索。
+- **VLM 参与采纳投票**（诊断与提案是 VLM 的；过不过不是）。
+- 手写相位 / F 标签作为选择或 proposer 输入。
+- 用 planner / TCP 当选择 fitness。
+- Proposal C（在线技能自著述）。
+- 本窗口真实机器人实验（案卷四件在真机上仍成立，作为 limitation 说明）。
 
 ---
 
-## 8. 立即行动清单（本周）
+## 8. 立即行动
 
-1. 确认 GPU 训练环境（§0 前提 1）——唯一需要用户确认的外部依赖；
-2. M1.6 阶段 A 四项修复动工（M1_6 文档 §2）；
-3. `evolution/task_split.json` 任务划分第 0 天冻结（写死并 commit）；
-4. Canvas B1 plumb line 实现（M1_6 文档 §3 B1）。
+1. 冻结 `evolution/task_split.json`（10 题切 train / val / held-out）。
+2. `diagnose.py`：案卷打包 + 诊断 VLM（只描述）。
+3. `propose.py` + `loop.py`：接 `compare.py` 的配对 `env_success`。
+4. 夜班：`--force-imagination` + `corpus.py`（有 GPU 再蒸）。

@@ -24,8 +24,8 @@ SubAgent，不再作为与 Main 并列、逐 turn 切换 ownership 的顶层循�
 Canvas、Function 和 Prompt 都只是该闭环的组成部分。任何单独截图、IK 成功、轨迹生成、
 夹爪闭合、Agent 声称成功或 scripted smoke 都不能证明 M1.5 完成。
 
-本文是 M1.5 的权威设计与验收文档。`M1_4_2_DUAL_AGENT_RUNTIME.md` 和
-`M1_4_3_GRASP_CONTEXT_OPTIMIZATION.md` 保留为历史基线与失败记录；若与本文冲突，以本文为准。
+本文是 M1.5 的权威设计与验收文档。`archive/M1_4_2_DUAL_AGENT_RUNTIME.md` 和
+`archive/M1_4_3_GRASP_CONTEXT_OPTIMIZATION.md` 保留为历史基线与失败记录；若与本文冲突，以本文为准。
 当前已实现的 Runtime、Function ownership、Context Builder 和 Canvas 契约集中记录在
 [`CURRENT_ARCHITECTURE.md`](CURRENT_ARCHITECTURE.md)，本文继续承担研究目标、版本演进与验收
 记录，不再要求读者从全部历史版本段落反推当前实现。

@@ -36,7 +36,7 @@ agent 域：运动学 planner 每步给可行性判定、commit 给 TCP 误差�
 
 ## 3. 方法概要
 
-（详细工程落地见 `../M1_6_RSI_READINESS_PLAN.md` §4，理论外壳见 `../RSI_METHOD_DESIGN.md`）
+（工程落地见 `../MASTER_PLAN_VERIFIED_COEVOLUTION.md`；本提案是 B 的文本旋钮章节）
 
 - **自改面（刻意受限，Autoresearch 纪律）**：相位索引 playbook 文本 +
   Imagination 委派路由规则。Contract（API/Canvas/事件语义）、Verifier、模型权重全部冻结。

@@ -181,11 +181,14 @@ cached plan，Main 审核 Preview 后即可 commit；无可执行计划的 commi
 Canvas schema 固定为：
 
 ```text
-context:  vaw-context-v41-evidence-lifecycle
-web:      41
-renderer: context-web-v41-evidence-lifecycle
+context:  vaw-context-v46-oblique-contact
+web:      46
+renderer: context-web-v46-oblique-contact
 viewport: 2048×1280, DPR=1
 ```
+
+携带载荷时 CONTACT SIDE 抬升为斜俯视（默认 55°），标题标出 `OBLIQUE <角度>° DOWN`。
+两个近水平面板只能就高度互相印证；横向对齐以带 OBLIQUE 标记的那一幅为准。
 
 下层按当前决策证据路由：
 

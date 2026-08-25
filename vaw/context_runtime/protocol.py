@@ -29,7 +29,7 @@ IMAGINATION_FUNCTION_NAMES = (
 
 FUNCTION_NAMES = tuple(dict.fromkeys((*MAIN_FUNCTION_NAMES, *IMAGINATION_FUNCTION_NAMES)))
 
-SYSTEM_PROMPT = """\
+CONTRACT_PREAMBLE = """\
 你是 Main ReAct Agent，通过 Visual Action Workspace 控制 LIBERO-PRO 机器人。每轮读取 User Task、
 Task Memory、Live References、Current Function Event 和当前 Canvas，然后调用且只调用一个 Main Function。
 
@@ -75,72 +75,9 @@ subject_relation=intended_attachment_unverified 明确表示这仍需当前视�
 control_subject 可以是容器，而 manipulation_subject 仍是被操作物；不得把场景中另一个相似物体误当成
 manipulation_subject，也不得仅凭该字段宣称抓持成功。
 
-detection_and_sam 返回当前 observation 中身份和二维位置的权威 region；不得用自己的分类否定其 query，
-但它不证明接触、抓持、支撑或包含。若 locate_point 的 query 属于一个已有 region，必须传
-within_region_id，禁止脱离该 region 重新搜索相似物体。region、point、seed 和 action ID 只在 Live
-References 中有效。每次物理动作后，region/point 会自动对照新画面复验：仍列出的条目即画面未变化，
-可直接继续引用，不需要重新 detection/locate；标记 status=occluded 的条目暂被机械臂遮挡、几何未能
-重新确认，使用前应结合当前 Canvas 判断；已发生变化的条目会被自动移除，Function Event 的
-world change check 会说明哪些被移除、哪些仍然有效。seed 与 ActionProposal 仍是 revision-local。
+"""
 
-select/propose_pose 创建 planned 空间 Action 并缓存规划；当 Preview 与当前视觉证据足以判断动作安全
-合理时，可以直接 commit。commit 执行当前空间 Action 的可执行缓存计划，planned 与 refined 均可，
-Live References.action_proposal.executable 是能否 commit 的权威标志；false 时 commit 必然拒绝且不改变
-世界，必须改用其他 seed、修改目标或 reject。同一组 seed 仍有效时，先尝试其中几何方向实质不同的
-候选，不要重新 detection/propose 生成等价集合。TOP、PCA、CGN 只是候选来源，不存在固定优先级；
-尤其对贴近支撑面的薄/扁物体，必须检查两指是否有支撑面净空，不能因为 top-down 看起来简单就默认选择。
-局部几何不确定、需要连续观察或旋转时，用
-call_imagination(action_id, instruction) 委派 Imagination，而不是重复盲目物理尝试。以下情形默认
-先委派而不是直接 commit 或反复物理微调：容器放置、插入或上架类目标；载荷或机械臂遮挡 Contact View
-使对齐不可判；载荷与目标沿口的间隙与载荷自身尺度相当；连续两次物理动作未改善同一对齐问题。
-这些是路由建议而非门控——若多视角证据已一致且 Preview 清晰合理，仍可直接 commit；
-它也不是 commit 的前置条件，refined 后仍须由你检查 Preview 再决定 commit。返回 status=partial
-（reason=turn_limit）表示预算耗尽但已交回成果：每步编辑都通过了规划校验，Action 停在最后一次已验证的
-编辑上，微调本身就有价值；审查 Preview 后可直接 commit、带更聚焦的 instruction 继续委派（从已
-推进的状态继续）或 reject。返回 status=failed 时 ActionProposal 回滚到进入前的目标，仍可 commit 或
-reject；失败原因和本 revision 的尝试记录留在 Live References：subagent_error 是内部错误，可原样
-重试一次；geometry_unresolved 或 plan_unavailable 说明该目标不可解，不得用等价 instruction 再次
-委派。只有回滚 Action 的 executable=true 才可直接 commit；否则应 reject、选择其他候选或引入实质
-不同的几何目标。
-
-locate_point 只提供当前视觉中的粗 metric anchor；容器开口、边缘和深度噪声可能使点落在边沿，固定
-offset 也不一定是最终位姿。允许根据当前 Contact View 对 point-derived Action 做有方向依据的适量微调。
-但若 query 明确是语义区域的 center/opening center，且对应 Action 已成功到达，优先保留该 metric anchor
-的 BASE XY：不同高度造成的透视偏移不能单独作为横移依据。斜俯视 Contact 显示足迹偏出目标，或两个
-Contact 面板形成一致证据时即可修改 XY。横向证据矛盾或不足时，被禁止的是继续下降和释放，而不是修正本身；
-修正方向必须来自当前可见几何，而不是重复同一感知循环或按次数切换策略。
-放置目标不要求完美居中，但二维重叠、物体位于容器后方或物体中心投影落在开口内，都不等于物体已经
-进入容器。释放前应从互补视角确认物体下部已经越过开口/边沿平面，而不是整个物体仍悬在边沿上方；
-同时保持夹爪和掌部的释放净空。满足该条件后应结束微调并推进释放，不得仅因透视差异反复 detection、
-重新取点或追求对称。释放后应先让夹爪退出遮挡，再确认物体仍位于容器有效内部而非停在边沿上，才能
-声明完成。若尚未对齐，每次重试必须来自当前可见几何并产生明确的新方向修正，而不是重复同一
-感知—proposal 循环。
-
-琥珀色 carried-volume 是可选的附着几何假设，不是所有抓取路径都会提供。存在时可用它做物体—容器
-对齐；不存在时，不得给 Imagination 下达依赖“未来物体投影/落点”的不可观察停止条件，而应改为让
-目标夹爪对齐到开口上方并保留安全净空，随后执行到高位并从新的真实 Canvas 闭环。
-
-Main 的 delta_move、open_gripper、close_gripper 是立即物理执行。新抓取接近时保持真实夹爪张开；只有
-当前 Contact View 支持物体位于两指闭合扫掠区域时才 close。闭合不等于抓住，释放命令也不等于物体已
-进入容器。close 后较大的 GRIP 可能表示物体阻挡了继续闭合，不等于命令没有执行；必须结合 Contact
-几何判断。若需要重新下降或横移来对位，应先 open，再移动并重新 close；不得让已闭合的手指朝支撑面
-下降来“寻找接触”。一次很短的抬升中物体瞬时随动，也不足以支持长距离运输：若抓持偏斜、仅单侧接触、仍贴近
-原支撑面或下一步会显著加速/转向，应先建立持续的双侧包夹与支撑面净空，否则重新调整抓取。若一次
-闭合后物体没有随动、机械臂遮挡目标或接触区已不可判断，可连续使用 base +Z 的
-delta_move 小步抬升来恢复净空和可观察性，再决定如何重试；不要把重新 detection 当作机械恢复动作。
-若刚执行的 move_to intent 是接近某个操作对象，当前优先问题是“局部几何是否支持下一个物理动作，
-或是否需要抬升/退让恢复可观察性”。只要目标仍清楚可见于当前 Contact View、身份没有歧义且修正方向
-可由当前坐标提示判断，就应直接进行局部修正或推进下一物理动作；
-尤其当对象仍位于张开夹爪正下方、只是存在竖直净空时，应直接沿 Contact 卡片所示 BASE 方向小步接近，
-不要仅因蓝轮廓已经消失而重新 detection；
-只有目标离开局部视野、身份不确定或必须重新生成抓取方向时，才重新调用 detection_and_sam 和
-propose_grasps。
-
-抓取几何中必须区分掌部/横梁与两根手指：掌部、横梁和指根是必须避开目标的刚性体；两根细长手指则应
-沿目标两侧下降，使目标进入两指内侧的闭合扫掠区域，指尖低于物体顶面可以是正常抓取状态。深青色窄带
-标出的掌部底面才是下降的终止面。不得把“指尖始终高于物体顶面”或固定的指尖—顶面距离写进 instruction
-的停止条件。instruction 应描述闭合通道、掌部净空和必要的方向关系，不要用单张二维图估计毫米级 gap。
-
+CONTRACT_COORDS = """\
 坐标使用 robot-base frame、单位米，四元数为 xyzw。每次调用前只写一句基于当前 Canvas 的简短依据。
 """
 
@@ -402,7 +339,18 @@ def parse_action(
     return name, arguments
 
 
+def _default_main_system_prompt() -> str:
+    from vaw.context_runtime.playbook import compose_default_main_prompt
+
+    return compose_default_main_prompt()
+
+
+SYSTEM_PROMPT = _default_main_system_prompt()
+
+
 __all__ = [
+    "CONTRACT_COORDS",
+    "CONTRACT_PREAMBLE",
     "FUNCTION_NAMES",
     "IMAGINATION_FUNCTION_NAMES",
     "IMAGINATION_SYSTEM_PROMPT",
