@@ -23,25 +23,19 @@ function FactRow({ label, children }: { label: string; children: ReactNode }) {
 }
 
 function ObservedLayer({ snapshot }: { snapshot: ContextSnapshot }) {
-  const opening = snapshot.world.robot?.gripper_opening
   return (
     <section className="via-observed">
-      <header>
-        <h1>OBSERVED NOW · REAL WORLD</h1>
-        <div className="via-observed-grip"><strong>GRIP</strong><code>{opening?.toFixed(3) ?? 'N/A'}</code></div>
-      </header>
+      <header><h1>PHYSICAL TRANSITION · REAL WORLD</h1></header>
       <div className="via-observed-grid">
         <article className="via-raster-card via-agentview">
           <Raster snapshot={snapshot} id={snapshot.world.agentviewRasterId} alt="当前 LIBERO-PRO 主视角" />
-          <span>AGENTVIEW · CURRENT RGB</span>
+          <span>{`NOW · CURRENT RGB · r${snapshot.revision}`}</span>
         </article>
-        <article className="via-raster-card via-observed-cloud">
-          <Raster
-            snapshot={snapshot}
-            id={snapshot.world.observedSceneRasterId}
-            alt="当前反侧真实相机视角"
-          />
-          <span>OPPOSITE VIEW · CURRENT RGB</span>
+        <article
+          className="via-raster-card via-auxiliary-view"
+          aria-label="陡角度辅助接触视图"
+        >
+          <Raster snapshot={snapshot} id={snapshot.world.contactAuxiliaryRasterId} alt="陡角度辅助接触视图" />
         </article>
       </div>
     </section>
@@ -154,10 +148,7 @@ function ImaginationLayer({ snapshot }: { snapshot: ContextSnapshot }) {
     snapshot.world.contactFrontRasterId !== null
     && snapshot.world.contactSideRasterId !== null
   )
-  const observedGrip = snapshot.world.robot?.gripper_opening
-  const seedHeader = observedGrip === undefined
-    ? 'ACTION SEEDS · VIRTUAL OPTIONS'
-    : `ACTION SEEDS · GRIP ${observedGrip.toFixed(3)} INHERITED`
+  const seedHeader = 'ACTION SEEDS · VIRTUAL OPTIONS'
   const header = decisionHeader(snapshot, seedHeader)
   return (
     <section className={`via-imagination${active ? ' via-imagination--active' : ''}${selecting ? ' via-imagination--seeds' : ''}${hasContactFocus ? ' via-imagination--contact' : ''}`}>

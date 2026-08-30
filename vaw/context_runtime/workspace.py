@@ -17,7 +17,6 @@ from vaw.context_runtime.geometry import (
     DEFAULT_TCP_TO_HAND_LOCAL_XYZ,
     tcp_position_from_hand_pose,
 )
-from vaw.context_runtime.memory import record_physical_transaction
 from vaw.context_runtime.model import (
     ActionSeed,
     ContextState,
@@ -62,12 +61,6 @@ class ContextWorkspace:
     # on the collision-aware coarse planner.
     LOCAL_TRANSLATION_LIMIT_M = 0.06
     LOCAL_ROTATION_LIMIT_DEG = 20.0
-    # Main may execute simple local controls directly.  ``commit`` executes the
-    # current ActionProposal's cached plan whether it is planned or refined.
-    PHYSICAL_FUNCTIONS = frozenset(
-        {"delta_move", "open_gripper", "close_gripper", "commit"}
-    )
-
     def __init__(
         self,
         api: Any,
@@ -194,7 +187,19 @@ class ContextWorkspace:
             "reason": "local_target" if use_local else "coarse_target",
         }
 
-    def begin_imagination(self, instruction: str, action_id: str) -> str:
+    def ensure_imagination_action(self, action_id: str | None) -> str:
+        """Resolve an Imagination action, lazily seeding from the live TCP."""
+
+        normalized = str(action_id).strip() if action_id is not None else ""
+        if normalized and normalized != "current":
+            return normalized
+        existing = self.state.action_proposal
+        if normalized != "current" and existing is not None:
+            return existing.action_id
+        created = self._functions.propose_from_current_tcp()
+        return str(created["action_id"])
+
+    def begin_imagination(self, instruction: str, action_id: str | None = None) -> str:
         """Open one synchronous Imagination task without yielding Main ownership."""
 
         if self.state.imagination is not None:
@@ -202,9 +207,13 @@ class ContextWorkspace:
         normalized = " ".join(str(instruction).split())
         if not normalized:
             raise ContextFunctionError("instruction must not be empty")
+        resolved = self.ensure_imagination_action(action_id)
         action = self.state.action_proposal
-        if action is None or action.action_id != action_id:
-            raise ContextFunctionError(f"unknown or expired action_id '{action_id}'")
+        if action is None or action.action_id != resolved:
+            raise ContextFunctionError(
+                f"unknown or expired action_id '{action_id or resolved}'"
+            )
+        action_id = resolved
         # A Contact Camera pair is selected once at session entry and then
         # remains fixed while Imagination edits the virtual target.  Re-entering
         # Imagination intentionally performs a fresh visibility selection.
@@ -256,9 +265,9 @@ class ContextWorkspace:
             self._tcp_to_hand_local_xyz,
         )
         # Carried regions/points are re-checked against the fresh image before
-        # anything downstream can reference them.  Anchors passed by physical
-        # handlers (grasped object, contact target) are removed without a
-        # pixel vote because the action itself implies their change.
+        # anything downstream can reference them.  Optional invalidate_*
+        # arguments skip the vote only when a caller has independent proof
+        # the citation is gone; motion itself is not that proof.
         self.last_evidence_report = revalidate_evidence(
             self.state,
             self._private,
@@ -271,12 +280,6 @@ class ContextWorkspace:
     def execute(self, function_name: str, **arguments: Any) -> ContextStepResult:
         before = self.state.observation_revision
         dispatched_arguments = dict(arguments)
-        pending_intent = (
-            self.state.action_proposal.intent
-            if self.state.action_proposal is not None
-            else None
-        )
-        previous_physical = self.state.last_physical_action
         self._private.begin_function_call()
         handler = self._functions.main_handlers.get(function_name)
         if handler is None:
@@ -298,8 +301,6 @@ class ContextWorkspace:
             dispatched_arguments,
             result,
             before,
-            pending_intent=pending_intent,
-            previous_physical=previous_physical,
         )
 
     def execute_imagination(
@@ -390,24 +391,8 @@ class ContextWorkspace:
         arguments: dict[str, Any],
         result: dict[str, Any],
         revision_before: int,
-        *,
-        pending_intent: str | None = None,
-        previous_physical: Any | None = None,
     ) -> ContextStepResult:
         revision_after = self.state.observation_revision
-        physical = self.state.last_physical_action
-        if (
-            function_name in self.PHYSICAL_FUNCTIONS
-            and physical is not None
-            and physical is not previous_physical
-        ):
-            record_physical_transaction(
-                self.state.task_memory,
-                function_name=function_name,
-                arguments=arguments,
-                intent=pending_intent,
-                physical_outcome=physical.outcome,
-            )
         self._private.presentation_event = PresentationEvent(
             function_name=function_name,
             result=dict(result),

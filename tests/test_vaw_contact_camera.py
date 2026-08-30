@@ -333,6 +333,38 @@ def test_side_elevation_keeps_the_camera_on_the_framing_sphere() -> None:
     assert radius(level.side) > 0.0
 
 
+def test_auxiliary_view_is_steeper_diagonal_without_tilting_contact_pair() -> None:
+    sim = _FakeSim()
+    pair = LiberoContactCameraProvider(_FakeEnv(sim))(
+        ContactCameraRequest(
+            center_base_xyz=(0.4, -0.08, 0.06),
+            frame_quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+            width=80,
+            panel_height=48,
+            preferred_signs=(1, 1),
+            side_elevation_deg=0.0,
+            auxiliary_elevation_deg=68.0,
+        )
+    )
+
+    assert pair.auxiliary is not None
+    front_forward = np.asarray(pair.front["pose_mat"], dtype=np.float64)[:3, 2]
+    side_forward = np.asarray(pair.side["pose_mat"], dtype=np.float64)[:3, 2]
+    auxiliary_forward = np.asarray(
+        pair.auxiliary["pose_mat"], dtype=np.float64
+    )[:3, 2]
+    assert np.isclose(front_forward[2], 0.0, atol=1e-8)
+    assert np.isclose(side_forward[2], 0.0, atol=1e-8)
+    assert np.isclose(
+        np.degrees(np.arcsin(-auxiliary_forward[2])),
+        68.0,
+        atol=1e-6,
+    )
+    horizontal = auxiliary_forward[:2] / np.linalg.norm(auxiliary_forward[:2])
+    assert np.allclose(horizontal, np.array([1.0, 1.0]) / np.sqrt(2.0), atol=1e-8)
+    assert len(sim.render_poses) == 3
+
+
 def test_side_elevation_rejects_out_of_range_tilts() -> None:
     with pytest.raises(ValueError, match="side_elevation_deg"):
         LiberoContactCameraProvider(_FakeEnv(_FakeSim()))(

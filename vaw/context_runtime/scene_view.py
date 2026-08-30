@@ -36,7 +36,7 @@ CONTACT_FOCUS_WIDTH_M = 0.32
 
 _PREVIEW_EDGE = (216, 203, 255)
 _PREVIEW_OCCUPANCY = np.array([167, 139, 250], dtype=np.uint8)
-_PREVIEW_OCCUPANCY_ALPHA = 0.18
+_PREVIEW_OCCUPANCY_ALPHA = 0.23
 _AMBER = np.array([245, 158, 11], dtype=np.uint8)
 _AMBER_EDGE = np.array([253, 230, 138], dtype=np.uint8)
 _AXIS_COLORS = ((239, 68, 68), (34, 197, 94), (59, 130, 246))

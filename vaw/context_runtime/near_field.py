@@ -46,15 +46,23 @@ _SOURCE_FILL = np.array([245, 158, 11], dtype=np.uint8)
 _SOURCE_EDGE = np.array([253, 230, 138], dtype=np.uint8)
 _CURRENT_FINGER_FILL = np.array([34, 211, 238], dtype=np.uint8)
 _CURRENT_FINGER_EDGE = np.array([165, 243, 252], dtype=np.uint8)
+_CURRENT_FINGER_ALPHA = 0.31
 # Same cyan family as the fingers because both are current real robot surface,
 # but darker so the palm floor reads as a separate part, not more finger.
 _PALM_FLOOR_FILL = np.array([14, 116, 144], dtype=np.uint8)
 _PALM_FLOOR_EDGE = np.array([8, 74, 92], dtype=np.uint8)
 _PREVIEW_EDGE = (216, 203, 255)
 _PREVIEW_OCCUPANCY = np.array([167, 139, 250], dtype=np.uint8)
-_PREVIEW_OCCUPANCY_ALPHA = 0.20
+_PREVIEW_OCCUPANCY_ALPHA = 0.25
 _CARRIED = np.array([245, 158, 11], dtype=np.uint8)
 _CARRIED_OUTLINE = np.array([253, 230, 138], dtype=np.uint8)
+GRASP_SWEEP_RGB = (250, 204, 21)
+_GRASP_SWEEP_OUTLINE = (15, 23, 42)
+# 闭合夹爪的本体标记：青色表示当前真实机器人，深色描边保证它在
+# 浅色机械臂和复杂背景上都清晰。该标记只表达实际 TCP 与 BASE-Z，
+# 不推断是否抓住物体，也不表达落点或任务进度。
+GRIPPER_Z_AXIS_RGB = (14, 165, 233)
+_GRIPPER_Z_AXIS_OUTLINE = (15, 23, 42)
 _MOVE = (22, 163, 74, 255)
 _AXIS_COLORS = (
     (220, 38, 38, 255),
@@ -123,6 +131,8 @@ def render_contact_focus(
     source_points_base: np.ndarray | None = None,
     contact_cameras: ContactCameraPair | None = None,
     carried_volume_triangles_base: np.ndarray | None = None,
+    grasp_sweep_segment_base: np.ndarray | None = None,
+    gripper_z_axis_base: np.ndarray | None = None,
     plumb_lines: list[PlumbLine] | None = None,
     output_width: int = CONTACT_FOCUS_WIDTH,
     panel_height: int = CONTACT_PANEL_HEIGHT,
@@ -144,6 +154,8 @@ def render_contact_focus(
             preview,
             source_points_base=source_points_base,
             carried_volume_triangles_base=carried_volume_triangles_base,
+            grasp_sweep_segment_base=grasp_sweep_segment_base,
+            gripper_z_axis_base=gripper_z_axis_base,
             plumb_lines=plumb_lines,
             output_width=output_width,
             panel_height=panel_height,
@@ -155,6 +167,8 @@ def render_contact_focus(
         preview,
         agentview_emphasis_mask=source_mask,
         carried_volume_triangles_base=carried_volume_triangles_base,
+        grasp_sweep_segment_base=grasp_sweep_segment_base,
+        gripper_z_axis_base=gripper_z_axis_base,
     )
     if pair is None:
         return None
@@ -162,6 +176,45 @@ def render_contact_focus(
         pair,
         output_width=output_width,
         panel_height=panel_height,
+    )
+
+
+def render_contact_auxiliary(
+    camera: dict,
+    robot: RobotState | None,
+    preview: NearFieldPreview | None,
+    *,
+    source_points_base: np.ndarray | None = None,
+    carried_volume_triangles_base: np.ndarray | None = None,
+    grasp_sweep_segment_base: np.ndarray | None = None,
+    gripper_z_axis_base: np.ndarray | None = None,
+    plumb_lines: list[PlumbLine] | None = None,
+    output_width: int = CONTACT_FOCUS_WIDTH,
+    panel_height: int = CONTACT_PANEL_HEIGHT,
+) -> np.ndarray | None:
+    """Render the steep, diagonal third view without a control gizmo.
+
+    FRONT/SIDE remain the calibrated action-reading pair.  This panel is only
+    complementary visual evidence: its diagonal azimuth and steeper elevation
+    make the fingers, payload and receptacle relation visible when the Panda
+    hand occludes a pure side camera.
+    """
+
+    if preview is None or robot is None:
+        return None
+    return _render_direct_contact_view(
+        camera,
+        "auxiliary",
+        robot,
+        preview,
+        source_points_base=source_points_base,
+        carried_volume_triangles_base=carried_volume_triangles_base,
+        grasp_sweep_segment_base=grasp_sweep_segment_base,
+        gripper_z_axis_base=gripper_z_axis_base,
+        plumb_lines=plumb_lines,
+        output_width=output_width,
+        panel_height=panel_height,
+        show_translation_axes=False,
     )
 
 
@@ -173,6 +226,8 @@ def _render_geometry_pair(
     *,
     agentview_emphasis_mask: np.ndarray | None = None,
     carried_volume_triangles_base: np.ndarray | None = None,
+    grasp_sweep_segment_base: np.ndarray | None = None,
+    gripper_z_axis_base: np.ndarray | None = None,
 ) -> np.ndarray | None:
     if robot.tcp_pose is None or robot.joint_positions_rad is None or robot.gripper_opening is None:
         return None
@@ -295,6 +350,20 @@ def _render_geometry_pair(
         carried_triangles_local = (
             np.asarray(carried_volume_triangles_base, dtype=np.float64) - frame_position
         ) @ frame_rotation
+    grasp_sweep_segment_local = None
+    if grasp_sweep_segment_base is not None:
+        segment = np.asarray(grasp_sweep_segment_base, dtype=np.float64).reshape(2, 3)
+        if np.isfinite(segment).all():
+            grasp_sweep_segment_local = np.ascontiguousarray(
+                (segment - frame_position) @ frame_rotation
+            )
+    gripper_z_axis_local = None
+    if gripper_z_axis_base is not None:
+        axis = np.asarray(gripper_z_axis_base, dtype=np.float64).reshape(3, 3)
+        if np.isfinite(axis).all():
+            gripper_z_axis_local = np.ascontiguousarray(
+                (axis - frame_position) @ frame_rotation
+            )
     panels = [
         _render_view(
             tuple(surfaces),
@@ -306,6 +375,8 @@ def _render_geometry_pair(
             current_tcp_position=frame_position,
             current_tcp_rotation=frame_rotation,
             preview=preview,
+            grasp_sweep_segment_local=grasp_sweep_segment_local,
+            gripper_z_axis_local=gripper_z_axis_local,
         )
         for view in views
     ]
@@ -324,6 +395,8 @@ def _render_direct_contact_pair(
     *,
     source_points_base: np.ndarray | None = None,
     carried_volume_triangles_base: np.ndarray | None = None,
+    grasp_sweep_segment_base: np.ndarray | None = None,
+    gripper_z_axis_base: np.ndarray | None = None,
     plumb_lines: list[PlumbLine] | None = None,
     output_width: int = CONTACT_FOCUS_WIDTH,
     panel_height: int = CONTACT_PANEL_HEIGHT,
@@ -340,6 +413,8 @@ def _render_direct_contact_pair(
             preview,
             source_points_base=source_points_base,
             carried_volume_triangles_base=carried_volume_triangles_base,
+            grasp_sweep_segment_base=grasp_sweep_segment_base,
+            gripper_z_axis_base=gripper_z_axis_base,
             plumb_lines=plumb_lines,
             output_width=output_width,
             panel_height=panel_height,
@@ -394,15 +469,18 @@ def _resize_contact_pair(
 
 def _render_direct_contact_view(
     camera: dict,
-    view_name: Literal["front", "side"],
+    view_name: Literal["front", "side", "auxiliary"],
     robot: RobotState,
     preview: NearFieldPreview,
     *,
     source_points_base: np.ndarray | None = None,
     carried_volume_triangles_base: np.ndarray | None = None,
+    grasp_sweep_segment_base: np.ndarray | None = None,
+    gripper_z_axis_base: np.ndarray | None = None,
     plumb_lines: list[PlumbLine] | None = None,
     output_width: int = CONTACT_FOCUS_WIDTH,
     panel_height: int = CONTACT_PANEL_HEIGHT,
+    show_translation_axes: bool = True,
 ) -> np.ndarray:
     image = np.asarray(camera["images"]["rgb"], dtype=np.uint8).copy()
     height, width = image.shape[:2]
@@ -431,7 +509,7 @@ def _render_direct_contact_view(
             _fit_mask(current_finger_mask, width, height),
             _CURRENT_FINGER_FILL,
             _CURRENT_FINGER_EDGE,
-            alpha=0.26,
+            alpha=_CURRENT_FINGER_ALPHA,
         )
     # Marked after the fingers and opaquely: on a top-down approach the palm
     # underside runs out of clearance first, and a translucent band would be
@@ -481,6 +559,10 @@ def _render_direct_contact_view(
     # its metric geometry follows the same camera as the other overlays.
     if plumb_lines:
         draw_plumb_overlays(image, render_camera, plumb_lines)
+    if grasp_sweep_segment_base is not None:
+        draw_grasp_sweep_overlay(image, render_camera, grasp_sweep_segment_base)
+    if gripper_z_axis_base is not None:
+        draw_gripper_z_axis_overlay(image, render_camera, gripper_z_axis_base)
 
     guide_active = (
         preview.rotation_gizmo_frame is not None and preview.rotation_gizmo_axis is not None
@@ -506,7 +588,8 @@ def _render_direct_contact_view(
     # current visual ablation.  Keep the renderer implementation below so it
     # can be restored without changing rotate semantics or trace data.
     # _draw_direct_rotation_axes(draw)
-    _draw_direct_translation_axes(draw, display_camera, scene_width)
+    if show_translation_axes:
+        _draw_direct_translation_axes(draw, display_camera, scene_width)
 
     # A tilted panel must say so. Read as level, an oblique image makes the
     # payload look laterally centred whenever it is merely nearer the camera.
@@ -1609,6 +1692,8 @@ def _render_view(
     current_tcp_position: np.ndarray,
     current_tcp_rotation: np.ndarray,
     preview: NearFieldPreview | None,
+    grasp_sweep_segment_local: np.ndarray | None = None,
+    gripper_z_axis_local: np.ndarray | None = None,
 ) -> np.ndarray:
     height, width = CONTACT_PANEL_HEIGHT, NEAR_FIELD_WIDTH
     image = np.full((height, width, 3), _BACKGROUND, dtype=np.uint8)
@@ -1652,6 +1737,22 @@ def _render_view(
     pil = Image.fromarray(image)
     draw = ImageDraw.Draw(pil, "RGBA")
     font = _label_font()
+    if grasp_sweep_segment_local is not None:
+        _draw_local_grasp_sweep(
+            draw,
+            grasp_sweep_segment_local,
+            view,
+            width,
+            height,
+        )
+    if gripper_z_axis_local is not None:
+        _draw_local_gripper_z_axis(
+            draw,
+            gripper_z_axis_local,
+            view,
+            width,
+            height,
+        )
     draw.rounded_rectangle(
         (8, 8, 330, 31),
         radius=4,
@@ -1683,6 +1784,159 @@ def _render_view(
             )
     _draw_scale_bar(draw, view, width, height)
     return np.asarray(pil, dtype=np.uint8)
+
+
+def draw_grasp_sweep_overlay(
+    image: np.ndarray,
+    camera: dict[str, Any],
+    segment_base: np.ndarray,
+) -> bool:
+    """Draw the observed parallel-jaw closing channel into a calibrated RGB view."""
+
+    segment = np.asarray(segment_base, dtype=np.float64).reshape(2, 3)
+    if not np.isfinite(segment).all():
+        return False
+    projected = project_world_to_pixel(
+        segment,
+        np.asarray(camera["intrinsics"], dtype=np.float64),
+        np.asarray(camera["pose_mat"], dtype=np.float64),
+    )
+    if not np.isfinite(projected).all() or np.any(projected[:, 2] <= 0.01):
+        return False
+    height, width = image.shape[:2]
+    points = [tuple(np.rint(point[:2]).astype(int)) for point in projected]
+    if all(
+        x < -12 or x >= width + 12 or y < -12 or y >= height + 12
+        for x, y in points
+    ):
+        return False
+    pil = Image.fromarray(np.asarray(image, dtype=np.uint8))
+    draw = ImageDraw.Draw(pil, "RGBA")
+    _draw_grasp_sweep_line(draw, points)
+    image[...] = np.asarray(pil, dtype=np.uint8)
+    return True
+
+
+def draw_gripper_z_axis_overlay(
+    image: np.ndarray,
+    camera: dict[str, Any],
+    axis_base: np.ndarray,
+) -> bool:
+    """绘制闭合夹爪 TCP 小球及穿过它的 BASE-Z 轴。
+
+    ``axis_base`` 按 ``[下端, TCP, 上端]`` 排列。几何完全来自当前机器人
+    状态；函数不读取 attachment、目标点或 Preview，因此不会把认知假设
+    伪装成本体感知。
+    """
+
+    axis = np.asarray(axis_base, dtype=np.float64).reshape(3, 3)
+    if not np.isfinite(axis).all():
+        return False
+    projected = project_world_to_pixel(
+        axis,
+        np.asarray(camera["intrinsics"], dtype=np.float64),
+        np.asarray(camera["pose_mat"], dtype=np.float64),
+    )
+    if not np.isfinite(projected).all() or np.any(projected[:, 2] <= 0.01):
+        return False
+    pixels = [tuple(np.rint(point[:2]).astype(int)) for point in projected]
+    height, width = image.shape[:2]
+    if all(
+        x < -12 or x >= width + 12 or y < -12 or y >= height + 12
+        for x, y in pixels
+    ):
+        return False
+    pil = Image.fromarray(np.asarray(image, dtype=np.uint8))
+    draw = ImageDraw.Draw(pil, "RGBA")
+    _draw_gripper_z_axis(draw, pixels)
+    image[...] = np.asarray(pil, dtype=np.uint8)
+    return True
+
+
+def _draw_local_grasp_sweep(
+    draw: ImageDraw.ImageDraw,
+    segment_local: np.ndarray,
+    view: _View,
+    width: int,
+    height: int,
+) -> None:
+    segment = np.asarray(segment_local, dtype=np.float64).reshape(2, 3)
+    u, v, _depth = _project(segment, view, width, height)
+    if not (np.isfinite(u).all() and np.isfinite(v).all()):
+        return
+    _draw_grasp_sweep_line(
+        draw,
+        [(int(round(float(u[0]))), int(round(float(v[0])))),
+         (int(round(float(u[1]))), int(round(float(v[1]))))],
+    )
+
+
+def _draw_local_gripper_z_axis(
+    draw: ImageDraw.ImageDraw,
+    axis_local: np.ndarray,
+    view: _View,
+    width: int,
+    height: int,
+) -> None:
+    axis = np.asarray(axis_local, dtype=np.float64).reshape(3, 3)
+    u, v, _depth = _project(axis, view, width, height)
+    if not (np.isfinite(u).all() and np.isfinite(v).all()):
+        return
+    _draw_gripper_z_axis(
+        draw,
+        [
+            (int(round(float(x))), int(round(float(y))))
+            for x, y in zip(u, v, strict=True)
+        ],
+    )
+
+
+def _draw_grasp_sweep_line(
+    draw: ImageDraw.ImageDraw,
+    points: list[tuple[int, int]],
+) -> None:
+    """Use an outlined, non-translucent cue that survives image rescaling."""
+
+    draw.line(points, fill=(*_GRASP_SWEEP_OUTLINE, 230), width=8)
+    draw.line(points, fill=(*GRASP_SWEEP_RGB, 255), width=4)
+    for x, y in points:
+        draw.ellipse(
+            (x - 5, y - 5, x + 5, y + 5),
+            fill=(*GRASP_SWEEP_RGB, 255),
+            outline=(*_GRASP_SWEEP_OUTLINE, 255),
+            width=2,
+        )
+
+
+def _draw_gripper_z_axis(
+    draw: ImageDraw.ImageDraw,
+    points: list[tuple[int, int]],
+) -> None:
+    """画一根细的 BASE-Z 轴，并用有高光的小球标出真实 TCP。"""
+
+    lower, anchor, upper = points
+    draw.line(
+        (lower, upper),
+        fill=(*_GRIPPER_Z_AXIS_OUTLINE, 225),
+        width=6,
+    )
+    draw.line(
+        (lower, upper),
+        fill=(*GRIPPER_Z_AXIS_RGB, 255),
+        width=3,
+    )
+    x, y = anchor
+    radius = 8
+    draw.ellipse(
+        (x - radius, y - radius, x + radius, y + radius),
+        fill=(*GRIPPER_Z_AXIS_RGB, 255),
+        outline=(*_GRIPPER_Z_AXIS_OUTLINE, 255),
+        width=2,
+    )
+    draw.ellipse(
+        (x - 3, y - 4, x + 1, y),
+        fill=(255, 255, 255, 210),
+    )
 
 
 def _overlay_triangles(
@@ -2061,9 +2315,14 @@ def _unit(vector: np.ndarray) -> np.ndarray:
 __all__ = [
     "CONTACT_FOCUS_HEIGHT",
     "CONTACT_FOCUS_WIDTH",
+    "GRASP_SWEEP_RGB",
+    "GRIPPER_Z_AXIS_RGB",
     "NEAR_FIELD_HEIGHT",
     "NEAR_FIELD_WIDTH",
     "NearFieldPreview",
+    "draw_grasp_sweep_overlay",
+    "draw_gripper_z_axis_overlay",
     "gravity_stable_contact_frame_quaternion",
+    "render_contact_auxiliary",
     "render_contact_focus",
 ]

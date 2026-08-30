@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import base64
 import io
+from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Literal, Sequence
+from typing import Any, Literal
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -14,10 +15,8 @@ from scipy.spatial.transform import Rotation
 
 from vaw.context_runtime import evidence as evidence_module
 from vaw.context_runtime.attached_object import volume_triangles_base
-from vaw.context_runtime.contact_camera import (
-    ContactCameraRequest,
-    OppositeSceneCameraRequest,
-)
+from vaw.context_runtime.contact_camera import ContactCameraRequest
+from vaw.context_runtime.follow_through import follow_through_summary
 from vaw.context_runtime.geometry import project_world_to_pixel
 from vaw.context_runtime.gripper_mesh import (
     load_panda_urdf_fk,
@@ -37,12 +36,12 @@ from vaw.context_runtime.near_field import (
     PreviewGripperStyle,
     _direct_target_gripper_triangles,
     gravity_stable_contact_frame_quaternion,
+    render_contact_auxiliary,
     render_contact_focus,
 )
 from vaw.context_runtime.plumb_line import (
     PlumbLine,
     compute_plumb_line,
-    draw_plumb_overlays,
     payload_bottom_from_triangles,
     surface_height_below,
 )
@@ -56,29 +55,28 @@ from vaw.context_runtime.presentation import (
     observed_source_ref as _observed_source_ref,
 )
 from vaw.context_runtime.private import PrivateEnvContext
-from vaw.context_runtime.scene_view import (
-    OBSERVED_SCENE_HEIGHT,
-    OBSERVED_SCENE_WIDTH,
-    render_scene_view,
-)
 from vaw.context_runtime.workspace import ContextWorkspace
 
-CONTEXT_SCHEMA = "vaw-context-v46-oblique-contact"
-CONTEXT_WEB_SCHEMA_VERSION = 46
-# Carrying a payload tilts the SIDE contact panel above the horizon.  Two level
-# panels agree on height and say nothing about lateral placement, which is why
-# agents kept driving Z while the footprint hung over a rim.
-CONTACT_CARRY_SIDE_ELEVATION_DEG = 55.0
+CONTEXT_SCHEMA = "vaw-context-v54-closed-gripper-z-cue"
+CONTEXT_WEB_SCHEMA_VERSION = 54
+# FRONT and SIDE stay level and metrically legible.  A separate steep diagonal
+# camera occupies the former blank upper-right slot, exposing lateral placement
+# and clearing the Panda hand without changing Contact semantics.
+CONTACT_AUXILIARY_ELEVATION_DEG = 68.0
 CONTEXT_WIDTH = 2048
 CONTEXT_HEIGHT = 1280
+IMAGINATION_CONTEXT_WIDTH = 2048
+IMAGINATION_CONTEXT_HEIGHT = 1280
 # Required live-hand points farther than this from TCP only inflate the
 # Contact distance; fingers and palm stay inside this radius.
 _LIVE_GRIPPER_FRAMING_RADIUS_M = 0.08
+# 当前闭合夹爪的 BASE-Z 标记采用固定的米制跨度。TCP 上方只保留一小段，
+# 下方延伸更长，以便在放置时直接阅读垂直投影；它不是轨迹或落点预测。
+_GRIPPER_Z_AXIS_ABOVE_M = 0.04
+_GRIPPER_Z_AXIS_BELOW_M = 0.24
 
-# Native raster sizes match their fixed CSS slots.  Main places the two
-# Contact views side by side; the focused Imagination projection stacks two
-# wider panels.  Rendering at the slot aspect ratio avoids spending pixels on
-# letterboxing and preserves MuJoCo detail instead of enlarging a small image.
+# Native raster sizes match the two-column policy slots. Main places NOW next
+# to the steep auxiliary contact view, with level Contact Front/Side below.
 MAIN_CONTACT_WIDTH = 1020
 MAIN_CONTACT_HEIGHT = 631
 IMAGINATION_CONTACT_WIDTH = 2042
@@ -192,29 +190,33 @@ class SeedSpec:
 @dataclass(frozen=True)
 class WorldContextSpec:
     agentview_raster_id: str
-    observed_scene_raster_id: str
     imagination_scene_raster_id: str
     contact_front_raster_id: str | None
     contact_side_raster_id: str | None
+    contact_auxiliary_raster_id: str | None
     robot: RobotState | None
     action: dict[str, Any] | None
     refinement_goal: str | None
     # Tilt of the SIDE contact panel above the horizon. The panel label has to
     # announce it, otherwise the policy reads an oblique image as a level one.
     contact_side_elevation_deg: float = 0.0
+    source_follow_through: dict[str, Any] | None = None
 
     def summary(self) -> dict[str, Any]:
-        return {
+        result = {
             "agentviewRasterId": self.agentview_raster_id,
-            "observedSceneRasterId": self.observed_scene_raster_id,
             "imaginationSceneRasterId": self.imagination_scene_raster_id,
             "contactFrontRasterId": self.contact_front_raster_id,
             "contactSideRasterId": self.contact_side_raster_id,
+            "contactAuxiliaryRasterId": self.contact_auxiliary_raster_id,
             "contactSideElevationDeg": round(float(self.contact_side_elevation_deg), 1),
             "robot": self.robot.summary() if self.robot is not None else None,
             "action": self.action,
             "refinementGoal": self.refinement_goal,
         }
+        if self.source_follow_through:
+            result["sourceFollowThrough"] = self.source_follow_through
+        return result
 
 
 @dataclass(frozen=True)
@@ -265,11 +267,16 @@ class ContextPacket:
     def summary(self) -> dict[str, Any]:
         """JSON-safe packet metadata; RGB arrays are represented by ids."""
 
+        width, height = (
+            (IMAGINATION_CONTEXT_WIDTH, IMAGINATION_CONTEXT_HEIGHT)
+            if self.projection == "imagination"
+            else (CONTEXT_WIDTH, CONTEXT_HEIGHT)
+        )
         return {
             "schema": self.schema,
             "projection": self.projection,
             "revision": self.revision,
-            "viewport": {"width": CONTEXT_WIDTH, "height": CONTEXT_HEIGHT},
+            "viewport": {"width": width, "height": height},
             "world": self.world.summary(),
             "catalog": self.catalog.summary(),
             "decision": self.decision.summary(),
@@ -327,6 +334,8 @@ class ContextPacket:
         }
         if self.imagination_attempts:
             result["imagination_attempts"] = self.imagination_attempts
+        if self.world.source_follow_through:
+            result["source_follow_through"] = self.world.source_follow_through
         return result
 
     def web_snapshot(self, *, render_id: str) -> dict[str, Any]:
@@ -397,12 +406,24 @@ class ContextCompiler:
                 state.robot.tcp_pose,
             )
         source_ref = _presentation_region_ref(state, active_artifacts)
-        source_mask = private.region_masks.get(source_ref) if source_ref is not None else None
-        source_points = None
+        framing_source_points = None
         if source_ref is not None:
             source_geometry = private.region_geometry.get(source_ref)
             if source_geometry is not None:
-                source_points = source_geometry.filtered_object_points_base
+                framing_source_points = source_geometry.filtered_object_points_base
+        # Contact framing follows the active action, while the amber overlay
+        # follows evidence validity.  Keeping those responsibilities separate
+        # prevents an expired ActionProposal from hiding a still-verified
+        # detection.  When an action exists it still owns camera framing;
+        # otherwise the verified evidence set defines the observable crop.
+        evidence_mask, evidence_points = _verified_contact_evidence(state, private)
+        verified_region_key = ",".join(
+            sorted(
+                region_id
+                for region_id, region in state.regions.items()
+                if region.status == "verified"
+            )
+        )
         contact_cameras = None
         contact_width, contact_panel_height = (
             (IMAGINATION_CONTACT_WIDTH, IMAGINATION_CONTACT_HEIGHT)
@@ -418,13 +439,9 @@ class ContextCompiler:
             action_id = (
                 state.action_proposal.action_id if state.action_proposal is not None else None
             )
-            # Only a carried payload needs the oblique readout; grasping wants
-            # both panels level so finger clearance stays measurable.
-            side_elevation_deg = (
-                CONTACT_CARRY_SIDE_ELEVATION_DEG
-                if private.attachment_hypothesis is not None
-                else 0.0
-            )
+            # The action-reading Contact pair is always level.  A separate
+            # auxiliary camera supplies the steep oblique evidence.
+            side_elevation_deg = 0.0
             if private.contact_camera_side_elevation_deg != side_elevation_deg:
                 # Entering or leaving carry changes which azimuth is occluded,
                 # so the session sign lock has to be re-earned at the new tilt.
@@ -432,7 +449,9 @@ class ContextCompiler:
                 private.contact_camera_side_elevation_deg = side_elevation_deg
             camera_cache_key = (
                 f"{action_id or 'observed'}:{projection}:"
-                f"{contact_width}x{contact_panel_height}:e{side_elevation_deg:.0f}"
+                f"{contact_width}x{contact_panel_height}:e{side_elevation_deg:.0f}:"
+                f"aux={CONTACT_AUXILIARY_ELEVATION_DEG:.0f}:"
+                f"regions={verified_region_key or 'none'}"
             )
             if (
                 private.contact_camera_pair is None
@@ -442,7 +461,15 @@ class ContextCompiler:
                     state.robot,
                     contact_preview,
                 )
-                subject_points = source_points
+                # Before an ActionProposal exists, frame the current gripper
+                # together with every verified detect surface so the persistent
+                # amber overlay is actually visible rather than merely
+                # projected outside a stale, gripper-only camera crop.
+                subject_points = (
+                    framing_source_points
+                    if framing_source_points is not None
+                    else evidence_points
+                )
                 if (
                     subject_points is None
                     and private.last_physical_artifacts is not None
@@ -476,6 +503,9 @@ class ContextCompiler:
                         int(len(subject_points)) if subject_points is not None else 0
                     ),
                     "destination_region_id": source_ref,
+                    "verified_region_ids": (
+                        verified_region_key.split(",") if verified_region_key else []
+                    ),
                 }
                 private.contact_camera_pair = private.contact_camera_provider(
                     ContactCameraRequest(
@@ -489,6 +519,7 @@ class ContextCompiler:
                         required_points_base=required_preview_points,
                         preferred_signs=private.contact_camera_signs,
                         side_elevation_deg=side_elevation_deg,
+                        auxiliary_elevation_deg=CONTACT_AUXILIARY_ELEVATION_DEG,
                     )
                 )
                 if private.contact_camera_signs is None:
@@ -499,62 +530,66 @@ class ContextCompiler:
                     )
                 private.contact_camera_action_id = camera_cache_key
             contact_cameras = private.contact_camera_pair
-        observed_scene = _compile_observed_scene(
-            workspace,
-            camera,
-            wrist_camera,
-        )
         # The global panel is context, not a second preview.  Use the current
         # raw agentview rather than the old dark point-cloud crop: the latter
         # became mostly empty once its occluding target mask was removed.
         # All virtual geometry now lives exclusively in Contact Front/Side.
         imagination_scene = rgb.copy()
-        plumb_lines = _compute_plumb_lines(
-            state,
-            private,
-            camera,
-            target,
-            carried_volume_triangles,
-            active_artifacts,
+        # 旧 plumb cue 依赖 attachment metadata，同一真实抓持会因 Action
+        # lineage 不同而时有时无。当前视觉协议改为只使用真实 TCP 的稳定
+        # BASE-Z 标记；旧几何函数暂留给离线诊断，不再进入 policy Canvas。
+        plumb_lines: list[PlumbLine] = []
+        # Preview 已经同时画出 current 与 future gripper。此时隐藏现实夹爪
+        # 的黄色闭合通道和 Z 标记，避免 VLM 把本体 cue 误认为候选动作。
+        show_current_gripper_cues = target is None
+        grasp_sweep_segment = (
+            _observed_grasp_sweep_segment(state.robot)
+            if show_current_gripper_cues
+            else None
+        )
+        gripper_z_axis = (
+            _observed_closed_gripper_z_axis(state.robot, private)
+            if show_current_gripper_cues
+            else None
         )
         contact_focus = render_contact_focus(
             camera,
             wrist_camera,
             state.robot,
             contact_preview,
-            source_mask=source_mask,
-            source_points_base=source_points,
+            source_mask=evidence_mask,
+            source_points_base=evidence_points,
             contact_cameras=contact_cameras,
             carried_volume_triangles_base=carried_volume_triangles,
+            grasp_sweep_segment_base=grasp_sweep_segment,
+            gripper_z_axis_base=gripper_z_axis,
             plumb_lines=plumb_lines,
             output_width=contact_width,
             panel_height=contact_panel_height,
         )
+        contact_auxiliary = None
+        if contact_cameras is not None and contact_cameras.auxiliary is not None:
+            contact_auxiliary = render_contact_auxiliary(
+                contact_cameras.auxiliary,
+                state.robot,
+                contact_preview,
+                source_points_base=evidence_points,
+                carried_volume_triangles_base=carried_volume_triangles,
+                grasp_sweep_segment_base=grasp_sweep_segment,
+                gripper_z_axis_base=gripper_z_axis,
+                plumb_lines=plumb_lines,
+                output_width=contact_width,
+                panel_height=contact_panel_height,
+            )
 
-        # The persistent world view stays sensor-clean except for the plumb
-        # line: a deterministic geometric vertical (dashed, clearly virtual)
-        # that resolves the single-view XY/depth ambiguity.  All other
-        # grounding, self and imagination overlays belong to the dynamic
-        # decision workspace below it.
+        # 本体 cue 只属于 Contact 视图；全局 RGB 保持完全真实、无辅助线。
         rasters: dict[str, np.ndarray] = {
             "agentview": rgb.copy(),
-            "observed_scene": observed_scene,
             "imagination_scene": imagination_scene,
         }
-        # Focused Imagination keeps its scene raster proxy-independent (the
-        # plumb still reaches it through the Contact panels); the Main
-        # projection draws the plumb into every scene view.
-        if plumb_lines and projection == "main":
-            draw_plumb_overlays(rasters["agentview"], camera, plumb_lines)
-            draw_plumb_overlays(rasters["imagination_scene"], camera, plumb_lines)
-            if private.opposite_scene_camera is not None:
-                draw_plumb_overlays(
-                    rasters["observed_scene"],
-                    private.opposite_scene_camera,
-                    plumb_lines,
-                )
         contact_front_id = None
         contact_side_id = None
+        contact_auxiliary_id = None
         if contact_focus is not None:
             contact_front_id = "contact_front"
             contact_side_id = "contact_side"
@@ -565,6 +600,9 @@ class ContextCompiler:
             rasters[contact_side_id] = np.ascontiguousarray(
                 contact_focus[side_top : side_top + contact_panel_height]
             )
+        if contact_auxiliary is not None:
+            contact_auxiliary_id = "contact_auxiliary"
+            rasters[contact_auxiliary_id] = np.ascontiguousarray(contact_auxiliary)
         region_specs = self._compile_regions(state, rgb, private.region_masks, rasters)
         point_specs = self._compile_points(state, rgb, rasters)
         seed_specs = self._compile_seeds(
@@ -580,20 +618,21 @@ class ContextCompiler:
             revision=state.observation_revision,
             world=WorldContextSpec(
                 agentview_raster_id="agentview",
-                observed_scene_raster_id="observed_scene",
                 imagination_scene_raster_id="imagination_scene",
                 contact_front_raster_id=contact_front_id,
-            contact_side_raster_id=contact_side_id,
-            contact_side_elevation_deg=(
-                0.0
-                if contact_cameras is None
-                else float(contact_cameras.selection.side_elevation_deg)
-            ),
-            robot=state.robot,
+                contact_side_raster_id=contact_side_id,
+                contact_auxiliary_raster_id=contact_auxiliary_id,
+                contact_side_elevation_deg=(
+                    0.0
+                    if contact_cameras is None
+                    else float(contact_cameras.selection.side_elevation_deg)
+                ),
+                robot=state.robot,
                 action=action_presentation,
                 refinement_goal=(
                     state.imagination.instruction if state.imagination is not None else None
                 ),
+                source_follow_through=follow_through_summary(workspace),
             ),
             catalog=EvidenceCatalogSpec(
                 regions=tuple(region_specs),
@@ -609,12 +648,18 @@ class ContextCompiler:
         return packet
 
 
-    def compile_imagination(self, workspace: ContextWorkspace) -> ContextPacket:
+    def compile_imagination(
+        self,
+        workspace: ContextWorkspace,
+    ) -> ContextPacket:
         """Compile the same trusted state into a focused SubAgent projection."""
 
         if workspace.state.imagination is None:
             raise ValueError("focused imagination context requires an active imagination session")
-        return self.compile(workspace, projection="imagination")
+        return self.compile(
+            workspace,
+            projection="imagination",
+        )
 
     @staticmethod
     def _compile_regions(
@@ -769,6 +814,56 @@ def _presentation_region_ref(
         parent = state.points[source_ref].within_region_id
         return parent if parent in state.regions else None
     return None
+
+
+def _verified_contact_evidence(
+    state: ContextState,
+    private: PrivateEnvContext,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Collect only currently verified detect regions for Contact overlays.
+
+    The agentview mask supports the RGB-D fallback renderer; metric surface
+    points are reprojected into the dedicated Contact Cameras.  Occluded
+    evidence remains available to the evidence lifecycle but is deliberately
+    not visualized as current object surface.  Invalidated evidence has already
+    been removed by ``revalidate_evidence``.
+    """
+
+    combined_mask: np.ndarray | None = None
+    point_sets: list[np.ndarray] = []
+    for region_id, region in state.regions.items():
+        if region.status != "verified":
+            continue
+
+        mask = private.region_masks.get(region_id)
+        if mask is not None:
+            candidate = np.asarray(mask, dtype=bool)
+            if candidate.ndim == 2:
+                if combined_mask is None:
+                    combined_mask = candidate.copy()
+                elif combined_mask.shape == candidate.shape:
+                    combined_mask |= candidate
+
+        geometry = private.region_geometry.get(region_id)
+        if geometry is None:
+            continue
+        points = np.asarray(
+            geometry.filtered_object_points_base,
+            dtype=np.float64,
+        )
+        if points.ndim != 2 or points.shape[1] != 3:
+            continue
+        points = points[np.isfinite(points).all(axis=1)]
+        if len(points) >= 3:
+            point_sets.append(points)
+
+    combined_points = (
+        np.ascontiguousarray(np.vstack(point_sets)) if point_sets else None
+    )
+    return (
+        np.ascontiguousarray(combined_mask) if combined_mask is not None else None,
+        combined_points,
+    )
 
 
 def _contact_camera_center(
@@ -989,7 +1084,7 @@ def _decision_spec(workspace: ContextWorkspace) -> DecisionWorkspaceSpec:
         )
 
     if event is not None:
-        if event.function_name == "done":
+        if event.function_name == "finish_task":
             return DecisionWorkspaceSpec(mode="terminal")
         result = event.result
         seed_ids = result.get("seed_ids")
@@ -1539,8 +1634,8 @@ def _compute_plumb_lines(
     the preview plumb hangs from the payload (or bare TCP) at the unexecuted
     target pose.  Both intersect the currently observed depth surface.
 
-    The dXY offset arrow only exists when the active action was built from a
-    semantic anchor point (``propose_pose``): a whole-region centroid (for a
+    The qualitative XY direction arrow only exists when the active action was built from a
+    semantic anchor point (``preview_pose``): a whole-region centroid (for a
     basket, roughly its body centre rather than its opening) reads as a
     biased correction and sends refinement chasing a skewed target, so no
     anchor means no arrow — the footprint and height remain.
@@ -1599,95 +1694,51 @@ def _compute_plumb_lines(
     return plumbs
 
 
-def _compile_observed_scene(
-    workspace: ContextWorkspace,
-    agentview: dict[str, Any],
-    wrist_camera: dict[str, Any] | None,
-) -> np.ndarray:
-    """Compile the complementary observed view without exposing calibration.
+def _observed_grasp_sweep_segment(robot: RobotState | None) -> np.ndarray | None:
+    """Project no intent: expose only the observed two-finger FK channel."""
 
-    Offline fixtures intentionally retain the camera-aligned RGB-D fallback.
-    A live LIBERO runner injects the opposite-camera provider; its pose is
-    episode-stable and its RGB is refreshed once per physical revision.
+    if (
+        robot is None
+        or robot.joint_positions_rad is None
+        or robot.gripper_opening is None
+    ):
+        return None
+    provider = load_panda_urdf_fk()
+    if provider is None:
+        return None
+    try:
+        segment = provider.grasp_sweep_segment(
+            np.asarray(robot.joint_positions_rad, dtype=np.float64),
+            float(robot.gripper_opening),
+        )
+    except (RuntimeError, TypeError, ValueError):
+        return None
+    return np.ascontiguousarray(segment)
+
+
+def _observed_closed_gripper_z_axis(
+    robot: RobotState | None,
+    private: PrivateEnvContext,
+) -> np.ndarray | None:
+    """返回 ``[下端, TCP, 上端]`` 的真实 BASE-Z 本体标记。
+
+    ``grasp_follow_through`` 在一次成功的 ``close_gripper`` 后建立，并在
+    ``open_gripper`` 时清除；它只用来确认最近的夹爪命令状态，不要求
+    object proxy、attachment hypothesis 或任务语义成立。
     """
 
-    private = workspace._private
-    provider = private.opposite_scene_camera_provider
-    if not callable(provider):
-        return render_scene_view(
-            agentview,
-            wrist_camera,
-            workspace.state.robot,
-            dark=False,
-        )
-    revision = workspace.state.observation_revision
     if (
-        private.opposite_scene_camera is None
-        or private.opposite_scene_camera_revision != revision
+        private.grasp_follow_through is None
+        or robot is None
+        or robot.tcp_pose is None
     ):
-        if private.opposite_scene_center_base_xyz is None:
-            private.opposite_scene_center_base_xyz = _observed_workspace_center(agentview)
-        pose_mat = np.asarray(agentview["pose_mat"], dtype=np.float64).reshape(4, 4)
-        forward = pose_mat[:3, 2]
-        private.opposite_scene_camera = provider(
-            OppositeSceneCameraRequest(
-                center_base_xyz=private.opposite_scene_center_base_xyz,
-                agentview_forward_base_xyz=tuple(float(value) for value in forward),
-                width=OBSERVED_SCENE_WIDTH,
-                height=OBSERVED_SCENE_HEIGHT,
-            )
-        )
-        private.opposite_scene_camera_revision = revision
-    return _rgb(private.opposite_scene_camera).copy()
-
-
-def _observed_workspace_center(camera: dict[str, Any]) -> tuple[float, float, float]:
-    """Estimate one robust LIBERO workspace centre from the first RGB-D frame."""
-
-    try:
-        depth = np.asarray(camera["images"]["depth"], dtype=np.float64)
-        if depth.ndim == 3:
-            depth = depth[..., 0]
-        intrinsics = np.asarray(camera["intrinsics"], dtype=np.float64).reshape(3, 3)
-        base_from_camera = np.asarray(camera["pose_mat"], dtype=np.float64).reshape(4, 4)
-    except (KeyError, TypeError, ValueError):
-        return (0.55, 0.0, 0.08)
-    height, width = depth.shape
-    stride = max(4, min(height, width) // 80)
-    rows, cols = np.mgrid[0:height:stride, 0:width:stride]
-    sampled_depth = depth[rows, cols]
-    valid = np.isfinite(sampled_depth) & (sampled_depth > 0.03) & (sampled_depth < 3.0)
-    if np.count_nonzero(valid) < 32:
-        return (0.55, 0.0, 0.08)
-    pixels = np.column_stack(
-        (
-            cols[valid].astype(np.float64),
-            rows[valid].astype(np.float64),
-            np.ones(np.count_nonzero(valid), dtype=np.float64),
-        )
-    )
-    rays = (np.linalg.inv(intrinsics) @ pixels.T).T
-    points_camera = rays * sampled_depth[valid, None]
-    homogeneous = np.column_stack(
-        (points_camera, np.ones(len(points_camera), dtype=np.float64))
-    )
-    points_base = (base_from_camera @ homogeneous.T).T[:, :3]
-    # Low surfaces contain the manipulable workspace while excluding the wall
-    # and most robot links.  Quantile midpoints resist a single close object.
-    usable = points_base[
-        np.isfinite(points_base).all(axis=1)
-        & (points_base[:, 2] >= -0.06)
-        & (points_base[:, 2] <= 0.28)
-    ]
-    if len(usable) < 32:
-        return (0.55, 0.0, 0.08)
-    low, high = np.percentile(usable[:, :2], (12.0, 88.0), axis=0)
-    center_xy = 0.5 * (low + high)
-    center_z = float(np.clip(np.percentile(usable[:, 2], 65.0) + 0.06, 0.06, 0.18))
-    center = np.array([center_xy[0], center_xy[1], center_z], dtype=np.float64)
-    if not np.isfinite(center).all():
-        return (0.55, 0.0, 0.08)
-    return tuple(float(value) for value in center)
+        return None
+    anchor = np.asarray(robot.tcp_pose.position_xyz, dtype=np.float64).reshape(3)
+    if not np.isfinite(anchor).all():
+        return None
+    lower = anchor - np.array([0.0, 0.0, _GRIPPER_Z_AXIS_BELOW_M])
+    upper = anchor + np.array([0.0, 0.0, _GRIPPER_Z_AXIS_ABOVE_M])
+    return np.ascontiguousarray(np.stack((lower, anchor, upper), axis=0))
 
 
 def _rgb(camera: dict[str, Any]) -> np.ndarray:
@@ -1716,6 +1767,8 @@ __all__ = [
     "CONTEXT_SCHEMA",
     "CONTEXT_WEB_SCHEMA_VERSION",
     "CONTEXT_WIDTH",
+    "IMAGINATION_CONTEXT_HEIGHT",
+    "IMAGINATION_CONTEXT_WIDTH",
     "SeedSpec",
     "ContextCompiler",
     "ContextPacket",

@@ -13,6 +13,7 @@ from vaw.context_runtime.attached_object import (
     ObjectProxyCandidate,
     ObjectVolumeProxy,
 )
+from vaw.context_runtime.follow_through import GraspFollowThrough
 from vaw.context_runtime.model import ActionTarget, Pose
 
 if TYPE_CHECKING:
@@ -203,6 +204,9 @@ class PrivateEnvContext:
     # TCP. Both are hypotheses for visualization, never environment truth.
     object_proxy_candidate: ObjectProxyCandidate | None = None
     attachment_hypothesis: AttachmentHypothesis | None = None
+    # Survives observation revisions until open_gripper.  Status stays
+    # unknown until a later lift is large enough to compare the source.
+    grasp_follow_through: GraspFollowThrough | None = None
     presentation_event: PresentationEvent | None = None
     trace_diagnostics: dict[str, Any] = field(default_factory=dict)
     # Simulation-only presenter hook. It is never serialized into ContextPacket

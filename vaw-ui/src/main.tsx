@@ -31,8 +31,8 @@ function Root() {
   useEffect(() => {
     window.__VAW_RENDER__ = async (next) => {
       if (
-        next.schemaVersion !== 46
-        || next.schema !== 'vaw-context-v46-oblique-contact'
+        next.schemaVersion !== 54
+        || next.schema !== 'vaw-context-v54-closed-gripper-z-cue'
         || next.viewport.width !== 2048
         || next.viewport.height !== 1280
       ) {

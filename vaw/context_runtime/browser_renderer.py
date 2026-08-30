@@ -86,6 +86,19 @@ class SnapshotBrowser:
             self.close()
             raise
 
+    def resize(self, width: int, height: int) -> None:
+        """Resize the policy viewport without rebuilding the browser session."""
+
+        target_width = int(width)
+        target_height = int(height)
+        if target_width == self.width and target_height == self.height:
+            return
+        self.page.set_viewport_size(
+            {"width": target_width, "height": target_height}
+        )
+        self.width = target_width
+        self.height = target_height
+
     def render(
         self,
         snapshot: dict[str, Any],

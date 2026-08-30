@@ -1,16 +1,25 @@
 """The revision-local VAW Context Runtime and its public contract."""
 
-from vaw.context_runtime.memory import FunctionEvent, PhysicalPrimitive, TaskMemory
+from vaw.context_runtime.context_projection import (
+    ActionRecency,
+    EmbodiedStateCard,
+    project_embodied_state,
+    render_main_context,
+)
+from vaw.context_runtime.memory import (
+    InteractionEvent,
+    InteractionMemory,
+)
 from vaw.context_runtime.model import (
     ActionPrediction,
+    ActionProposal,
     ActionSeed,
     ActionTarget,
     ContextState,
+    ImaginationSession,
     LastPhysicalAction,
-    ActionProposal,
     PointEvidence,
     Pose,
-    ImaginationSession,
     RegionEvidence,
     RobotState,
 )
@@ -26,10 +35,14 @@ from vaw.context_runtime.protocol import (
     IMAGINATION_FUNCTION_NAMES,
     IMAGINATION_SYSTEM_PROMPT,
     MAIN_FUNCTION_NAMES,
+    ROBOT_FUNCTION_NAMES,
     SYSTEM_PROMPT,
+    FunctionRegistry,
+    FunctionSpec,
     function_definitions,
     imagination_function_definitions,
     main_function_definitions,
+    main_function_registry,
 )
 from vaw.context_runtime.runtime import (
     ContextRunConfig,
@@ -41,6 +54,7 @@ from vaw.context_runtime.workspace import ContextStepResult, ContextWorkspace
 
 __all__ = [
     "ActionPrediction",
+    "ActionRecency",
     "ActionSeed",
     "ActionTarget",
     "ContextState",
@@ -52,26 +66,32 @@ __all__ = [
     "ContextWorkspace",
     "CuroboMotionBackend",
     "FUNCTION_NAMES",
-    "FunctionEvent",
+    "EmbodiedStateCard",
+    "FunctionRegistry",
+    "FunctionSpec",
     "IMAGINATION_FUNCTION_NAMES",
     "IMAGINATION_SYSTEM_PROMPT",
     "ImaginationRunner",
     "LastPhysicalAction",
     "MAIN_FUNCTION_NAMES",
+    "ROBOT_FUNCTION_NAMES",
     "MotionBackend",
     "MotionPlan",
     "PointEvidence",
     "ActionProposal",
-    "PhysicalPrimitive",
+    "InteractionEvent",
+    "InteractionMemory",
     "Pose",
     "PyrokiMotionBackend",
     "RegionEvidence",
     "ImaginationSession",
     "RobotState",
     "SYSTEM_PROMPT",
-    "TaskMemory",
     "function_definitions",
     "imagination_function_definitions",
     "main_function_definitions",
+    "main_function_registry",
+    "project_embodied_state",
+    "render_main_context",
     "run_context_episode",
 ]

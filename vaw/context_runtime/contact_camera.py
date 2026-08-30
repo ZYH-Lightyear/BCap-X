@@ -45,6 +45,11 @@ class ContactCameraRequest:
     # lateral placement unobservable, so carrying a payload trades the
     # redundant second elevation readout for an oblique XY readout.
     side_elevation_deg: float = 0.0
+    # Optional third view used outside the orthogonal Contact pair.  It looks
+    # diagonally across FRONT/SIDE and steeply downward, so the upper Canvas
+    # panel can reveal fingers and carried objects that a pure side view hides
+    # behind the Panda hand.  It never changes the two metric Contact views.
+    auxiliary_elevation_deg: float | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +83,7 @@ class ContactCameraPair:
     front: dict[str, Any]
     side: dict[str, Any]
     selection: ContactCameraSelection = ContactCameraSelection(1, 1, 1.0, 1.0, 1.0)
+    auxiliary: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -230,6 +236,14 @@ class LiberoContactCameraProvider:
         side_elevation_deg = float(request.side_elevation_deg)
         if not np.isfinite(side_elevation_deg) or not 0.0 <= side_elevation_deg <= 80.0:
             raise ValueError("side_elevation_deg must be in [0, 80]")
+        auxiliary_elevation_deg = request.auxiliary_elevation_deg
+        if auxiliary_elevation_deg is not None:
+            auxiliary_elevation_deg = float(auxiliary_elevation_deg)
+            if (
+                not np.isfinite(auxiliary_elevation_deg)
+                or not 0.0 <= auxiliary_elevation_deg <= 80.0
+            ):
+                raise ValueError("auxiliary_elevation_deg must be in [0, 80]")
 
         base_position_world, base_rotation_world = _base_pose_world(self._env, sim)
         center_world = base_position_world + base_rotation_world @ center_base
@@ -342,6 +356,52 @@ class LiberoContactCameraProvider:
                         camera,
                         depth_metric,
                     )
+                if auxiliary_elevation_deg is not None:
+                    # A diagonal azimuth exposes both fingers; the steeper
+                    # elevation clears the hand body that occludes a 55° pure
+                    # side view during transport and placement.
+                    auxiliary_horizontal = _unit(
+                        front_world + side_world,
+                        "contact auxiliary diagonal",
+                    )
+                    auxiliary_tilt = np.radians(auxiliary_elevation_deg)
+                    auxiliary_forward = (
+                        np.cos(auxiliary_tilt) * auxiliary_horizontal
+                        - np.sin(auxiliary_tilt) * up_world
+                    )
+                    auxiliary_up = (
+                        np.sin(auxiliary_tilt) * auxiliary_horizontal
+                        + np.cos(auxiliary_tilt) * up_world
+                    )
+                    auxiliary_distance = _framing_distance(
+                        subject_points,
+                        required_points,
+                        center_base,
+                        horizontal_forward_base=(
+                            base_rotation_world.T @ auxiliary_forward
+                        ),
+                        up_base=base_rotation_world.T @ auxiliary_up,
+                        width=width,
+                        height=height,
+                        fovy_deg=self._fovy_deg,
+                        minimum_m=self._distance_m,
+                        padding_m=self._framing_padding_m,
+                    )
+                    auxiliary, _ = self._render_view(
+                        sim,
+                        camera_name="sideview",
+                        view_name="auxiliary",
+                        center_world=center_world,
+                        horizontal_forward_world=auxiliary_horizontal,
+                        up_world=up_world,
+                        base_position_world=base_position_world,
+                        base_rotation_world=base_rotation_world,
+                        width=width,
+                        height=height,
+                        distance_m=auxiliary_distance,
+                        elevation_deg=auxiliary_elevation_deg,
+                    )
+                    rendered["auxiliary"] = auxiliary
                 front_score = scores["front"]
                 side_score = scores["side"]
                 # Both views must be useful. Maximising the weaker view avoids
@@ -404,6 +464,7 @@ class LiberoContactCameraProvider:
                 azimuth_offset_deg=azimuth_offset_deg,
                 side_elevation_deg=side_elevation_deg,
             ),
+            auxiliary=rendered.get("auxiliary"),
         )
 
     def _render_view(
@@ -411,7 +472,7 @@ class LiberoContactCameraProvider:
         sim: Any,
         *,
         camera_name: str,
-        view_name: Literal["front", "side"],
+        view_name: Literal["front", "side", "auxiliary"],
         center_world: np.ndarray,
         horizontal_forward_world: np.ndarray,
         up_world: np.ndarray,

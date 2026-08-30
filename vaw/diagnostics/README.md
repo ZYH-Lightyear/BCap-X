@@ -57,3 +57,28 @@ python -m vaw.diagnostics.run_static_vlm \
 - `summary.md`：便于快速阅读的对照表。
 
 `--allow-image-egress` 是显式确认：这些 trace PNG 会被发送到 `--server-url` 指定的服务。
+
+## Absolute Progress Critic Demo
+
+`run_progress_demo` 对每个真实物理动作结束后的状态独立估计任务完成进度，再由连续状态计算：
+
+```text
+delta_t = progress_t - progress_(t-1)
+accel_t = delta_t - delta_(t-1)
+```
+
+Critic 只看到 Task、初始 Canvas、动作前后 Canvas、动作起始/中间/结束帧以及当前函数结果；
+不会收到未来步骤、`env_success`、reward 或 Agent 的成功声明。下面的命令使用本机 VLM，保存
+逐状态请求、响应、token logprobs、曲线数据和同步 H.264 视频：
+
+```bash
+python -m vaw.diagnostics.run_progress_demo \
+  --trace /absolute/path/to/task8_s1 \
+  --server-url http://127.0.0.1:5088/v1/chat/completions \
+  --model /mnt/nas/maqi/Gemma_4_31B \
+  --render-video
+```
+
+默认输出到 `<trace>/progress_critic/absolute_progress_<timestamp>/`。中断后可用原输出目录加
+`--resume`，已经完成的 Critic 状态不会重新请求。`progress_overlay.mp4` 使用 action manifest
+中的精确全局帧号同步 AgentView；新的进度点只在对应 AFTER 证据出现后显示。

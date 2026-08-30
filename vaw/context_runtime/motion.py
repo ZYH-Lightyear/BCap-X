@@ -26,6 +26,10 @@ class MotionBackendError(RuntimeError):
     """An expected planner/controller boundary failure."""
 
 
+class MotionExecutionUnsettledError(MotionBackendError):
+    """The command was dispatched, but controller convergence is unconfirmed."""
+
+
 @dataclass(frozen=True)
 class MotionPlan:
     """Episode-private plan associated with an imagined action target."""
@@ -306,7 +310,9 @@ class CuroboMotionBackend:
             max_steps=self.max_steps_per_waypoint,
         )
         if isinstance(status, dict) and status.get("all_converged") is False:
-            raise MotionBackendError("execute_joint_trajectory did not converge")
+            raise MotionExecutionUnsettledError(
+                "execute_joint_trajectory did not converge"
+            )
 
         max_joint_error = self._final_joint_max_error(trajectory[-1])
         if max_joint_error > self.final_joint_tolerance_rad and status is None:
@@ -335,7 +341,7 @@ class CuroboMotionBackend:
             )
             max_joint_error = self._final_joint_max_error(trajectory[-1])
         if max_joint_error > self.final_joint_tolerance_rad:
-            raise MotionBackendError(
+            raise MotionExecutionUnsettledError(
                 "CuRobo trajectory execution did not converge: "
                 f"max joint error {max_joint_error:.6f} rad exceeds "
                 f"{self.final_joint_tolerance_rad:.6f} rad"

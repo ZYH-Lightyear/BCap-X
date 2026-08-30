@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
@@ -19,8 +20,16 @@ from vaw.agents.contracts import (
     ToolCall,
 )
 from vaw.agents.providers.base import ModelProvider
-from vaw.context_runtime.memory import FunctionEvent, project_function_event
-from vaw.context_runtime.model import LastPhysicalAction
+from vaw.context_runtime.context_projection import (
+    EmbodiedStateCard,
+    project_embodied_state,
+    render_main_context,
+)
+from vaw.context_runtime.memory import (
+    InteractionEvent,
+    InteractionMemory,
+    interaction_outcome,
+)
 from vaw.context_runtime.packet import (
     CONTEXT_SCHEMA,
     ContextCompiler,
@@ -32,8 +41,9 @@ from vaw.context_runtime.protocol import (
     IMAGINATION_FUNCTION_NAMES,
     IMAGINATION_SYSTEM_PROMPT,
     MAIN_FUNCTION_NAMES,
+    SYSTEM_PROMPT,
     imagination_function_definitions,
-    main_function_definitions,
+    main_function_registry,
     parse_action,
 )
 from vaw.context_runtime.trace import ContextTraceLogger, SubagentTraceLogger
@@ -47,15 +57,33 @@ _NOTICE_LABEL = {
     "advisory": "上一轮编辑未生效，Preview 未改变",
 }
 
-MAX_MAIN_TURNS = 64
-
-
 class ContextRenderer(Protocol):
     name: str
 
     def render(self, packet: ContextPacket) -> Any: ...
 
     def close(self) -> None: ...
+
+
+class ActionMediaRecorder(Protocol):
+    """Optional observer around one physical Function transaction."""
+
+    def start(
+        self,
+        *,
+        turn: int,
+        function: str,
+        arguments: dict[str, Any],
+        revision_before: int,
+    ) -> Any: ...
+
+    def finish(
+        self,
+        token: Any,
+        *,
+        outcome: str,
+        revision_after: int,
+    ) -> dict[str, Any] | None: ...
 
 
 @dataclass
@@ -68,12 +96,6 @@ class ContextRunConfig:
     # multi Function call.  0 restores the old "silence burns a turn" rule.
     max_no_call_retries: int = 2
     on_turn: Callable[[int, StepRecord], None] | None = None
-
-    def __post_init__(self) -> None:
-        if not 1 <= self.max_main_turns <= MAX_MAIN_TURNS:
-            raise ValueError(f"max_main_turns must be in [1, {MAX_MAIN_TURNS}]")
-        if not 0 <= self.max_no_call_retries <= 3:
-            raise ValueError("max_no_call_retries must be in [0, 3]")
 
 
 @dataclass(frozen=True)
@@ -97,6 +119,7 @@ class ImaginationRunner:
         max_turns: int,
         trace: SubagentTraceLogger | None = None,
         usage_callback: Callable[[ModelResponse, str], None] | None = None,
+        turn_callback: Callable[[int], None] | None = None,
     ) -> None:
         self.provider = provider
         self.workspace = workspace
@@ -106,8 +129,9 @@ class ImaginationRunner:
         self.trace = trace
         self.tools = imagination_function_definitions()
         self.usage_callback = usage_callback
+        self.turn_callback = turn_callback
 
-    def run(self, instruction: str, action_id: str) -> ImaginationResult:
+    def run(self, instruction: str, action_id: str | None) -> ImaginationResult:
         try:
             self.workspace.begin_imagination(instruction, action_id)
         except Exception as exc:
@@ -119,9 +143,29 @@ class ImaginationRunner:
             packet = self.compiler.compile_imagination(self.workspace)
             image = self.renderer.render(packet)
             messages = self._messages(packet, image, feedback)
+            visible_messages, visible_tools = _provider_visible_request(
+                self.provider,
+                messages,
+                self.tools,
+            )
+            if self.trace is not None:
+                self.trace.log_model_request(
+                    turn=turn,
+                    attempt=1,
+                    owner="imagination",
+                    messages=visible_messages,
+                    tools=visible_tools,
+                )
             try:
                 response = self.provider.generate(messages, self.tools)
             except Exception as exc:
+                if self.trace is not None:
+                    self.trace.log_model_response(
+                        turn=turn,
+                        attempt=1,
+                        owner="imagination",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
                 step = self.workspace.fail_imagination("subagent_error")
                 result = dict(step.result)
                 self._log(
@@ -140,6 +184,13 @@ class ImaginationRunner:
                         turn,
                         result,
                     )
+                )
+            if self.trace is not None:
+                self.trace.log_model_response(
+                    turn=turn,
+                    attempt=1,
+                    owner="imagination",
+                    response=response,
                 )
             if self.usage_callback is not None:
                 self.usage_callback(response, "imagination")
@@ -222,21 +273,21 @@ class ImaginationRunner:
         current_turn = artifacts.turn_count if artifacts is not None else 0
         target_basis = _target_basis(artifacts)
         carried_geometry = (
-            "available_as_amber_proxy"
+            "可用：以琥珀色代理体显示"
             if self.workspace._private.attachment_hypothesis is not None
-            else "unavailable_use_gripper_only_fallback"
+            else "不可用：仅依据夹爪几何判断"
         )
         text = (
-            f"Imagination Task：{session.instruction}\n"
-            f"Target Basis：{target_basis}\n"
-            f"Carried Geometry：{carried_geometry}\n"
-            "Current Edit Summary："
+            f"想象任务：{session.instruction}\n"
+            f"目标依据：{target_basis}\n"
+            f"携带物几何：{carried_geometry}\n"
+            "当前编辑摘要："
             + json.dumps(summary.summary(), ensure_ascii=False, separators=(",", ":"))
-            + f"\nRemaining Edit Turns：{max(0, self.max_turns - current_turn + 1)}"
+            + f"\n剩余编辑轮数：{max(0, self.max_turns - current_turn + 1)}"
         )
         if feedback is not None:
             text += f"\n{_NOTICE_LABEL[feedback[0]]}：{feedback[1]}"
-        return _image_messages(IMAGINATION_SYSTEM_PROMPT, text, image, label="FOCUSED IMAGINATION CANVAS")
+        return _image_messages(IMAGINATION_SYSTEM_PROMPT, text, image, label="当前局部想象画布")
 
     def _set_turn(self, count: int) -> None:
         artifacts = self.workspace._private.action_artifacts
@@ -263,6 +314,8 @@ class ImaginationRunner:
                 thought=thought,
                 result=result,
             )
+        if self.turn_callback is not None:
+            self.turn_callback(turn)
 
 
 class ContextRuntime:
@@ -280,12 +333,8 @@ class ContextRuntime:
         trace: ContextTraceLogger | None = None,
         env_check: Callable[[], bool] | None = None,
         env_terminal_check: Callable[[], bool] | None = None,
-        playbook_dir: str | None = None,
-        playbook_injection: str = "all",
-        playbook_phase: str | None = None,
+        action_media_recorder: ActionMediaRecorder | None = None,
     ) -> None:
-        from vaw.context_runtime.playbook import compose_default_main_prompt, default_playbook_dir
-
         self.main_provider = main_provider
         self.imagination_provider = imagination_provider or main_provider
         self.workspace = workspace
@@ -295,22 +344,16 @@ class ContextRuntime:
         self.trace = trace
         self.env_check = env_check
         self.env_terminal_check = env_terminal_check
-        self.main_tools = main_function_definitions()
+        self.function_registry = main_function_registry()
+        self.main_tools = self.function_registry.definitions
+        self.interaction_memory = InteractionMemory()
         self.usage: dict[str, int] = {}
         self.env_success: bool | None = None
         self.physical_ops = 0
         self.main_turns = 0
-        self._current_event: FunctionEvent | None = None
         self._subagent_index = 0
-        resolved_playbook_dir = playbook_dir or str(default_playbook_dir())
-        self.playbook_dir = resolved_playbook_dir
-        self.playbook_injection = playbook_injection
-        self.playbook_phase = playbook_phase
-        self._system_prompt = compose_default_main_prompt(
-            resolved_playbook_dir,
-            injection=playbook_injection,  # type: ignore[arg-type]
-            phase=playbook_phase,
-        )
+        self.action_media_recorder = action_media_recorder
+        self._system_prompt = SYSTEM_PROMPT
         if trace is not None:
             trace.log_meta(
                 {
@@ -322,9 +365,6 @@ class ContextRuntime:
                     "motion_backend": workspace.motion_backend_name,
                     "local_motion_backend": workspace.local_motion_backend_name,
                     "preview_gripper": self.compiler.preview_gripper_style,
-                    "playbook_dir": resolved_playbook_dir,
-                    "playbook_injection": playbook_injection,
-                    "playbook_phase": playbook_phase,
                 }
             )
 
@@ -341,7 +381,22 @@ class ContextRuntime:
 
             packet = self.compiler.compile(self.workspace)
             image = self.renderer.render(packet)
-            messages = self._main_messages(packet, image)
+            decision_turn = self.main_turns + 1
+            context_card = self._embodied_state(decision_turn=decision_turn)
+            context_snapshot = self._main_context_snapshot(
+                packet,
+                decision_turn=decision_turn,
+                embodied_state=context_card,
+            )
+            messages = self._messages_from_context(image, context_snapshot)
+            context_snapshot_ref = None
+            interaction_memory_before = self.interaction_memory.snapshot()
+            if self.trace is not None:
+                context_snapshot_ref = self.trace.freeze_turn_context(
+                    turn=decision_turn,
+                    image=image,
+                    snapshot=context_snapshot,
+                )
             self.main_turns += 1
             turn = self.main_turns
             try:
@@ -354,7 +409,22 @@ class ContextRuntime:
                 return self._finish(TerminateMode.ERROR, steps, f"{type(exc).__name__}: {exc}")
             if call is None:
                 continue
-            requested_physical = call.name in self.workspace.PHYSICAL_FUNCTIONS
+            if self.trace is not None:
+                self.trace.log_event(
+                    "model_decision_ready",
+                    {
+                        "turn": turn,
+                        "decision_basis": response.text,
+                        "function": call.name,
+                        "arguments": dict(call.args),
+                    },
+                )
+
+            function_spec = self.function_registry.get(call.name)
+            requested_physical = (
+                function_spec is not None
+                and function_spec.world_effect == "physical"
+            )
             if (
                 requested_physical
                 and self.physical_ops >= self.config.max_physical_ops
@@ -365,22 +435,87 @@ class ContextRuntime:
                     "physical operation limit reached",
                 )
 
-            if call.name == "call_imagination":
+            previous_physical = self.workspace.state.last_physical_action
+            if self.trace is not None:
+                self.trace.log_event(
+                    "function_started",
+                    {
+                        "turn": turn,
+                        "function": call.name,
+                        "arguments": dict(call.args),
+                        "effect_kind": "action" if requested_physical else "call",
+                        "revision": packet.revision,
+                    },
+                )
+            media_token = None
+            if requested_physical and self.action_media_recorder is not None:
+                with suppress(Exception):
+                    media_token = self.action_media_recorder.start(
+                        turn=turn,
+                        function=call.name,
+                        arguments=dict(call.args),
+                        revision_before=packet.revision,
+                    )
+            if call.name == "imagine_action":
                 step = self._call_imagination(call)
             else:
                 step = self._dispatch_main(call)
             physical = requested_physical and step.revision_after > step.revision_before
+            latest_physical = self.workspace.state.last_physical_action
+            physical_outcome = (
+                latest_physical.outcome
+                if requested_physical
+                and latest_physical is not None
+                and latest_physical is not previous_physical
+                else None
+            )
+            event = InteractionEvent(
+                turn=turn,
+                kind="action" if requested_physical else "call",
+                function=call.name,
+                arguments=dict(step.arguments),
+                outcome=interaction_outcome(
+                    step.result,
+                    physical_outcome=physical_outcome,
+                ),
+                revision_before=step.revision_before,
+                revision_after=step.revision_after,
+            )
+            action_segment = None
+            if media_token is not None and self.action_media_recorder is not None:
+                with suppress(Exception):
+                    action_segment = self.action_media_recorder.finish(
+                        media_token,
+                        outcome=event.outcome,
+                        revision_after=step.revision_after,
+                    )
+            self.interaction_memory.record(
+                event,
+                effect_channel=(
+                    function_spec.effect_channel
+                    if function_spec is not None
+                    else None
+                ),
+            )
             if physical:
                 self.physical_ops += 1
-            if physical or call.name == "done":
+            if physical or call.name == "finish_task":
                 self._update_env_success()
             record = _step_record(turn, "main", step, response.text, physical=physical)
             steps.append(record)
-            self._log(turn, image, packet, _call_summary(call), step, response)
-            self._current_event = project_function_event(
-                call.name,
-                step.result,
-                world_changed=step.revision_after > step.revision_before,
+            self._log(
+                turn,
+                image,
+                packet,
+                _call_summary(call),
+                step,
+                response,
+                embodied_state_card=context_card,
+                function_effect_kind=event.kind,
+                context_snapshot_ref=context_snapshot_ref,
+                interaction_memory_before=interaction_memory_before,
+                interaction_event=event.summary(),
+                action_segment=action_segment,
             )
             self._notify(turn, record)
             if physical and self._environment_terminated():
@@ -391,10 +526,15 @@ class ContextRuntime:
             return self.workspace.reject(call.name, call.args, call.parse_error)
         try:
             _name, arguments = parse_action(
-                {"name": call.name, "arguments": call.args}, allowed=("call_imagination",)
+                {"name": call.name, "arguments": call.args}, allowed=("imagine_action",)
             )
             instruction = str(arguments["instruction"])
-            action_id = str(arguments["action_id"])
+            raw_action_id = arguments.get("action_id")
+            action_id = (
+                str(raw_action_id).strip()
+                if raw_action_id is not None and str(raw_action_id).strip()
+                else None
+            )
         except (KeyError, ValueError) as exc:
             return self.workspace.reject(call.name, call.args, str(exc))
         before = self.workspace.state.observation_revision
@@ -404,6 +544,27 @@ class ContextRuntime:
             self._subagent_index += 1
             subtrace = self.trace.new_subagent_trace(self._subagent_index, instruction)
             subtrace_rel = str(subtrace.dir.relative_to(self.trace.dir))
+            self.trace.log_event(
+                "imagination_started",
+                {
+                    "turn": self.main_turns,
+                    "trace": subtrace_rel,
+                    "instruction": instruction,
+                    "action_id": action_id,
+                },
+            )
+
+        def on_imagination_turn(subagent_turn: int) -> None:
+            if self.trace is not None and subtrace_rel is not None:
+                self.trace.log_event(
+                    "imagination_turn_closed",
+                    {
+                        "turn": self.main_turns,
+                        "subagent_turn": int(subagent_turn),
+                        "trace": subtrace_rel,
+                    },
+                )
+
         result = ImaginationRunner(
             self.imagination_provider,
             self.workspace,
@@ -412,7 +573,19 @@ class ContextRuntime:
             max_turns=self.config.max_imagination_turns,
             trace=subtrace,
             usage_callback=self._accumulate_usage,
+            turn_callback=on_imagination_turn,
         ).run(instruction, action_id)
+        if self.trace is not None and subtrace_rel is not None:
+            self.trace.log_event(
+                "imagination_closed",
+                {
+                    "turn": self.main_turns,
+                    "trace": subtrace_rel,
+                    "status": result.status,
+                    "turns": result.turns,
+                    "action_id": result.action_id,
+                },
+            )
         payload: dict[str, Any] = {"status": result.status}
         if result.action_id is not None:
             payload["action_id"] = result.action_id
@@ -431,7 +604,7 @@ class ContextRuntime:
         if subtrace_rel is not None:
             diagnostics["trace"] = subtrace_rel
         return ContextStepResult(
-            function_name="call_imagination",
+            function_name="imagine_action",
             arguments=dict(call.args),
             result=payload,
             revision_before=before,
@@ -466,7 +639,42 @@ class ContextRuntime:
 
         attempts = 0
         while True:
-            response = self.main_provider.generate(messages, self.main_tools)
+            attempt_number = attempts + 1
+            if self.trace is not None:
+                self.trace.log_event(
+                    "model_started",
+                    {"turn": turn, "attempt": attempt_number},
+                )
+                visible_messages, visible_tools = _provider_visible_request(
+                    self.main_provider,
+                    messages,
+                    self.main_tools,
+                )
+                self.trace.log_model_request(
+                    turn=turn,
+                    attempt=attempt_number,
+                    owner="main",
+                    messages=visible_messages,
+                    tools=visible_tools,
+                )
+            try:
+                response = self.main_provider.generate(messages, self.main_tools)
+            except Exception as exc:
+                if self.trace is not None:
+                    self.trace.log_model_response(
+                        turn=turn,
+                        attempt=attempt_number,
+                        owner="main",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                raise
+            if self.trace is not None:
+                self.trace.log_model_response(
+                    turn=turn,
+                    attempt=attempt_number,
+                    owner="main",
+                    response=response,
+                )
             self._accumulate_usage(response, "main")
             call, error = _single_call(response)
             if error is None:
@@ -484,56 +692,88 @@ class ContextRuntime:
                     },
                 )
             if attempts > self.config.max_no_call_retries:
-                self._current_event = FunctionEvent(
-                    function="protocol",
-                    status="failed",
-                    message=error,
-                )
                 self._log(turn, image, packet, None, None, response)
                 return None, response
-            messages = self._main_messages(packet, image, feedback=error)
+            messages = self._main_messages(
+                packet,
+                image,
+                decision_turn=turn,
+                feedback=error,
+            )
 
     def _main_messages(
         self,
         packet: ContextPacket,
         image: np.ndarray,
+        *,
+        decision_turn: int | None = None,
         feedback: str | None = None,
     ) -> list[Message]:
-        text = (
-            f"User Task：{self.workspace.state.task_prompt}\n"
-            "Task Memory："
-            + json.dumps(
-                self.workspace.state.task_memory.summary(),
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            + "\nLive References："
-            + json.dumps(packet.manifest(), ensure_ascii=False, separators=(",", ":"))
+        snapshot = self._main_context_snapshot(
+            packet,
+            decision_turn=decision_turn,
+            feedback=feedback,
         )
-        attachment = self.workspace._private.attachment_hypothesis
-        continuity = _control_continuity(
-            self.workspace.state.last_physical_action,
-            manipulation_subject=(attachment.query if attachment is not None else None),
+        return self._messages_from_context(image, snapshot)
+
+    def _main_context_snapshot(
+        self,
+        packet: ContextPacket,
+        *,
+        decision_turn: int | None = None,
+        embodied_state: EmbodiedStateCard | None = None,
+        feedback: str | None = None,
+    ) -> dict[str, Any]:
+        state_card = embodied_state or self._embodied_state(
+            decision_turn=decision_turn
         )
-        if continuity is not None:
-            text += "\nControl Continuity：" + json.dumps(
-                continuity,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        if self._current_event is not None:
-            text += "\nCurrent Function Event：" + json.dumps(
-                self._current_event.summary(),
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        if feedback is not None:
-            text += f"\n{_NOTICE_LABEL['protocol']}：{feedback}"
-        return _image_messages(self._system_prompt, text, image, label="CURRENT MAIN CONTEXT CANVAS")
+        text = render_main_context(
+            task=self.workspace.state.task_prompt,
+            live_references=packet.manifest(),
+            embodied_state=state_card,
+            interaction_memory=self.interaction_memory,
+            feedback=feedback,
+        )
+        return {
+            "schema": "vaw-agent-context-v2-no-goal",
+            "task": self.workspace.state.task_prompt,
+            "revision": packet.revision,
+            "live_references": packet.manifest(),
+            "embodied_state_card": state_card.summary(),
+            "interaction_memory_before": self.interaction_memory.snapshot(),
+            "interaction_memory_prompt": self.interaction_memory.prompt_lines(),
+            "protocol_feedback": feedback,
+            "prompt_text": text,
+        }
+
+    def _messages_from_context(
+        self,
+        image: np.ndarray,
+        snapshot: dict[str, Any],
+    ) -> list[Message]:
+        return _image_messages(
+            self._system_prompt,
+            str(snapshot["prompt_text"]),
+            image,
+            label="当前主智能体上下文画布",
+        )
+
+    def _embodied_state(
+        self,
+        *,
+        decision_turn: int | None = None,
+    ) -> EmbodiedStateCard:
+        return project_embodied_state(
+            self.workspace.state,
+            self.interaction_memory,
+            decision_turn=(
+                self.main_turns + 1 if decision_turn is None else decision_turn
+            ),
+        )
 
     def _finish(self, mode: TerminateMode, steps: list[StepRecord], detail: str) -> EpisodeResult:
         if not self.workspace.finished:
-            step = self.workspace.execute("done", success=False)
+            step = self.workspace.execute("finish_task", success=False)
             steps.append(_step_record(self.main_turns, "runtime", step, "", physical=False))
         self._update_env_success()
         return self._result(mode, steps, detail)
@@ -549,6 +789,15 @@ class ContextRuntime:
                     "env_success": self.env_success,
                     "usage": self.usage,
                 }
+            )
+            self.trace.log_event(
+                "episode_closed",
+                {
+                    "terminate_mode": mode.value,
+                    "turns": self.main_turns,
+                    "claimed_success": self.workspace.claimed_success,
+                    "env_success": self.env_success,
+                },
             )
         return EpisodeResult(
             terminate_mode=mode,
@@ -569,8 +818,18 @@ class ContextRuntime:
         call: dict[str, Any] | None,
         step: ContextStepResult | None,
         response: ModelResponse,
+        *,
+        embodied_state_card: EmbodiedStateCard | None = None,
+        function_effect_kind: str | None = None,
+        context_snapshot_ref: str | None = None,
+        interaction_memory_before: list[dict[str, Any]] | None = None,
+        interaction_event: dict[str, Any] | None = None,
+        action_segment: dict[str, Any] | None = None,
     ) -> None:
         if self.trace is not None:
+            state_card = embodied_state_card or self._embodied_state(
+                decision_turn=turn
+            )
             self.trace.log_turn(
                 turn=turn,
                 agent_owner="main",
@@ -584,6 +843,13 @@ class ContextRuntime:
                 raw_response_text=response.raw_response_text or response.text,
                 provider_reasoning=response.provider_reasoning,
                 state_summary=self.workspace.state.trace_summary(),
+                embodied_state_card=state_card.summary(),
+                interaction_memory_before=interaction_memory_before or [],
+                interaction_event=interaction_event,
+                interaction_memory_after=self.interaction_memory.snapshot(),
+                function_effect_kind=function_effect_kind,
+                context_snapshot_ref=context_snapshot_ref,
+                action_segment=action_segment,
             )
 
     def _notify(self, turn: int, record: StepRecord) -> None:
@@ -592,10 +858,8 @@ class ContextRuntime:
         # The observer runs after the transaction committed and the trace was
         # written; it must never be able to kill an episode (a real crash was
         # a BlockingIOError from a print into a non-blocking stdout pipe).
-        try:
+        with suppress(Exception):
             self.config.on_turn(turn, record)
-        except Exception:
-            pass
 
     def _accumulate_usage(self, response: ModelResponse, scope: str) -> None:
         for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
@@ -634,62 +898,51 @@ def _target_basis(artifacts: Any | None) -> str:
 
     context = artifacts.planning_context if artifacts is not None else None
     if context is None:
-        return "relative pose from current TCP"
+        return "相对于当前 TCP 的局部位姿"
     if context.source_kind == "point":
         return (
-            "coarse point + offset anchor; refine only from visible target geometry, "
-            "not from assumed perfect centering"
+            "粗略语义点与偏移锚点；只能依据可见目标几何微调，"
+            "不能假设初始锚点已经完美居中"
         )
     if context.source_kind == "grasp":
-        return "coarse grasp seed; verify and refine visible contact geometry"
-    return f"coarse {context.source_kind} seed"
+        return "粗略抓取候选；依据可见接触几何验证并微调"
+    return f"来源类型为 {context.source_kind} 的粗略候选"
 
 
-def _control_continuity(
-    action: LastPhysicalAction | None,
+def _image_messages(
+    system_prompt: str,
+    text: str,
+    image: np.ndarray,
     *,
-    manipulation_subject: str | None = None,
-) -> dict[str, Any] | None:
-    """Expose only the causal focus of the latest physical command.
-
-    This deliberately omits controller telemetry and does not assert that the
-    intended grasp/place relation became true.  Its purpose is to keep a
-    revision change from erasing which manipulation problem Main was solving.
-    """
-
-    if action is None and manipulation_subject is None:
-        return None
-    result: dict[str, Any] = {}
-    if manipulation_subject:
-        result["manipulation_subject"] = manipulation_subject
-        result["subject_relation"] = "intended_attachment_unverified"
-    if action is not None:
-        result.update(
-            {
-                "last_intent": action.intent,
-                "executed_stage": action.executed_stages,
-                "command_status": action.outcome,
-            }
-        )
-        if action.source_query:
-            result["control_subject"] = action.source_query
-        if action.target_gripper is not None:
-            result["target_gripper"] = action.target_gripper
-    return result
-
-
-def _image_messages(system_prompt: str, text: str, image: np.ndarray, *, label: str) -> list[Message]:
+    label: str,
+    extra_parts: list[dict[str, Any]] | None = None,
+) -> list[Message]:
+    content: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    if extra_parts:
+        content.extend(extra_parts)
+    content.extend(
+        [
+            {"type": "text", "text": label},
+            {"type": "image_url", "image_url": {"url": encode_png_data_url(image)}},
+        ]
+    )
     return [
         {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": text},
-                {"type": "text", "text": label},
-                {"type": "image_url", "image_url": {"url": encode_png_data_url(image)}},
-            ],
-        },
+        {"role": "user", "content": content},
     ]
+
+
+def _provider_visible_request(
+    provider: ModelProvider,
+    messages: list[Message],
+    tools: list[dict[str, Any]] | None,
+) -> tuple[list[Message], list[dict[str, Any]] | None]:
+    """展开文本协议，使 trace 与模型真正收到的请求保持一致。"""
+
+    prepare = getattr(provider, "prepare_messages", None)
+    if callable(prepare):
+        return prepare(messages, tools), None
+    return messages, tools
 
 
 def run_context_episode(
@@ -704,9 +957,6 @@ def run_context_episode(
     env_check: Callable[[], bool] | None = None,
     env_terminal_check: Callable[[], bool] | None = None,
     motion_backend: str = "curobo",
-    playbook_dir: str | None = None,
-    playbook_injection: str = "all",
-    playbook_phase: str | None = None,
 ) -> EpisodeResult:
     workspace = ContextWorkspace(api, task_prompt, motion_backend=motion_backend)
     trace = ContextTraceLogger(trace_dir) if trace_dir is not None else None
@@ -720,9 +970,6 @@ def run_context_episode(
             trace=trace,
             env_check=env_check,
             env_terminal_check=env_terminal_check,
-            playbook_dir=playbook_dir,
-            playbook_injection=playbook_injection,
-            playbook_phase=playbook_phase,
         ).run()
     finally:
         renderer.close()

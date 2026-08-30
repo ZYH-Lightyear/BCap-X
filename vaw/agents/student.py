@@ -5,10 +5,8 @@ protocol, same context policy. Any divergence here would show up as a
 train/inference mismatch, since the student's SFT data is teacher traces
 recorded through exactly this path.
 
-Defaults to the text protocol rather than native function calling. Two reasons:
-``<tool_call>`` blocks are Qwen's own training format, and a locally served
-checkpoint mid-RL cannot be relied on to hold a native tool schema — while the
-text path degrades into something still parseable.
+默认使用原生工具通道：服务端通过模型自己的 chat template 把标准 schema
+编译成训练时格式，并把输出解析回结构化 tool call。文本协议只作为显式回退。
 
     from vaw.agents.student import student_provider
     from vaw.context_runtime.runtime import run_context_episode
@@ -38,7 +36,7 @@ def student_provider(
     *,
     server_url: str = DEFAULT_STUDENT_URL,
     api_key: str | None = None,
-    protocol: str = "text",
+    protocol: str = "native",
     temperature: float = 0.0,
     max_tokens: int = 2048,
 ) -> ModelProvider:

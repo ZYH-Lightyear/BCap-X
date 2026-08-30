@@ -111,6 +111,44 @@ class PandaUrdfGripperFK:
             ("panda_leftfinger", "panda_rightfinger"),
         )
 
+    def grasp_sweep_segment(
+        self,
+        joint_positions_rad: np.ndarray,
+        gripper_opening: float,
+    ) -> np.ndarray:
+        """Return the observed closing channel between both finger middles.
+
+        The two endpoints are visual-mesh centroids evaluated under one FK
+        update.  Connecting them therefore shows where the *observed* fingers
+        would sweep when they close; it is not inferred from TCP pose or from
+        an unexecuted action proposal.
+        """
+
+        joints = np.asarray(joint_positions_rad, dtype=np.float64).reshape(-1)
+        if joints.shape != (7,) or not np.isfinite(joints).all():
+            raise ValueError("Panda FK requires exactly seven finite arm joints")
+        opening = float(gripper_opening)
+        if not np.isfinite(opening):
+            raise ValueError("gripper opening must be finite")
+
+        with self._lock:
+            config = dict(zip(self._ARM_JOINTS, joints, strict=True))
+            config["panda_finger_joint1"] = (
+                self.finger_max_q * float(np.clip(opening, 0.0, 1.0))
+            )
+            self.urdf.update_cfg(config)
+            centers = []
+            for link in ("panda_leftfinger", "panda_rightfinger"):
+                parts = self._visual_meshes((link,))
+                if not parts:
+                    raise RuntimeError(f"Panda URDF has no visual mesh for {link}")
+                centers.append(
+                    np.concatenate([vertices for vertices, _faces in parts], axis=0).mean(
+                        axis=0
+                    )
+                )
+        return np.ascontiguousarray(np.stack(centers, axis=0))
+
     def robot_triangles(
         self,
         joint_positions_rad: np.ndarray,

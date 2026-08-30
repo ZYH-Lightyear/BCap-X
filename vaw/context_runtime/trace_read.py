@@ -18,6 +18,41 @@ _TASK_IN_NAME = re.compile(r"task(\d+)", re.IGNORECASE)
 _SEED_IN_NAME = re.compile(r"_s(\d+)$")
 _SUITE_IN_NAME = re.compile(r"(libero_[a-z0-9_]+)")
 
+# Historical traces remain valuable RSI evidence after the public Function API
+# is renamed. These aliases are deliberately confined to the read path: the
+# live Runtime and the model-facing schemas accept only the current names.
+_MAIN_TRACE_ALIASES = {
+    "detection_and_sam": "detect_region",
+    "propose_pose": "preview_pose",
+    "select": "preview_grasp",
+    "call_imagination": "imagine_action",
+    "delta_move": "move_tcp_delta",
+    "reject_action": "discard_action",
+    "commit": "execute_action",
+    "done": "finish_task",
+}
+_IMAGINATION_TRACE_ALIASES = {
+    "delta_move": "shift_preview",
+    "rotate": "rotate_preview",
+    "show_rotation_gizmo": "inspect_rotation",
+    "done": "finish_imagination",
+}
+
+
+def canonical_trace_function(name: Any, *, owner: str = "main") -> Any:
+    """Return the current display/fitness name for a historical Function.
+
+    This is trace compatibility, not a live API alias. Unknown values are
+    preserved so diagnostic tools never erase malformed-run evidence.
+    """
+
+    if not isinstance(name, str):
+        return name
+    aliases = (
+        _IMAGINATION_TRACE_ALIASES if owner == "imagination" else _MAIN_TRACE_ALIASES
+    )
+    return aliases.get(name, name)
+
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     """Parse a JSONL file that another process may be appending to."""
@@ -68,10 +103,11 @@ def _norm(vector: list[float]) -> float:
     return sum(value * value for value in vector) ** 0.5
 
 
-def _commanded_move_m(call: dict[str, Any]) -> float | None:
+def _commanded_move_m(call: dict[str, Any], *, owner: str) -> float | None:
     """Length of a translation command, or None for non-motion functions."""
 
-    if call.get("name") != "delta_move":
+    name = canonical_trace_function(call.get("name"), owner=owner)
+    if name not in {"move_tcp_delta", "shift_preview"}:
         return None
     arguments = call.get("arguments")
     if not isinstance(arguments, dict):
@@ -90,6 +126,7 @@ def _motion(
     following: dict[str, Any] | None,
     *,
     physical: bool,
+    owner: str,
 ) -> dict[str, Any] | None:
     """Compare a commanded translation against the displacement it produced.
 
@@ -100,7 +137,7 @@ def _motion(
     """
 
     call = record.get("function_call") or {}
-    commanded = _commanded_move_m(call)
+    commanded = _commanded_move_m(call, owner=owner)
     if commanded is None:
         return None
     if not physical:
@@ -155,13 +192,14 @@ def _compile_turn(
     image_prefix: str,
 ) -> dict[str, Any]:
     call = record.get("function_call") or {}
+    turn_owner = record.get("agent_owner") or owner
     payload, advisory, error = _result_fields(record)
     image = record.get("context_image")
     return {
         "index": record.get("index"),
         "turn": record.get("turn"),
-        "owner": record.get("agent_owner") or owner,
-        "function": call.get("name"),
+        "owner": turn_owner,
+        "function": canonical_trace_function(call.get("name"), owner=turn_owner),
         "arguments": call.get("arguments"),
         "result": payload,
         "advisory": advisory,
@@ -174,7 +212,8 @@ def _compile_turn(
         "motion": _motion(
             record,
             following,
-            physical=(record.get("agent_owner") or owner) != "imagination",
+            physical=turn_owner != "imagination",
+            owner=turn_owner,
         ),
         "envSuccess": record.get("env_success"),
         "done": record.get("done"),
@@ -267,7 +306,7 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "turns": int(meta["turns"]) if meta.get("turns") is not None else len(turns),
         "tools": tools,
         "imaginationCalls": int(
-            tools.get("call_imagination", 0) or len(_subagent_dirs(run_dir))
+            tools.get("imagine_action", 0) or len(_subagent_dirs(run_dir))
         ),
         "blockedMoves": sum(
             1 for turn in turns if (turn.get("motion") or {}).get("blocked")
@@ -407,6 +446,7 @@ def load_run(run_dir: str | Path) -> dict[str, Any]:
 
 
 __all__ = [
+    "canonical_trace_function",
     "compile_board",
     "compile_run",
     "discover_runs",

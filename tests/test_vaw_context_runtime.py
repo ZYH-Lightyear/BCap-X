@@ -20,6 +20,7 @@ from vaw.context_runtime.motion import (
     CUROBO_TCP_TO_HAND_LOCAL_XYZ,
     CuroboMotionBackend,
     MotionBackendError,
+    MotionExecutionUnsettledError,
     MotionPlan,
     PyrokiMotionBackend,
 )
@@ -28,12 +29,20 @@ from vaw.context_runtime.errors import ContextFunctionError
 from vaw.context_runtime.functions import _geometric_grasps, _top_width_advisory
 from vaw.context_runtime.private import build_edit_summary
 from vaw.context_runtime.protocol import (
+    CONTRACT_PREAMBLE,
     IMAGINATION_FUNCTION_NAMES,
     IMAGINATION_SYSTEM_PROMPT,
     MAIN_FUNCTION_NAMES,
+    SYSTEM_PROMPT,
     imagination_function_definitions,
     main_function_definitions,
 )
+
+
+def test_main_system_prompt_is_compact() -> None:
+    assert len(SYSTEM_PROMPT) <= 1_999
+    assert "每轮先用最新画布判断当前真实状态" in SYSTEM_PROMPT
+    assert "非零开度可能" in SYSTEM_PROMPT
 
 
 class FakeContextApi:
@@ -127,9 +136,9 @@ class FakeContextApi:
 
 
 def _selected_action(workspace: ContextWorkspace, query: str = "can") -> str:
-    region = workspace.execute("detection_and_sam", query=query).result["region_id"]
+    region = workspace.execute("detect_region", query=query).result["region_id"]
     seed = workspace.execute("propose_grasps", region_id=region).result["seed_ids"][0]
-    return workspace.execute("select", seed_id=seed).result["action_id"]
+    return workspace.execute("preview_grasp", seed_id=seed).result["action_id"]
 
 
 class FakeCuroboContextApi(FakeContextApi):
@@ -376,18 +385,35 @@ class RecordingMotionBackend:
         self.executions.append((plan, target))
 
 
+class UnsettledMotionBackend(RecordingMotionBackend):
+    def execute(self, plan, target):
+        self.executions.append((plan, target))
+        raise MotionExecutionUnsettledError(
+            "CuRobo trajectory execution did not converge: max joint error "
+            "0.024000 rad exceeds 0.020000 rad"
+        )
+
+
 def test_main_and_imagination_function_contracts_are_disjoint_and_small() -> None:
-    assert len(FUNCTION_NAMES) == 15
-    assert FUNCTION_NAMES[0] == "detection_and_sam"
+    assert len(FUNCTION_NAMES) == 16
+    assert FUNCTION_NAMES[0] == "detect_region"
     assert FUNCTION_NAMES[1:3] == ("propose_grasps", "locate_point")
     assert "inspect" not in FUNCTION_NAMES
     assert IMAGINATION_FUNCTION_NAMES == (
-        "delta_move",
-        "rotate",
-        "show_rotation_gizmo",
+        "shift_preview",
+        "rotate_preview",
+        "inspect_rotation",
         "finish_imagination",
     )
     main = function_definitions()
+    preview_pose = next(
+        item for item in main if item["function"]["name"] == "preview_pose"
+    )["function"]
+    assert len(preview_pose["description"]) < 80
+    quaternion = preview_pose["parameters"]["properties"]["quaternion_xyzw"]
+    assert quaternion["minItems"] == quaternion["maxItems"] == 4
+    assert "[1,0,0,0]" in quaternion["description"]
+    assert "[0,0,0,1]" in quaternion["description"]
     standard = main_function_definitions()
     imagination = imagination_function_definitions()
     assert [item["function"]["name"] for item in main] == list(FUNCTION_NAMES)
@@ -397,15 +423,13 @@ def test_main_and_imagination_function_contracts_are_disjoint_and_small() -> Non
     assert [item["function"]["name"] for item in standard] == list(
         MAIN_FUNCTION_NAMES
     )
-    assert "commit" in MAIN_FUNCTION_NAMES
-    assert "reject_action" in MAIN_FUNCTION_NAMES
-    assert "call_imagination" in MAIN_FUNCTION_NAMES
-    assert "delta_move" in MAIN_FUNCTION_NAMES
-    assert "rotate" not in MAIN_FUNCTION_NAMES
+    assert "execute_action" in MAIN_FUNCTION_NAMES
+    assert "discard_action" in MAIN_FUNCTION_NAMES
+    assert "imagine_action" in MAIN_FUNCTION_NAMES
+    assert "move_tcp_delta" in MAIN_FUNCTION_NAMES
+    assert "rotate_preview" not in MAIN_FUNCTION_NAMES
     assert "start_imagination" not in FUNCTION_NAMES
-    assert set(IMAGINATION_FUNCTION_NAMES).intersection(MAIN_FUNCTION_NAMES) == {
-        "delta_move"
-    }
+    assert set(IMAGINATION_FUNCTION_NAMES).isdisjoint(MAIN_FUNCTION_NAMES)
     open_definition = next(
         x["function"] for x in standard if x["function"]["name"] == "open_gripper"
     )
@@ -417,10 +441,10 @@ def test_main_and_imagination_function_contracts_are_disjoint_and_small() -> Non
     encoded = json.dumps(main + imagination).lower()
     assert "history" not in encoded and "receipt" not in encoded and "obb" not in encoded
     detection = main[0]["function"]
-    assert "bbox detection" in detection["description"]
-    assert "sam" in detection["description"].lower()
+    assert "检测并分割" in detection["description"]
+    assert "sam" not in detection["description"].lower()
     assert "不移动机器人" in detection["description"]
-    for name in ("delta_move", "rotate"):
+    for name in ("shift_preview", "rotate_preview"):
         definition = next(
             x["function"] for x in imagination if x["function"]["name"] == name
         )
@@ -429,52 +453,64 @@ def test_main_and_imagination_function_contracts_are_disjoint_and_small() -> Non
     delta = next(
         x["function"]
         for x in imagination
-        if x["function"]["name"] == "delta_move"
+        if x["function"]["name"] == "shift_preview"
     )
-    pose = next(x["function"] for x in main if x["function"]["name"] == "propose_pose")
+    pose = next(x["function"] for x in main if x["function"]["name"] == "preview_pose")
     grasps = next(
         x["function"] for x in main if x["function"]["name"] == "propose_grasps"
     )
     point = next(x["function"] for x in main if x["function"]["name"] == "locate_point")
-    assert "TOP、PCA 和 GraspNet" in grasps["description"]
-    assert "不生成方向" in point["description"]
-    assert "planned 空间 Action" in pose["description"]
-    assert "厘米级平移" in delta["description"]
+    assert "多个抓取候选" in grasps["description"]
+    assert "粗略三维锚点" in point["description"]
+    assert "不能确认目标身份" in point["description"]
+    assert "不会复验该区域的物体身份" in (
+        point["parameters"]["properties"]["within_region_id"]["description"]
+    )
+    assert "不会重新检测或确认区域身份" in (
+        point["parameters"]["properties"]["force_refresh"]["description"]
+    )
+    assert "动作预览" in pose["description"]
+    assert "平移虚拟动作预览" in delta["description"]
     frame_description = delta["parameters"]["properties"]["frame"]["description"]
-    assert "base" in frame_description and "+Z 恒为世界上方" in frame_description
+    assert "base" in frame_description and "tool" in frame_description
     rotate = next(
-        x["function"] for x in imagination if x["function"]["name"] == "rotate"
+        x["function"] for x in imagination if x["function"]["name"] == "rotate_preview"
     )
     assert "右手定则" in rotate["description"]
-    assert "平移不能修复" in rotate["description"]
-    assert "绝对值不超过 10°" in rotate["description"]
+    assert len(rotate["description"]) < 50
     assert rotate["parameters"]["properties"]["angle_deg"]["minimum"] == -10.0
     assert rotate["parameters"]["properties"]["angle_deg"]["maximum"] == 10.0
     gizmo = next(
-        x["function"] for x in imagination if x["function"]["name"] == "show_rotation_gizmo"
+        x["function"] for x in imagination if x["function"]["name"] == "inspect_rotation"
     )
-    assert "不修改目标" in gizmo["description"]
-    assert "正负号" in gizmo["description"]
-    assert "base +Z 恒为上抬" in IMAGINATION_SYSTEM_PROMPT
-    assert "CONTACT FRONT 和 SIDE" in IMAGINATION_SYSTEM_PROMPT
-    assert "gripper-only fallback" in IMAGINATION_SYSTEM_PROMPT
-    assert "Preview 对位不能恢复那个真实几何" in IMAGINATION_SYSTEM_PROMPT
+    assert "不修改动作预览" in gizmo["description"]
+    assert "正负旋转方向" in gizmo["description"]
+    assert "基座 +Z 恒为上抬" in IMAGINATION_SYSTEM_PROMPT
+    assert "CONTACT FRONT" in IMAGINATION_SYSTEM_PROMPT
+    assert "CONTACT SIDE" in IMAGINATION_SYSTEM_PROMPT
+    assert "仅夹爪回退" in IMAGINATION_SYSTEM_PROMPT
+    assert "动作预览对位不能恢复真实几何" in IMAGINATION_SYSTEM_PROMPT
     assert "指尖低于物体顶面并不代表碰撞" in IMAGINATION_SYSTEM_PROMPT
+    assert "不要用 point 坐标覆盖清楚的视觉证据" in CONTRACT_PREAMBLE
     assert "真正需要净空" in IMAGINATION_SYSTEM_PROMPT
     assert "掌部/横梁/指根" in IMAGINATION_SYSTEM_PROMPT
     assert "必须分别判断位置与方向" in IMAGINATION_SYSTEM_PROMPT
     assert "继续平移不能修复方向错误" in IMAGINATION_SYSTEM_PROMPT
-    assert "PCA 可以是非 top-down" in IMAGINATION_SYSTEM_PROMPT
+    assert "PCA 可以是非垂直下抓" in IMAGINATION_SYSTEM_PROMPT
     assert "open_gripper" not in [
         item["function"]["name"] for item in imagination
     ]
-    refine = next(x["function"] for x in standard if x["function"]["name"] == "call_imagination")
-    assert refine["parameters"]["required"] == ["action_id", "instruction"]
-    assert "不是 commit 的前置条件" in refine["description"]
+    refine = next(x["function"] for x in standard if x["function"]["name"] == "imagine_action")
+    assert refine["parameters"]["required"] == ["instruction"]
+    assert "不执行" in refine["description"]
+    assert len(refine["description"]) < 40
+    assert "局部几何目标" in refine["parameters"]["properties"]["instruction"]["description"]
+    assert "场景目标" in IMAGINATION_SYSTEM_PROMPT
+    assert "不是要满足的对象" in IMAGINATION_SYSTEM_PROMPT
     commit_definition = next(
-        x["function"] for x in standard if x["function"]["name"] == "commit"
+        x["function"] for x in standard if x["function"]["name"] == "execute_action"
     )
-    assert "planned 与 refined 均可" in commit_definition["description"]
+    assert "执行指定动作" in commit_definition["description"]
     for definition in imagination:
         assert "refinement_goal" not in definition["function"]["parameters"]["properties"]
 
@@ -558,7 +594,7 @@ def test_far_imagination_target_stays_on_coarse_planner() -> None:
 
     workspace.begin_imagination("lower by one centimetre", action_id)
     edited = workspace.execute_imagination(
-        "delta_move",
+        "shift_preview",
         delta_xyz_m=[0.0, 0.0, -0.01],
         frame="base",
     )
@@ -572,7 +608,7 @@ def test_far_imagination_target_stays_on_coarse_planner() -> None:
         status="ready",
     ).ok
 
-    committed = workspace.execute("commit", action_id=action_id)
+    committed = workspace.execute("execute_action", action_id=action_id)
 
     assert committed.ok
     assert len(coarse.executions) == 1
@@ -597,7 +633,7 @@ def test_near_imagination_target_uses_local_planner_and_executor() -> None:
 
     workspace.begin_imagination("lower by one centimetre", action_id)
     edited = workspace.execute_imagination(
-        "delta_move",
+        "shift_preview",
         delta_xyz_m=[0.0, 0.0, -0.01],
         frame="base",
     )
@@ -610,7 +646,7 @@ def test_near_imagination_target_uses_local_planner_and_executor() -> None:
         "finish_imagination",
         status="ready",
     ).ok
-    committed = workspace.execute("commit", action_id=action_id)
+    committed = workspace.execute("execute_action", action_id=action_id)
     assert committed.ok
     assert not coarse.executions
     assert len(local.executions) == 1
@@ -651,8 +687,7 @@ def test_main_direct_delta_uses_local_planner_without_curobo_fallback() -> None:
         local_motion_backend=local,
     )
 
-    result = workspace.execute(
-        "delta_move",
+    result = workspace.execute("move_tcp_delta",
         delta_xyz_m=[0.0, 0.0, 0.01],
         frame="base",
     )
@@ -711,7 +746,7 @@ def test_curobo_final_settle_does_not_relax_max_joint_threshold() -> None:
         trajectory,
     )
 
-    with pytest.raises(MotionBackendError, match="max joint error"):
+    with pytest.raises(MotionExecutionUnsettledError, match="max joint error"):
         backend.execute(plan, target)
 
     assert len(api.curobo_execute_calls) == 2
@@ -745,8 +780,8 @@ def test_detection_is_idempotent_within_one_observation_revision() -> None:
     api = FakeContextApi()
     workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
 
-    first = workspace.execute("detection_and_sam", query=" Alphabet   Soup Can ")
-    second = workspace.execute("detection_and_sam", query="alphabet soup can")
+    first = workspace.execute("detect_region", query=" Alphabet   Soup Can ")
+    second = workspace.execute("detect_region", query="alphabet soup can")
 
     assert second.result == first.result
     assert list(workspace.state.regions) == [first.result["region_id"]]
@@ -766,7 +801,9 @@ def test_main_gripper_controls_are_direct_physical_actions() -> None:
 
     result = workspace.execute("close_gripper")
 
-    assert result.ok and "gripper_opening" in result.result
+    assert result.ok
+    assert "gripper_opening" not in result.result
+    assert result.trace_diagnostics and "gripper_opening" in result.trace_diagnostics
     assert workspace.state.imagination is None
     assert workspace.state.action_proposal is None
     assert workspace.state.observation_revision == revision + 1
@@ -778,7 +815,7 @@ def test_detection_privately_requests_exact_semantic_disambiguation() -> None:
     api = FakeContextApi()
     workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
 
-    result = workspace.execute("detection_and_sam", query="alphabet soup can")
+    result = workspace.execute("detect_region", query="alphabet soup can")
 
     assert result.ok
     assert len(api.bbox_queries) == 1
@@ -792,7 +829,7 @@ def test_detection_reviews_enlarged_candidates_before_registering_region() -> No
     api = FakeSemanticGroundingApi(choice=2)
     workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
 
-    result = workspace.execute("detection_and_sam", query="alphabet soup can")
+    result = workspace.execute("detect_region", query="alphabet soup can")
 
     assert result.ok
     assert result.result["bbox_xyxy_px"] == pytest.approx([96.0, 12.0, 144.0, 60.0])
@@ -801,8 +838,8 @@ def test_detection_reviews_enlarged_candidates_before_registering_region() -> No
         (120, 160, 3),
         (720, 1200, 3),
     ]
-    assert "up to three distinct plausible candidates" in api.query_prompts[0]
-    assert "enlarged candidate crops" in api.query_prompts[1]
+    assert "最多三个彼此不同的合理候选" in api.query_prompts[0]
+    assert "放大的候选裁剪图" in api.query_prompts[1]
     diagnostics = result.trace_diagnostics["semantic_grounding"]
     assert diagnostics["mode"] == "candidate_review"
     assert diagnostics["selected_candidate"] == 2
@@ -819,7 +856,7 @@ def test_detection_retries_empty_candidate_and_review_replies_locally() -> None:
     )
     workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
 
-    result = workspace.execute("detection_and_sam", query="alphabet soup can")
+    result = workspace.execute("detect_region", query="alphabet soup can")
 
     assert result.ok
     assert len(api.query_images) == 4
@@ -839,7 +876,7 @@ def test_detection_keeps_raw_replies_when_candidate_parsing_exhausts_retries() -
     api = ScriptedSemanticGroundingApi(["", "still not json", "also not json"])
     workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
 
-    result = workspace.execute("detection_and_sam", query="alphabet soup can")
+    result = workspace.execute("detect_region", query="alphabet soup can")
 
     assert not result.ok
     assert "candidate parsing failed" in result.result["error"]
@@ -868,8 +905,8 @@ def test_detection_uses_private_hires_semantic_view_and_maps_box_back() -> None:
         semantic_rgb_provider=semantic_rgb_provider,
     )
 
-    first = workspace.execute("detection_and_sam", query="alphabet soup can")
-    second = workspace.execute("detection_and_sam", query="alphabet soup can")
+    first = workspace.execute("detect_region", query="alphabet soup can")
+    second = workspace.execute("detect_region", query="alphabet soup can")
 
     assert first.ok and second.ok
     assert first.result["bbox_xyxy_px"] == pytest.approx([48.0, 6.0, 72.0, 30.0])
@@ -883,11 +920,11 @@ def test_detection_uses_private_hires_semantic_view_and_maps_box_back() -> None:
     workspace.refresh_observation()
     # The carried region survives revalidation (the fake scene is static), so
     # an identical query reuses it without touching the semantic camera.
-    workspace.execute("detection_and_sam", query="alphabet soup can")
+    workspace.execute("detect_region", query="alphabet soup can")
     assert captures == 1
     # A genuinely new grounding request in the new revision re-captures the
     # private hi-res semantic view.
-    workspace.execute("detection_and_sam", query="tomato sauce can")
+    workspace.execute("detect_region", query="tomato sauce can")
     assert captures == 2
 
 
@@ -895,7 +932,7 @@ def test_detection_rejects_ambiguous_semantic_review_without_region() -> None:
     api = FakeSemanticGroundingApi(choice=None)
     workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
 
-    result = workspace.execute("detection_and_sam", query="ambiguous can")
+    result = workspace.execute("detect_region", query="ambiguous can")
 
     assert not result.ok
     assert "ambiguous" in result.result["error"]
@@ -907,11 +944,11 @@ def test_continuous_refinement_edits_one_action_proposal_then_returns_ready() ->
     action_id = _selected_action(workspace)
     workspace.begin_imagination("把夹爪向下并调正", action_id)
     first = workspace.execute_imagination(
-        "delta_move", delta_xyz_m=[0.0, 0.0, -0.02], frame="base"
+        "shift_preview", delta_xyz_m=[0.0, 0.0, -0.02], frame="base"
     )
     target1 = workspace.state.action_proposal.target.pose
     second = workspace.execute_imagination(
-        "rotate", axis="z", angle_deg=10, frame="tool"
+        "rotate_preview", axis="z", angle_deg=10, frame="tool"
     )
     target2 = workspace.state.action_proposal.target.pose
 
@@ -936,7 +973,7 @@ def test_direct_gripper_action_does_not_create_or_replace_spatial_action() -> No
     action_id = _selected_action(workspace)
     workspace.begin_imagination("向下微调", action_id)
     edited = workspace.execute_imagination(
-        "delta_move",
+        "shift_preview",
         delta_xyz_m=[0.0, 0.0, -0.01],
         frame="base",
     )
@@ -948,13 +985,13 @@ def test_direct_gripper_action_does_not_create_or_replace_spatial_action() -> No
 
 def test_planned_action_commits_directly_without_imagination() -> None:
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
-    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    region = workspace.execute("detect_region", query="can").result["region_id"]
     seed = workspace.execute("propose_grasps", region_id=region).result["seed_ids"][0]
-    action_id = workspace.execute("select", seed_id=seed).result["action_id"]
+    action_id = workspace.execute("preview_grasp", seed_id=seed).result["action_id"]
     revision = workspace.state.observation_revision
     assert workspace.state.action_proposal.refined is False
 
-    result = workspace.execute("commit", action_id=action_id)
+    result = workspace.execute("execute_action", action_id=action_id)
 
     assert result.ok
     assert workspace.state.imagination is None
@@ -970,13 +1007,13 @@ def test_commit_rejects_action_without_executable_cached_plan() -> None:
     )
     point_id = workspace.execute("locate_point", query="center").result["point_id"]
     action_id = workspace.execute(
-        "propose_pose",
+        "preview_pose",
         point_id=point_id,
-        offset_xyz=[0.0, 0.0, 0.0],
+        offset_xyz_m=[0.0, 0.0, 0.0],
     ).result["action_id"]
     revision = workspace.state.observation_revision
 
-    result = workspace.execute("commit", action_id=action_id)
+    result = workspace.execute("execute_action", action_id=action_id)
 
     assert not result.ok
     assert "no executable cached plan" in result.result["error"]
@@ -988,8 +1025,7 @@ def test_commit_rejects_action_without_executable_cached_plan() -> None:
 def test_main_direct_delta_move_executes_without_action_proposal() -> None:
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
     revision = workspace.state.observation_revision
-    result = workspace.execute(
-        "delta_move", delta_xyz_m=[0.0, 0.0, 0.01], frame="base"
+    result = workspace.execute("move_tcp_delta", delta_xyz_m=[0.0, 0.0, 0.01], frame="base"
     )
 
     assert result.ok
@@ -1001,25 +1037,26 @@ def test_main_direct_delta_move_executes_without_action_proposal() -> None:
 def test_refined_commit_invalidates_revision_state() -> None:
     api = FakeContextApi()
     workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
-    region_id = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    region_id = workspace.execute("detect_region", query="can").result["region_id"]
     seed = workspace.execute("propose_grasps", region_id=region_id).result["seed_ids"][0]
-    action_id = workspace.execute("select", seed_id=seed).result["action_id"]
+    action_id = workspace.execute("preview_grasp", seed_id=seed).result["action_id"]
     workspace.begin_imagination("上移 2cm", action_id)
     workspace.execute_imagination(
-        "delta_move", delta_xyz_m=[0.0, 0.0, 0.02], frame="base"
+        "shift_preview", delta_xyz_m=[0.0, 0.0, 0.02], frame="base"
     )
     action_id = workspace.execute_imagination(
         "finish_imagination", status="ready"
     ).result["action_id"]
     before = workspace.state.observation_revision
 
-    result = workspace.execute("commit", action_id=action_id)
+    result = workspace.execute("execute_action", action_id=action_id)
 
     assert result.ok
     assert api.operation_log == ["arm"]
     assert workspace.state.observation_revision == before + 1
     assert workspace.state.action_proposal is None
-    assert region_id not in workspace.state.regions
+    assert region_id in workspace.state.regions
+    assert workspace.state.regions[region_id].status in {"verified", "occluded"}
     assert workspace.state.last_physical_action.intent == "approach can for grasp"
     assert workspace.state.last_physical_action.executed_stages == "arm"
     assert workspace.state.last_physical_action.outcome == "completed"
@@ -1029,15 +1066,15 @@ def test_refined_commit_invalidates_revision_state() -> None:
     assert workspace._private.last_physical_artifacts.focus_pose is not None
 
 
-def test_reject_action_explicitly_discards_review_without_physics() -> None:
+def test_discard_action_explicitly_discards_review_without_physics() -> None:
     api = FakeContextApi()
     workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
-    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    region = workspace.execute("detect_region", query="can").result["region_id"]
     seed = workspace.execute("propose_grasps", region_id=region).result["seed_ids"][0]
-    action_id = workspace.execute("select", seed_id=seed).result["action_id"]
+    action_id = workspace.execute("preview_grasp", seed_id=seed).result["action_id"]
     revision = workspace.state.observation_revision
 
-    result = workspace.execute("reject_action", action_id=action_id)
+    result = workspace.execute("discard_action", action_id=action_id)
 
     assert result.ok
     assert result.result == {
@@ -1051,6 +1088,27 @@ def test_reject_action_explicitly_discards_review_without_physics() -> None:
     assert api.operation_log == []
 
 
+def test_commit_projects_curobo_endpoint_miss_as_dispatched_unsettled() -> None:
+    backend = UnsettledMotionBackend("curobo-test")
+    workspace = ContextWorkspace(
+        FakeContextApi(),
+        "task",
+        motion_backend=backend,
+    )
+    action_id = _selected_action(workspace)
+    before = workspace.state.observation_revision
+
+    result = workspace.execute("execute_action", action_id=action_id)
+
+    assert not result.ok
+    assert result.result["status"] == "dispatched_unsettled"
+    assert result.result["world_may_have_changed"] is True
+    assert result.revision_after == before + 1
+    assert workspace.state.last_physical_action.outcome == "arm_unsettled"
+    assert workspace.state.last_physical_action.recovery_hint is None
+    assert not hasattr(workspace.state, "task_memory")
+
+
 def test_commit_records_failed_stage_without_claiming_task_effect() -> None:
     arm_api = FakeContextApi()
     arm_api.move_error = True
@@ -1058,7 +1116,7 @@ def test_commit_records_failed_stage_without_claiming_task_effect() -> None:
     arm_action = _selected_action(arm_workspace)
     arm_workspace.begin_imagination("move", arm_action)
     arm_workspace.execute_imagination(
-        "delta_move", delta_xyz_m=[0.0, 0.0, 0.01], frame="base"
+        "shift_preview", delta_xyz_m=[0.0, 0.0, 0.01], frame="base"
     )
     arm_action = arm_workspace.execute_imagination(
         "finish_imagination", status="ready"
@@ -1066,7 +1124,7 @@ def test_commit_records_failed_stage_without_claiming_task_effect() -> None:
         "action_id"
     ]
 
-    arm_result = arm_workspace.execute("commit", action_id=arm_action)
+    arm_result = arm_workspace.execute("execute_action", action_id=arm_action)
 
     assert not arm_result.ok
     assert arm_api.operation_log == ["arm"]
@@ -1074,7 +1132,7 @@ def test_commit_records_failed_stage_without_claiming_task_effect() -> None:
     assert arm_workspace.state.last_physical_action.outcome == "arm_failed"
     assert arm_workspace.state.last_physical_action.failed_action_id == arm_action
     assert arm_workspace.state.last_physical_action.evidence_invalidated is True
-    assert arm_workspace.state.last_physical_action.recovery_hint
+    assert arm_workspace.state.last_physical_action.recovery_hint is None
     assert arm_workspace.state.last_physical_action.error_detail
     assert arm_workspace.state.action_proposal is None
 
@@ -1094,19 +1152,19 @@ def test_commit_records_failed_stage_without_claiming_task_effect() -> None:
     assert gripper_workspace.state.last_physical_action.evidence_invalidated is True
 
 
-def test_failed_grasp_commit_exposes_source_query_for_redetection() -> None:
+def test_failed_grasp_commit_does_not_prescribe_redetection() -> None:
     api = FakeContextApi()
     api.move_error = True
     workspace = ContextWorkspace(api, "task", motion_backend="pyroki")
-    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    region = workspace.execute("detect_region", query="can").result["region_id"]
     seed_id = workspace.execute("propose_grasps", region_id=region).result["seed_ids"][0]
-    action_id = workspace.execute("select", seed_id=seed_id).result["action_id"]
+    action_id = workspace.execute("preview_grasp", seed_id=seed_id).result["action_id"]
     workspace.begin_imagination("keep selected grasp", action_id)
     action_id = workspace.execute_imagination(
         "finish_imagination", status="ready"
     ).result["action_id"]
 
-    result = workspace.execute("commit", action_id=action_id)
+    result = workspace.execute("execute_action", action_id=action_id)
 
     assert not result.ok
     last = workspace.state.last_physical_action
@@ -1114,15 +1172,15 @@ def test_failed_grasp_commit_exposes_source_query_for_redetection() -> None:
     assert last.failed_action_id == action_id
     assert last.source_query == "can"
     assert last.evidence_invalidated is True
-    assert last.recovery_hint
-    assert "detection_and_sam" in last.recovery_hint
-    assert region not in workspace.state.regions
+    assert last.recovery_hint is None
+    assert region in workspace.state.regions
+    assert workspace.state.regions[region].status in {"verified", "occluded"}
     assert workspace.state.action_proposal is None
 
 
 def test_grasp_proposal_returns_general_action_seeds() -> None:
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
-    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    region = workspace.execute("detect_region", query="can").result["region_id"]
     result = workspace.execute("propose_grasps", region_id=region)
     seed_id = result.result["seed_ids"][0]
     assert seed_id.startswith("s")
@@ -1132,7 +1190,7 @@ def test_grasp_proposal_returns_general_action_seeds() -> None:
         if artifact.family
     }
     assert families & {"top", "pca", "cgn"}
-    selected = workspace.execute("select", seed_id=seed_id)
+    selected = workspace.execute("preview_grasp", seed_id=seed_id)
     assert selected.ok
     assert workspace.state.action_proposal.target.pose is not None
 
@@ -1140,11 +1198,11 @@ def test_grasp_proposal_returns_general_action_seeds() -> None:
 def test_select_forwards_plan_detail_and_reuses_measured_seed_plan() -> None:
     backend = CountingFailedGraspPlanBackend()
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend=backend)
-    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    region = workspace.execute("detect_region", query="can").result["region_id"]
     seed_id = workspace.execute("propose_grasps", region_id=region).result["seed_ids"][0]
 
-    first = workspace.execute("select", seed_id=seed_id)
-    second = workspace.execute("select", seed_id=seed_id)
+    first = workspace.execute("preview_grasp", seed_id=seed_id)
+    second = workspace.execute("preview_grasp", seed_id=seed_id)
 
     assert first.ok
     assert first.result["solve_ik"] == "error"
@@ -1157,7 +1215,7 @@ def test_select_forwards_plan_detail_and_reuses_measured_seed_plan() -> None:
     assert workspace._private.seed_artifacts[seed_id].motion_plan is not None
 
     commit = workspace.execute(
-        "commit", action_id=second.result["action_id"]
+        "execute_action", action_id=second.result["action_id"]
     )
     assert not commit.ok
     assert "no executable cached plan" in commit.result["error"]
@@ -1166,11 +1224,11 @@ def test_select_forwards_plan_detail_and_reuses_measured_seed_plan() -> None:
 def test_select_reuses_successful_seed_plan() -> None:
     backend = RecordingMotionBackend("coarse")
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend=backend)
-    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    region = workspace.execute("detect_region", query="can").result["region_id"]
     seed_id = workspace.execute("propose_grasps", region_id=region).result["seed_ids"][0]
 
-    first = workspace.execute("select", seed_id=seed_id)
-    second = workspace.execute("select", seed_id=seed_id)
+    first = workspace.execute("preview_grasp", seed_id=seed_id)
+    second = workspace.execute("preview_grasp", seed_id=seed_id)
 
     assert first.ok
     assert second.result["plan_reused"] is True
@@ -1179,7 +1237,7 @@ def test_select_reuses_successful_seed_plan() -> None:
 
 def test_propose_grasps_keeps_geometric_families_and_limits_graspnet() -> None:
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
-    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    region = workspace.execute("detect_region", query="can").result["region_id"]
 
     result = workspace.execute("propose_grasps", region_id=region)
 
@@ -1197,7 +1255,7 @@ def test_propose_grasps_keeps_geometric_families_and_limits_graspnet() -> None:
 
 def test_new_grasp_proposal_replaces_previous_seed_catalogue() -> None:
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
-    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    region = workspace.execute("detect_region", query="can").result["region_id"]
 
     first = workspace.execute("propose_grasps", region_id=region).result["seed_ids"]
     second = workspace.execute("propose_grasps", region_id=region).result["seed_ids"]
@@ -1205,7 +1263,7 @@ def test_new_grasp_proposal_replaces_previous_seed_catalogue() -> None:
     assert set(first).isdisjoint(second)
     assert set(workspace.state.seeds) == set(second)
     assert set(workspace._private.seed_artifacts) == set(second)
-    assert not workspace.execute("select", seed_id=first[0]).ok
+    assert not workspace.execute("preview_grasp", seed_id=first[0]).ok
 
 
 @pytest.mark.parametrize(
@@ -1395,7 +1453,7 @@ def test_dispatch_ignores_unknown_provider_field_when_required_argument_exists()
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
 
     step = workspace.execute(
-        "detection_and_sam",
+        "detect_region",
         query="can",
         text="provider-added synonym",
     )
@@ -1407,7 +1465,7 @@ def test_dispatch_ignores_unknown_provider_field_when_required_argument_exists()
 def test_dispatch_still_rejects_typo_that_omits_required_argument() -> None:
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
 
-    step = workspace.execute("detection_and_sam", qurey="can")
+    step = workspace.execute("detect_region", qurey="can")
 
     assert not step.ok
     assert "missing a required argument" in step.result["error"]
@@ -1425,7 +1483,7 @@ def test_propose_grasps_omits_ik_mismatch_seeds() -> None:
             return self._reachable_calls != 2
 
     workspace = ContextWorkspace(SelectiveIkApi(), "task", motion_backend="pyroki")
-    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    region = workspace.execute("detect_region", query="can").result["region_id"]
     result = workspace.execute("propose_grasps", region_id=region)
 
     assert result.ok
@@ -1444,7 +1502,7 @@ def test_grasp_proposal_rejects_seed_outside_its_source_geometry() -> None:
         "task",
         motion_backend="pyroki",
     )
-    region = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    region = workspace.execute("detect_region", query="can").result["region_id"]
 
     result = workspace.execute("propose_grasps", region_id=region)
 
@@ -1468,7 +1526,7 @@ def test_imagination_limit_hands_back_the_last_verified_edit_as_partial() -> Non
     original_target = workspace.state.action_proposal.target
     workspace.begin_imagination("test limit", action_id)
     edited = workspace.execute_imagination(
-        "delta_move", delta_xyz_m=[0.0, 0.0, 0.02], frame="base"
+        "shift_preview", delta_xyz_m=[0.0, 0.0, 0.02], frame="base"
     )
     assert edited.ok
     edited_target = workspace.state.action_proposal.target
@@ -1487,7 +1545,7 @@ def test_imagination_limit_hands_back_the_last_verified_edit_as_partial() -> Non
     assert workspace.state.action_proposal.refined is True
     assert workspace.state.observation_revision == 1
     assert workspace.state.imagination_attempts.failed == 0
-    assert workspace.execute("commit", action_id=action_id).ok
+    assert workspace.execute("execute_action", action_id=action_id).ok
     assert (
         result.trace_diagnostics["imagination_handoff"]["status"] == "partial"
     )
@@ -1505,14 +1563,14 @@ def test_imagination_limit_without_executable_plan_still_rolls_back() -> None:
     )
     point_id = workspace.execute("locate_point", query="center").result["point_id"]
     action_id = workspace.execute(
-        "propose_pose",
+        "preview_pose",
         point_id=point_id,
-        offset_xyz=[0.0, 0.0, 0.0],
+        offset_xyz_m=[0.0, 0.0, 0.0],
     ).result["action_id"]
     original = workspace.state.action_proposal
     workspace.begin_imagination("unreachable", action_id)
     workspace.execute_imagination(
-        "delta_move", delta_xyz_m=[0.01, 0.0, 0.0], frame="base"
+        "shift_preview", delta_xyz_m=[0.01, 0.0, 0.0], frame="base"
     )
 
     result = workspace.limit_imagination()
@@ -1523,7 +1581,7 @@ def test_imagination_limit_without_executable_plan_still_rolls_back() -> None:
     assert result.result["reason"] == "plan_unavailable"
     assert workspace.state.imagination is None
     assert workspace.state.action_proposal is original
-    assert not workspace.execute("commit", action_id=action_id).ok
+    assert not workspace.execute("execute_action", action_id=action_id).ok
 
 
 def test_refinement_cannot_implicitly_create_a_current_tcp_action() -> None:
@@ -1542,20 +1600,20 @@ def test_rotate_rejects_angle_outside_ten_degrees() -> None:
     start_pose = workspace.state.action_proposal.target.pose
 
     rejected = workspace.execute_imagination(
-        "rotate", axis="x", angle_deg=-90, frame="base"
+        "rotate_preview", axis="x", angle_deg=-90, frame="base"
     )
     assert not rejected.ok
     assert "10" in rejected.result["error"]
     assert workspace.state.action_proposal.target.pose == start_pose
 
     too_large = workspace.execute_imagination(
-        "rotate", axis="z", angle_deg=10.1, frame="base"
+        "rotate_preview", axis="z", angle_deg=10.1, frame="base"
     )
     assert not too_large.ok
     assert "10" in too_large.result["error"]
 
     accepted = workspace.execute_imagination(
-        "rotate", axis="z", angle_deg=-10, frame="base"
+        "rotate_preview", axis="z", angle_deg=-10, frame="base"
     )
     assert accepted.ok
     assert accepted.result["preview"] == "updated"
@@ -1566,11 +1624,11 @@ def test_gizmo_does_not_require_a_following_rotate() -> None:
     action_id = _selected_action(workspace)
     workspace.begin_imagination("inspect then translate", action_id)
     gizmo = workspace.execute_imagination(
-        "show_rotation_gizmo", frame="base", axis="z"
+        "inspect_rotation", frame="base", axis="z"
     )
     assert gizmo.ok
     moved = workspace.execute_imagination(
-        "delta_move", delta_xyz_m=[0.0, 0.0, 0.01], frame="base"
+        "shift_preview", delta_xyz_m=[0.0, 0.0, 0.01], frame="base"
     )
     assert moved.ok
     assert moved.result["preview"] == "updated"
@@ -1603,9 +1661,9 @@ def test_ready_without_executable_plan_is_plan_unavailable() -> None:
     )
     point_id = workspace.execute("locate_point", query="center").result["point_id"]
     action_id = workspace.execute(
-        "propose_pose",
+        "preview_pose",
         point_id=point_id,
-        offset_xyz=[0.0, 0.0, 0.0],
+        offset_xyz_m=[0.0, 0.0, 0.0],
     ).result["action_id"]
     workspace.begin_imagination("accept unreachable", action_id)
 
@@ -1618,25 +1676,25 @@ def test_ready_without_executable_plan_is_plan_unavailable() -> None:
 
 
 def test_unplannable_edit_keeps_the_last_executable_proposal() -> None:
-    # propose_pose consumes the first plan, the accepted edit the second.
+    # preview_pose consumes the first plan, the accepted edit the second.
     backend = PlanBudgetMotionBackend(successes=2)
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend=backend)
     point_id = workspace.execute("locate_point", query="center").result["point_id"]
     action_id = workspace.execute(
-        "propose_pose",
+        "preview_pose",
         point_id=point_id,
-        offset_xyz=[0.0, 0.0, 0.0],
+        offset_xyz_m=[0.0, 0.0, 0.0],
     ).result["action_id"]
     workspace.begin_imagination("lower onto the contact", action_id)
 
     accepted = workspace.execute_imagination(
-        "delta_move", delta_xyz_m=[0.0, 0.0, -0.02], frame="base"
+        "shift_preview", delta_xyz_m=[0.0, 0.0, -0.02], frame="base"
     )
     assert accepted.result["preview"] == "updated"
     reachable_target = workspace.state.action_proposal.target
 
     rejected = workspace.execute_imagination(
-        "delta_move", delta_xyz_m=[0.0, 0.0, -0.02], frame="base"
+        "shift_preview", delta_xyz_m=[0.0, 0.0, -0.02], frame="base"
     )
 
     # The transaction reports success: nothing was corrupted, the target simply
@@ -1659,22 +1717,22 @@ def test_unplannable_edit_does_not_become_the_next_edit_reference() -> None:
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend=backend)
     point_id = workspace.execute("locate_point", query="center").result["point_id"]
     action_id = workspace.execute(
-        "propose_pose",
+        "preview_pose",
         point_id=point_id,
-        offset_xyz=[0.0, 0.0, 0.0],
+        offset_xyz_m=[0.0, 0.0, 0.0],
     ).result["action_id"]
     workspace.begin_imagination("rotate into the opening", action_id)
     entry_target = workspace.state.action_proposal.target
 
     assert (
         workspace.execute_imagination(
-            "rotate", axis="z", angle_deg=8.0, frame="base"
+            "rotate_preview", axis="z", angle_deg=8.0, frame="base"
         ).result["preview"]
         == "unchanged"
     )
     assert (
         workspace.execute_imagination(
-            "rotate", axis="z", angle_deg=8.0, frame="base"
+            "rotate_preview", axis="z", angle_deg=8.0, frame="base"
         ).result["preview"]
         == "unchanged"
     )
@@ -1690,8 +1748,56 @@ def test_imagination_attempts_clear_when_the_revision_advances() -> None:
     workspace.execute_imagination("finish_imagination", status="failed")
     assert workspace.state.imagination_attempts.summary()["failed"] == 1
 
-    assert workspace.execute("commit", action_id=action_id).ok
+    assert workspace.execute("execute_action", action_id=action_id).ok
 
     assert workspace.state.imagination_attempts.summary() is None
     packet = ContextCompiler().compile(workspace)
     assert "imagination_attempts" not in packet.manifest()
+
+
+def test_imagination_seeds_from_current_tcp_when_no_action_exists() -> None:
+    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
+    start = workspace.state.robot.tcp_pose
+    assert start is not None
+    assert workspace.state.action_proposal is None
+
+    action_id = workspace.begin_imagination("向上 1cm")
+    action = workspace.state.action_proposal
+    assert action is not None
+    assert action.action_id == action_id
+    assert action.intent == "refine from current TCP"
+    assert action.target.pose.position_xyz == start.position_xyz
+
+    workspace.execute_imagination(
+        "shift_preview", delta_xyz_m=[0.0, 0.0, 0.01], frame="base"
+    )
+    assert workspace.state.action_proposal.target.pose.position_xyz[2] == pytest.approx(
+        start.position_xyz[2] + 0.01
+    )
+
+
+def test_omitted_action_id_reuses_the_live_proposal() -> None:
+    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
+    existing = _selected_action(workspace)
+    resolved = workspace.begin_imagination("检查当前候选")
+    assert resolved == existing
+    assert workspace.state.action_proposal.action_id == existing
+
+
+def test_source_follow_through_marks_stationary_after_a_lift() -> None:
+    workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
+    workspace.execute("detect_region", query="can")
+    workspace.execute("close_gripper")
+    assert workspace._private.grasp_follow_through is not None
+    assert workspace._private.grasp_follow_through.status == "unknown"
+
+    workspace.execute("move_tcp_delta", delta_xyz_m=[0.0, 0.0, 0.03], frame="base")
+    follow = workspace._private.grasp_follow_through
+    assert follow is not None
+    assert follow.status == "stationary"
+    packet = ContextCompiler().compile(workspace)
+    assert packet.world.source_follow_through == {"status": "stationary", "query": "can"}
+    assert packet.manifest()["source_follow_through"]["status"] == "stationary"
+
+    workspace.execute("open_gripper")
+    assert workspace._private.grasp_follow_through is None

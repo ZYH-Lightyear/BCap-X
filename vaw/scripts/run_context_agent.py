@@ -39,16 +39,18 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--server-url", default="http://127.0.0.1:8110/chat/completions")
     parser.add_argument("--api-key", default=os.environ.get("V_API_KEY"))
-    parser.add_argument("--protocol", choices=("native", "text"), default="text")
+    parser.add_argument(
+        "--protocol",
+        choices=("native", "text"),
+        default="native",
+        help=(
+            "native 将标准 tools 交给服务端按模型 chat template 编译；"
+            "text 仅用于不支持工具通道的显式回退"
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=4096)
-    parser.add_argument(
-        "--max-turns",
-        type=int,
-        choices=range(1, 65),
-        default=32,
-        metavar="1..64",
-    )
+    parser.add_argument("--max-turns", type=int, default=32)
     parser.add_argument("--max-time-s", type=float, default=1800.0)
     parser.add_argument("--max-physical-ops", type=int, default=30)
     parser.add_argument("--max-imagination-turns", type=int, default=6)
@@ -90,18 +92,6 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--trace-dir", type=pathlib.Path, default=None)
-    parser.add_argument(
-        "--playbook-dir",
-        type=pathlib.Path,
-        default=None,
-        help="phase-indexed playbook directory (default: vaw/playbooks)",
-    )
-    parser.add_argument(
-        "--playbook-injection",
-        choices=("all", "phase"),
-        default="all",
-        help="gen-0 uses all; phase gating is reserved for later ablation",
-    )
     parser.add_argument("--object-query", default="the alphabet soup can")
     parser.add_argument("--point-query", default="the center of the alphabet soup can")
     parser.add_argument(
@@ -266,6 +256,7 @@ def _run_agent(
     from vaw.context_runtime.packet import ContextCompiler
     from vaw.context_runtime.runtime import ContextRunConfig, ContextRuntime
     from vaw.context_runtime.workspace import ContextWorkspace
+    from vaw.observatory.media import ActionMediaRecorder
 
     def make_provider(model: str) -> Any:
         provider: Any = OpenAIProvider(
@@ -306,8 +297,6 @@ def _run_agent(
         renderer,
         imagination_provider=imagination_provider,
         compiler=ContextCompiler(preview_gripper_style=args.preview_gripper),
-        playbook_dir=str(args.playbook_dir) if args.playbook_dir is not None else None,
-        playbook_injection=args.playbook_injection,
         config=ContextRunConfig(
             max_main_turns=args.max_turns,
             max_imagination_turns=args.max_imagination_turns,
@@ -316,6 +305,11 @@ def _run_agent(
             on_turn=on_turn,
         ),
         trace=trace,
+        action_media_recorder=(
+            ActionMediaRecorder(env, trace, fps=args.video_fps)
+            if args.record_video
+            else None
+        ),
         env_check=env.task_completed,
         env_terminal_check=lambda: bool(getattr(env, "_current_done", False)),
     )
@@ -345,6 +339,7 @@ def _run_scripted(
     preview_gripper_style: str = "fk-mesh",
 ) -> int:
     from vaw.context_runtime.packet import CONTEXT_SCHEMA, ContextCompiler
+    from vaw.context_runtime.protocol import main_function_registry
     from vaw.context_runtime.workspace import ContextWorkspace
 
     workspace = ContextWorkspace(
@@ -368,6 +363,7 @@ def _run_scripted(
         }
     )
     turn = 0
+    function_registry = main_function_registry()
 
     def step(name: str, *, trace_owner: str = "main", **arguments: Any) -> dict[str, Any]:
         nonlocal turn
@@ -382,9 +378,10 @@ def _run_scripted(
             if trace_owner == "imagination"
             else workspace.execute(name, **arguments)
         )
+        spec = function_registry.get(name) if trace_owner == "main" else None
         env_success = (
             bool(env.task_completed())
-            if trace_owner == "main" and name in workspace.PHYSICAL_FUNCTIONS
+            if spec is not None and spec.world_effect == "physical"
             else None
         )
         trace.log_turn(
@@ -406,12 +403,12 @@ def _run_scripted(
         return result.result
 
     step("open_gripper")
-    region_id = step("detection_and_sam", query=object_query)["region_id"]
+    region_id = step("detect_region", query=object_query)["region_id"]
     step("locate_point", query=point_query, within_region_id=region_id)
     seed_ids = step("propose_grasps", region_id=region_id)["seed_ids"]
     if not seed_ids:
         raise RuntimeError("scripted smoke received no grasp candidates")
-    action_id = step("select", seed_id=seed_ids[0])["action_id"]
+    action_id = step("preview_grasp", seed_id=seed_ids[0])["action_id"]
     workspace.begin_imagination(
         f"使两指围绕 {object_query} 形成可审查的对称接触几何",
         action_id,
@@ -433,9 +430,9 @@ def _run_scripted(
     action_id = step(
         "finish_imagination", trace_owner="imagination", status="ready"
     )["action_id"]
-    step("commit", action_id=action_id)
+    step("execute_action", action_id=action_id)
     step("close_gripper")
-    step("done", success=False)
+    step("finish_task", success=False)
 
     final_packet = compiler.compile(workspace)
     final_image = renderer.render(final_packet)

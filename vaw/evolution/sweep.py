@@ -25,7 +25,6 @@ def sweep_jobs(
     *,
     tasks: tuple[int, ...] = DEFAULT_TASKS,
     seeds: tuple[int, ...] = DEFAULT_SEEDS,
-    playbook_dir: str | None = None,
 ) -> list[dict[str, Any]]:
     jobs = []
     for task_id in tasks:
@@ -34,7 +33,6 @@ def sweep_jobs(
                 {
                     "task_id": task_id,
                     "seed": seed,
-                    "playbook_dir": playbook_dir,
                 }
             )
     return jobs
@@ -119,13 +117,9 @@ def run_episode(job: dict[str, Any]) -> dict[str, Any]:
         str(job["max_physical_ops"]),
         "--motion-backend",
         str(job["motion_backend"]),
-        "--playbook-injection",
-        str(job["playbook_injection"]),
         "--trace-dir",
         str(run_dir),
     ]
-    if job.get("playbook_dir"):
-        command.extend(["--playbook-dir", str(job["playbook_dir"])])
     if job.get("record_video"):
         command.append("--record-video")
     else:
@@ -249,7 +243,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default="vapi/claude-opus-5")
     parser.add_argument("--imagination-model", default=None)
     parser.add_argument("--server-url", default="http://127.0.0.1:8110/chat/completions")
-    parser.add_argument("--protocol", default="text")
+    parser.add_argument("--protocol", choices=("native", "text"), default="native")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--max-turns", type=int, default=32)
@@ -257,8 +251,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-time-s", type=float, default=3600.0)
     parser.add_argument("--max-physical-ops", type=int, default=30)
     parser.add_argument("--motion-backend", default="curobo")
-    parser.add_argument("--playbook-dir", default=None)
-    parser.add_argument("--playbook-injection", choices=("all", "phase"), default="all")
     parser.add_argument(
         "--workers",
         type=int,
@@ -282,7 +274,6 @@ def main(argv: list[str] | None = None) -> int:
     for spec in sweep_jobs(
         tasks=_parse_int_list(args.tasks),
         seeds=_parse_int_list(args.seeds),
-        playbook_dir=args.playbook_dir,
     ):
         jobs.append(
             {
@@ -301,7 +292,6 @@ def main(argv: list[str] | None = None) -> int:
                 "max_time_s": args.max_time_s,
                 "max_physical_ops": args.max_physical_ops,
                 "motion_backend": args.motion_backend,
-                "playbook_injection": args.playbook_injection,
                 "resume": args.resume,
                 "record_video": args.record_video,
             }

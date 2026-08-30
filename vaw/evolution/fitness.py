@@ -6,7 +6,7 @@ import json
 import pathlib
 from typing import Any
 
-from vaw.context_runtime.trace_read import load_run
+from vaw.context_runtime.trace_read import canonical_trace_function, load_run
 
 PHASES = ("reach", "grasp", "transport", "place")
 F4_SELECT_STREAK = 3
@@ -70,7 +70,7 @@ def _calls(record: dict[str, Any]) -> dict[str, Any]:
     call = record.get("function_call") or {}
     result = record.get("function_result") or {}
     return {
-        "name": call.get("name"),
+        "name": canonical_trace_function(call.get("name"), owner="main"),
         "arguments": call.get("arguments") if isinstance(call.get("arguments"), dict) else {},
         "result": result if isinstance(result, dict) else {},
         "revision_before": record.get("revision_before"),
@@ -106,7 +106,7 @@ def _physical_ops(records: list[dict[str, Any]]) -> int:
 
 def _reach(calls: list[dict[str, Any]]) -> bool:
     for item in calls:
-        if item["name"] != "commit":
+        if item["name"] != "execute_action":
             continue
         result = item["result"]
         if result.get("error"):
@@ -130,7 +130,7 @@ def _grasp(calls: list[dict[str, Any]], records: list[dict[str, Any]]) -> bool:
     lifted = False
     source_removed = False
     for item in calls[close_at:]:
-        if item["name"] == "delta_move":
+        if item["name"] == "move_tcp_delta":
             delta = item["arguments"].get("delta_xyz_m") or [0, 0, 0]
             if isinstance(delta, list) and len(delta) == 3:
                 try:
@@ -165,7 +165,7 @@ def _transport(calls: list[dict[str, Any]], grasp: bool) -> bool:
             break
     window = calls[close_at + 1 : open_at]
     for item in window:
-        if item["name"] in {"locate_point", "propose_pose", "commit"}:
+        if item["name"] in {"locate_point", "preview_pose", "execute_action"}:
             blob = " ".join(
                 [
                     str(item["arguments"].get("query") or ""),
@@ -173,7 +173,7 @@ def _transport(calls: list[dict[str, Any]], grasp: bool) -> bool:
                     str((item["result"] or {}).get("action_id") or ""),
                 ]
             ).lower()
-            if item["name"] in {"propose_pose", "commit"} or any(
+            if item["name"] in {"preview_pose", "execute_action"} or any(
                 token in blob for token in _CONTAINER_TOKENS
             ):
                 return True
@@ -198,13 +198,13 @@ def _labels(
         labels.append("F1")
     if _phantom_empty(calls):
         labels.append("F2")
-    delta_count = _tool_histogram(calls).get("delta_move", 0)
+    delta_count = _tool_histogram(calls).get("move_tcp_delta", 0)
     turns_n = max(1, len(calls))
     if delta_count / turns_n >= F3_DELTA_FRACTION:
         labels.append("F3")
     if _imagination_discarded(calls):
         labels.append("F5")
-    if not reach and "F4" not in labels and _has_function(calls, "select"):
+    if not reach and "F4" not in labels and _has_function(calls, "preview_grasp"):
         labels.append("F4")
     return labels
 
@@ -212,7 +212,7 @@ def _labels(
 def _select_error_streak(calls: list[dict[str, Any]]) -> int:
     longest = current = 0
     for item in calls:
-        failed_select = item["name"] == "select" and (
+        failed_select = item["name"] == "preview_grasp" and (
             item["result"].get("solve_ik") == "error"
             or item["result"].get("preview") == "unchanged"
         )
@@ -232,7 +232,7 @@ def _aligned_never_releases(calls: list[dict[str, Any]], *, grasp: bool) -> bool
         return False
     descend = 0
     for item in calls[close_at + 1 :]:
-        if item["name"] != "delta_move":
+        if item["name"] != "move_tcp_delta":
             continue
         delta = item["arguments"].get("delta_xyz_m") or [0, 0, 0]
         if isinstance(delta, list) and len(delta) == 3:
@@ -253,7 +253,7 @@ def _phantom_empty(calls: list[dict[str, Any]]) -> bool:
         if item["name"] == "open_gripper":
             opened = True
             continue
-        if item["name"] != "detection_and_sam" or opened:
+        if item["name"] != "detect_region" or opened:
             continue
         query = str(item["arguments"].get("query") or "").lower()
         if any(token in query for token in _CONTAINER_TOKENS):
@@ -264,7 +264,7 @@ def _phantom_empty(calls: list[dict[str, Any]]) -> bool:
 
 def _imagination_discarded(calls: list[dict[str, Any]]) -> bool:
     for index, item in enumerate(calls):
-        if item["name"] != "call_imagination":
+        if item["name"] != "imagine_action":
             continue
         status = item["result"].get("status")
         if status not in {"ready", "partial"}:
@@ -273,7 +273,7 @@ def _imagination_discarded(calls: list[dict[str, Any]]) -> bool:
         if index + 1 >= len(calls):
             return True
         nxt = calls[index + 1]
-        if nxt["name"] == "commit" and nxt["arguments"].get("action_id") == action_id:
+        if nxt["name"] == "execute_action" and nxt["arguments"].get("action_id") == action_id:
             continue
         return True
     return False

@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="zh-CN" data-resolution="landscape">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1920, height=1080" />
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <style>
+      :root {
+        --bg: #071018;
+        --panel: #0e1a24;
+        --fg: #e8f0f5;
+        --muted: #91a4b2;
+        --accent: #35b8d0;
+        --advance: #38c786;
+        --regress: #f05d5e;
+        --unknown: #e3b341;
+      }
+
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      html,
+      body {
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: "IBM Plex Sans", sans-serif;
+      }
+
+      .clip {
+        position: absolute;
+      }
+
+      #root {
+        position: relative;
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        background: var(--bg);
+      }
+
+      #video-stage {
+        position: absolute;
+        inset: 0 auto auto 0;
+        width: 1280px;
+        height: 820px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        background: #03080d;
+        border-right: 2px solid #1b3544;
+      }
+
+      #agent-video {
+        position: relative;
+        width: 1280px;
+        height: 820px;
+        object-fit: contain;
+        background: #03080d;
+      }
+
+      #run-panel {
+        position: absolute;
+        top: 0;
+        right: 0;
+        width: 640px;
+        height: 820px;
+        padding: 52px 52px 42px;
+        display: flex;
+        flex-direction: column;
+        gap: 26px;
+        background: var(--panel);
+      }
+
+      .eyebrow {
+        color: var(--accent);
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 21px;
+        font-weight: 600;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      #task-text {
+        max-width: 530px;
+        color: var(--fg);
+        font-size: 35px;
+        font-weight: 700;
+        line-height: 1.24;
+        letter-spacing: -0.025em;
+      }
+
+      .rule {
+        width: 100%;
+        height: 2px;
+        transform-origin: left center;
+        background: #244252;
+      }
+
+      #score-stage {
+        position: relative;
+        flex: 1;
+        min-height: 0;
+      }
+
+      .score-card {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 18px;
+        opacity: 0;
+      }
+
+      .score-card.initial {
+        opacity: 1;
+      }
+
+      .score-function {
+        color: var(--muted);
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 24px;
+        line-height: 1.35;
+      }
+
+      .score-number {
+        color: var(--fg);
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 104px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: -0.065em;
+        line-height: 1;
+      }
+
+      .score-number span {
+        color: var(--muted);
+        font-size: 38px;
+        font-weight: 400;
+        letter-spacing: 0;
+      }
+
+      .score-dynamics {
+        display: flex;
+        gap: 30px;
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 24px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .score-dynamics .positive {
+        color: var(--advance);
+      }
+
+      .score-dynamics .negative {
+        color: var(--regress);
+      }
+
+      .score-dynamics .neutral {
+        color: var(--muted);
+      }
+
+      .level-chip {
+        align-self: flex-start;
+        padding: 9px 15px;
+        border: 2px solid var(--accent);
+        border-radius: 3px;
+        color: var(--accent);
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 21px;
+        font-weight: 600;
+      }
+
+      #chart-panel {
+        position: absolute;
+        inset: auto 0 0;
+        width: 1920px;
+        height: 260px;
+        padding: 22px 54px 26px;
+        background: #09141d;
+        border-top: 2px solid #1b3544;
+      }
+
+      #chart-header {
+        height: 38px;
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+      }
+
+      #chart-title {
+        color: var(--fg);
+        font-size: 25px;
+        font-weight: 700;
+        letter-spacing: -0.01em;
+      }
+
+      #chart-note {
+        color: var(--muted);
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 18px;
+      }
+
+      #progress-svg {
+        width: 1812px;
+        height: 174px;
+        overflow: visible;
+      }
+
+      .axis-label {
+        fill: var(--muted);
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 17px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .axis-rule {
+        stroke: #29414f;
+        stroke-width: 2;
+      }
+
+      .score-segment {
+        fill: none;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 6;
+      }
+
+      .score-point {
+        stroke: #09141d;
+        stroke-width: 4;
+      }
+
+      #playhead {
+        stroke: var(--accent);
+        stroke-width: 3;
+        opacity: 0.8;
+      }
+    </style>
+  </head>
+  <body>
+    <div
+      id="root"
+      data-composition-id="main"
+      data-start="0"
+      data-duration="__DURATION__"
+      data-width="1920"
+      data-height="1080"
+    >
+      <div id="video-stage">
+        <video
+          id="agent-video"
+          class="clip"
+          data-start="0"
+          data-duration="__DURATION__"
+          data-track-index="0"
+          src="agentview.mp4"
+          muted
+          playsinline
+        ></video>
+      </div>
+
+      <aside id="run-panel">
+        <div class="eyebrow">VAW · Progress Critic</div>
+        <div id="task-text"></div>
+        <div class="rule"></div>
+        <div id="score-stage"></div>
+      </aside>
+
+      <section id="chart-panel">
+        <div id="chart-header">
+          <div id="chart-title">ABSOLUTE TASK PROGRESS</div>
+          <div id="chart-note">score revealed only after AFTER evidence</div>
+        </div>
+        <svg id="progress-svg" viewBox="0 0 1812 174" aria-label="task progress curve">
+          <line class="axis-rule" x1="64" y1="10" x2="64" y2="154"></line>
+          <line class="axis-rule" x1="64" y1="154" x2="1792" y2="154"></line>
+          <text class="axis-label" x="0" y="18">100%</text>
+          <text class="axis-label" x="10" y="88">50%</text>
+          <text class="axis-label" x="20" y="158">0%</text>
+          <g id="curve-layer"></g>
+          <line id="playhead" x1="64" y1="8" x2="64" y2="158"></line>
+        </svg>
+      </section>
+    </div>
+
+    <script>
+      const DATA = __PROGRESS_DATA__;
+      const NS = "http://www.w3.org/2000/svg";
+      const chart = { left: 64, right: 1792, top: 10, bottom: 154 };
+      const duration = DATA.duration_s;
+      const rootStyles = getComputedStyle(document.documentElement);
+      const colors = {
+        advance: rootStyles.getPropertyValue("--advance").trim(),
+        regress: rootStyles.getPropertyValue("--regress").trim(),
+        neutral: rootStyles.getPropertyValue("--muted").trim(),
+        unknown: rootStyles.getPropertyValue("--unknown").trim(),
+        accent: rootStyles.getPropertyValue("--accent").trim(),
+      };
+
+      const xFor = (time) => chart.left + (Math.max(0, Math.min(duration, time)) / duration) * (chart.right - chart.left);
+      const yFor = (score) => chart.bottom - Math.max(0, Math.min(1, score)) * (chart.bottom - chart.top);
+      const tone = (delta) => delta == null ? "neutral" : delta > 0.025 ? "advance" : delta < -0.025 ? "regress" : "neutral";
+      const signed = (value) => value == null ? "—" : `${value >= 0 ? "+" : ""}${Math.round(value * 100)}%`;
+
+      document.getElementById("task-text").textContent = DATA.task;
+      const scoreStage = document.getElementById("score-stage");
+      const curveLayer = document.getElementById("curve-layer");
+
+      DATA.states.forEach((state, index) => {
+        const card = document.createElement("div");
+        card.id = `score-card-${index}`;
+        card.className = `score-card${index === 0 ? " initial" : ""}`;
+        const deltaTone = tone(state.delta);
+        card.innerHTML = `
+          <div class="score-function">${state.turn === 0 ? "INITIAL STATE" : `TURN ${state.turn} · ${state.function}`}</div>
+          <div class="score-number">${state.progress == null ? "—" : Math.round(state.progress * 100)}<span>%</span></div>
+          <div class="score-dynamics">
+            <span class="${deltaTone === "advance" ? "positive" : deltaTone === "regress" ? "negative" : "neutral"}">Δ ${signed(state.delta)}</span>
+            <span class="neutral">A ${signed(state.acceleration)}</span>
+          </div>
+          <div class="level-chip">LEVEL ${state.level || "?"}</div>
+        `;
+        scoreStage.appendChild(card);
+      });
+
+      const validStates = DATA.states.filter((state) => typeof state.progress === "number");
+      validStates.forEach((state, index) => {
+        const point = document.createElementNS(NS, "circle");
+        point.id = `score-point-${state.state_index}`;
+        point.classList.add("score-point");
+        point.setAttribute("cx", xFor(state.time_s));
+        point.setAttribute("cy", yFor(state.progress));
+        point.setAttribute("r", index === 0 ? "8" : "9");
+        point.setAttribute("fill", index === 0 ? colors.accent : colors[tone(state.delta)]);
+        point.style.opacity = index === 0 ? "1" : "0";
+        curveLayer.appendChild(point);
+
+        if (index === 0) return;
+        const previous = validStates[index - 1];
+        const path = document.createElementNS(NS, "path");
+        path.id = `score-segment-${state.state_index}`;
+        path.classList.add("score-segment");
+        path.setAttribute(
+          "d",
+          `M ${xFor(previous.time_s)} ${yFor(previous.progress)} L ${xFor(state.time_s)} ${yFor(state.progress)}`,
+        );
+        path.setAttribute("stroke", colors[tone(state.delta)]);
+        curveLayer.insertBefore(path, point);
+        const length = path.getTotalLength();
+        path.style.strokeDasharray = `${length}`;
+        path.style.strokeDashoffset = `${length}`;
+      });
+
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true });
+      tl.from("#video-stage", { opacity: 0, scale: 0.992, duration: 0.42, ease: "power3.out" }, 0.15);
+      tl.from("#run-panel", { opacity: 0, x: 24, duration: 0.48, ease: "expo.out" }, 0.2);
+      tl.from("#chart-panel", { opacity: 0, y: 18, duration: 0.36, ease: "sine.out" }, 0.27);
+      tl.from(".rule", { scaleX: 0, duration: 0.55, ease: "power4.out" }, 0.34);
+      tl.fromTo(
+        "#playhead",
+        { attr: { x1: chart.left, x2: chart.left } },
+        { attr: { x1: chart.right, x2: chart.right }, duration: Math.max(0.1, duration - 0.1), ease: "none" },
+        0.1,
+      );
+
+      let previousCard = "#score-card-0";
+      validStates.slice(1).forEach((state) => {
+        const revealAt = Math.max(0.5, state.time_s - 0.18);
+        const path = `#score-segment-${state.state_index}`;
+        const point = `#score-point-${state.state_index}`;
+        const card = `#score-card-${state.state_index}`;
+        tl.to(path, { strokeDashoffset: 0, duration: 0.18, ease: "power2.out" }, revealAt);
+        tl.to(point, { opacity: 1, scale: 1, duration: 0.16, ease: "back.out(1.4)" }, state.time_s - 0.02);
+        tl.set(previousCard, { opacity: 0 }, state.time_s);
+        tl.set(card, { opacity: 1 }, state.time_s);
+        previousCard = card;
+      });
+      window.__timelines["main"] = tl;
+    </script>
+  </body>
+</html>

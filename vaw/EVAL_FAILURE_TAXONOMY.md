@@ -1,8 +1,7 @@
 # VAW 评测失败分类（m16y / m16z / m17a）
 
 > 状态：C2 需求文档（2026-08-23）
-> 取代 [`M1_6_RSI_READINESS_PLAN.md`](M1_6_RSI_READINESS_PLAN.md) §1 的过期诊断
-> （「至今没有一条 trace 进入 Imagination」）。该问题已解决：m16z 六个成功中四个
+> 取代早期“没有 trace 进入 Imagination”的过期诊断。该问题已解决：m16z 六个成功中四个
 > 使用了 `call_imagination`，且下一轮即 `commit` 同一 `action_id`。
 >
 > 数据：`out/libero_pro_object_eval/`，suite `libero_object_swap`，

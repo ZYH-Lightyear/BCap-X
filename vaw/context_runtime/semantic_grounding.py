@@ -32,30 +32,26 @@ def candidate_prompt(
 ) -> str:
     target = " ".join(str(query).split())
     coordinate_instruction = (
-        "using 0-1000 normalized coordinates"
+        "坐标使用 0 到 1000 的归一化数值"
         if coord_space == "norm1000"
-        else f"using real pixel coordinates for a width={width}, height={height} image"
+        else f"坐标使用图像真实像素，图像宽度={width}、高度={height}"
     )
     return (
-        f"Find up to three distinct plausible candidates for the exact semantic target "
-        f"'{target}'. Compare visible attributes and relations; include competing "
-        "same-category objects instead of silently choosing the nearest or largest one. "
-        "Reply only as a JSON array "
-        '[{"box":[x1,y1,x2,y2],"evidence":"visible cue"}] '
-        f"{coordinate_instruction}, best candidate first. Return [] if none are visible."
+        f"请为精确语义目标“{target}”找出最多三个彼此不同的合理候选。比较可见属性与场景关系；"
+        "如果存在同类别竞争物体，也要保留为候选，不能直接选择最近或最大的物体。"
+        "只返回 JSON 数组："
+        '[{"box":[x1,y1,x2,y2],"evidence":"可见依据"}]。'
+        f"{coordinate_instruction}；最可信候选排在最前面。没有可见候选时返回 []。"
     )
 
 
 def review_prompt(query: str) -> str:
     target = " ".join(str(query).split())
     return (
-        f"The numbered cards are candidate regions for the exact semantic target "
-        f"'{target}'. The image contains the full scene and enlarged candidate crops. "
-        "Inspect the actual pixels in every crop and compare visible semantic attributes "
-        "and scene relations. Choose the single candidate that exactly matches; do not "
-        "accept a generic same-category object. If the target is not identifiable or the "
-        'candidates remain ambiguous, use null. Reply only JSON {"candidate":1} or '
-        '{"candidate":null}.'
+        f"编号卡片是精确语义目标“{target}”的候选区域。图像同时包含完整场景与放大的候选裁剪图。"
+        "请检查每张裁剪图的真实像素，并比较可见语义属性与场景关系。只选择一个完全匹配的候选，"
+        "不能接受仅类别相同的普通物体。若目标无法辨认或候选仍有歧义，使用 null。"
+        '只返回 JSON：{"candidate":1} 或 {"candidate":null}。'
     )
 
 
@@ -146,7 +142,7 @@ def render_candidate_review(
     review = Image.new("RGB", (1200, 720), "white")
     review.paste(scene, (0, 104))
     draw = ImageDraw.Draw(review)
-    draw.text((20, 64), "FULL SCENE", fill="#111827", font=font)
+    draw.text((20, 64), "完整场景", fill="#111827", font=font)
     card_height = 720 // max(1, len(candidates))
     for index, candidate in enumerate(candidates):
         x1, y1, x2, y2 = candidate.box_xyxy_px
@@ -165,7 +161,7 @@ def render_candidate_review(
         draw.rectangle((800, top, 1199, top + card_height - 1), outline=colors[index], width=5)
         draw.text(
             (816, top + 10),
-            f"CANDIDATE {index + 1}",
+            f"候选 {index + 1}",
             fill=colors[index],
             font=font,
         )

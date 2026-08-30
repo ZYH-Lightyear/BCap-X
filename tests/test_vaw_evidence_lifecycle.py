@@ -7,7 +7,7 @@ import pytest
 
 from tests.test_vaw_context_runtime import FakeContextApi
 from vaw.context_runtime import evidence as evidence_module
-from vaw.context_runtime.memory import project_function_event
+from vaw.context_runtime.memory import interaction_outcome
 from vaw.context_runtime.packet import ContextCompiler
 from vaw.context_runtime.workspace import ContextWorkspace
 
@@ -30,7 +30,7 @@ def _workspace(api: FakeContextApi | None = None) -> ContextWorkspace:
 def test_evidence_survives_a_physical_action_when_the_scene_is_unchanged() -> None:
     api = FakeContextApi()
     workspace = _workspace(api)
-    region_id = workspace.execute("detection_and_sam", query="basket").result["region_id"]
+    region_id = workspace.execute("detect_region", query="basket").result["region_id"]
     point_id = workspace.execute(
         "locate_point", query="basket opening", within_region_id=region_id
     ).result["point_id"]
@@ -56,7 +56,7 @@ def test_evidence_survives_a_physical_action_when_the_scene_is_unchanged() -> No
 def test_verified_grounding_is_reused_instead_of_regrounded() -> None:
     api = FakeContextApi()
     workspace = _workspace(api)
-    region_id = workspace.execute("detection_and_sam", query="basket").result["region_id"]
+    region_id = workspace.execute("detect_region", query="basket").result["region_id"]
     point_id = workspace.execute(
         "locate_point", query="basket opening", within_region_id=region_id
     ).result["point_id"]
@@ -66,7 +66,7 @@ def test_verified_grounding_is_reused_instead_of_regrounded() -> None:
     located = workspace.execute(
         "locate_point", query="basket opening", within_region_id=region_id
     )
-    detected = workspace.execute("detection_and_sam", query="basket")
+    detected = workspace.execute("detect_region", query="basket")
 
     assert located.result["point_id"] == point_id
     assert located.result["reused"] is True
@@ -77,7 +77,7 @@ def test_verified_grounding_is_reused_instead_of_regrounded() -> None:
 def test_moved_object_is_dropped_and_its_points_cascade() -> None:
     api = FakeContextApi()
     workspace = _workspace(api)
-    region_id = workspace.execute("detection_and_sam", query="can").result["region_id"]
+    region_id = workspace.execute("detect_region", query="can").result["region_id"]
     point_id = workspace.execute(
         "locate_point", query="can top", within_region_id=region_id
     ).result["point_id"]
@@ -102,7 +102,7 @@ def test_moved_object_is_dropped_and_its_points_cascade() -> None:
 def test_occluded_evidence_is_kept_flagged_and_not_reused() -> None:
     api = FakeContextApi()
     workspace = _workspace(api)
-    region_id = workspace.execute("detection_and_sam", query="basket").result["region_id"]
+    region_id = workspace.execute("detect_region", query="basket").result["region_id"]
     point_id = workspace.execute("locate_point", query="basket opening").result["point_id"]
 
     # A closer surface moved in front of the archived one: presence is
@@ -133,7 +133,7 @@ def test_occluded_evidence_is_kept_flagged_and_not_reused() -> None:
 def test_occluded_evidence_recovers_once_the_view_clears() -> None:
     api = FakeContextApi()
     workspace = _workspace(api)
-    region_id = workspace.execute("detection_and_sam", query="basket").result["region_id"]
+    region_id = workspace.execute("detect_region", query="basket").result["region_id"]
 
     original_depth = api.depth.copy()
     api.depth = api.depth - 0.3
@@ -148,27 +148,42 @@ def test_occluded_evidence_recovers_once_the_view_clears() -> None:
     assert region_id in result.result["world_changes"]["verified"]
 
 
-def test_commit_retires_its_grasp_target_but_keeps_bystanders() -> None:
+def test_commit_revalidates_grasp_source_instead_of_force_dropping_it() -> None:
     api = FakeContextApi()
     workspace = _workspace(api)
-    grasp_region = workspace.execute("detection_and_sam", query="can").result["region_id"]
-    bystander = workspace.execute("detection_and_sam", query="basket").result["region_id"]
+    grasp_region = workspace.execute("detect_region", query="can").result["region_id"]
+    bystander = workspace.execute("detect_region", query="basket").result["region_id"]
     seed = workspace.execute("propose_grasps", region_id=grasp_region).result["seed_ids"][0]
-    action_id = workspace.execute("select", seed_id=seed).result["action_id"]
+    action_id = workspace.execute("preview_grasp", seed_id=seed).result["action_id"]
 
-    result = workspace.execute("commit", action_id=action_id)
+    result = workspace.execute("execute_action", action_id=action_id)
 
     assert result.ok
-    # The contact target is retired by the action itself, without a pixel
-    # vote; the untouched bystander survives verified.
-    assert grasp_region not in workspace.state.regions
+    # Approach is not contact: an unchanged scene keeps both the grasp
+    # source and the bystander after the pixel vote.
+    assert workspace.state.regions[grasp_region].status == "verified"
     assert workspace.state.regions[bystander].status == "verified"
     changes = result.result["world_changes"]
-    assert f"{grasp_region}(can)" in changes["removed"]
-    assert bystander in changes["verified"]
+    assert "removed" not in changes
+    assert set(changes["verified"]) == {grasp_region, bystander}
+
+
+def test_commit_drops_grasp_source_only_when_the_surface_actually_changed() -> None:
+    api = FakeContextApi()
+    workspace = _workspace(api)
+    grasp_region = workspace.execute("detect_region", query="can").result["region_id"]
+    seed = workspace.execute("propose_grasps", region_id=grasp_region).result["seed_ids"][0]
+    action_id = workspace.execute("preview_grasp", seed_id=seed).result["action_id"]
+
+    api.depth = api.depth + 0.3
+    result = workspace.execute("execute_action", action_id=action_id)
+
+    assert result.ok
+    assert grasp_region not in workspace.state.regions
+    assert f"{grasp_region}(can)" in result.result["world_changes"]["removed"]
     report = workspace.last_evidence_report
     reasons = {item["id"]: item["reason"] for item in report["removed"]}
-    assert reasons[grasp_region] == "action_target"
+    assert reasons[grasp_region] == "changed"
 
 
 def test_repeated_gripper_closures_surface_an_advisory() -> None:
@@ -182,17 +197,17 @@ def test_repeated_gripper_closures_surface_an_advisory() -> None:
     assert workspace.state.gripper_close_count == 2
     assert "close_gripper attempt #2" in second.result["advisory"]
 
-    event = project_function_event("close_gripper", second.result)
-    assert event.status == "ok"
-    assert "close_gripper attempt #2" in event.message
+    outcome = interaction_outcome(second.result, physical_outcome="completed")
+    assert outcome.startswith("completed")
+    assert "close_gripper attempt #2" in outcome
 
 
 def test_repeated_descent_does_not_inject_a_strategy_advisory() -> None:
     workspace = _workspace()
 
-    first = workspace.execute("delta_move", delta_xyz_m=[0.0, 0.0, -0.01], frame="base")
-    second = workspace.execute("delta_move", delta_xyz_m=[0.0, 0.0, -0.01], frame="base")
-    third = workspace.execute("delta_move", delta_xyz_m=[0.0, 0.0, -0.01], frame="base")
+    first = workspace.execute("move_tcp_delta", delta_xyz_m=[0.0, 0.0, -0.01], frame="base")
+    second = workspace.execute("move_tcp_delta", delta_xyz_m=[0.0, 0.0, -0.01], frame="base")
+    third = workspace.execute("move_tcp_delta", delta_xyz_m=[0.0, 0.0, -0.01], frame="base")
 
     assert first.ok and second.ok and third.ok
     assert "advisory" not in first.result
@@ -200,9 +215,9 @@ def test_repeated_descent_does_not_inject_a_strategy_advisory() -> None:
     assert "advisory" not in third.result
     assert not hasattr(workspace.state, "descend_streak")
 
-    event = project_function_event("delta_move", third.result)
-    assert event.status == "ok"
-    assert event.message is None or "descending delta_move" not in event.message
+    outcome = interaction_outcome(third.result, physical_outcome="completed")
+    assert outcome == "completed"
+    assert "descending delta_move" not in outcome
 
 
 def test_force_refresh_bypasses_verified_point_reuse() -> None:
@@ -224,9 +239,8 @@ def test_force_refresh_bypasses_verified_point_reuse() -> None:
     assert "reused" not in refreshed.result
 
 
-def test_function_event_projects_the_world_change_check() -> None:
-    event = project_function_event(
-        "commit",
+def test_interaction_outcome_does_not_promote_evidence_diffs_to_memory() -> None:
+    outcome = interaction_outcome(
         {
             "position_error_m": 0.002,
             "world_changes": {
@@ -235,18 +249,12 @@ def test_function_event_projects_the_world_change_check() -> None:
                 "verified": ["p1"],
             },
         },
+        physical_outcome="completed",
     )
 
-    assert event.status == "ok"
-    assert "world change check" in event.message
-    assert "changed and dropped: region1(can)" in event.message
-    assert "occluded, kept unverified: region2" in event.message
-    assert "verified unchanged: p1" in event.message
-
-    reuse = project_function_event(
-        "locate_point", {"point_id": "p1", "reused": True}
-    )
-    assert "reused an existing verified grounding" in reuse.message
+    assert outcome == "completed"
+    assert "region1" not in outcome
+    assert interaction_outcome({"point_id": "p1", "reused": True}) == "ok"
 
 
 def test_persisted_point_remains_a_valid_proposal_anchor() -> None:
@@ -255,7 +263,7 @@ def test_persisted_point_remains_a_valid_proposal_anchor() -> None:
     workspace.execute("close_gripper")
 
     proposal = workspace.execute(
-        "propose_pose", point_id=point_id, offset_xyz=[0.0, 0.0, 0.1]
+        "preview_pose", point_id=point_id, offset_xyz_m=[0.0, 0.0, 0.1]
     )
 
     assert proposal.ok

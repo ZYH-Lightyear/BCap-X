@@ -10,8 +10,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from vaw.context_runtime.memory import TaskMemory
-
 
 def _floats(values: tuple[float, ...]) -> list[float]:
     return [round(float(value), 6) for value in values]
@@ -127,7 +125,9 @@ class LastPhysicalAction:
 
     intent: str
     executed_stages: Literal["arm", "gripper"]
-    outcome: Literal["completed", "arm_failed", "gripper_failed"]
+    outcome: Literal[
+        "completed", "arm_failed", "arm_unsettled", "gripper_failed"
+    ]
     target_gripper: Literal["open", "closed"] | None = None
     requested_arm_delta_base_m: tuple[float, float, float] | None = None
     failed_action_id: str | None = None
@@ -256,7 +256,6 @@ class ActionPrediction:
 @dataclass
 class ContextState:
     task_prompt: str
-    task_memory: TaskMemory = field(default_factory=TaskMemory)
     observation_revision: int = 0
     regions: dict[str, RegionEvidence] = field(default_factory=dict)
     points: dict[str, PointEvidence] = field(default_factory=dict)
@@ -341,7 +340,6 @@ class ContextState:
     def trace_summary(self) -> dict[str, Any]:
         return {
             "task_prompt": self.task_prompt,
-            "task_memory": self.task_memory.summary(),
             "observation_revision": self.observation_revision,
             "regions": [item.summary() for item in self.regions.values()],
             "points": [item.summary() for item in self.points.values()],

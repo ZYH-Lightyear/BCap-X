@@ -5,7 +5,9 @@ view, "is the payload horizontally above the target?" is a depth guess.  We
 drop a geometric vertical from the payload bottom-centre (or the TCP when no
 payload volume is attached), intersect it with the currently observed scene
 surface, and render the landing footprint plus the XY offset to the active
-target region as explicit pixels and centimetre labels.
+target region as explicit pixels.  We intentionally do not print the vertical
+height: small decimal labels are an unreliable visual-language interface and
+can be read at the wrong scale when the canvas is resized.
 
 Everything here is presentation-only geometry derived from privileged depth
 and the attached-object OBB.  It is a geometric vertical and a surface
@@ -15,11 +17,12 @@ implied, exactly like the preview gripper.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, Sequence
+from typing import Any, Literal
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 from vaw.context_runtime.geometry import project_world_to_pixel
 
@@ -32,7 +35,7 @@ OFFSET_ARROW_RGB = (220, 38, 38)
 # A plumb line only exists when the anchor actually hangs above a surface.
 _MIN_HEIGHT_M = 0.008
 # Offsets below this are visual noise, not a usable correction signal.
-_MIN_OFFSET_LABEL_M = 0.005
+_MIN_OFFSET_ARROW_M = 0.005
 # On a zoomed contact panel a centimetre is only a few pixels; a sub-12 px
 # arrow degenerates into two isolated wings, so we draw a target circle.
 _MIN_DXY_ARROW_PX = 12.0
@@ -177,14 +180,12 @@ def draw_plumb_overlays(
         return
     pil = Image.fromarray(np.asarray(image_rgb, dtype=np.uint8))
     draw = ImageDraw.Draw(pil, "RGBA")
-    font = ImageFont.load_default()
     for plumb in plumbs:
         _draw_one(
             draw,
             plumb,
             intrinsics,
             pose_mat,
-            font,
         )
     np.copyto(image_rgb, np.asarray(pil, dtype=np.uint8))
 
@@ -194,7 +195,6 @@ def _draw_one(
     plumb: PlumbLine,
     intrinsics: np.ndarray,
     pose_mat: np.ndarray,
-    font: ImageFont.ImageFont,
 ) -> None:
     color = CURRENT_PLUMB_RGB if plumb.kind == "current" else PREVIEW_PLUMB_RGB
     anchor = np.asarray(plumb.anchor_base_xyz, dtype=np.float64)
@@ -227,18 +227,9 @@ def _draw_one(
                 width=2,
             )
 
-    label_anchor = projected[len(projected) // 2]
-    _pill_label(
-        draw,
-        (label_anchor[0] + 8, label_anchor[1] - 8),
-        f"H {plumb.height_m * 100:.1f}cm",
-        color,
-        font,
-    )
-
     if plumb.offset_xy_m is not None and plumb.target_center_base_xyz is not None:
         offset_norm = float(np.hypot(*plumb.offset_xy_m))
-        if offset_norm >= _MIN_OFFSET_LABEL_M:
+        if offset_norm >= _MIN_OFFSET_ARROW_M:
             target_at_landing = np.array(
                 [
                     plumb.target_center_base_xyz[0],
@@ -256,17 +247,6 @@ def _draw_one(
                     _target_circle(draw, arrow[1], OFFSET_ARROW_RGB)
                 else:
                     _arrow(draw, arrow[0], arrow[1], OFFSET_ARROW_RGB)
-                midpoint = (
-                    0.5 * (arrow[0][0] + arrow[1][0]),
-                    0.5 * (arrow[0][1] + arrow[1][1]) + 10,
-                )
-                _pill_label(
-                    draw,
-                    midpoint,
-                    f"dXY {offset_norm * 100:.1f}cm",
-                    OFFSET_ARROW_RGB,
-                    font,
-                )
 
 
 def _footprint_loop(footprint: np.ndarray) -> np.ndarray:
@@ -345,23 +325,6 @@ def _arrow(
             fill=(*color, 255),
             width=3,
         )
-
-
-def _pill_label(
-    draw: ImageDraw.ImageDraw,
-    pixel: tuple[float, float],
-    text: str,
-    color: tuple[int, int, int],
-    font: ImageFont.ImageFont,
-) -> None:
-    x, y = int(round(pixel[0])), int(round(pixel[1]))
-    box = draw.textbbox((x, y), text, font=font)
-    draw.rounded_rectangle(
-        (box[0] - 4, box[1] - 3, box[2] + 4, box[3] + 3),
-        radius=3,
-        fill=(*color, 220),
-    )
-    draw.text((x, y), text, font=font, fill=(255, 255, 255, 255))
 
 
 __all__ = [

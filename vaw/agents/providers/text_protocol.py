@@ -1,40 +1,7 @@
-"""Text protocol provider: ``<tool_call>`` tags instead of native function calling.
+"""显式文本回退协议。
 
-Forked from ``agentx/providers/text_protocol.py``. Wraps any
-:class:`~vaw.agents.providers.base.ModelProvider` and still returns a
-:class:`~vaw.agents.contracts.ModelResponse` with ``tool_calls`` filled in, so
-the Context Runtime remains independent of the provider's tool-call transport.
-
-## Why it exists
-
-Native function calling is better when it works: schema-constrained decoding,
-and a structural difference between *discussing* a call and *making* one. But
-it needs the entire chain to support it, and the chain is fragile — proxies
-swallow ``tools``, compatibility shims mistranslate, and some routes fall out
-of native mode intermittently and start narrating a fake conversation instead.
-The text protocol only needs completion, so it works everywhere. For VAW it is
-also the student path: a locally served Qwen3-VL speaks this natively.
-
-## Format
-
-``<tool_call>{"name": ..., "arguments": {...}}</tool_call>``
-
-XML tag around a JSON body. Tag boundaries are easy to cut and tolerant of
-noise, and the body maps one-to-one onto ``ToolCall.args``. It is also Qwen's
-own training format, so for the student this is closer to the pretraining
-distribution than an OpenAI compatibility layer would be.
-
-## Divergence from the original: one op per step
-
-AgentX told the model to emit consecutive blocks for parallel calls. VAW
-forbids that — the canvas is a full state render and ops are strongly ordered,
-so one step is one op. The instructions below say so, and :func:`parse_tool_calls`
-still returns every block it finds: silently dropping the extras would hide a
-protocol violation that the runtime needs to see and answer explicitly.
-
-The continuity rule is kept regardless. When a model glitches it alternates
-invented calls with invented results, so cutting at the first non-blank gap
-stops before the fabricated part.
+默认路径应把标准 tools 交给服务端，由模型自己的 chat template 与 tool parser
+处理。本模块只服务于没有结构化工具通道的端点；它不冒充任何模型家族的原生格式。
 """
 
 from __future__ import annotations
@@ -49,30 +16,11 @@ from vaw.agents.providers.base import ModelProvider
 
 TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 
-PROTOCOL_INSTRUCTIONS = """
-# Operation call format
-
-You have no native tool channel. To run a workspace operation, write a
-`<tool_call>` block containing a JSON object with `name` and `arguments`:
-
-<tool_call>{"name": "ground", "arguments": {"text": "red mug"}}</tool_call>
-
-Rules:
-
-- **Exactly one `<tool_call>` block per reply.** One step is one operation; the
-  canvas you get back reflects that operation and nothing else.
-- Follow the task's system instructions about a concise decision basis. When
-  requested, write that basis as plain text before the block.
-- Stop after the block. **Never** write the operation's result yourself — the
-  runtime will apply the call and provide the next freshly compiled canvas.
-  Inventing a result makes everything after it reasoning on fiction.
-- `arguments` must be a valid JSON object; escape newlines in strings as \\n.
-- Plain text without a `<tool_call>` block does not execute anything.
-
-# Available operations
-
-Operations you can call, with their parameter schemas (JSON Schema):
-""".strip()
+PROTOCOL_INSTRUCTIONS = """\
+当前端点没有结构化工具通道。每轮只调用一个函数，格式为：
+<tool_call>{"name":"detect_region","arguments":{"query":"红色杯子"}}</tool_call>
+可在调用前写一句依据；调用后立即停止，不得编造结果。arguments 必须是 JSON 对象。
+可用函数的标准 schema 位于 <tools> 中。"""
 
 
 class TextProtocolProvider:
@@ -90,7 +38,9 @@ class TextProtocolProvider:
         messages: list[Message],
         tools: list[dict[str, Any]] | None = None,
     ) -> ModelResponse:
-        rewritten = rewrite_history(messages, tools)
+        if not tools:
+            return self.inner.generate(messages, tools=None)
+        rewritten = self.prepare_messages(messages, tools)
         # Key point: do not pass tools down. An endpoint that supports native
         # calling would then have two channels open, and the model can answer
         # half in each, breaking both parsing and pairing.
@@ -106,6 +56,17 @@ class TextProtocolProvider:
             raw_response_text=raw_text,
             provider_reasoning=response.provider_reasoning,
         )
+
+    def prepare_messages(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> list[Message]:
+        """返回文本协议下模型实际接收的消息，用于可观测性记录。"""
+
+        if not tools:
+            return messages
+        return rewrite_history(messages, tools)
 
 
 def parse_tool_calls(raw: str) -> tuple[str, list[ToolCall]]:
@@ -156,19 +117,19 @@ def _build_call(body: str) -> ToolCall:
         return ToolCall(
             id=call_id,
             name="",
-            parse_error=f"<tool_call> body is not valid JSON ({exc}): {text[:200]}",
+            parse_error=f"<tool_call> 内容不是合法 JSON（{exc}）：{text[:200]}",
         )
 
     if not isinstance(parsed, dict):
         return ToolCall(
             id=call_id,
             name="",
-            parse_error=f"<tool_call> must be a JSON object, got {type(parsed).__name__}",
+            parse_error=f"<tool_call> 必须是 JSON 对象，实际为 {type(parsed).__name__}",
         )
 
     name = str(parsed.get("name") or "")
     if not name:
-        return ToolCall(id=call_id, name="", parse_error="<tool_call> is missing 'name'")
+        return ToolCall(id=call_id, name="", parse_error="<tool_call> 缺少 name 字段")
 
     # Accept arguments / args / input: model families were trained on different
     # spellings, and burning a round trip on that is not worth it.
@@ -187,13 +148,13 @@ def _build_call(body: str) -> ToolCall:
             return ToolCall(
                 id=call_id,
                 name=name,
-                parse_error=f"arguments is a string and not valid JSON: {args[:200]}",
+                parse_error=f"arguments 是字符串但不是合法 JSON：{args[:200]}",
             )
     if not isinstance(args, dict):
         return ToolCall(
             id=call_id,
             name=name,
-            parse_error=f"arguments must be an object, got {type(args).__name__}",
+            parse_error=f"arguments 必须是对象，实际为 {type(args).__name__}",
         )
 
     return ToolCall(id=call_id, name=name, args=args)
@@ -282,21 +243,16 @@ def _render_assistant_calls(message: Message) -> str:
 
 
 def _render_tool_docs(tools: list[dict[str, Any]] | None) -> str:
-    """Render the op schemas into the system prompt."""
+    """紧凑渲染标准 schema；不展开重复的 Markdown 参数章节。"""
 
     if not tools:
-        return PROTOCOL_INSTRUCTIONS + "\n\n(No operations available.)"
+        return PROTOCOL_INSTRUCTIONS + "\n\n（当前没有可用函数。）"
 
-    blocks: list[str] = []
-    for tool in tools:
-        function = tool.get("function") or {}
-        blocks.append(
-            f"## {function.get('name', '')}\n\n"
-            f"{function.get('description', '')}\n\n"
-            f"Parameters:\n```json\n"
-            f"{json.dumps(function.get('parameters', {}), ensure_ascii=False, indent=2)}\n```"
-        )
-    return PROTOCOL_INSTRUCTIONS + "\n\n" + "\n\n".join(blocks)
+    rendered = "\n".join(
+        json.dumps(tool, ensure_ascii=False, separators=(",", ":"))
+        for tool in tools
+    )
+    return f"{PROTOCOL_INSTRUCTIONS}\n<tools>\n{rendered}\n</tools>"
 
 
 __all__ = [

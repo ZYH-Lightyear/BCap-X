@@ -7,8 +7,8 @@ export interface VisualEditSummary {
 }
 
 export interface ContextSnapshot {
-  schemaVersion: 46
-  schema: 'vaw-context-v46-oblique-contact'
+  schemaVersion: 54
+  schema: 'vaw-context-v54-closed-gripper-z-cue'
   projection: 'main' | 'imagination'
   renderId: string
   revision: number
@@ -17,12 +17,16 @@ export interface ContextSnapshot {
   rasters: Record<string, string>
   world: {
     agentviewRasterId: string
-    observedSceneRasterId: string
     imaginationSceneRasterId: string
     contactFrontRasterId: string | null
     contactSideRasterId: string | null
+    contactAuxiliaryRasterId: string | null
     contactSideElevationDeg: number
     refinementGoal: string | null
+    sourceFollowThrough?: {
+      status: 'followed' | 'stationary'
+      query?: string
+    }
     robot: {
       ee_pose?: { position_xyz: number[]; quaternion_xyzw: number[] }
       tcp_pose?: { position_xyz: number[]; quaternion_xyzw: number[] }

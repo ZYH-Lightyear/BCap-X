@@ -10,12 +10,14 @@ from vaw.context_runtime.browser_renderer import SnapshotBrowser
 from vaw.context_runtime.packet import (
     CONTEXT_HEIGHT,
     CONTEXT_WIDTH,
+    IMAGINATION_CONTEXT_HEIGHT,
+    IMAGINATION_CONTEXT_WIDTH,
     ContextPacket,
 )
 
 
 class ContextWebRenderer:
-    name = "context-web-v46-oblique-contact"
+    name = "context-web-v54-closed-gripper-z-cue"
     width = CONTEXT_WIDTH
     height = CONTEXT_HEIGHT
 
@@ -27,8 +29,8 @@ class ContextWebRenderer:
         timeout_ms: float = 8000.0,
     ) -> None:
         self._bridge = SnapshotBrowser(
-            width=self.width,
-            height=self.height,
+            width=max(self.width, IMAGINATION_CONTEXT_WIDTH),
+            height=max(self.height, IMAGINATION_CONTEXT_HEIGHT),
             asset_dir=asset_dir,
             headed=headed,
             timeout_ms=timeout_ms,
@@ -43,6 +45,11 @@ class ContextWebRenderer:
         render_id = f"context-{self._render_index:06d}"
         self._render_index += 1
         snapshot = packet.web_snapshot(render_id=render_id)
+        viewport = snapshot["viewport"]
+        self._bridge.resize(
+            int(viewport["width"]),
+            int(viewport["height"]),
+        )
         return self._bridge.render(
             snapshot,
             render_id=render_id,

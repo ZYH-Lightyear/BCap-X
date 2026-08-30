@@ -2,6 +2,7 @@
 
 from vaw.context_runtime import (
     FUNCTION_NAMES,
+    ROBOT_FUNCTION_NAMES,
     SYSTEM_PROMPT,
     ContextCompiler,
     ContextRunConfig,
@@ -17,6 +18,7 @@ __all__ = [
     "ContextRuntime",
     "ContextWorkspace",
     "FUNCTION_NAMES",
+    "ROBOT_FUNCTION_NAMES",
     "SYSTEM_PROMPT",
     "function_definitions",
     "run_context_episode",

@@ -65,6 +65,7 @@ class OpenAIProvider:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+            payload["parallel_tool_calls"] = False
 
         data = self._post_with_retry(payload)
         return _parse_response(data)
