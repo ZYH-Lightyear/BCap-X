@@ -70,10 +70,6 @@ _AXIS_COLORS = (
     (37, 99, 235, 255),
 )
 _SURFACE_HALF_EXTENT_M = (0.24, 0.24, 0.22)
-_ROTATION_GUIDE_WIDTH = 236
-_ROTATION_GUIDE_ANGLE_DEG = 10.0
-_ROTATION_CORNER_WIDTH = 188
-_ROTATION_CORNER_HEIGHT = 146
 # 20% larger than the original 244×168 plate so the projected BASE signs
 # stay readable after Contact panels are packed into the canvas.
 _TRANSLATION_CORNER_WIDTH = 293
@@ -111,8 +107,6 @@ class NearFieldPreview:
     visual_edit: VisualEdit | None = None
     previous_target_pose: Pose | None = None
     previous_gripper_opening: float | None = None
-    rotation_gizmo_frame: Literal["base", "tool"] | None = None
-    rotation_gizmo_axis: Literal["x", "y", "z"] | None = None
     # Gravity-stable camera orientation locked when the Imagination session
     # starts.  It is presenter-private and deliberately independent of later
     # target rotations, so rotate edits move the virtual gripper rather than
@@ -192,7 +186,7 @@ def render_contact_auxiliary(
     output_width: int = CONTACT_FOCUS_WIDTH,
     panel_height: int = CONTACT_PANEL_HEIGHT,
 ) -> np.ndarray | None:
-    """Render the steep, diagonal third view without a control gizmo.
+    """Render the steep third view with a calibrated BASE-XY compass.
 
     FRONT/SIDE remain the calibrated action-reading pair.  This panel is only
     complementary visual evidence: its diagonal azimuth and steeper elevation
@@ -215,6 +209,7 @@ def render_contact_auxiliary(
         output_width=output_width,
         panel_height=panel_height,
         show_translation_axes=False,
+        show_base_xy_axes=True,
     )
 
 
@@ -481,6 +476,7 @@ def _render_direct_contact_view(
     output_width: int = CONTACT_FOCUS_WIDTH,
     panel_height: int = CONTACT_PANEL_HEIGHT,
     show_translation_axes: bool = True,
+    show_base_xy_axes: bool = False,
 ) -> np.ndarray:
     image = np.asarray(camera["images"]["rgb"], dtype=np.uint8).copy()
     height, width = image.shape[:2]
@@ -555,8 +551,7 @@ def _render_direct_contact_view(
             alpha=0.42,
         )
 
-    # The plumb line is drawn before the optional rotation-guide resize so
-    # its metric geometry follows the same camera as the other overlays.
+    # Draw metric overlays in the same calibrated camera as the RGB scene.
     if plumb_lines:
         draw_plumb_overlays(image, render_camera, plumb_lines)
     if grasp_sweep_segment_base is not None:
@@ -564,40 +559,21 @@ def _render_direct_contact_view(
     if gripper_z_axis_base is not None:
         draw_gripper_z_axis_overlay(image, render_camera, gripper_z_axis_base)
 
-    guide_active = (
-        preview.rotation_gizmo_frame is not None and preview.rotation_gizmo_axis is not None
-    )
-    scene_width = width - _ROTATION_GUIDE_WIDTH if guide_active else width
-    if guide_active:
-        scene = np.asarray(
-            Image.fromarray(image).resize(
-                (scene_width, height),
-                resample=Image.Resampling.BILINEAR,
-            ),
-            dtype=np.uint8,
-        )
-        canvas = np.full((height, width, 3), _BACKGROUND, dtype=np.uint8)
-        canvas[:, :scene_width] = scene
-        image = canvas
-
     pil = Image.fromarray(image)
     draw = ImageDraw.Draw(pil, "RGBA")
     font = _label_font()
-    display_camera = _scaled_camera(camera, scene_width, height)
-    # The persistent ROTATE BASE gimbal is intentionally hidden for the
-    # current visual ablation.  Keep the renderer implementation below so it
-    # can be restored without changing rotate semantics or trace data.
-    # _draw_direct_rotation_axes(draw)
+    scene_width = width
+    display_camera = _scaled_camera(camera, width, height)
     if show_translation_axes:
         _draw_direct_translation_axes(draw, display_camera, scene_width)
+    elif show_base_xy_axes:
+        _draw_direct_base_xy_axes(draw, display_camera, scene_width)
 
     # A tilted panel must say so. Read as level, an oblique image makes the
     # payload look laterally centred whenever it is merely nearer the camera.
     tilt_deg = _camera_tilt_deg(camera)
     label = (
-        f"CONTACT {view_name.upper()}"
-        if guide_active
-        else f"CONTACT {view_name.upper()} · "
+        f"CONTACT {view_name.upper()} · "
         + (f"OBLIQUE {tilt_deg:.0f}° DOWN · " if tilt_deg >= _MIN_OBLIQUE_LABEL_DEG else "")
         + ("CURRENT + PREVIEW" if preview.target_pose is not None else "CURRENT")
     )
@@ -622,24 +598,12 @@ def _render_direct_contact_view(
             height,
             preview,
         )
-        if not guide_active:
-            _draw_target_depth_scale(
-                draw,
-                display_camera,
-                scene_width,
-                height,
-                preview.target_pose,
-            )
-    if guide_active:
-        _draw_direct_rotation_guide(
-            pil,
-            np.asarray(camera["images"]["rgb"], dtype=np.uint8),
-            camera,
-            robot,
-            preview,
+        _draw_target_depth_scale(
+            draw,
+            display_camera,
             scene_width,
-            width,
             height,
+            preview.target_pose,
         )
     return np.asarray(pil, dtype=np.uint8)
 
@@ -806,129 +770,70 @@ def _draw_direct_translation_axes(
     )
 
 
-def _draw_direct_rotation_axes(
+def _draw_direct_base_xy_axes(
     draw: ImageDraw.ImageDraw,
+    camera: dict,
+    scene_width: int,
 ) -> None:
-    """Draw a legible three-dimensional right-hand-positive BASE gimbal.
+    """Draw calibrated ``±X/±Y`` directions in the 68° auxiliary view."""
 
-    Unlike the translation triad, this is a control legend rather than a
-    measured scene overlay.  A fixed oblique view deliberately prevents any
-    ring from collapsing into an ambiguous straight line when a Contact
-    Camera happens to look along one of the BASE axes.
-    """
-
-    left = 8
+    left = scene_width - _TRANSLATION_CORNER_WIDTH - 8
     top = 8
-    right = left + _ROTATION_CORNER_WIDTH
-    bottom = top + _ROTATION_CORNER_HEIGHT
-    _draw_gizmo_plate(draw, (left, top, right, bottom), "ROTATE BASE")
-
-    center = np.array([left + 94.0, top + 79.0], dtype=np.float64)
-    view_forward = _unit(np.array([1.0, 1.0, 0.52], dtype=np.float64))
-    view_right = _unit(np.cross(view_forward, np.array([0.0, 0.0, 1.0])))
-    view_up = _unit(np.cross(view_right, view_forward))
-    projection = np.vstack((view_right, -view_up))
-    ring_bases = (
-        (np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])),
-        (np.array([0.0, 0.0, 1.0]), np.array([1.0, 0.0, 0.0])),
-        (np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])),
+    right = scene_width - 8
+    bottom = top + _TRANSLATION_CORNER_HEIGHT
+    _draw_gizmo_plate(
+        draw,
+        (left, top, right, bottom),
+        "BASE XY",
+        title_font=_translation_title_font(),
     )
-    arrow_phases = (0.18, 2.25, 4.30)
-    samples = np.linspace(0.0, 2.0 * np.pi, num=145, dtype=np.float64)
-    radius = 51.0
-    for axis_index, ((basis_u, basis_v), arrow_phase) in enumerate(
-        zip(ring_bases, arrow_phases, strict=True)
-    ):
-        ring_3d = (
-            np.cos(samples)[:, None] * basis_u
-            + np.sin(samples)[:, None] * basis_v
-        )
-        points_array = center + radius * (ring_3d @ projection.T)
+    origin = np.array(
+        [
+            left + 0.5 * _TRANSLATION_CORNER_WIDTH,
+            top + 0.57 * _TRANSLATION_CORNER_HEIGHT,
+        ],
+        dtype=np.float64,
+    )
+    camera_directions = _base_axis_camera_directions(camera)
+    arm_px = 64.0
+    for axis_index in (0, 1):
+        axis = "XY"[axis_index]
+        direction = camera_directions[axis_index, :2]
+        norm = float(np.linalg.norm(direction))
+        if norm <= 1e-9:
+            continue
+        unit_direction = direction / norm
+        endpoint = origin + unit_direction * arm_px
+        reverse_endpoint = origin - unit_direction * arm_px
         color = _AXIS_COLORS[axis_index]
-
-        # Draw the far half first and desaturate it.  The bright near half and
-        # large tangent arrow then make the ring read as a 3-D rotation, not a
-        # flat circle or crosshair.
-        depth = ring_3d @ view_forward
-        for near, line_color, line_width in (
-            (False, (*color[:3], 82), 3),
-            (True, (*color[:3], 245), 5),
-        ):
-            for index in range(len(samples) - 1):
-                if bool(0.5 * (depth[index] + depth[index + 1]) >= 0.0) != near:
-                    continue
-                draw.line(
-                    (
-                        float(points_array[index, 0]),
-                        float(points_array[index, 1]),
-                        float(points_array[index + 1, 0]),
-                        float(points_array[index + 1, 1]),
-                    ),
-                    fill=line_color,
-                    width=line_width,
-                )
-
-        arrow_index = int(round(arrow_phase / (2.0 * np.pi) * (len(samples) - 1)))
-        arrow_index = max(3, min(arrow_index, len(samples) - 1))
-        arrow_start = tuple(float(value) for value in points_array[arrow_index - 3])
-        arrow_end = tuple(float(value) for value in points_array[arrow_index])
-        _draw_gimbal_arrow_head(
+        start = tuple(float(value) for value in origin)
+        end = tuple(float(value) for value in endpoint)
+        reverse_end = tuple(float(value) for value in reverse_endpoint)
+        draw.line((*reverse_end, *end), fill=(2, 6, 23, 238), width=17)
+        draw.line((*reverse_end, *end), fill=color, width=11)
+        _draw_arrow_head(draw, start, end, color, size=22.0)
+        _draw_arrow_head(draw, start, reverse_end, color, size=22.0)
+        _draw_centered_dark_axis_label(
             draw,
-            arrow_start,
-            arrow_end,
+            tuple(float(value) for value in endpoint + unit_direction * 20.0),
+            f"+{axis}",
             color,
-            size=16.0,
+            bounds=(left + 8, top + 42, right - 8, bottom - 8),
+            font=_translation_axis_font(),
         )
-        radial = points_array[arrow_index] - center
-        radial_norm = max(1e-9, float(np.linalg.norm(radial)))
-        label_anchor = points_array[arrow_index] + radial / radial_norm * 9.0
-        _draw_dark_axis_label(
+        _draw_centered_dark_axis_label(
             draw,
-            tuple(float(value) for value in label_anchor),
-            f"+{'XYZ'[axis_index]}",
+            tuple(float(value) for value in reverse_endpoint - unit_direction * 20.0),
+            f"−{axis}",
             color,
+            bounds=(left + 8, top + 42, right - 8, bottom - 8),
+            font=_translation_axis_font(),
         )
-
     draw.ellipse(
-        (center[0] - 4, center[1] - 4, center[0] + 4, center[1] + 4),
+        (origin[0] - 8, origin[1] - 8, origin[0] + 8, origin[1] + 8),
         fill=(248, 250, 252, 255),
         outline=(15, 23, 42, 255),
-        width=1,
-    )
-    draw.text(
-        (left + 13, bottom - 19),
-        "+ ARROW  ·  − REVERSE",
-        fill=(226, 232, 240, 255),
-        font=_label_font(),
-    )
-
-
-def _draw_gimbal_arrow_head(
-    draw: ImageDraw.ImageDraw,
-    start: tuple[float, float],
-    end: tuple[float, float],
-    color: tuple[int, int, int, int],
-    *,
-    size: float,
-) -> None:
-    direction = np.asarray(end, dtype=np.float64) - np.asarray(start, dtype=np.float64)
-    norm = float(np.linalg.norm(direction))
-    if norm <= 1e-9:
-        return
-    unit = direction / norm
-    normal = np.array([-unit[1], unit[0]], dtype=np.float64)
-    tip = np.asarray(end, dtype=np.float64) + unit * size * 0.35
-    base = tip - unit * size
-    polygon = [
-        tuple(tip),
-        tuple(base + normal * size * 0.62),
-        tuple(base - normal * size * 0.62),
-    ]
-    draw.polygon(
-        polygon,
-        fill=color,
-        outline=(248, 250, 252, 235),
-        width=2,
+        width=3,
     )
 
 
@@ -951,33 +856,6 @@ def _draw_gizmo_plate(
         title,
         fill=(248, 250, 252, 255),
         font=title_font or _label_font(),
-    )
-
-
-def _draw_dark_axis_label(
-    draw: ImageDraw.ImageDraw,
-    anchor: tuple[float, float],
-    label: str,
-    color: tuple[int, int, int, int],
-) -> None:
-    font = _label_font()
-    bounds = draw.textbbox((0, 0), label, font=font)
-    label_width = bounds[2] - bounds[0] + 8
-    label_height = bounds[3] - bounds[1] + 5
-    left = anchor[0]
-    top = anchor[1] - label_height * 0.5
-    draw.rounded_rectangle(
-        (left, top, left + label_width, top + label_height),
-        radius=2,
-        fill=(3, 7, 18, 226),
-        outline=color,
-        width=2,
-    )
-    draw.text(
-        (left + 4, top + 2 - bounds[1]),
-        label,
-        fill=color,
-        font=font,
     )
 
 
@@ -1028,210 +906,6 @@ def _scaled_camera(camera: dict, width: int, height: int) -> dict:
         "intrinsics": intrinsics,
         "pose_mat": camera["pose_mat"],
     }
-
-
-def _draw_direct_rotation_guide(
-    image: Image.Image,
-    rgb: np.ndarray,
-    camera: dict,
-    robot: RobotState,
-    preview: NearFieldPreview,
-    rail_left: int,
-    width: int,
-    height: int,
-) -> None:
-    """Show one selected rotation axis as two non-occluding +/- examples."""
-
-    draw = ImageDraw.Draw(image, "RGBA")
-    frame = preview.rotation_gizmo_frame
-    axis = preview.rotation_gizmo_axis
-    target = preview.target_pose
-    opening = preview.gripper_opening
-    if frame is None or axis is None or target is None or opening is None:
-        return
-
-    axis_color = _AXIS_COLORS["xyz".index(axis)]
-    draw.rectangle(
-        (rail_left, 0, width, height),
-        fill=(248, 250, 253, 255),
-        outline=(59, 91, 219, 255),
-        width=2,
-    )
-    font = _label_font()
-    draw.text(
-        (rail_left + 10, 9),
-        f"ROTATE {frame.upper()} {axis.upper()}",
-        fill=axis_color,
-        font=font,
-    )
-    draw.text(
-        (rail_left + 10, 27),
-        f"RIGHT-HAND ABOUT +{axis.upper()}",
-        fill=(51, 65, 85, 255),
-        font=font,
-    )
-
-    negative = _rotated_pose(
-        target,
-        frame,
-        axis,
-        -_ROTATION_GUIDE_ANGLE_DEG,
-    )
-    positive = _rotated_pose(
-        target,
-        frame,
-        axis,
-        _ROTATION_GUIDE_ANGLE_DEG,
-    )
-    guide_triangles = (
-        _direct_target_gripper_triangles(
-            robot,
-            negative,
-            opening,
-        ),
-        _direct_target_gripper_triangles(
-            robot,
-            positive,
-            opening,
-        ),
-    )
-    masks = tuple(
-        None
-        if triangles is None
-        else _projected_silhouette(
-            triangles,
-            camera,
-            rgb.shape[1],
-            rgb.shape[0],
-        )
-        for triangles in guide_triangles
-    )
-    crop_box = _rotation_guide_crop(masks, camera, target, rgb.shape[1], rgb.shape[0])
-    card_width = width - rail_left - 16
-    card_height = 126
-    for index, (angle, triangles) in enumerate(
-        zip(
-            (-_ROTATION_GUIDE_ANGLE_DEG, _ROTATION_GUIDE_ANGLE_DEG),
-            guide_triangles,
-            strict=True,
-        )
-    ):
-        top = 51 + index * 143
-        card = _rotation_guide_card(
-            rgb,
-            triangles,
-            camera,
-            crop_box,
-            card_width,
-            card_height,
-        )
-        image.paste(Image.fromarray(card), (rail_left + 8, top))
-        border = (202, 70, 70, 255) if angle < 0.0 else (22, 163, 74, 255)
-        draw.rounded_rectangle(
-            (rail_left + 8, top, width - 8, top + card_height),
-            radius=4,
-            outline=border,
-            width=3,
-        )
-        sign = "−" if angle < 0.0 else "+"
-        label = f"{sign}{abs(angle):.0f}°"
-        draw.rounded_rectangle(
-            (rail_left + 15, top + 7, rail_left + 66, top + 30),
-            radius=4,
-            fill=(255, 255, 255, 232),
-            outline=border,
-            width=2,
-        )
-        draw.text((rail_left + 24, top + 11), label, fill=border, font=font)
-    draw.text(
-        (rail_left + 10, height - 18),
-        "GUIDE ONLY · TARGET UNCHANGED",
-        fill=(71, 85, 105, 255),
-        font=font,
-    )
-
-
-def _rotated_pose(
-    pose: Pose,
-    frame: Literal["base", "tool"],
-    axis: Literal["x", "y", "z"],
-    angle_deg: float,
-) -> Pose:
-    reference = Rotation.from_quat(np.asarray(pose.quaternion_xyzw, dtype=np.float64))
-    axis_vector = np.eye(3, dtype=np.float64)["xyz".index(axis)]
-    delta = Rotation.from_rotvec(axis_vector * np.deg2rad(float(angle_deg)))
-    rotated = delta * reference if frame == "base" else reference * delta
-    return Pose(
-        pose.position_xyz,
-        tuple(float(value) for value in rotated.as_quat()),
-    )
-
-
-def _rotation_guide_crop(
-    masks: tuple[np.ndarray | None, np.ndarray | None],
-    camera: dict,
-    target: Pose,
-    width: int,
-    height: int,
-) -> tuple[int, int, int, int]:
-    combined = np.zeros((height, width), dtype=bool)
-    for mask in masks:
-        if mask is not None and mask.shape == combined.shape:
-            combined |= mask
-    if np.any(combined):
-        ys, xs = np.nonzero(combined)
-        center_x = 0.5 * float(xs.min() + xs.max())
-        center_y = 0.5 * float(ys.min() + ys.max())
-        span_x = max(120.0, float(xs.max() - xs.min()) + 28.0)
-        span_y = max(84.0, float(ys.max() - ys.min()) + 24.0)
-    else:
-        projected = project_world_to_pixel(
-            np.asarray([target.position_xyz], dtype=np.float64),
-            camera["intrinsics"],
-            camera["pose_mat"],
-        )[0]
-        center_x = float(projected[0]) if np.isfinite(projected[0]) else width * 0.5
-        center_y = float(projected[1]) if np.isfinite(projected[1]) else height * 0.5
-        span_x, span_y = 160.0, 96.0
-    aspect = (width - _ROTATION_GUIDE_WIDTH - 16) / 126.0
-    if span_x / span_y < aspect:
-        span_x = span_y * aspect
-    else:
-        span_y = span_x / aspect
-    left = int(round(center_x - span_x * 0.5))
-    top = int(round(center_y - span_y * 0.5))
-    right = int(round(center_x + span_x * 0.5))
-    bottom = int(round(center_y + span_y * 0.5))
-    left, right = _fit_interval(left, right, width)
-    top, bottom = _fit_interval(top, bottom, height)
-    return left, top, right, bottom
-
-
-def _fit_interval(start: int, end: int, limit: int) -> tuple[int, int]:
-    size = min(limit, max(2, end - start))
-    start = max(0, min(start, limit - size))
-    return start, start + size
-
-
-def _rotation_guide_card(
-    rgb: np.ndarray,
-    triangles: np.ndarray | None,
-    camera: dict,
-    crop_box: tuple[int, int, int, int],
-    width: int,
-    height: int,
-) -> np.ndarray:
-    image = np.asarray(rgb, dtype=np.uint8).copy()
-    if triangles is not None:
-        _overlay_camera_mesh_outline(image, triangles, camera)
-    left, top, right, bottom = crop_box
-    return np.asarray(
-        Image.fromarray(image[top:bottom, left:right]).resize(
-            (width, height),
-            resample=Image.Resampling.BILINEAR,
-        ),
-        dtype=np.uint8,
-    )
 
 
 def _camera_gripper_triangles(
@@ -1772,16 +1446,6 @@ def _render_view(
             current_tcp_position,
             current_tcp_rotation,
         )
-        if preview.rotation_gizmo_frame is not None:
-            _draw_rotation_gizmo(
-                draw,
-                view,
-                width,
-                height,
-                preview,
-                current_tcp_position,
-                current_tcp_rotation,
-            )
     _draw_scale_bar(draw, view, width, height)
     return np.asarray(pil, dtype=np.uint8)
 
@@ -2109,32 +1773,48 @@ def _draw_contact_axis_key(
 
 def gravity_stable_contact_frame_quaternion(
     pose: Pose,
+    *,
+    reference_quaternion_xyzw: tuple[float, float, float, float] | None = None,
 ) -> tuple[float, float, float, float]:
     """Return a yaw-only contact frame with local +Z aligned to WORLD +Z.
 
-    The initial tool +Y (finger closing direction) supplies the preferred
-    horizontal direction.  A projected tool +X fallback handles the rare case
-    where tool +Y is nearly vertical.  The result is deterministic and remains
-    locked for the full Imagination/Review session.
+    使用 tool-X/tool-Y 中水平投影更稳定的一根轴建立方位，避免水平抓取
+    时把接近竖直的 tool-Y 投影归一化，进而将微小 IK 数值噪声放大为
+    Contact Camera 的大幅偏航。若给出上一 Contact frame，则只消除 180°
+    符号翻转；frame 的生命周期和冻结由调用方管理。
     """
 
     rotation = Rotation.from_quat(np.asarray(pose.quaternion_xyzw, dtype=np.float64)).as_matrix()
     world_z = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    locked_y = rotation[:, 1].copy()
-    locked_y[2] = 0.0
-    if float(np.linalg.norm(locked_y)) > 1e-8:
-        locked_y /= np.linalg.norm(locked_y)
+    projected_x = rotation[:, 0].copy()
+    projected_y = rotation[:, 1].copy()
+    projected_x[2] = 0.0
+    projected_y[2] = 0.0
+    norm_x = float(np.linalg.norm(projected_x))
+    norm_y = float(np.linalg.norm(projected_y))
+
+    # 对合法旋转矩阵，tool-X/tool-Y 不可能同时平行于 WORLD-Z，因此较大
+    # 的水平投影总是良定义；这里不需要经验阈值或世界轴硬编码兜底。
+    # 两根轴同样稳定时沿用原来的 tool-Y 语义，避免改变常见竖直抓取的
+    # FRONT/SIDE 定义；只有 tool-X 明显拥有更大的水平投影时才切换。
+    if norm_y >= norm_x:
+        locked_y = projected_y / norm_y
         locked_x = np.cross(locked_y, world_z)
     else:
-        locked_x = rotation[:, 0].copy()
-        locked_x[2] = 0.0
-        if float(np.linalg.norm(locked_x)) <= 1e-8:
-            locked_x = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-        locked_x /= np.linalg.norm(locked_x)
+        locked_x = projected_x / norm_x
         locked_y = np.cross(world_z, locked_x)
     locked_x /= np.linalg.norm(locked_x)
     locked_y = np.cross(world_z, locked_x)
     locked_y /= np.linalg.norm(locked_y)
+
+    if reference_quaternion_xyzw is not None:
+        reference_x = Rotation.from_quat(
+            np.asarray(reference_quaternion_xyzw, dtype=np.float64)
+        ).as_matrix()[:, 0]
+        if float(np.dot(locked_x, reference_x)) < 0.0:
+            locked_x = -locked_x
+            locked_y = -locked_y
+
     matrix = np.column_stack((locked_x, locked_y, world_z))
     quaternion = Rotation.from_matrix(matrix).as_quat()
     return tuple(float(value) for value in quaternion)
@@ -2225,41 +1905,6 @@ def _draw_adjustment_label(
         width=2,
     )
     draw.text((19, top + 7), label, fill=color, font=font)
-
-
-def _draw_rotation_gizmo(
-    draw: ImageDraw.ImageDraw,
-    view: _View,
-    width: int,
-    height: int,
-    preview: NearFieldPreview,
-    current_tcp_position: np.ndarray,
-    current_tcp_rotation: np.ndarray,
-) -> None:
-    """Fallback single-axis sign key; never cover the contact target."""
-
-    target = preview.target_pose
-    frame = preview.rotation_gizmo_frame
-    axis = preview.rotation_gizmo_axis
-    if target is None or frame is None or axis is None:
-        return
-    del view, current_tcp_position, current_tcp_rotation
-    font = _label_font()
-    color = _AXIS_COLORS["xyz".index(axis)]
-    label = (
-        f"ROTATE {frame.upper()} {axis.upper()}  "
-        f"−{_ROTATION_GUIDE_ANGLE_DEG:.0f}°  |  +{_ROTATION_GUIDE_ANGLE_DEG:.0f}°"
-    )
-    box = draw.textbbox((0, 0), label, font=font)
-    label_width = box[2] - box[0]
-    draw.rounded_rectangle(
-        (10, 38, min(width - 10, label_width + 28), 68),
-        radius=5,
-        fill=(255, 255, 255, 238),
-        outline=color,
-        width=2,
-    )
-    draw.text((18, 46), label, fill=color, font=font)
 
 
 def _draw_arrow_head(

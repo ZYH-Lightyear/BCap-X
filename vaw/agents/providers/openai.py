@@ -42,6 +42,7 @@ class OpenAIProvider:
         max_tokens: int = DEFAULT_MAX_TOKENS,
         timeout_s: float = 300.0,
         max_retries: int = 3,
+        extra_body: dict[str, Any] | None = None,
     ) -> None:
         self.model = model
         self.server_url = server_url
@@ -50,6 +51,7 @@ class OpenAIProvider:
         self.max_tokens = max_tokens
         self.timeout_s = timeout_s
         self.max_retries = max_retries
+        self.extra_body = dict(extra_body or {})
 
     def generate(
         self,
@@ -57,6 +59,7 @@ class OpenAIProvider:
         tools: list[dict[str, Any]] | None = None,
     ) -> ModelResponse:
         payload: dict[str, Any] = {
+            **self.extra_body,
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,

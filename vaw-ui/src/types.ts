@@ -7,8 +7,8 @@ export interface VisualEditSummary {
 }
 
 export interface ContextSnapshot {
-  schemaVersion: 54
-  schema: 'vaw-context-v54-closed-gripper-z-cue'
+  schemaVersion: 57
+  schema: 'vaw-context-v57-mmskill-reference'
   projection: 'main' | 'imagination'
   renderId: string
   revision: number
@@ -98,6 +98,17 @@ export interface ContextSnapshot {
     actionId: string | null
     primaryRasterId: string | null
   }
+  skillReference: {
+    skillId: string
+    references: Array<{
+      referenceId: string
+      state: string
+      view: string
+      whenToUse: string
+      visualCue: string
+      rasterId: string
+    }>
+  } | null
 }
 
 declare global {

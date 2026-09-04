@@ -70,6 +70,10 @@ class ContextWorkspace:
         local_motion_backend: str | MotionBackend | None = None,
         tcp_to_hand_local_xyz: tuple[float, float, float] | None = None,
         semantic_rgb_provider: Callable[[], np.ndarray] | None = None,
+        grounding_model: str | None = None,
+        grounding_coord_space: str | None = None,
+        point_model: str | None = None,
+        point_coord_space: str | None = None,
         contact_camera_provider: Any | None = None,
         opposite_scene_camera_provider: Any | None = None,
     ) -> None:
@@ -120,6 +124,10 @@ class ContextWorkspace:
             str(self.local_motion.name): self.local_motion,
         }
         self._semantic_rgb_provider = semantic_rgb_provider
+        self.grounding_model = grounding_model
+        self.grounding_coord_space = grounding_coord_space
+        self.point_model = point_model
+        self.point_coord_space = point_coord_space
         self.state = ContextState(task_prompt=task_prompt)
         self._private = PrivateEnvContext(
             contact_camera_provider=contact_camera_provider,
@@ -233,7 +241,7 @@ class ContextWorkspace:
         self.state.imagination = None
         self._private.action_artifacts = None
         self._private.imagination_checkpoint = None
-        self._private.clear_contact_camera_lock()
+        self._private.reset_contact_frame()
 
     def restore_imagination_checkpoint(self) -> None:
         """Roll the working proposal back to the Imagination entry snapshot."""

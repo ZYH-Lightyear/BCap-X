@@ -127,6 +127,24 @@ function ModeOverlay({ snapshot }: { snapshot: ContextSnapshot }) {
   return null
 }
 
+function SkillReferenceBoard({ snapshot }: { snapshot: ContextSnapshot }) {
+  const board = snapshot.skillReference
+  if (!board || board.references.length === 0) return null
+  return (
+    <aside className="via-skill-references" aria-label="历史技能视觉参考">
+      <header>REFERENCE · NOT CURRENT · {board.skillId}</header>
+      <div>
+        {board.references.map((reference) => (
+          <article key={reference.referenceId}>
+            <Raster snapshot={snapshot} id={reference.rasterId} alt={`历史技能参考 ${reference.referenceId}`} />
+            <p><strong>{reference.state}</strong> · {reference.visualCue}</p>
+          </article>
+        ))}
+      </div>
+    </aside>
+  )
+}
+
 function decisionHeader(snapshot: ContextSnapshot, seedHeader: string): string {
   switch (snapshot.decision.mode) {
     case 'seeds': return seedHeader
@@ -144,6 +162,7 @@ function decisionHeader(snapshot: ContextSnapshot, seedHeader: string): string {
 function ImaginationLayer({ snapshot }: { snapshot: ContextSnapshot }) {
   const active = snapshot.world.action !== null
   const selecting = snapshot.decision.mode === 'seeds'
+  const hasSkillReference = Boolean(snapshot.skillReference?.references.length)
   const hasContactFocus = (
     snapshot.world.contactFrontRasterId !== null
     && snapshot.world.contactSideRasterId !== null
@@ -153,20 +172,23 @@ function ImaginationLayer({ snapshot }: { snapshot: ContextSnapshot }) {
   return (
     <section className={`via-imagination${active ? ' via-imagination--active' : ''}${selecting ? ' via-imagination--seeds' : ''}${hasContactFocus ? ' via-imagination--contact' : ''}`}>
       <header><h1>{header}</h1></header>
-      <div className="via-imagination-stage">
-        {selecting
-          ? <SeedGallery snapshot={snapshot} />
-          : hasContactFocus
-            ? <div className="via-imagination-visuals">
-                <div className="via-contact-panel via-contact-panel--front">
-                  <Raster snapshot={snapshot} id={snapshot.world.contactFrontRasterId} alt="目标夹爪正面接触视图" />
+      <div className={`via-imagination-stage${hasSkillReference ? ' via-imagination-stage--reference' : ''}`}>
+        <div className="via-decision-current">
+          {selecting
+            ? <SeedGallery snapshot={snapshot} />
+            : hasContactFocus
+              ? <div className="via-imagination-visuals">
+                  <div className="via-contact-panel via-contact-panel--front">
+                    <Raster snapshot={snapshot} id={snapshot.world.contactFrontRasterId} alt="目标夹爪正面接触视图" />
+                  </div>
+                  <div className="via-contact-panel via-contact-panel--side">
+                    <Raster snapshot={snapshot} id={snapshot.world.contactSideRasterId} alt="目标夹爪侧面接触视图" />
+                  </div>
                 </div>
-                <div className="via-contact-panel via-contact-panel--side">
-                  <Raster snapshot={snapshot} id={snapshot.world.contactSideRasterId} alt="目标夹爪侧面接触视图" />
-                </div>
-              </div>
-            : <Raster snapshot={snapshot} id={snapshot.world.imaginationSceneRasterId} alt="当前点云上的虚拟 Waypoint" />}
-        {!selecting && <ModeOverlay snapshot={snapshot} />}
+              : <Raster snapshot={snapshot} id={snapshot.world.imaginationSceneRasterId} alt="当前点云上的虚拟 Waypoint" />}
+          {!selecting && <ModeOverlay snapshot={snapshot} />}
+        </div>
+        <SkillReferenceBoard snapshot={snapshot} />
       </div>
     </section>
   )

@@ -80,12 +80,6 @@ def _target_presentation(
     edit_summary = build_edit_summary(target, artifacts) if artifacts is not None else None
     if edit_summary is not None:
         result["edit_summary"] = edit_summary.summary()
-    if (
-        artifacts is not None and artifacts.rotation_gizmo_frame is not None
-        and artifacts.rotation_gizmo_axis is not None
-    ):
-        result["rotation_gizmo_frame"] = artifacts.rotation_gizmo_frame
-        result["rotation_gizmo_axis"] = artifacts.rotation_gizmo_axis
     return result
 
 
@@ -151,16 +145,6 @@ def compile_near_field_preview(
         visual_edit=visual_edit,
         previous_target_pose=previous_pose,
         previous_gripper_opening=(robot.gripper_opening if previous_pose is not None else None),
-        rotation_gizmo_frame=(
-            artifacts.rotation_gizmo_frame
-            if artifacts is not None and artifacts.rotation_gizmo_frame in {"base", "tool"}
-            else None
-        ),
-        rotation_gizmo_axis=(
-            artifacts.rotation_gizmo_axis
-            if artifacts is not None and artifacts.rotation_gizmo_axis in {"x", "y", "z"}
-            else None
-        ),
         contact_frame_quaternion_xyzw=(
             gravity_stable_contact_frame_quaternion(contact_frame_pose)
             if contact_frame_pose is not None

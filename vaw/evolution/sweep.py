@@ -1,4 +1,4 @@
-"""Batch-evaluate VAW episodes with crash isolation and resume."""
+"""Run VAW episode batches and summarize terminal environment outcomes."""
 
 from __future__ import annotations
 
@@ -12,9 +12,6 @@ import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any
-
-from vaw.evolution.compare import seed_phase_variance
-from vaw.evolution.fitness import evaluate_run
 
 DEFAULT_SUITE = "libero_object_swap"
 DEFAULT_TASKS = tuple(range(10))
@@ -72,6 +69,30 @@ def is_complete(run_dir: pathlib.Path) -> bool:
     }
 
 
+def read_episode_outcome(run_dir: str | pathlib.Path) -> dict[str, Any]:
+    """Read facts written by the episode runtime without inferring task phases."""
+
+    directory = pathlib.Path(run_dir)
+    meta_path = directory / "meta.json"
+    if not meta_path.is_file():
+        raise FileNotFoundError(f"missing episode metadata: {meta_path}")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    usage = meta.get("usage") if isinstance(meta.get("usage"), dict) else {}
+    return {
+        "run": directory.name,
+        "suite": meta.get("suite"),
+        "task_id": meta.get("task_id"),
+        "seed": meta.get("seed"),
+        "task_prompt": meta.get("task_prompt"),
+        "terminate_mode": meta.get("terminate_mode"),
+        "env_success": bool(meta.get("env_success")),
+        "claimed_success": bool(meta.get("claimed_success")),
+        "turns": int(meta.get("turns") or 0),
+        "main_tokens": usage.get("main_total_tokens") or usage.get("total_tokens"),
+        "imagination_tokens": usage.get("imagination_total_tokens") or 0,
+    }
+
+
 def run_episode(job: dict[str, Any]) -> dict[str, Any]:
     root = pathlib.Path(job["root"])
     task_id = int(job["task_id"])
@@ -81,8 +102,8 @@ def run_episode(job: dict[str, Any]) -> dict[str, Any]:
     log_path = root / "logs" / f"task{task_id}_s{seed}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     if job.get("resume") and is_complete(run_dir):
-        fitness = evaluate_run(run_dir)
-        return {"status": "skipped", "run": str(run_dir), "fitness": fitness}
+        outcome = read_episode_outcome(run_dir)
+        return {"status": "skipped", "run": str(run_dir), "outcome": outcome}
     command = [
         sys.executable,
         "-m",
@@ -151,7 +172,7 @@ def run_episode(job: dict[str, Any]) -> dict[str, Any]:
             "elapsed_s": elapsed,
         }
     try:
-        fitness = evaluate_run(run_dir)
+        outcome = read_episode_outcome(run_dir)
     except Exception as exc:  # noqa: BLE001
         return {
             "status": "incomplete",
@@ -164,28 +185,25 @@ def run_episode(job: dict[str, Any]) -> dict[str, Any]:
         "run": str(run_dir),
         "returncode": completed.returncode,
         "elapsed_s": elapsed,
-        "fitness": fitness,
+        "outcome": outcome,
     }
 
 
 def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
-    fitnesses = [item["fitness"] for item in results if "fitness" in item]
-    phase_rates = {}
-    for phase in ("reach", "grasp", "transport", "place"):
-        if fitnesses:
-            phase_rates[phase] = sum(
-                1 for item in fitnesses if item["phases"].get(phase)
-            ) / len(fitnesses)
-        else:
-            phase_rates[phase] = 0.0
+    outcomes = [item["outcome"] for item in results if "outcome" in item]
+    successes = sum(1 for item in outcomes if item.get("env_success"))
+    claimed = sum(1 for item in outcomes if item.get("claimed_success"))
+    turns = [int(item["turns"]) for item in outcomes if item.get("turns") is not None]
     return {
         "episodes": len(results),
+        "completed": len(outcomes),
         "ok": sum(1 for item in results if item.get("status") == "ok"),
         "skipped": sum(1 for item in results if item.get("status") == "skipped"),
         "failed": sum(1 for item in results if item.get("status") not in {"ok", "skipped"}),
-        "env_success": sum(1 for item in fitnesses if item.get("env_success")),
-        "phase_rates": phase_rates,
-        "seed_phase_variance": seed_phase_variance({"results": results}),
+        "env_success": successes,
+        "env_success_rate": successes / len(outcomes) if outcomes else 0.0,
+        "claimed_success": claimed,
+        "mean_turns": sum(turns) / len(turns) if turns else 0.0,
         "results": results,
     }
 

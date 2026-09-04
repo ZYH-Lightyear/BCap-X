@@ -31,8 +31,8 @@ function Root() {
   useEffect(() => {
     window.__VAW_RENDER__ = async (next) => {
       if (
-        next.schemaVersion !== 54
-        || next.schema !== 'vaw-context-v54-closed-gripper-z-cue'
+        next.schemaVersion !== 57
+        || next.schema !== 'vaw-context-v57-mmskill-reference'
         || next.viewport.width !== 2048
         || next.viewport.height !== 1280
       ) {

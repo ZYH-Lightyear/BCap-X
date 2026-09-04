@@ -82,3 +82,38 @@ python -m vaw.diagnostics.run_progress_demo \
 默认输出到 `<trace>/progress_critic/absolute_progress_<timestamp>/`。中断后可用原输出目录加
 `--resume`，已经完成的 Critic 状态不会重新请求。`progress_overlay.mp4` 使用 action manifest
 中的精确全局帧号同步 AgentView；新的进度点只在对应 AFTER 证据出现后显示。
+
+## TOPReward Reproduction
+
+`run_topreward` 复现官方 Qwen3-VL 打分路径：冻结模型，将“视频前缀 + Task”组织成真值判断，
+只读取提示末尾 `True` token 的 log-probability。默认模型为官方使用的
+`Qwen/Qwen3-VL-8B-Instruct`，每个前缀均匀采样 15 帧；模型不会看到 VAW Preview、
+Imagination Canvas、reward 或环境成功真值。
+
+先安装独立依赖。推荐单独环境，避免改变 LIBERO-PRO Runtime 的 Transformers 版本：
+
+```bash
+python -m venv --system-site-packages .venv-topreward
+.venv-topreward/bin/python -m pip install \
+  "transformers==4.57.1" "accelerate>=1.0" "qwen-vl-utils==0.0.14"
+```
+
+对已有 VAW trace 运行并生成 Action 对齐视频：
+
+```bash
+MPLCONFIGDIR=/tmp/mplconfig \
+.venv-topreward/bin/python -m vaw.diagnostics.run_topreward \
+  --trace /absolute/path/to/libero_spatial_task/task0_s1 \
+  --output-dir /absolute/path/to/topreward_result \
+  --model Qwen/Qwen3-VL-8B-Instruct \
+  --device cuda:0 \
+  --local-files-only \
+  --render-video
+```
+
+输出包括逐状态 `states/*/response.json`、`progress.json[l]` 和
+`topreward_action_curve.mp4`。曲线节点严格为初始状态与真实物理动作结束边界；非物理
+Function call 不产生伪进度节点。`raw_reward` 是比较与学习应使用的原始 log-probability；
+`relative_progress` 是官方 episode 内 min-max 形式。`progress` 在终局失败时再做线性显示校准：
+惩罚率从低进度的 15% 下降到高进度的 5%，所以失败轨迹最多显示 95%，但仍保留局部趋势。
+二者都只用于单条视频诊断，不能跨 episode 比较；原始学习证据始终是 `raw_reward`。

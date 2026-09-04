@@ -150,6 +150,11 @@ def test_direct_controls_preserve_the_grasp_subject_across_revisions() -> None:
         frame="base",
     ).ok
     assert workspace.state.last_physical_action.source_query == "can"
+    assert workspace.execute("rotate_tcp_delta", angle_deg=5.0).ok
+    assert workspace.state.last_physical_action.source_query == "can"
+    assert workspace.state.last_physical_action.summary()[
+        "requested_arm_rotation_tool_z_deg"
+    ] == 5.0
 
 
 def test_pre_dispatch_planner_failure_does_not_create_a_physical_receipt() -> None:

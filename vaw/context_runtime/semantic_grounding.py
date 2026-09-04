@@ -23,6 +23,31 @@ class GroundingCandidate:
     evidence: str
 
 
+def resolve_grounding_coord_space(model: str, requested: str = "auto") -> str:
+    """Resolve the coordinate protocol used by one grounding VLM adapter.
+
+    Gemini and Qwen vision models conventionally emit boxes in a 0--1000
+    coordinate space even when the image has a different pixel resolution;
+    Gemini additionally uses ``[y1,x1,y2,x2]`` ordering. Keeping those adapter
+    facts explicit prevents a correct box from being transposed or interpreted
+    as an upper-left pixel box.
+    """
+
+    if requested in {"pixel", "norm1000", "norm1000_yxyx"}:
+        return requested
+    if requested != "auto":
+        raise ValueError(
+            "grounding coordinate space must be auto, pixel, norm1000 "
+            "or norm1000_yxyx"
+        )
+    normalized_model = str(model).casefold()
+    if "gemini" in normalized_model:
+        return "norm1000_yxyx"
+    if "qwen" in normalized_model:
+        return "norm1000"
+    return "pixel"
+
+
 def candidate_prompt(
     query: str,
     *,
@@ -31,16 +56,23 @@ def candidate_prompt(
     coord_space: str,
 ) -> str:
     target = " ".join(str(query).split())
-    coordinate_instruction = (
-        "坐标使用 0 到 1000 的归一化数值"
-        if coord_space == "norm1000"
-        else f"坐标使用图像真实像素，图像宽度={width}、高度={height}"
-    )
+    if coord_space == "norm1000_yxyx":
+        coordinate_instruction = "坐标使用 0 到 1000 的归一化数值，box 顺序为 [y1,x1,y2,x2]"
+        box_schema = "y1,x1,y2,x2"
+    elif coord_space == "norm1000":
+        coordinate_instruction = "坐标使用 0 到 1000 的归一化数值，box 顺序为 [x1,y1,x2,y2]"
+        box_schema = "x1,y1,x2,y2"
+    else:
+        coordinate_instruction = (
+            f"坐标使用图像真实像素，图像宽度={width}、高度={height}，"
+            "box 顺序为 [x1,y1,x2,y2]"
+        )
+        box_schema = "x1,y1,x2,y2"
     return (
         f"请为精确语义目标“{target}”找出最多三个彼此不同的合理候选。比较可见属性与场景关系；"
         "如果存在同类别竞争物体，也要保留为候选，不能直接选择最近或最大的物体。"
         "只返回 JSON 数组："
-        '[{"box":[x1,y1,x2,y2],"evidence":"可见依据"}]。'
+        f'[{{"box":[{box_schema}],"evidence":"可见依据"}}]。'
         f"{coordinate_instruction}；最可信候选排在最前面。没有可见候选时返回 []。"
     )
 
@@ -65,8 +97,10 @@ def parse_candidates(
 ) -> list[GroundingCandidate]:
     """Parse model-specific coordinates into clipped pixel candidates."""
 
-    if coord_space not in {"pixel", "norm1000"}:
-        raise ValueError("candidate coordinate space must be pixel or norm1000")
+    if coord_space not in {"pixel", "norm1000", "norm1000_yxyx"}:
+        raise ValueError(
+            "candidate coordinate space must be pixel, norm1000 or norm1000_yxyx"
+        )
 
     payload = _json_payload(reply)
     if isinstance(payload, dict):
@@ -85,9 +119,13 @@ def parse_candidates(
             continue
         if box.size != 4 or not np.isfinite(box).all():
             continue
-        x1, x2 = sorted((float(box[0]), float(box[2])))
-        y1, y2 = sorted((float(box[1]), float(box[3])))
-        if coord_space == "norm1000":
+        if coord_space == "norm1000_yxyx":
+            y1, x1, y2, x2 = (float(value) for value in box)
+        else:
+            x1, y1, x2, y2 = (float(value) for value in box)
+        x1, x2 = sorted((x1, x2))
+        y1, y2 = sorted((y1, y2))
+        if coord_space in {"norm1000", "norm1000_yxyx"}:
             x1, x2 = x1 / 1000.0 * width, x2 / 1000.0 * width
             y1, y2 = y1 / 1000.0 * height, y2 / 1000.0 * height
         x1 = float(np.clip(x1, 0, width - 1))
@@ -234,5 +272,6 @@ __all__ = [
     "parse_candidates",
     "parse_choice",
     "render_candidate_review",
+    "resolve_grounding_coord_space",
     "review_prompt",
 ]

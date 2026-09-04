@@ -48,6 +48,7 @@ from vaw.context_runtime.motion import (
     MotionExecutionUnsettledError,
     MotionPlan,
 )
+from vaw.context_runtime.point_grounding import parse_point_reply, point_prompt
 from vaw.context_runtime.private import (
     ActionArtifacts,
     LastPhysicalArtifacts,
@@ -111,6 +112,7 @@ class ContextFunctions:
             "preview_pose": self.preview_pose,
             "preview_grasp": self.preview_grasp,
             "move_tcp_delta": self.move_tcp_delta,
+            "rotate_tcp_delta": self.rotate_tcp_delta,
             "execute_action": self.execute_action,
             "open_gripper": self.open_gripper,
             "close_gripper": self.close_gripper,
@@ -120,7 +122,6 @@ class ContextFunctions:
         self.imagination_handlers: dict[str, Callable[..., dict[str, Any]]] = {
             "shift_preview": self.shift_preview,
             "rotate_preview": self.rotate_preview,
-            "inspect_rotation": self.inspect_rotation,
             "finish_imagination": self.finish_imagination,
         }
 
@@ -237,7 +238,7 @@ class ContextFunctions:
             }
             return _bounded_box(box, rgb.shape[1], rgb.shape[0])
 
-        coord_space = _grounding_coord_space(self.ws.api)
+        coord_space = self.ws.grounding_coord_space or _grounding_coord_space(self.ws.api)
         diagnostics: dict[str, Any] = {
             "mode": "candidate_review",
             "coord_space": coord_space,
@@ -259,6 +260,7 @@ class ContextFunctions:
                 "query_vlm",
                 candidate_query,
                 images=rgb,
+                model=self.ws.grounding_model,
                 temperature=0.0,
                 max_tokens=512,
             )
@@ -300,6 +302,7 @@ class ContextFunctions:
                 "query_vlm",
                 review_prompt(query),
                 images=review_raster,
+                model=self.ws.grounding_model,
                 temperature=0.0,
                 max_tokens=160,
             )
@@ -362,11 +365,47 @@ class ContextFunctions:
         camera = self.ws._camera()
         rgb = _camera_image(camera, "rgb")
         crop_rgb, origin = self.ws._crop_rgb(rgb, within_region_id)
-        local_point = _vector(
-            self.ws._call_backend("vlm_point_detection", crop_rgb, str(query)),
-            2,
-            "VLM point",
-        )
+        if self.ws.point_model is None:
+            local_point = _vector(
+                self.ws._call_backend("vlm_point_detection", crop_rgb, str(query)),
+                2,
+                "VLM point",
+            )
+        else:
+            coord_space = self.ws.point_coord_space or "pixel_xy"
+            raw_reply = str(
+                self.ws._call_backend(
+                    "query_vlm",
+                    point_prompt(
+                        str(query),
+                        width=crop_rgb.shape[1],
+                        height=crop_rgb.shape[0],
+                        coord_space=coord_space,
+                    ),
+                    images=crop_rgb,
+                    model=self.ws.point_model,
+                    temperature=0.0,
+                    max_tokens=160,
+                )
+            )
+            try:
+                parsed_point = parse_point_reply(
+                    raw_reply,
+                    width=crop_rgb.shape[1],
+                    height=crop_rgb.shape[0],
+                    coord_space=coord_space,
+                )
+            except ValueError as exc:
+                raise ContextFunctionError(f"VLM point parsing failed: {exc}") from exc
+            self.ws._private.trace_diagnostics["point_grounding"] = {
+                "mode": "model_adapter",
+                "model": self.ws.point_model,
+                "coord_space": coord_space,
+                "raw_reply": raw_reply,
+            }
+            if parsed_point is None:
+                raise ContextFunctionError(f"VLM found no point for '{query}'")
+            local_point = np.asarray(parsed_point, dtype=np.float64)
         if not (
             0.0 <= local_point[0] < crop_rgb.shape[1] and 0.0 <= local_point[1] < crop_rgb.shape[0]
         ):
@@ -741,50 +780,22 @@ class ContextFunctions:
                 initial_target=artifacts.initial_target,
                 previous_visual_edit=artifacts.previous_visual_edit,
                 latest_visual_edit=visual_edit,
-                rotation_gizmo_frame=artifacts.rotation_gizmo_frame,
-                rotation_gizmo_axis=artifacts.rotation_gizmo_axis,
                 turn_count=artifacts.turn_count,
             ),
         )
 
     def rotate_preview(
         self,
-        axis: str,
         angle_deg: float,
-        frame: str,
     ) -> dict[str, Any]:
-        normalized_axis = str(axis)
-        if normalized_axis not in {"x", "y", "z"}:
-            raise ContextFunctionError("axis must be one of 'x', 'y', or 'z'")
-        try:
-            angle = float(angle_deg)
-        except (TypeError, ValueError) as exc:
-            raise ContextFunctionError("angle_deg must be a finite number") from exc
-        if not np.isfinite(angle):
-            raise ContextFunctionError("angle_deg must be a finite number")
-        if angle == 0.0:
-            raise ContextFunctionError("angle_deg must be non-zero")
-        if abs(angle) > self.MAX_ROTATION_DEG:
-            raise ContextFunctionError("angle_deg must be within [-10, 10] degrees")
-        normalized_frame = _frame(frame)
+        angle = _rotation_angle(angle_deg, self.MAX_ROTATION_DEG)
         reference, artifacts = self._adjustment_reference()
-        reference_rotation = _pose_rotation(reference)
-        axis_vector = np.eye(3, dtype=np.float64)["xyz".index(normalized_axis)]
-        delta_rotation = Rotation.from_rotvec(axis_vector * np.deg2rad(angle))
-        target_rotation = (
-            delta_rotation * reference_rotation
-            if normalized_frame == "base"
-            else reference_rotation * delta_rotation
-        )
-        target = Pose(
-            reference.position_xyz,
-            tuple(float(value) for value in target_rotation.as_quat()),
-        )
+        target = _rotate_pose_about_tool_z(reference, angle)
         visual_edit = VisualEdit(
             kind="rotate",
-            frame=normalized_frame,
+            frame="tool",
             reference_pose=reference,
-            axis=normalized_axis,
+            axis="z",
             angle_deg=angle,
         )
         planning_context = artifacts.planning_context
@@ -797,8 +808,6 @@ class ContextFunctions:
                 initial_target=artifacts.initial_target,
                 previous_visual_edit=artifacts.previous_visual_edit,
                 latest_visual_edit=visual_edit,
-                rotation_gizmo_frame=artifacts.rotation_gizmo_frame,
-                rotation_gizmo_axis=artifacts.rotation_gizmo_axis,
                 turn_count=artifacts.turn_count,
             ),
         )
@@ -864,13 +873,11 @@ class ContextFunctions:
             initial_target=target,
             previous_visual_edit=None,
             latest_visual_edit=artifacts.latest_visual_edit,
-            rotation_gizmo_frame=None,
-            rotation_gizmo_axis=None,
             turn_count=0,
         )
         self.ws.state.action_proposal = ActionProposal(action_id, target, intent)
         self.ws._private.action_artifacts = artifacts
-        self.ws._private.clear_contact_camera_lock()
+        self.ws._private.reset_contact_frame()
         return _preview_result(action_id, target, artifacts)
 
     def _store_action_proposal(
@@ -898,20 +905,6 @@ class ContextFunctions:
             else:
                 latest_edit = previous.latest_visual_edit
                 previous_edit = previous.previous_visual_edit
-        rotation_gizmo_frame = (
-            artifacts.rotation_gizmo_frame
-            if artifacts.rotation_gizmo_frame is not None
-            else previous.rotation_gizmo_frame
-            if previous is not None
-            else None
-        )
-        rotation_gizmo_axis = (
-            artifacts.rotation_gizmo_axis
-            if artifacts.rotation_gizmo_axis is not None
-            else previous.rotation_gizmo_axis
-            if previous is not None
-            else None
-        )
         self.ws.state.action_proposal = ActionProposal(
             action.action_id,
             target,
@@ -924,8 +917,6 @@ class ContextFunctions:
             initial_target=initial_target,
             previous_visual_edit=previous_edit,
             latest_visual_edit=latest_edit,
-            rotation_gizmo_frame=rotation_gizmo_frame,
-            rotation_gizmo_axis=rotation_gizmo_axis,
             turn_count=turn_count,
         )
         self.ws._private.trace_diagnostics["imagination_edit"] = {
@@ -1095,8 +1086,13 @@ class ContextFunctions:
             ),
             evidence_invalidated=True,
         )
+        observed_focus = (
+            self.ws.state.robot.tcp_pose
+            if self.ws.state.robot is not None
+            else None
+        )
         self.ws._private.last_physical_artifacts = LastPhysicalArtifacts(
-            focus_pose=target,
+            focus_pose=observed_focus or target,
             subject_query=(
                 previous_physical.subject_query if previous_physical is not None else None
             ),
@@ -1121,6 +1117,104 @@ class ContextFunctions:
                         - np.asarray(target.position_xyz, dtype=np.float64)
                     )
                 ),
+                6,
+            )
+        changes = change_summary(self.ws.last_evidence_report)
+        if changes:
+            result["world_changes"] = changes
+        if execution_error is not None:
+            if execution_unsettled:
+                result.update(
+                    status="dispatched_unsettled",
+                    error=str(execution_error),
+                    world_may_have_changed=True,
+                )
+                return result
+            raise execution_error
+        return result
+
+    def rotate_tcp_delta(self, angle_deg: float) -> dict[str, Any]:
+        """Execute one small rotation about the current TCP's tool-local +Z axis."""
+
+        angle = _rotation_angle(angle_deg, self.MAX_ROTATION_DEG)
+        robot = self.ws.state.robot
+        if robot is None or robot.tcp_pose is None:
+            raise ContextFunctionError("current TCP pose is unavailable")
+        target = _rotate_pose_about_tool_z(robot.tcp_pose, angle)
+
+        # As with direct translation, planning is not a physical event. A
+        # pre-dispatch failure therefore preserves the current revision.
+        try:
+            plan = self.ws.local_motion.plan_pose(target)
+        except MotionBackendError as exc:
+            raise ContextFunctionError(str(exc)) from exc
+        if plan.prediction.solve_ik != "returned":
+            raise ContextFunctionError(
+                plan.prediction.detail or "rotate_tcp_delta has no executable plan"
+            )
+
+        previous_physical = self.ws._private.last_physical_artifacts
+        execution_error: ContextFunctionError | None = None
+        execution_unsettled = False
+        try:
+            self.ws.execute_motion_plan(plan, target)
+        except MotionExecutionUnsettledError as exc:
+            execution_error = ContextFunctionError(str(exc))
+            execution_unsettled = True
+        except MotionBackendError as exc:
+            execution_error = ContextFunctionError(str(exc))
+        finally:
+            self.ws.refresh_observation()
+
+        self.ws.state.last_physical_action = LastPhysicalAction(
+            intent="rotate_tcp_delta about tool-local +Z",
+            executed_stages="arm",
+            outcome=(
+                "completed"
+                if execution_error is None
+                else "arm_unsettled"
+                if execution_unsettled
+                else "arm_failed"
+            ),
+            requested_arm_rotation_tool_z_deg=angle,
+            error_detail=str(execution_error) if execution_error is not None else None,
+            source_query=(
+                previous_physical.subject_query
+                if previous_physical is not None
+                else None
+            ),
+            evidence_invalidated=True,
+        )
+        observed_focus = (
+            self.ws.state.robot.tcp_pose
+            if self.ws.state.robot is not None
+            else None
+        )
+        self.ws._private.last_physical_artifacts = LastPhysicalArtifacts(
+            focus_pose=observed_focus or target,
+            subject_query=(
+                previous_physical.subject_query if previous_physical is not None else None
+            ),
+            subject_points_base=(
+                previous_physical.subject_points_base if previous_physical is not None else None
+            ),
+        )
+        refresh_follow_through(self.ws)
+        # tool-local 旋转会改变接触几何的水平参考方向；下一张画布应基于
+        # 新观测 TCP 建立新 frame，而不是沿用旋转前的局部操作参考系。
+        self.ws._private.reset_contact_frame()
+        self.ws._private.trace_diagnostics["direct_local_rotate"] = {
+            "motion_backend": plan.backend,
+            "axis": "tool-local +Z",
+            "angle_deg": angle,
+        }
+        achieved = self.ws.state.robot.tcp_pose if self.ws.state.robot is not None else None
+        result: dict[str, Any] = {}
+        if achieved is not None:
+            achieved_rotation = _pose_rotation(achieved)
+            target_rotation = _pose_rotation(target)
+            result["orientation_error_deg"] = round(
+                float(np.rad2deg((achieved_rotation.inv() * target_rotation).magnitude())),
                 6,
             )
         changes = change_summary(self.ws.last_evidence_report)
@@ -1247,8 +1341,13 @@ class ContextFunctions:
             source_query=subject_query,
             evidence_invalidated=True,
         )
+        observed_focus = (
+            self.ws.state.robot.tcp_pose
+            if self.ws.state.robot is not None
+            else None
+        )
         self.ws._private.last_physical_artifacts = LastPhysicalArtifacts(
-            focus_pose=focus_pose,
+            focus_pose=observed_focus or focus_pose,
             subject_query=subject_query,
             subject_points_base=subject_points,
         )
@@ -1315,35 +1414,6 @@ class ContextFunctions:
     def close_gripper(self) -> dict[str, Any]:
         return self._execute_gripper("closed")
 
-    def inspect_rotation(self, frame: str, axis: str) -> dict[str, Any]:
-        """Request a non-occluding +/- guide for one rotation axis."""
-
-        normalized_frame = _frame(frame)
-        normalized_axis = str(axis).lower()
-        if normalized_axis not in {"x", "y", "z"}:
-            raise ContextFunctionError("axis must be one of 'x', 'y', or 'z'")
-        action = self.ws.state.action_proposal
-        if action is None:
-            raise ContextFunctionError("there is no pending action")
-        artifacts = self.ws._private.action_artifacts or ActionArtifacts()
-        self.ws._private.action_artifacts = replace(
-            artifacts,
-            rotation_gizmo_frame=normalized_frame,
-            rotation_gizmo_axis=normalized_axis,
-        )
-        self.ws._private.trace_diagnostics["rotation_gizmo"] = {
-            "frame": normalized_frame,
-            "axis": normalized_axis,
-            "target": action.target.summary(),
-        }
-        return {
-            "preview": "updated",
-            "rotation_guide": {
-                "frame": normalized_frame,
-                "axis": normalized_axis,
-            },
-        }
-
     def _execute_gripper(self, target: str) -> dict[str, Any]:
         """Execute a simple Main-owned gripper command immediately."""
 
@@ -1376,8 +1446,13 @@ class ContextFunctions:
             ),
             evidence_invalidated=True,
         )
+        observed_focus = (
+            self.ws.state.robot.tcp_pose
+            if self.ws.state.robot is not None
+            else None
+        )
         self.ws._private.last_physical_artifacts = LastPhysicalArtifacts(
-            focus_pose=focus_pose,
+            focus_pose=observed_focus or focus_pose,
             subject_query=(
                 previous_physical.subject_query if previous_physical is not None else None
             ),
@@ -2304,7 +2379,7 @@ def _grounding_coord_space(api: Any) -> str:
             value = str(resolver(None, None))
         except (TypeError, ValueError):
             value = "pixel"
-        if value in {"pixel", "norm1000"}:
+        if value in {"pixel", "norm1000", "norm1000_yxyx"}:
             return value
     return "pixel"
 
@@ -2360,6 +2435,36 @@ def _pose_rotation(pose: Pose) -> Rotation:
     if norm <= 1e-12:
         raise ContextFunctionError("pose quaternion must be non-zero")
     return Rotation.from_quat(quaternion / norm)
+
+
+def _rotation_angle(value: Any, limit_deg: float) -> float:
+    try:
+        angle = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ContextFunctionError("angle_deg must be a finite number") from exc
+    if not np.isfinite(angle):
+        raise ContextFunctionError("angle_deg must be a finite number")
+    if angle == 0.0:
+        raise ContextFunctionError("angle_deg must be non-zero")
+    if abs(angle) > limit_deg:
+        raise ContextFunctionError(
+            f"angle_deg must be within [-{limit_deg:g}, {limit_deg:g}] degrees"
+        )
+    return angle
+
+
+def _rotate_pose_about_tool_z(pose: Pose, angle_deg: float) -> Pose:
+    """Right-compose a local +Z rotation while preserving the TCP position."""
+
+    reference_rotation = _pose_rotation(pose)
+    delta_rotation = Rotation.from_rotvec(
+        np.asarray([0.0, 0.0, np.deg2rad(angle_deg)], dtype=np.float64)
+    )
+    target_rotation = reference_rotation * delta_rotation
+    return Pose(
+        pose.position_xyz,
+        tuple(float(value) for value in target_rotation.as_quat()),
+    )
 
 
 __all__ = ["ContextFunctions"]

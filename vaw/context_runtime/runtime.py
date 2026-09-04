@@ -48,6 +48,7 @@ from vaw.context_runtime.protocol import (
 )
 from vaw.context_runtime.trace import ContextTraceLogger, SubagentTraceLogger
 from vaw.context_runtime.workspace import ContextStepResult, ContextWorkspace
+from vaw.mmskill import MMSkill, MMSkillBuffer, MMSkillLibrary
 
 NO_CALL_FEEDBACK = "未执行：本轮必须且只能调用一个 Function。"
 MULTI_CALL_ERROR = "未执行：一轮只能调用一个 Function。"
@@ -120,6 +121,8 @@ class ImaginationRunner:
         trace: SubagentTraceLogger | None = None,
         usage_callback: Callable[[ModelResponse, str], None] | None = None,
         turn_callback: Callable[[int], None] | None = None,
+        active_mmskill: MMSkill | None = None,
+        reference_mmskill: MMSkill | None = None,
     ) -> None:
         self.provider = provider
         self.workspace = workspace
@@ -130,6 +133,8 @@ class ImaginationRunner:
         self.tools = imagination_function_definitions()
         self.usage_callback = usage_callback
         self.turn_callback = turn_callback
+        self.active_mmskill = active_mmskill
+        self.reference_mmskill = reference_mmskill
 
     def run(self, instruction: str, action_id: str | None) -> ImaginationResult:
         try:
@@ -140,7 +145,10 @@ class ImaginationRunner:
         feedback: tuple[str, str] | None = None
         for turn in range(1, self.max_turns + 1):
             self._set_turn(turn)
-            packet = self.compiler.compile_imagination(self.workspace)
+            packet = self.compiler.compile_imagination(
+                self.workspace,
+                active_mmskill=self.reference_mmskill,
+            )
             image = self.renderer.render(packet)
             messages = self._messages(packet, image, feedback)
             visible_messages, visible_tools = _provider_visible_request(
@@ -287,6 +295,11 @@ class ImaginationRunner:
         )
         if feedback is not None:
             text += f"\n{_NOTICE_LABEL[feedback[0]]}：{feedback[1]}"
+        if self.active_mmskill is not None:
+            text += (
+                f"\n本轮加载视觉技能：{self.active_mmskill.skill_id}\n"
+                + self.active_mmskill.prompt_block()
+            )
         return _image_messages(IMAGINATION_SYSTEM_PROMPT, text, image, label="当前局部想象画布")
 
     def _set_turn(self, count: int) -> None:
@@ -334,6 +347,7 @@ class ContextRuntime:
         env_check: Callable[[], bool] | None = None,
         env_terminal_check: Callable[[], bool] | None = None,
         action_media_recorder: ActionMediaRecorder | None = None,
+        skill_library: MMSkillLibrary | None = None,
     ) -> None:
         self.main_provider = main_provider
         self.imagination_provider = imagination_provider or main_provider
@@ -347,6 +361,8 @@ class ContextRuntime:
         self.function_registry = main_function_registry()
         self.main_tools = self.function_registry.definitions
         self.interaction_memory = InteractionMemory()
+        self.mmskill_library = skill_library or MMSkillLibrary.builtin()
+        self.mmskill_buffer = MMSkillBuffer()
         self.usage: dict[str, int] = {}
         self.env_success: bool | None = None
         self.physical_ops = 0
@@ -365,6 +381,8 @@ class ContextRuntime:
                     "motion_backend": workspace.motion_backend_name,
                     "local_motion_backend": workspace.local_motion_backend_name,
                     "preview_gripper": self.compiler.preview_gripper_style,
+                    "mmskill_library": self.mmskill_library.summary(),
+                    "mmskill": self.mmskill_library.provenance(),
                 }
             )
 
@@ -379,7 +397,10 @@ class ContextRuntime:
             if time.monotonic() - started >= self.config.max_time_s:
                 return self._finish(TerminateMode.TIMEOUT, steps, "time limit reached")
 
-            packet = self.compiler.compile(self.workspace)
+            packet = self.compiler.compile(
+                self.workspace,
+                active_mmskill=self.mmskill_buffer.reference_skill,
+            )
             image = self.renderer.render(packet)
             decision_turn = self.main_turns + 1
             context_card = self._embodied_state(decision_turn=decision_turn)
@@ -458,9 +479,23 @@ class ContextRuntime:
                     )
             if call.name == "imagine_action":
                 step = self._call_imagination(call)
+            elif call.name == "consult_mmskill":
+                step = self._consult_mmskill(call)
             else:
                 step = self._dispatch_main(call)
             physical = requested_physical and step.revision_after > step.revision_before
+            if physical and self.mmskill_buffer.reference_skill is not None:
+                skill_id = self.mmskill_buffer.reference_skill.skill_id
+                self.mmskill_buffer.hide_references()
+                if self.trace is not None:
+                    self.trace.log_event(
+                        "mmskill_reference_hidden",
+                        {
+                            "turn": turn,
+                            "skill_id": skill_id,
+                            "reason": "physical_action",
+                        },
+                    )
             latest_physical = self.workspace.state.last_physical_action
             physical_outcome = (
                 latest_physical.outcome
@@ -574,6 +609,8 @@ class ContextRuntime:
             trace=subtrace,
             usage_callback=self._accumulate_usage,
             turn_callback=on_imagination_turn,
+            active_mmskill=self.mmskill_buffer.active,
+            reference_mmskill=self.mmskill_buffer.reference_skill,
         ).run(instruction, action_id)
         if self.trace is not None and subtrace_rel is not None:
             self.trace.log_event(
@@ -611,6 +648,34 @@ class ContextRuntime:
             revision_after=self.workspace.state.observation_revision,
             manifest=self.workspace.state.manifest(),
             trace_diagnostics={"subagent": diagnostics},
+        )
+
+    def _consult_mmskill(self, call: ToolCall) -> ContextStepResult:
+        before = self.workspace.state.observation_revision
+        if call.parse_error:
+            return self.workspace.reject(call.name, call.args, call.parse_error)
+        try:
+            _name, arguments = parse_action(
+                {"name": call.name, "arguments": call.args},
+                allowed=("consult_mmskill",),
+            )
+            skill = self.mmskill_library.get(str(arguments["skill_id"]))
+        except (KeyError, ValueError) as exc:
+            return self.workspace.reject(call.name, call.args, str(exc))
+        reused = (
+            self.mmskill_buffer.active is not None
+            and self.mmskill_buffer.active.skill_id == skill.skill_id
+        )
+        if not reused:
+            self.mmskill_buffer.load(skill)
+        return ContextStepResult(
+            function_name="consult_mmskill",
+            arguments=dict(call.args),
+            result={"skill_id": skill.skill_id, "loaded": True},
+            revision_before=before,
+            revision_after=before,
+            manifest=self.workspace.state.manifest(),
+            trace_diagnostics={"mmskill": skill.summary(), "reused": reused},
         )
 
     def _dispatch_main(self, call: ToolCall) -> ContextStepResult:
@@ -729,19 +794,23 @@ class ContextRuntime:
         )
         text = render_main_context(
             task=self.workspace.state.task_prompt,
+            available_mmskills=self.mmskill_library.format_index(),
             live_references=packet.manifest(),
             embodied_state=state_card,
             interaction_memory=self.interaction_memory,
+            active_mmskill=self.mmskill_buffer.active,
             feedback=feedback,
         )
         return {
-            "schema": "vaw-agent-context-v2-no-goal",
+            "schema": "vaw-agent-context-v3-mmskill",
             "task": self.workspace.state.task_prompt,
             "revision": packet.revision,
             "live_references": packet.manifest(),
             "embodied_state_card": state_card.summary(),
             "interaction_memory_before": self.interaction_memory.snapshot(),
             "interaction_memory_prompt": self.interaction_memory.prompt_lines(),
+            "available_mmskills": self.mmskill_library.index(),
+            "active_mmskill": self.mmskill_buffer.summary(),
             "protocol_feedback": feedback,
             "prompt_text": text,
         }
@@ -957,8 +1026,27 @@ def run_context_episode(
     env_check: Callable[[], bool] | None = None,
     env_terminal_check: Callable[[], bool] | None = None,
     motion_backend: str = "curobo",
+    grounding_model: str | None = None,
+    point_model: str | None = None,
 ) -> EpisodeResult:
-    workspace = ContextWorkspace(api, task_prompt, motion_backend=motion_backend)
+    from vaw.context_runtime.perception_defaults import (
+        DEFAULT_GROUNDING_MODEL,
+        DEFAULT_POINT_MODEL,
+    )
+    from vaw.context_runtime.point_grounding import resolve_point_coord_space
+    from vaw.context_runtime.semantic_grounding import resolve_grounding_coord_space
+
+    resolved_grounding_model = grounding_model or DEFAULT_GROUNDING_MODEL
+    resolved_point_model = point_model or DEFAULT_POINT_MODEL
+    workspace = ContextWorkspace(
+        api,
+        task_prompt,
+        motion_backend=motion_backend,
+        grounding_model=resolved_grounding_model,
+        grounding_coord_space=resolve_grounding_coord_space(resolved_grounding_model),
+        point_model=resolved_point_model,
+        point_coord_space=resolve_point_coord_space(resolved_point_model),
+    )
     trace = ContextTraceLogger(trace_dir) if trace_dir is not None else None
     try:
         return ContextRuntime(

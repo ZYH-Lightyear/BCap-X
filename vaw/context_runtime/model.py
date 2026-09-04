@@ -130,6 +130,7 @@ class LastPhysicalAction:
     ]
     target_gripper: Literal["open", "closed"] | None = None
     requested_arm_delta_base_m: tuple[float, float, float] | None = None
+    requested_arm_rotation_tool_z_deg: float | None = None
     failed_action_id: str | None = None
     error_detail: str | None = None
     source_query: str | None = None
@@ -147,6 +148,10 @@ class LastPhysicalAction:
         if self.requested_arm_delta_base_m is not None:
             result["requested_arm_delta_base_m"] = _floats(
                 self.requested_arm_delta_base_m
+            )
+        if self.requested_arm_rotation_tool_z_deg is not None:
+            result["requested_arm_rotation_tool_z_deg"] = round(
+                float(self.requested_arm_rotation_tool_z_deg), 6
             )
         if self.failed_action_id is not None:
             result["failed_action_id"] = self.failed_action_id

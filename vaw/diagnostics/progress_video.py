@@ -194,6 +194,7 @@ def _draw_score_panel(
     task: str,
     state: dict[str, Any],
     score_kind: str = "absolute",
+    env_success: bool | None = None,
 ) -> None:
     cv2.rectangle(frame, (1280, 0), (1919, 819), _COLORS["panel"], -1)
     cv2.line(frame, (1280, 0), (1280, 820), _COLORS["rule"], 2)
@@ -202,7 +203,11 @@ def _draw_score_panel(
         (
             "VAW / PAIRWISE PROGRESS"
             if score_kind == "pairwise_latent"
-            else "VAW / PROGRESS CRITIC"
+            else (
+                "VAW / TOPREWARD"
+                if score_kind == "topreward"
+                else "VAW / PROGRESS CRITIC"
+            )
         ),
         (1332, 76),
         scale=0.72,
@@ -266,13 +271,27 @@ def _draw_score_panel(
         (
             "LOG-ODDS UTILITY (NOT %)"
             if score_kind == "pairwise_latent"
-            else f"LEVEL {state.get('level') or '?'}"
+            else (
+                f"RAW LOG P(TRUE)  {float(state['raw_reward']):+.3f}"
+                if score_kind == "topreward"
+                and isinstance(state.get("raw_reward"), (int, float))
+                else f"LEVEL {state.get('level') or '?'}"
+            )
         ),
         (1334, y + 310),
         scale=0.8,
         color=_COLORS["accent"],
         thickness=2,
     )
+    if score_kind == "topreward" and env_success is not None:
+        _put_text(
+            frame,
+            f"ENV OUTCOME  {'SUCCESS' if env_success else 'NOT SUCCESSFUL'}",
+            (1334, y + 355),
+            scale=0.72,
+            color=_COLORS["advance" if env_success else "regress"],
+            thickness=2,
+        )
 
 
 def _draw_progress_chart(
@@ -290,7 +309,11 @@ def _draw_progress_chart(
         (
             "PAIRWISE LATENT TASK PROGRESS"
             if score_kind == "pairwise_latent"
-            else "ABSOLUTE TASK PROGRESS"
+            else (
+                "TOPREWARD / OUTCOME-CALIBRATED PROGRESS"
+                if score_kind == "topreward"
+                else "ABSOLUTE TASK PROGRESS"
+            )
         ),
         (54, 866),
         scale=0.75,
@@ -299,7 +322,11 @@ def _draw_progress_chart(
     )
     _put_text(
         frame,
-        "revealed only after AFTER evidence",
+        (
+            "post-hoc env calibration; raw log-probability preserved"
+            if score_kind == "topreward"
+            else "revealed only after AFTER evidence"
+        ),
         (1420, 866),
         scale=0.54,
         color=_COLORS["muted"],
@@ -386,6 +413,9 @@ def render_progress_video(
     states = progress.get("states")
     task = progress.get("task")
     score_kind = str(progress.get("score_kind") or "absolute")
+    env_success = progress.get("env_success")
+    if env_success is not None and not isinstance(env_success, bool):
+        raise ValueError("progress env_success must be boolean or null")
     if not isinstance(states, list) or not states:
         raise ValueError("progress file has no states")
     if not isinstance(task, str) or not task.strip():
@@ -428,7 +458,11 @@ def render_progress_video(
                 canvas = np.full((1080, 1920, 3), _COLORS["bg"], dtype=np.uint8)
                 canvas[:820, :1280] = _fit_agentview(source_frame)
                 _draw_score_panel(
-                    canvas, task=task, state=current, score_kind=score_kind
+                    canvas,
+                    task=task,
+                    state=current,
+                    score_kind=score_kind,
+                    env_success=env_success,
                 )
                 _draw_progress_chart(
                     canvas,

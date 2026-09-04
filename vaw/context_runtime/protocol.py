@@ -14,6 +14,7 @@ ROBOT_FUNCTION_NAMES = (
     "preview_grasp",
     "imagine_action",
     "move_tcp_delta",
+    "rotate_tcp_delta",
     "open_gripper",
     "close_gripper",
     "discard_action",
@@ -21,12 +22,11 @@ ROBOT_FUNCTION_NAMES = (
     "finish_task",
 )
 
-MAIN_FUNCTION_NAMES = ROBOT_FUNCTION_NAMES
+MAIN_FUNCTION_NAMES = (*ROBOT_FUNCTION_NAMES, "consult_mmskill")
 
 IMAGINATION_FUNCTION_NAMES = (
     "shift_preview",
     "rotate_preview",
-    "inspect_rotation",
     "finish_imagination",
 )
 
@@ -70,8 +70,13 @@ CONTRACT_PREAMBLE = """\
 你是通过 Visual Action Workspace 控制 LIBERO-PRO 机器人的主智能体。运用你的视觉理解、物理常识
 和提供的 Functions 完成用户任务。每轮先用最新画布判断当前真实状态，再调用且只调用一个 Function。
 优先采取能够直接推进任务的最小充分动作；已有证据足够时不要重复检测、定位或想象。
+当技能描述与当前任务状态匹配时，可以调用 `consult_mmskill` 加载详细描述来获取更多信息指引；
+没有明确匹配时不要加载，当前技能已加载时不要重复调用。
 
 画布左上 NOW 是最新主相机全局视图，右上为俯视视图, 下方为围绕夹爪的水平视角视图; 这些视图在视觉上都可能存在遮挡, 你需要根据“不遮挡的视角”做出你的判断;
+68° 俯视中的 BASE XY 表示 move_tcp_delta(frame="base") 的真实水平方向。
+开抽屉时, 需要保证抽屉是大幅度打开的, 可以一点点移动达成这个目标
+一般开抽屉的流程是: 在确认抽屉点的位置后, 先以水平抓取姿态, 运动到抽屉的平行位置, 然后再逐步靠近, 抓取抽屉把手;
 """
 
 CONTRACT_COORDS = """\
@@ -121,6 +126,7 @@ IMAGINATION_SYSTEM_PROMPT = """\
 每个“MOVE BASE”卡片只显示该接触平面内可判断的两条基座轴，轴两端的正负标签就是对应
 shift_preview 的符号；不要根据物体在屏幕左侧或右侧自行猜测方向。卡片和图例只用于读取符号，
 不是需要对齐或验收的对象。
+rotate_preview 只绕夹爪延伸方向（tool-local +Z）旋转，正角度遵循 +Z 右手定则；它不接受其他轴或坐标系。
 
 琥珀色“CARRIED VOLUME”只是随虚拟 TCP 移动的刚性附着假设，可用于比较开口与净空，不证明
 真实抓持、无滑移、无碰撞或释放落点。垂直虚线是载荷底面中心到观测表面的几何垂线
@@ -134,8 +140,8 @@ shift_preview 的符号；不要根据物体在屏幕左侧或右侧自行猜测
 抓取时判断物体是否进入两指闭合扫掠区域并可形成稳定侧向接触；真正需要净空的是
 掌部/横梁/指根。指尖低于物体顶面并不代表碰撞，不要用固定“指尖距顶面”或像素级对称
 作为停止条件。必须分别判断位置与方向：若两指通道中心已经接近目标，但通道方向、接触面方向或
-掌部朝向不合理，应先用 rotate_preview 修正姿态；继续平移不能修复方向错误。正负方向不确定时先调用
-inspect_rotation，再从更新后的两个接触视图选择方向。TOP 与 PCA 只是不同的粗候选来源：
+掌部朝向不合理，应先用 rotate_preview 修正姿态；继续平移不能修复方向错误。正负方向不确定时使用
+小角度 rotate_preview，并从更新后的两个接触视图判断是否改善。TOP 与 PCA 只是不同的粗候选来源：
 PCA 可以是非垂直下抓的侧向接近，不能把所有候选强行旋成竖直下抓。放置时，若可见的携带体积
 已充分进入有效开口并保留释放净空，不要追求完美居中。若当前真实画面显示容器已倾倒或沿口
 已被压住，动作预览对位不能恢复真实几何，应结束本轮想象，把判断交回主智能体。
@@ -191,22 +197,11 @@ def _edit_definitions() -> dict[str, dict[str, Any]]:
         ),
         "rotate_preview": _function(
             "rotate_preview",
-            "按右手定则旋转虚拟动作预览，不执行真实动作。",
+            "绕夹爪延伸方向（tool-local +Z）旋转虚拟预览；正角度遵循右手定则，不执行真实动作。",
             {
-                "axis": {"type": "string", "enum": ["x", "y", "z"]},
                 "angle_deg": {"type": "number", "minimum": -10.0, "maximum": 10.0},
-                "frame": frame,
             },
-            ("axis", "angle_deg", "frame"),
-        ),
-        "inspect_rotation": _function(
-            "inspect_rotation",
-            "显示指定坐标系和轴的正负旋转方向，不修改动作预览。",
-            {
-                "frame": frame,
-                "axis": {"type": "string", "enum": ["x", "y", "z"]},
-            },
-            ("frame", "axis"),
+            ("angle_deg",),
         ),
         "finish_imagination": _function(
             "finish_imagination",
@@ -253,7 +248,7 @@ def _main_tool_definitions() -> list[dict[str, Any]]:
         ),
         _function(
             "locate_point",
-            "估计粗略三维锚点；不能确认目标身份、精确接触点或闭合条件。",
+            "估计粗略三维锚点；不能确认目标身份、精确接触点或闭合条件。如果需要标注的点在一个已知的区域内，可以考虑 point 时传入 region；例如，想找到抽屉把手这种难以直接定位的点位，可以先 detect 获得区域，再 point。",
             {
                 "query": {
                     "type": "string",
@@ -284,7 +279,7 @@ def _main_tool_definitions() -> list[dict[str, Any]]:
                     "items": {"type": "number"},
                     "minItems": 4,
                     "maxItems": 4,
-                    "description": "可选的基座系绝对手部姿态 xyzw；省略则保持当前姿态。向下常用 [1,0,0,0] 或 [0,1,0,0]；[0,0,0,1] 朝上。",
+                    "description": "可选的基座系绝对手部姿态 xyzw；省略则保持当前姿态。向下常用 [1,0,0,0] 或 [0,1,0,0]；[0,0,0,1] 朝上。侧抓横把手常用 [0.707,0,0,0.707]。",
                 },
             },
             ("point_id", "offset_xyz_m"),
@@ -297,7 +292,7 @@ def _main_tool_definitions() -> list[dict[str, Any]]:
         ),
         _function(
             "imagine_action",
-            "让想象智能体检查并微调局部空间动作；如果你通过preview_pose得到了一个预备姿态, 那么你可以调用这个函数, 启动一个想象智能体帮你微调姿态, 直到抓住物体 / 移动到你想要的位置; 调用完成后, Canvas返回的紫色mask就是想象结果",
+            "让想象智能体检查并微调当前局部空间动作；返回紫色虚拟预览，不执行真实动作。",
             {
                 "action_id": {
                     "type": "string",
@@ -329,6 +324,18 @@ def _main_tool_definitions() -> list[dict[str, Any]]:
             ("delta_xyz_m", "frame"),
         ),
         _function(
+            "rotate_tcp_delta",
+            "绕当前 TCP 的 tool-local +Z 立即旋转并刷新观测；正角遵循右手定则。",
+            {
+                "angle_deg": {
+                    "type": "number",
+                    "minimum": -10.0,
+                    "maximum": 10.0,
+                },
+            },
+            ("angle_deg",),
+        ),
+        _function(
             "open_gripper",
             "立即打开真实夹爪。",
         ),
@@ -354,6 +361,17 @@ def _main_tool_definitions() -> list[dict[str, Any]]:
             {"success": {"type": "boolean"}},
             ("success",),
         ),
+        _function(
+            "consult_mmskill",
+            "加载指定 SKILL.md；不执行动作，已加载时勿重复调用。",
+            {
+                "skill_id": {
+                    "type": "string",
+                    "description": "使用可用 MMSkills 列表中的精确 skill_id",
+                }
+            },
+            ("skill_id",),
+        ),
     ]
     return robot_definitions
 
@@ -363,6 +381,7 @@ def main_function_specs() -> tuple[FunctionSpec, ...]:
 
     physical = {
         "move_tcp_delta": "arm",
+        "rotate_tcp_delta": "arm",
         "execute_action": "arm",
         "open_gripper": "gripper",
         "close_gripper": "gripper",

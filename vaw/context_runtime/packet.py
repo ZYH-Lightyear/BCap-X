@@ -6,7 +6,7 @@ import base64
 import io
 from collections.abc import Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 import numpy as np
@@ -56,9 +56,10 @@ from vaw.context_runtime.presentation import (
 )
 from vaw.context_runtime.private import PrivateEnvContext
 from vaw.context_runtime.workspace import ContextWorkspace
+from vaw.mmskill import MMSkill
 
-CONTEXT_SCHEMA = "vaw-context-v54-closed-gripper-z-cue"
-CONTEXT_WEB_SCHEMA_VERSION = 54
+CONTEXT_SCHEMA = "vaw-context-v57-mmskill-reference"
+CONTEXT_WEB_SCHEMA_VERSION = 57
 # FRONT and SIDE stay level and metrically legible.  A separate steep diagonal
 # camera occupies the former blank upper-right slot, exposing lateral placement
 # and clearing the Panda hand without changing Contact semantics.
@@ -254,12 +255,49 @@ class DecisionWorkspaceSpec:
 
 
 @dataclass(frozen=True)
+class SkillReferenceSpec:
+    """当前已加载技能的一张历史参考；只含策略可见内容。"""
+
+    reference_id: str
+    state: str
+    view: str
+    when_to_use: str
+    visual_cue: str
+    raster_id: str
+
+    def summary(self) -> dict[str, str]:
+        return {
+            "referenceId": self.reference_id,
+            "state": self.state,
+            "view": self.view,
+            "whenToUse": self.when_to_use,
+            "visualCue": self.visual_cue,
+            "rasterId": self.raster_id,
+        }
+
+
+@dataclass(frozen=True)
+class SkillReferenceBoardSpec:
+    """技能正文加载后才出现的视觉参考集合。"""
+
+    skill_id: str
+    references: tuple[SkillReferenceSpec, ...]
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "skillId": self.skill_id,
+            "references": [item.summary() for item in self.references],
+        }
+
+
+@dataclass(frozen=True)
 class ContextPacket:
     revision: int
     world: WorldContextSpec
     catalog: EvidenceCatalogSpec
     decision: DecisionWorkspaceSpec
     rasters: dict[str, np.ndarray]
+    skill_reference: SkillReferenceBoardSpec | None = None
     projection: ContextProjection = "main"
     schema: str = CONTEXT_SCHEMA
     imagination_attempts: dict[str, Any] | None = None
@@ -280,6 +318,11 @@ class ContextPacket:
             "world": self.world.summary(),
             "catalog": self.catalog.summary(),
             "decision": self.decision.summary(),
+            "skillReference": (
+                self.skill_reference.summary()
+                if self.skill_reference is not None
+                else None
+            ),
             "rasterIds": list(self.rasters),
         }
 
@@ -363,6 +406,7 @@ class ContextCompiler:
         workspace: ContextWorkspace,
         *,
         projection: ContextProjection = "main",
+        active_mmskill: MMSkill | None = None,
     ) -> ContextPacket:
         state = workspace.state
         private = workspace._private
@@ -384,6 +428,33 @@ class ContextCompiler:
             else None
         )
         contact_preview = scene_preview or _current_physical_contact_preview(workspace)
+        if (
+            contact_preview is not None
+            and contact_preview.contact_frame_quaternion_xyzw is not None
+        ):
+            if private.contact_frame_quaternion_xyzw is None:
+                private.contact_frame_quaternion_xyzw = (
+                    contact_preview.contact_frame_quaternion_xyzw
+                )
+                private.contact_frame_source_revision = state.observation_revision
+            contact_preview = replace(
+                contact_preview,
+                contact_frame_quaternion_xyzw=(
+                    private.contact_frame_quaternion_xyzw
+                ),
+            )
+            private.trace_diagnostics["contact_frame"] = {
+                "quaternion_xyzw": [
+                    round(float(value), 8)
+                    for value in private.contact_frame_quaternion_xyzw
+                ],
+                "created_revision": private.contact_frame_source_revision,
+                "current_revision": state.observation_revision,
+                "locked_across_revision": (
+                    private.contact_frame_source_revision
+                    != state.observation_revision
+                ),
+            }
         carried_volume_triangles = None
         if target is not None and private.attachment_hypothesis is not None:
             carried_volume_triangles = volume_triangles_base(
@@ -530,11 +601,11 @@ class ContextCompiler:
                     )
                 private.contact_camera_action_id = camera_cache_key
             contact_cameras = private.contact_camera_pair
-        # The global panel is context, not a second preview.  Use the current
-        # raw agentview rather than the old dark point-cloud crop: the latter
-        # became mostly empty once its occluding target mask was removed.
-        # All virtual geometry now lives exclusively in Contact Front/Side.
+        # The global panel is direct visual context, not a second preview.
+        # Keep it identical to the latest physical RGB; all action geometry
+        # and coordinate cues belong to the dedicated Contact views.
         imagination_scene = rgb.copy()
+        agentview = rgb.copy()
         # 旧 plumb cue 依赖 attachment metadata，同一真实抓持会因 Action
         # lineage 不同而时有时无。当前视觉协议改为只使用真实 TCP 的稳定
         # BASE-Z 标记；旧几何函数暂留给离线诊断，不再进入 policy Canvas。
@@ -582,9 +653,9 @@ class ContextCompiler:
                 panel_height=contact_panel_height,
             )
 
-        # 本体 cue 只属于 Contact 视图；全局 RGB 保持完全真实、无辅助线。
+        # 接触 cue 和坐标提示只属于 Contact 视图；全局 RGB 保持干净。
         rasters: dict[str, np.ndarray] = {
-            "agentview": rgb.copy(),
+            "agentview": agentview,
             "imagination_scene": imagination_scene,
         }
         contact_front_id = None
@@ -603,6 +674,7 @@ class ContextCompiler:
         if contact_auxiliary is not None:
             contact_auxiliary_id = "contact_auxiliary"
             rasters[contact_auxiliary_id] = np.ascontiguousarray(contact_auxiliary)
+        skill_reference = _compile_skill_references(active_mmskill, rasters)
         region_specs = self._compile_regions(state, rgb, private.region_masks, rasters)
         point_specs = self._compile_points(state, rgb, rasters)
         seed_specs = self._compile_seeds(
@@ -641,6 +713,7 @@ class ContextCompiler:
             ),
             decision=decision,
             rasters=rasters,
+            skill_reference=skill_reference,
             projection=projection,
             imagination_attempts=state.imagination_attempts.summary(),
         )
@@ -651,6 +724,8 @@ class ContextCompiler:
     def compile_imagination(
         self,
         workspace: ContextWorkspace,
+        *,
+        active_mmskill: MMSkill | None = None,
     ) -> ContextPacket:
         """Compile the same trusted state into a focused SubAgent projection."""
 
@@ -659,6 +734,7 @@ class ContextCompiler:
         return self.compile(
             workspace,
             projection="imagination",
+            active_mmskill=active_mmskill,
         )
 
     @staticmethod
@@ -1741,6 +1817,32 @@ def _observed_closed_gripper_z_axis(
     return np.ascontiguousarray(np.stack((lower, anchor, upper), axis=0))
 
 
+def _compile_skill_references(
+    skill: MMSkill | None,
+    rasters: dict[str, np.ndarray],
+) -> SkillReferenceBoardSpec | None:
+    """将已加载技能的历史图片加入 Packet，不触碰当前环境私有状态。"""
+
+    if skill is None or not skill.references:
+        return None
+    specs: list[SkillReferenceSpec] = []
+    for reference in skill.references:
+        raster_id = f"mmskill:{skill.skill_id}:{reference.reference_id}"
+        with Image.open(io.BytesIO(reference.image_bytes)) as image:
+            rasters[raster_id] = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        specs.append(
+            SkillReferenceSpec(
+                reference_id=reference.reference_id,
+                state=reference.state,
+                view=reference.view,
+                when_to_use=reference.when_to_use,
+                visual_cue=reference.visual_cue,
+                raster_id=raster_id,
+            )
+        )
+    return SkillReferenceBoardSpec(skill.skill_id, tuple(specs))
+
+
 def _rgb(camera: dict[str, Any]) -> np.ndarray:
     try:
         rgb = np.asarray(camera["images"]["rgb"])
@@ -1777,6 +1879,8 @@ __all__ = [
     "EvidenceCatalogSpec",
     "PointSpec",
     "RegionSpec",
+    "SkillReferenceBoardSpec",
+    "SkillReferenceSpec",
     "WorldContextSpec",
     "encode_png_data_url",
 ]

@@ -17,7 +17,7 @@ from vaw.context_runtime.packet import (
 
 
 class ContextWebRenderer:
-    name = "context-web-v54-closed-gripper-z-cue"
+    name = "context-web-v57-mmskill-reference"
     width = CONTEXT_WIDTH
     height = CONTEXT_HEIGHT
 

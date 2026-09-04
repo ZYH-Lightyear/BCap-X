@@ -250,8 +250,8 @@ def test_imagination_limit_hands_the_partial_state_back_to_main(tmp_path: Path) 
     )
     imagination = RecordingProvider(
         [
-            _response(1, "inspect_rotation", frame="base", axis="z"),
-            _response(2, "inspect_rotation", frame="tool", axis="y"),
+            _response(1, "rotate_preview", angle_deg=5.0),
+            _response(2, "rotate_preview", angle_deg=-5.0),
         ]
     )
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
@@ -282,7 +282,7 @@ def test_imagination_limit_hands_the_partial_state_back_to_main(tmp_path: Path) 
     assert "imagine_action" in _user_text(main.messages[1])
     assert "partial (reason=turn_limit" in _user_text(main.messages[1])
     assert "review the Preview" in _user_text(main.messages[1])
-    assert "inspect_rotation" not in _user_text(main.messages[1])
+    assert "rotate_preview" not in _user_text(main.messages[1])
     meta = json.loads(
         (tmp_path / "subagents" / "imagination_0001" / "meta.json").read_text()
     )
@@ -553,7 +553,7 @@ def test_main_context_and_trace_have_no_model_authored_goal(tmp_path: Path) -> N
     frozen = json.loads(
         (tmp_path / "contexts" / "turn_0001" / "context.json").read_text()
     )
-    assert frozen["schema"] == "vaw-agent-context-v2-no-goal"
+    assert frozen["schema"] == "vaw-agent-context-v3-mmskill"
     assert "current_goal" not in frozen
     rows = [
         json.loads(line)

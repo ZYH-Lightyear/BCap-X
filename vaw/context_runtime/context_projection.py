@@ -12,6 +12,7 @@ from vaw.context_runtime.memory import (
     InteractionMemory,
 )
 from vaw.context_runtime.model import ContextState
+from vaw.mmskill import MMSkill
 
 
 @dataclass(frozen=True)
@@ -95,19 +96,33 @@ def project_embodied_state(
 def render_main_context(
     *,
     task: str,
+    available_mmskills: str,
     live_references: dict[str, Any],
     embodied_state: EmbodiedStateCard,
     interaction_memory: InteractionMemory,
+    active_mmskill: MMSkill | None = None,
     feedback: str | None = None,
 ) -> str:
     """Build the textual half of Main's multimodal context in one place."""
 
     lines = [
         f"用户任务：{task}",
-        "当前有效引用：" + _json(live_references),
-        "机器人本体状态：" + _json(embodied_state.summary()),
-        "短期交互记忆：",
+        available_mmskills,
     ]
+    if active_mmskill is not None:
+        lines.extend(
+            [
+                f"当前加载技能：{active_mmskill.skill_id}",
+                active_mmskill.prompt_block(),
+            ]
+        )
+    lines.extend(
+        [
+            "当前有效引用：" + _json(live_references),
+            "机器人本体状态：" + _json(embodied_state.summary()),
+            "短期交互记忆：",
+        ]
+    )
     history = interaction_memory.prompt_lines(limit=DEFAULT_PROMPT_WINDOW)
     lines.extend(history if history else ["（空）"])
     if feedback is not None:

@@ -24,7 +24,7 @@ from vaw.context_runtime.packet import (
     _presentation_region_ref,
     _required_contact_points,
 )
-from vaw.context_runtime.private import LastPhysicalArtifacts
+from vaw.context_runtime.private import LastPhysicalArtifacts, PrivateEnvContext
 from vaw.context_runtime.model import Pose
 from vaw.context_runtime.workspace import ContextWorkspace
 
@@ -51,16 +51,37 @@ def _walk_keys(value):
             yield from _walk_keys(item)
 
 
-def test_main_packet_uses_clean_current_rgb_and_fixed_viewport() -> None:
+def test_contact_frame_survives_observation_revision_but_resets_for_new_action() -> None:
+    private = PrivateEnvContext(
+        contact_frame_quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+        contact_frame_source_revision=3,
+        contact_camera_signs=(-1, 1),
+        contact_camera_pair=object(),
+        contact_camera_action_id="observed:main",
+    )
+
+    private.begin_revision({"agentview": {}})
+
+    assert private.contact_frame_quaternion_xyzw == (0.0, 0.0, 0.0, 1.0)
+    assert private.contact_frame_source_revision == 3
+    assert private.contact_camera_signs == (-1, 1)
+    assert private.contact_camera_pair is None
+
+    private.reset_contact_frame()
+
+    assert private.contact_frame_quaternion_xyzw is None
+    assert private.contact_frame_source_revision is None
+    assert private.contact_camera_signs is None
+
+
+def test_main_packet_keeps_agentview_clean_and_uses_fixed_viewport() -> None:
     workspace = _workspace()
     packet = ContextCompiler().compile(workspace)
+    raw = workspace._private.camera("agentview")["images"]["rgb"]
 
     assert packet.schema == CONTEXT_SCHEMA
     assert packet.projection == "main"
-    assert np.array_equal(
-        packet.rasters["agentview"],
-        workspace._private.camera("agentview")["images"]["rgb"],
-    )
+    assert np.array_equal(packet.rasters["agentview"], raw)
     assert packet.summary()["viewport"] == {
         "width": CONTEXT_WIDTH,
         "height": CONTEXT_HEIGHT,
@@ -103,8 +124,8 @@ def test_observed_grasp_sweep_is_persistent_and_contact_only(monkeypatch) -> Non
 
     assert len(routed_segments) == 2
     assert all(np.array_equal(value, segment) for value in routed_segments)
+    assert np.array_equal(before_close.rasters["agentview"], after_close.rasters["agentview"])
     assert np.array_equal(before_close.rasters["agentview"], raw_rgb)
-    assert np.array_equal(after_close.rasters["agentview"], raw_rgb)
     assert before_close.world.contact_front_raster_id == "contact_front"
     assert after_close.world.contact_front_raster_id == "contact_front"
 
@@ -274,7 +295,8 @@ def test_main_packet_never_projects_previous_action_visual() -> None:
         workspace._private.camera("agentview", previous=True)["images"]["rgb"]
         == 31
     )
-    assert np.all(after.rasters["agentview"] == 79)
+    unchanged = np.all(after.rasters["agentview"] == 79, axis=2)
+    assert np.all(unchanged)
     assert "previous_action" not in after.rasters
     assert "previousActionRasterId" not in after.world.summary()
     assert "physicalTransition" not in after.world.summary()

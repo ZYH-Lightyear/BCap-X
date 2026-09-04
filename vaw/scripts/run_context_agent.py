@@ -22,7 +22,12 @@ from typing import Any
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
+from vaw.context_runtime.perception_defaults import (
+    DEFAULT_GROUNDING_MODEL,
+    DEFAULT_POINT_MODEL,
+)
 from vaw.context_runtime.services import preflight_services
+from vaw.mmskill import MMSkillLibrary
 
 
 def _parse_args() -> argparse.Namespace:
@@ -32,6 +37,31 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--task-id", type=int, default=0)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--model", default="vapi/qwen3.5-plus", help="Main Agent model")
+    parser.add_argument(
+        "--grounding-model",
+        default=DEFAULT_GROUNDING_MODEL,
+        help=(
+            "VLM used only by detect_region candidate generation/review "
+            f"(default: {DEFAULT_GROUNDING_MODEL})"
+        ),
+    )
+    parser.add_argument(
+        "--grounding-coord-space",
+        choices=("auto", "pixel", "norm1000", "norm1000_yxyx"),
+        default="auto",
+        help="detect_region box coordinate protocol (default: infer from model)",
+    )
+    parser.add_argument(
+        "--point-model",
+        default=DEFAULT_POINT_MODEL,
+        help=f"VLM used only by locate_point (default: {DEFAULT_POINT_MODEL})",
+    )
+    parser.add_argument(
+        "--point-coord-space",
+        choices=("auto", "pixel_xy", "norm1000_xy", "norm1000_yx"),
+        default="auto",
+        help="locate_point coordinate protocol (default: infer from model)",
+    )
     parser.add_argument(
         "--imagination-model",
         default=None,
@@ -92,6 +122,19 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--trace-dir", type=pathlib.Path, default=None)
+    parser.add_argument(
+        "--skill-root",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "技能目录或 evolution 实验根目录；实验根目录默认读取 active generation"
+        ),
+    )
+    parser.add_argument(
+        "--skill-generation",
+        default=None,
+        help="显式选择 --skill-root 实验中的 generation，用于候选评测",
+    )
     parser.add_argument("--object-query", default="the alphabet soup can")
     parser.add_argument("--point-query", default="the center of the alphabet soup can")
     parser.add_argument(
@@ -109,8 +152,44 @@ def _safe_name(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", value).strip("_") or "model"
 
 
+def _resolve_skill_library(
+    skill_root: pathlib.Path | None,
+    skill_generation: str | None,
+) -> MMSkillLibrary:
+    """解析 Runtime 技能来源；候选 generation 只能通过显式参数加载。"""
+
+    from vaw.evolution.store import GenerationStore
+
+    if skill_root is None:
+        if skill_generation is not None:
+            raise ValueError("--skill-generation 必须与 --skill-root 一起使用")
+        return MMSkillLibrary.builtin()
+
+    root = skill_root.resolve()
+    if (root / "experiment.json").is_file():
+        store = GenerationStore.open(root)
+        generation_id = skill_generation or store.active_generation()
+        manifest = store.read_manifest(generation_id)
+        return MMSkillLibrary.from_root(
+            store.generation_path(generation_id) / "skills",
+            source=str(root),
+            generation_id=generation_id,
+            expected_digest=manifest.skill_digest,
+        )
+    if skill_generation is not None:
+        raise ValueError("普通 --skill-root 不支持 --skill-generation")
+    return MMSkillLibrary.from_root(root)
+
+
 def main() -> int:
     args = _parse_args()
+    try:
+        skill_library = _resolve_skill_library(
+            args.skill_root,
+            args.skill_generation,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
     try:
         preflight_services()
     except RuntimeError as exc:
@@ -123,6 +202,8 @@ def main() -> int:
         LiberoOppositeSceneCameraProvider,
     )
     from vaw.context_runtime.libero_sensor import make_libero_semantic_rgb_provider
+    from vaw.context_runtime.point_grounding import resolve_point_coord_space
+    from vaw.context_runtime.semantic_grounding import resolve_grounding_coord_space
     from vaw.context_runtime.trace import ContextTraceLogger
     from vaw.context_runtime.video import save_episode_videos
     from vaw.context_runtime.web_renderer import ContextWebRenderer
@@ -136,6 +217,20 @@ def main() -> int:
     _, reset_info = env.reset(seed=args.seed)
     task_prompt = str(reset_info["task_prompt"])
     api = FrankaLiberoApiReduced(env)
+    grounding_coord_space = None
+    point_coord_space = None
+    if args.grounding_model:
+        grounding_coord_space = resolve_grounding_coord_space(
+            args.grounding_model,
+            args.grounding_coord_space,
+        )
+    if args.point_model:
+        point_coord_space = resolve_point_coord_space(
+            args.point_model,
+            args.point_coord_space,
+        )
+    if args.grounding_model or args.point_model:
+        api.configure_vlm_backend(server_url=args.server_url, api_key=args.api_key)
     semantic_rgb_provider = make_libero_semantic_rgb_provider(
         env,
         scale=args.semantic_render_scale,
@@ -156,6 +251,10 @@ def main() -> int:
             "task_id": args.task_id,
             "seed": args.seed,
             "model": args.model,
+            "grounding_model": args.grounding_model,
+            "grounding_coord_space": grounding_coord_space,
+            "point_model": args.point_model,
+            "point_coord_space": point_coord_space,
             "imagination_model": args.imagination_model or args.model,
             "semantic_render_scale": args.semantic_render_scale,
             "contact_camera": "mujoco-direct-simulation-only",
@@ -189,6 +288,10 @@ def main() -> int:
                 object_query=args.object_query,
                 point_query=args.point_query,
                 motion_backend=args.motion_backend,
+                grounding_model=args.grounding_model,
+                grounding_coord_space=grounding_coord_space,
+                point_model=args.point_model,
+                point_coord_space=point_coord_space,
                 scripted_refinement=args.scripted_refinement,
                 semantic_rgb_provider=semantic_rgb_provider,
                 contact_camera_provider=contact_camera_provider,
@@ -202,6 +305,11 @@ def main() -> int:
             renderer,
             trace,
             args,
+            skill_library=skill_library,
+            grounding_model=args.grounding_model,
+            grounding_coord_space=grounding_coord_space,
+            point_model=args.point_model,
+            point_coord_space=point_coord_space,
             semantic_rgb_provider=semantic_rgb_provider,
             contact_camera_provider=contact_camera_provider,
             opposite_scene_camera_provider=opposite_scene_camera_provider,
@@ -247,6 +355,11 @@ def _run_agent(
     trace: Any,
     args: argparse.Namespace,
     *,
+    skill_library: MMSkillLibrary,
+    grounding_model: str | None,
+    grounding_coord_space: str | None,
+    point_model: str | None,
+    point_coord_space: str | None,
     semantic_rgb_provider: Any,
     contact_camera_provider: Any,
     opposite_scene_camera_provider: Any,
@@ -290,6 +403,10 @@ def _run_agent(
             api,
             task_prompt,
             motion_backend=args.motion_backend,
+            grounding_model=grounding_model,
+            grounding_coord_space=grounding_coord_space,
+            point_model=point_model,
+            point_coord_space=point_coord_space,
             semantic_rgb_provider=semantic_rgb_provider,
             contact_camera_provider=contact_camera_provider,
             opposite_scene_camera_provider=opposite_scene_camera_provider,
@@ -312,6 +429,7 @@ def _run_agent(
         ),
         env_check=env.task_completed,
         env_terminal_check=lambda: bool(getattr(env, "_current_done", False)),
+        skill_library=skill_library,
     )
     result = runtime.run()
     print(
@@ -332,6 +450,10 @@ def _run_scripted(
     object_query: str,
     point_query: str,
     motion_backend: str,
+    grounding_model: str | None,
+    grounding_coord_space: str | None,
+    point_model: str | None,
+    point_coord_space: str | None,
     scripted_refinement: bool,
     semantic_rgb_provider: Any,
     contact_camera_provider: Any | None = None,
@@ -346,6 +468,10 @@ def _run_scripted(
         api,
         task_prompt,
         motion_backend=motion_backend,
+        grounding_model=grounding_model,
+        grounding_coord_space=grounding_coord_space,
+        point_model=point_model,
+        point_coord_space=point_coord_space,
         semantic_rgb_provider=semantic_rgb_provider,
         contact_camera_provider=contact_camera_provider,
         opposite_scene_camera_provider=opposite_scene_camera_provider,

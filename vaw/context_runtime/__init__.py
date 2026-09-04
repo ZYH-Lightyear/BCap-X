@@ -51,6 +51,7 @@ from vaw.context_runtime.runtime import (
     run_context_episode,
 )
 from vaw.context_runtime.workspace import ContextStepResult, ContextWorkspace
+from vaw.mmskill import MMSkill, MMSkillBuffer, MMSkillLibrary
 
 __all__ = [
     "ActionPrediction",
@@ -77,6 +78,9 @@ __all__ = [
     "ROBOT_FUNCTION_NAMES",
     "MotionBackend",
     "MotionPlan",
+    "MMSkill",
+    "MMSkillBuffer",
+    "MMSkillLibrary",
     "PointEvidence",
     "ActionProposal",
     "InteractionEvent",

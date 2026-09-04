@@ -342,6 +342,7 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
 def _run_manifest(
     *,
     spec: EvolutionSpec,
+    suite: str,
     split: str,
     tasks: Sequence[int],
     seeds: Sequence[int],
@@ -352,7 +353,7 @@ def _run_manifest(
     return {
         "schema": "vaw-day-run-v1",
         "experiment_id": spec.experiment_id,
-        "suite": spec.evolve_suite,
+        "suite": suite,
         "split": split,
         "tasks": list(tasks),
         "seeds": list(seeds),
@@ -394,6 +395,7 @@ def build_jobs(
         run_root,
         _run_manifest(
             spec=spec,
+            suite=spec.evolve_suite,
             split=split,
             tasks=selected_tasks,
             seeds=selected_seeds,
@@ -423,6 +425,66 @@ def build_jobs(
                 )
             )
     return tuple(jobs)
+
+
+def build_heldout_jobs(
+    *,
+    store: GenerationStore,
+    run_root: Path,
+    suite: str,
+    tasks: Sequence[int],
+    seeds: Sequence[int],
+    generation_id: str | None = None,
+) -> tuple[DayJob, ...]:
+    """为 sealed held-out suite 构造只评测、不学习的 episode。
+
+    该入口刻意不复用 evolve/gate split。调用方只能选择实验创建时已经冻结为
+    held-out 的 suite，输出也标为 ``transfer``，避免后续 M3/M4 误把它当 DAY 证据。
+    """
+
+    spec = store.read_spec()
+    if suite not in spec.heldout_suites:
+        raise ValueError(f"suite 未冻结为 held-out: {suite}")
+    selected_tasks = tuple(int(value) for value in tasks)
+    selected_seeds = tuple(int(value) for value in seeds)
+    if not selected_tasks or not selected_seeds:
+        raise ValueError("held-out tasks 和 seeds 不能为空")
+    if len(set(selected_tasks)) != len(selected_tasks) or len(set(selected_seeds)) != len(selected_seeds):
+        raise ValueError("held-out tasks 和 seeds 不能重复")
+
+    selected_generation = generation_id or store.active_generation()
+    manifest = store.read_manifest(selected_generation)
+    runner_args = runner_args_from_spec(spec)
+    _prepare_run(
+        run_root,
+        _run_manifest(
+            spec=spec,
+            suite=suite,
+            split="transfer",
+            tasks=selected_tasks,
+            seeds=selected_seeds,
+            generation_id=selected_generation,
+            skill_digest=manifest.skill_digest,
+            runner_args=runner_args,
+        ),
+    )
+    return tuple(
+        DayJob(
+            episode_key=f"{suite}:t{task_id}:s{seed}",
+            suite=suite,
+            task_id=task_id,
+            seed=seed,
+            generation_id=selected_generation,
+            skill_digest=manifest.skill_digest,
+            experiment_root=store.root,
+            run_root=run_root,
+            trace_dir=run_root / "traces" / f"task{task_id}_s{seed}",
+            log_path=run_root / "logs" / f"task{task_id}_s{seed}.log",
+            runner_args=runner_args,
+        )
+        for task_id in selected_tasks
+        for seed in selected_seeds
+    )
 
 
 def _existing_records(run_root: Path) -> dict[str, DayEpisodeRecord]:
@@ -585,6 +647,7 @@ __all__ = [
     "DayStatus",
     "ProcessOutcome",
     "build_jobs",
+    "build_heldout_jobs",
     "compile_record",
     "episode_command",
     "parse_int_list",

@@ -214,6 +214,9 @@ extend-exclude = [
 
 
 [tool.setuptools.package-data]
+"vaw" = [
+  "mmskills/*/SKILL.md",
+]
 "capx.envs" = [
   "assets/ur5_pick_place/*.xml",
   "assets/ur5_pick_place/ur5e/*.obj",

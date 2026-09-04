@@ -1,9 +1,12 @@
 # VAW-RSI：Verifier-Governed Day–Night MMSkill Co-Evolution
 
-> 状态：方法设计草案 v2（2026-08-30）
+> 状态：方法设计草案 v3（2026-09-02）
 > 目标：定义 VAW 最关键的 DAY–NIGHT 自进化机制
 > 边界：本文档只定义方法目标；工程实施边界见 `MMSKILL_RSI_REFACTOR_PLAN.md`
 > 工作名称：**VAW-RSI / Verifier-Governed Day–Night MMSkill Co-Evolution**
+
+本文的 §0–§12 保留完整目标设计；其中未实现的模块不会因当前代码尚未覆盖而删除。§13–§14 单独记录
+当前代码事实和完成状态，避免把目标架构误读为已落地能力。
 
 ---
 
@@ -75,9 +78,9 @@ flowchart TB
     end
 
     subgraph NIGHT_FAST["NIGHT Fast Lane：MMSkill"]
-        L --> S["Decision Window 切分"]
-        S --> V["混合验证器"]
-        V --> X["成功/失败对比案例挖掘"]
+        L --> S["Episode Atlas"]
+        S --> V["Trace Investigator"]
+        V --> X["Independent Evidence Review"]
         X --> G["MMSkill Compiler"]
         G --> Q["候选 MMSkill"]
         Q --> A["离线反事实测试"]
@@ -197,7 +200,7 @@ distillation_readiness
 version / parent_version
 ```
 
-`distillation_examples` 只引用已经验证的 Decision Window，不复制进 Agent Context；
+`distillation_examples` 只引用已经审核的 SegmentEvidence，不复制进 Agent Context；
 `distillation_readiness` 表示该技能是否已经跨多个对象、布局或任务获得稳定支持。只有 ready 的 MMSkill
 能够进入 LoRA Slow Lane。
 
@@ -214,36 +217,33 @@ version / parent_version
 
 ## 4. 动态 MMSkill 加载
 
-当前 task-start Knowledge Pack 适合为 episode 提供稳定先验，但无法在具体空间困难发生时即时提供参考。
-VAW-RSI 增加一个非物理、非控制型工具：
+当前在线实现不再使用 task-start Knowledge Pack。Main 每轮先看到全部短技能的
+`skill_id + name + description` 轻量索引，需要正文时显式调用非物理、非控制型工具：
 
 ```text
-consult_mmskill(question, action_id?)
+consult_mmskill(skill_id)
 ```
 
 示例：
 
 ```json
 {
-  "question": "当前夹爪相对目标是否适合闭合，应从哪个方向微调？",
-  "action_id": "a3"
+  "skill_id": "container-rim-place-recovery"
 }
 ```
 
-检索输入包括：
-
-- 当前 Main 或 Imagination Canvas；
-- Agent 的自然语言问题；
-- 当前 Action 类型及可用视角；
-- 当前有效的 region/point/action 引用。
-
-系统只加载最高相关的 1–2 个技能。Function result 保持最小：
+当前没有 embedding、reranker 或视觉检索器；Main 根据当前 Canvas 和轻量索引自行选择精确
+`skill_id`。Function result 为：
 
 ```json
-{"loaded": true}
+{"skill_id":"container-rim-place-recovery","loaded":true}
 ```
 
-技能内容进入下一张 Canvas，而不是以长文本 Function result 注入。推荐的视觉结构为：
+正文进入下一轮 Main/Imagination 的独立文本上下文，不绘制到当前 Canvas。Buffer 同时只保留一个技能；
+加载其他技能时覆盖，下一次真实物理动作后清除。
+
+下面是尚未实现、保留用于多模态技能阶段的目标设计：当技能带 Visual Reference 时，可加入冻结的
+视觉检索，并把参考编译成独立 Reference Canvas：
 
 ```text
 CURRENT EVIDENCE | POSITIVE REFERENCE | NEGATIVE REFERENCE
@@ -255,7 +255,8 @@ CURRENT EVIDENCE | POSITIVE REFERENCE | NEGATIVE REFERENCE
 REFERENCE — NOT CURRENT — NOT EXECUTED
 ```
 
-技能的生命周期是 action-local：Action 被执行、丢弃或替换后自动卸载，不进入几十轮的长期上下文。
+未来 Visual Reference 的生命周期可以进一步收窄为 action-local；当前短文本正文采用
+“overwrite-only + physical-action clear”，不进入长期 transcript。
 未来可加入通用的恢复提示：当 Progress Critic 检测到连续停滞时，仅提示“存在可查询视觉参考”，而不
 强制加载某个流程。
 
@@ -276,44 +277,38 @@ REFERENCE — NOT CURRENT — NOT EXECUTED
 
 DAY 期间不在线修改技能，避免同一 generation 内的策略漂移和不可复现实验。
 
-### 5.2 Decision Window
+### 5.2 Episode Atlas 与主动调查
 
-每个真实物理变化形成一个局部决策窗口：
-
-```text
-DecisionWindow
-├── task
-├── before_canvas
-├── loaded_visual_skills
-├── VLM function call
-├── requested_action
-├── achieved_action
-├── after_canvas
-└── terminal_outcome       # trace-only
-```
-
-窗口通常覆盖：
+完整 trace 不再由规则预切成学习窗口。系统先生成 episode 级 Atlas：
 
 ```text
-感知/创建 Action
-→ 一组 Preview 或 Imagination edits
-→ 物理执行
-→ 新真实 Observation
+EpisodeAtlas
+├── task / terminal outcome
+├── TOPReward raw curve
+├── physical action markers
+└── sparse visual storyboard
 ```
 
-`requested_action` 和 `achieved_action` 必须分开保存。如果控制器只实现了部分位移，Night 不能把结果
-错误归因给 VLM 的空间理解，否则知识库会学习如何补偿 controller bug。
+独立 Investigator 根据 Atlas 自主提出问题，并通过唯一的只读工具按需取回局部证据：
+
+```text
+inspect_segment(start_action, end_action, question)
+```
+
+工具返回区间内的高分辨率 policy-visible Canvas 和精简语义动作。Agent 可以移动、扩大或缩小
+区间，直到证据足以支持一个通用 finding。原始请求动作、实际画面和底层 telemetry 仍完整保留在
+trace 中，但不作为预拼接字段污染模型输入。
 
 ---
 
 ## 6. NIGHT：从轨迹到技能
 
-### 6.1 决策窗口切分
+### 6.1 Trace Investigator
 
-Night 不直接总结完整 episode，而是围绕真实物理变化切分局部窗口。局部窗口使系统能够判断一个视觉
-决策是否产生了预期物理效果，也避免完整 transcript 中的大量感知和恢复调用淹没关键因果关系。
+Night 不直接总结完整 episode，也不由规则决定关键窗口。Investigator 阅读 Atlas 后主动检索局部
+视觉证据；上下文只保留 Atlas、覆盖式调查笔记和最近三段证据，避免完整 transcript 淹没关键关系。
 
-### 6.2 混合验证器
+### 6.2 独立 Evidence Reviewer
 
 验证分为四层：
 
@@ -337,28 +332,20 @@ UNKNOWN
 它用于定位关键窗口、发现停滞和构造正反例，不直接决定候选技能是否晋升。最终晋升仍需依赖固定预算、
 相同 task/seed 的闭环配对结果，避免视觉 critic 被候选知识投机利用。
 
-### 6.3 保守失败归因
+### 6.3 最小 Finding Contract
 
-Night 对失败只做以下粗粒度归因：
+Investigator 不先把问题塞入固定 taxonomy。每条发现只表达被视觉证据支持的事实与通用经验：
 
-```text
-perception_gap
-visual_reasoning_gap
-execution_gap
-effect_verification_gap
-missing_capability
-unknown
+```json
+{
+  "span": [4, 6],
+  "observation": "动作后目标关系短暂改善，随后同向调整使其退化。",
+  "insight": "连续微调应在每次真实结果后重新确认方向，而不是沿旧假设累积。"
+}
 ```
 
-只有高置信度的 `visual_reasoning_gap` 和 `effect_verification_gap` 可以产生 MMSkill 候选。
-
-下列问题必须进入工程问题队列，不能被知识卡掩盖：
-
-- detector/SAM 错误；
-- 坐标变换错误；
-- PyRoki/CuRobo 没有实现请求动作；
-- 观测或 Canvas 渲染错误；
-- 缺少必要的 Action API。
+若视觉证据不足，允许输出空 findings。solver、坐标变换、渲染错误等内部原因不能由 Investigator
+根据 Canvas 猜测；这类问题继续保留在工程 trace，由人工或独立工程诊断处理。
 
 无法可靠归因时标记为 `unknown`，不生成技能。
 
@@ -399,7 +386,7 @@ unknown
 - privileged truth；
 - 伪 phase machine；
 - 与工具、frame 或视觉语义冲突的内容；
-- 无法追溯到已验证 Decision Window 的图片。
+- 无法追溯到已审核 SegmentEvidence 的图片。
 
 ### Gate B：离线反事实决策测试
 
@@ -496,7 +483,7 @@ MMSkillTrainingExample
 1. Function 和坐标语义合法；
 2. requested action 与 achieved action 一致；
 3. 对应 MMSkill 已通过 Skill Gate，而不是刚生成的候选；
-4. 该 Decision Window 不属于 `execution_gap`、`perception_gap` 或 `unknown`；
+4. 对应 finding 已通过独立 Evidence Reviewer；
 5. 最终动作得到闭环任务成功或可靠的局部物理进展支持；
 6. 输入中不含 reward、env success、planner telemetry 或未来画面。
 
@@ -552,8 +539,9 @@ Operational Memory
     episode-local，overwrite-only
 
 MMSkill Buffer
-    当前动态加载的 1–2 个视觉参考
-    action-local，用完即清除
+    当前实现：一个动态加载的短文本技能
+    overwrite-only，加载其他技能或真实物理动作后清除
+    目标设计：再加入 1–2 个 action-local Visual Reference
 
 MMSkill Library
     跨 episode 的已验证视觉经验
@@ -662,24 +650,29 @@ VAW-RSI 不是“检索一张相似图片”而已。它要求参考来自可审
 
 ## 13. 与当前 VAW 的代码距离
 
-当前系统已经具备大部分 DAY 侧基础：
+当前系统已经具备 DAY 侧基础和 NIGHT 侧的证据调查闭环：
 
 - grounded perception 与 XYZ；
 - low-level physical tools；
 - Main 与 Imagination；
 - 多视角 Canvas；
 - 完整 trace/video；
-- Task Knowledge Registry；
-- Progress Critic 原型。
+- 四个短文本 MMSkill、常驻轻量索引与 `consult_mmskill` 动态正文加载；
+- 可注入 skill root / generation，以及 trace-only generation digest provenance；
+- 冻结 `EvolutionSpec`、不可变 generation snapshot、append-only ledger 和 rollback 指针；
+- 支持 resume 的轻量 DAY runner 与终局 outcome 汇总；
+- TOPReward 原始进度曲线与 Episode Atlas；
+- 主动式 `TraceInvestigator + inspect_segment`；
+- finding 级独立 `EvidenceReviewer`。
 
 关键缺口是：
 
-1. action-local 动态 MMSkill；
-2. MMSkill Capsule 数据结构和 Reference Canvas；
-3. trace 到 DecisionWindow 的编译器；
-4. Progress Critic 的校准与 Night 接入；
-5. contrastive MMSkill Compiler；
-6. paired evaluator、generation ledger 和回滚；
+1. MMSkill Capsule 数据结构和 Reference Canvas；
+2. 从 Reviewer finding 到 MMSkill mutation 的 Writer；
+3. 跨 episode 的 success/failure contrast 与候选合并；
+4. Candidate Skill Reviewer 与内容契约检查；
+5. Progress Critic 的独立校准；M3 当前只使用原始曲线作导航；
+6. paired evaluator、人工 approval 与 promotion CLI；
 7. 跨代技能合并、更新和淘汰；
 8. verified multimodal corpus builder；
 9. Imagination LoRA trainer、replay gate 和独立部署版本管理。
@@ -693,26 +686,29 @@ VAW-RSI 不是“检索一张相似图片”而已。它要求参考来自可审
 
 ### RSI-0：冻结实验基座
 
-- 冻结工具、坐标约定和 Canvas 基础语义；
-- 固定 train/validation/final-test；
-- 校准 Progress Critic；
-- trace 同时记录 requested 与 achieved action；
-- 建立 generation ledger。
+- [ ] 冻结论文实验使用的最终工具、坐标约定和 Canvas 版本；
+- [x] 通过 `EvolutionSpec` 固定 evolve/gate/reserve/held-out split；
+- [x] 建立 generation snapshot、digest、ledger 和 rollback 指针；
+- [x] DAY runner 固定 generation/config 并汇总终局 outcome；
+- [ ] 完成大规模 DAY baseline；
+- [ ] 独立校准 Progress Critic。
 
 ### RSI-1：动态 MMSkill
 
-- 定义 `MMSkillCapsule`；
-- 实现 `consult_mmskill`；
-- 实现 action-local Reference Canvas；
-- 先用 5–10 张人工但符合契约的技能卡验证机制价值。
+- [x] 定义短 `SKILL.md` 契约与完整轻量索引；
+- [x] 实现 `consult_mmskill` 和 overwrite-only 正文生命周期；
+- [x] 支持 builtin、显式 root 与指定 generation 注入；
+- [x] 当前四个手写技能可作为 `g000` 文本基线；
+- [ ] 定义包含视觉参考的 `MMSkillCapsule`；
+- [ ] 实现 action-local Reference Canvas。
 
-### RSI-2：Night Experience Compiler
+### RSI-2：Night Trace Investigation
 
-- DecisionWindow 切分；
-- 正反例匹配；
-- 视觉规范化与匿名化；
-- 候选技能生成；
-- 内容契约检查。
+- [x] Episode Atlas；
+- [x] 主动式 SegmentEvidence 检索；
+- [x] 独立 Evidence Review；
+- [ ] 候选技能生成；
+- [ ] 内容契约检查。
 
 ### RSI-3：晋升闭环
 

@@ -9,6 +9,7 @@ from vaw.evolution import EvolutionSpec, GenerationStore
 from vaw.evolution.day import (
     DayStatus,
     ProcessOutcome,
+    build_heldout_jobs,
     build_jobs,
     episode_command,
     run_day,
@@ -16,6 +17,8 @@ from vaw.evolution.day import (
     select_seeds,
     select_tasks,
 )
+from vaw.evolution.cycle import CyclePlan, MultiAgentCycle
+from vaw.evolution.gate import load_day_index
 
 
 def _write_skill(root: Path) -> None:
@@ -115,6 +118,34 @@ def test_build_jobs_freezes_selection_and_injects_generation(tmp_path: Path) -> 
         )
 
 
+def test_heldout_jobs_are_separate_from_learning_splits(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_root = tmp_path / "transfer"
+    jobs = build_heldout_jobs(
+        store=store,
+        run_root=run_root,
+        suite="libero_object_task",
+        tasks=(0, 4),
+        seeds=(1,),
+    )
+
+    assert [job.episode_key for job in jobs] == [
+        "libero_object_task:t0:s1",
+        "libero_object_task:t4:s1",
+    ]
+    run = json.loads((run_root / "run.json").read_text())
+    assert run["split"] == "transfer"
+    assert run["suite"] == "libero_object_task"
+    with pytest.raises(ValueError, match="未冻结为 held-out"):
+        build_heldout_jobs(
+            store=store,
+            run_root=tmp_path / "leak",
+            suite="libero_90",
+            tasks=(0,),
+            seeds=(1,),
+        )
+
+
 def test_runner_config_is_extensible_but_cannot_override_episode_identity(
     tmp_path: Path,
 ) -> None:
@@ -207,3 +238,59 @@ def test_incomplete_and_interrupted_runs_are_not_resumed(tmp_path: Path) -> None
     assert records[0].env_success is None
     assert records[0].error == "service unavailable"
     assert records[1].terminate_mode is None
+
+
+def test_multi_agent_cycle_freezes_identity_and_resumes_day(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    plan = CyclePlan(
+        cycle_id="smoke-cycle",
+        parent_generation="g000",
+        candidate_generation="g001",
+        mutation_id="m001",
+        tasks=(0, 3),
+        seeds=(1,),
+    )
+    cycle = MultiAgentCycle(store, plan, resume=False)
+    calls: list[str] = []
+
+    def fake_runner(job):
+        calls.append(job.episode_key)
+        _write_complete_trace(job, success=job.task_id == 0)
+        return ProcessOutcome(0, 0.1)
+
+    index = cycle.run_baseline(workers=2, episode_runner=fake_runner)
+    resumed = MultiAgentCycle(store, plan, resume=True)
+    resumed.run_baseline(workers=2, episode_runner=fake_runner)
+
+    assert index.is_file()
+    loaded = load_day_index(index)
+    assert loaded[0, 1].trace_dir == jobs_trace(store, "smoke-cycle", 0)
+    assert len(calls) == 2
+    assert resumed.status()["stages"]["baseline"] is True
+    with pytest.raises(ValueError, match="不一致"):
+        MultiAgentCycle(
+            store,
+            CyclePlan(
+                cycle_id="smoke-cycle",
+                parent_generation="g000",
+                candidate_generation="g002",
+                mutation_id="m001",
+                tasks=(0, 3),
+                seeds=(1,),
+            ),
+            resume=True,
+        )
+
+
+def jobs_trace(store: GenerationStore, cycle_id: str, task_id: int) -> Path:
+    """返回 cycle DAY 的预期 trace；用于防止路径解析再次依赖固定层数。"""
+
+    return (
+        store.root
+        / "cycles"
+        / cycle_id
+        / "day"
+        / "baseline"
+        / "traces"
+        / f"task{task_id}_s1"
+    ).resolve()

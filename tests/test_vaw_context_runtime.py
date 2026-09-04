@@ -27,6 +27,10 @@ from vaw.context_runtime.motion import (
 from vaw.context_runtime.attached_object import fit_gravity_stable_proxy
 from vaw.context_runtime.errors import ContextFunctionError
 from vaw.context_runtime.functions import _geometric_grasps, _top_width_advisory
+from vaw.context_runtime.semantic_grounding import (
+    parse_candidates,
+    resolve_grounding_coord_space,
+)
 from vaw.context_runtime.private import build_edit_summary
 from vaw.context_runtime.protocol import (
     CONTRACT_PREAMBLE,
@@ -42,7 +46,40 @@ from vaw.context_runtime.protocol import (
 def test_main_system_prompt_is_compact() -> None:
     assert len(SYSTEM_PROMPT) <= 1_999
     assert "每轮先用最新画布判断当前真实状态" in SYSTEM_PROMPT
-    assert "非零开度可能" in SYSTEM_PROMPT
+    assert "非零开度可能" not in SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("vapi/gemini-3.7-flash", "norm1000_yxyx"),
+        ("vapi/qwen3.5-27b", "norm1000"),
+        ("vapi/gpt-5.5", "pixel"),
+        ("vapi/claude-opus-5", "pixel"),
+    ],
+)
+def test_grounding_coordinate_protocol_is_model_aware(
+    model: str,
+    expected: str,
+) -> None:
+    assert resolve_grounding_coord_space(model) == expected
+
+
+def test_grounding_coordinate_protocol_honors_explicit_override() -> None:
+    assert resolve_grounding_coord_space("vapi/gemini-3.7-flash", "pixel") == "pixel"
+
+
+def test_gemini_yxyx_grounding_box_maps_to_pixels() -> None:
+    candidates = parse_candidates(
+        '[{"box":[391,426,492,473],"evidence":"target"}]',
+        width=1600,
+        height=1024,
+        coord_space="norm1000_yxyx",
+    )
+
+    assert candidates[0].box_xyxy_px == pytest.approx(
+        (681.6, 400.384, 756.8, 503.808)
+    )
 
 
 class FakeContextApi:
@@ -395,14 +432,13 @@ class UnsettledMotionBackend(RecordingMotionBackend):
 
 
 def test_main_and_imagination_function_contracts_are_disjoint_and_small() -> None:
-    assert len(FUNCTION_NAMES) == 16
+    assert len(FUNCTION_NAMES) == 17
     assert FUNCTION_NAMES[0] == "detect_region"
     assert FUNCTION_NAMES[1:3] == ("propose_grasps", "locate_point")
     assert "inspect" not in FUNCTION_NAMES
     assert IMAGINATION_FUNCTION_NAMES == (
         "shift_preview",
         "rotate_preview",
-        "inspect_rotation",
         "finish_imagination",
     )
     main = function_definitions()
@@ -414,6 +450,7 @@ def test_main_and_imagination_function_contracts_are_disjoint_and_small() -> Non
     assert quaternion["minItems"] == quaternion["maxItems"] == 4
     assert "[1,0,0,0]" in quaternion["description"]
     assert "[0,0,0,1]" in quaternion["description"]
+    assert "[0.707,0,0,0.707]" in quaternion["description"]
     standard = main_function_definitions()
     imagination = imagination_function_definitions()
     assert [item["function"]["name"] for item in main] == list(FUNCTION_NAMES)
@@ -427,6 +464,8 @@ def test_main_and_imagination_function_contracts_are_disjoint_and_small() -> Non
     assert "discard_action" in MAIN_FUNCTION_NAMES
     assert "imagine_action" in MAIN_FUNCTION_NAMES
     assert "move_tcp_delta" in MAIN_FUNCTION_NAMES
+    assert "rotate_tcp_delta" in MAIN_FUNCTION_NAMES
+    assert "consult_mmskill" in MAIN_FUNCTION_NAMES
     assert "rotate_preview" not in MAIN_FUNCTION_NAMES
     assert "start_imagination" not in FUNCTION_NAMES
     assert set(IMAGINATION_FUNCTION_NAMES).isdisjoint(MAIN_FUNCTION_NAMES)
@@ -444,12 +483,11 @@ def test_main_and_imagination_function_contracts_are_disjoint_and_small() -> Non
     assert "检测并分割" in detection["description"]
     assert "sam" not in detection["description"].lower()
     assert "不移动机器人" in detection["description"]
-    for name in ("shift_preview", "rotate_preview"):
-        definition = next(
-            x["function"] for x in imagination if x["function"]["name"] == name
-        )
-        assert "frame" in definition["parameters"]["required"]
-        assert "refinement_goal" not in definition["parameters"]["required"]
+    shift = next(
+        x["function"] for x in imagination if x["function"]["name"] == "shift_preview"
+    )
+    assert "frame" in shift["parameters"]["required"]
+    assert "refinement_goal" not in shift["parameters"]["required"]
     delta = next(
         x["function"]
         for x in imagination
@@ -480,18 +518,18 @@ def test_main_and_imagination_function_contracts_are_disjoint_and_small() -> Non
     assert len(rotate["description"]) < 50
     assert rotate["parameters"]["properties"]["angle_deg"]["minimum"] == -10.0
     assert rotate["parameters"]["properties"]["angle_deg"]["maximum"] == 10.0
-    gizmo = next(
-        x["function"] for x in imagination if x["function"]["name"] == "inspect_rotation"
-    )
-    assert "不修改动作预览" in gizmo["description"]
-    assert "正负旋转方向" in gizmo["description"]
+    assert rotate["parameters"]["required"] == ["angle_deg"]
+    assert set(rotate["parameters"]["properties"]) == {"angle_deg"}
     assert "基座 +Z 恒为上抬" in IMAGINATION_SYSTEM_PROMPT
     assert "CONTACT FRONT" in IMAGINATION_SYSTEM_PROMPT
     assert "CONTACT SIDE" in IMAGINATION_SYSTEM_PROMPT
     assert "仅夹爪回退" in IMAGINATION_SYSTEM_PROMPT
     assert "动作预览对位不能恢复真实几何" in IMAGINATION_SYSTEM_PROMPT
     assert "指尖低于物体顶面并不代表碰撞" in IMAGINATION_SYSTEM_PROMPT
-    assert "不要用 point 坐标覆盖清楚的视觉证据" in CONTRACT_PREAMBLE
+    # Main's deliberately minimal prompt describes the visual interface but
+    # leaves task procedure to the model and Function contracts.
+    assert "优先采取能够直接推进任务的最小充分动作" in CONTRACT_PREAMBLE
+    assert "这些视图在视觉上都可能存在遮挡" in CONTRACT_PREAMBLE
     assert "真正需要净空" in IMAGINATION_SYSTEM_PROMPT
     assert "掌部/横梁/指根" in IMAGINATION_SYSTEM_PROMPT
     assert "必须分别判断位置与方向" in IMAGINATION_SYSTEM_PROMPT
@@ -503,7 +541,6 @@ def test_main_and_imagination_function_contracts_are_disjoint_and_small() -> Non
     refine = next(x["function"] for x in standard if x["function"]["name"] == "imagine_action")
     assert refine["parameters"]["required"] == ["instruction"]
     assert "不执行" in refine["description"]
-    assert len(refine["description"]) < 40
     assert "局部几何目标" in refine["parameters"]["properties"]["instruction"]["description"]
     assert "场景目标" in IMAGINATION_SYSTEM_PROMPT
     assert "不是要满足的对象" in IMAGINATION_SYSTEM_PROMPT
@@ -698,6 +735,34 @@ def test_main_direct_delta_uses_local_planner_without_curobo_fallback() -> None:
     assert len(local.executions) == 1
 
 
+def test_main_direct_rotate_is_exact_tool_local_z_and_uses_local_planner() -> None:
+    coarse = RecordingMotionBackend("coarse")
+    local = RecordingMotionBackend("local")
+    workspace = ContextWorkspace(
+        FakeContextApi(),
+        "task",
+        motion_backend=coarse,
+        local_motion_backend=local,
+    )
+    start = workspace.state.robot.tcp_pose
+    assert start is not None
+
+    result = workspace.execute("rotate_tcp_delta", angle_deg=10.0)
+
+    assert result.ok
+    assert not coarse.pose_plans and not coarse.executions
+    assert len(local.pose_plans) == 1
+    assert len(local.executions) == 1
+    target = local.pose_plans[0]
+    assert target.position_xyz == start.position_xyz
+    expected = Rotation.from_quat(start.quaternion_xyzw) * Rotation.from_euler(
+        "z", 10.0, degrees=True
+    )
+    actual = Rotation.from_quat(target.quaternion_xyzw)
+    assert np.rad2deg((actual.inv() * expected).magnitude()) == pytest.approx(0.0)
+    assert workspace.state.last_physical_action.requested_arm_rotation_tool_z_deg == 10.0
+
+
 def test_curobo_retries_exact_final_waypoint_when_reduced_api_is_still_settling() -> None:
     api = SettlingCuroboApi(settle=True)
     backend = CuroboMotionBackend(api)
@@ -889,6 +954,28 @@ def test_detection_keeps_raw_replies_when_candidate_parsing_exhausts_retries() -
     assert diagnostics["candidate_reply"] == "also not json"
 
 
+def test_locate_point_can_use_explicit_gemini_adapter() -> None:
+    api = ScriptedSemanticGroundingApi(['```json\n{"point":[500,500]}\n```'])
+    workspace = ContextWorkspace(
+        api,
+        "task",
+        motion_backend="pyroki",
+        point_model="vapi/gemini-3.7-flash",
+        point_coord_space="norm1000_yx",
+    )
+
+    result = workspace.execute("locate_point", query="target center")
+
+    assert result.ok
+    assert result.result["pixel_xy"] == pytest.approx([80.0, 60.0])
+    assert result.trace_diagnostics["point_grounding"] == {
+        "mode": "model_adapter",
+        "model": "vapi/gemini-3.7-flash",
+        "coord_space": "norm1000_yx",
+        "raw_reply": '```json\n{"point":[500,500]}\n```',
+    }
+
+
 def test_detection_uses_private_hires_semantic_view_and_maps_box_back() -> None:
     api = FakeSemanticGroundingApi(choice=2)
     captures = 0
@@ -948,7 +1035,7 @@ def test_continuous_refinement_edits_one_action_proposal_then_returns_ready() ->
     )
     target1 = workspace.state.action_proposal.target.pose
     second = workspace.execute_imagination(
-        "rotate_preview", axis="z", angle_deg=10, frame="tool"
+        "rotate_preview", angle_deg=10
     )
     target2 = workspace.state.action_proposal.target.pose
 
@@ -956,6 +1043,13 @@ def test_continuous_refinement_edits_one_action_proposal_then_returns_ready() ->
     assert target2.position_xyz == target1.position_xyz
     assert first.result["action_id"] == second.result["action_id"] == action_id
     assert workspace.state.imagination.instruction == "把夹爪向下并调正"
+    expected = Rotation.from_quat(target1.quaternion_xyzw) * Rotation.from_euler(
+        "z", 10.0, degrees=True
+    )
+    actual = Rotation.from_quat(target2.quaternion_xyzw)
+    assert np.rad2deg((actual.inv() * expected).magnitude()) == pytest.approx(0.0)
+    assert workspace._private.action_artifacts.latest_visual_edit.frame == "tool"
+    assert workspace._private.action_artifacts.latest_visual_edit.axis == "z"
 
     handoff = workspace.execute_imagination("finish_imagination", status="ready")
     assert workspace.state.imagination is None
@@ -1600,38 +1694,34 @@ def test_rotate_rejects_angle_outside_ten_degrees() -> None:
     start_pose = workspace.state.action_proposal.target.pose
 
     rejected = workspace.execute_imagination(
-        "rotate_preview", axis="x", angle_deg=-90, frame="base"
+        "rotate_preview", angle_deg=-90
     )
     assert not rejected.ok
     assert "10" in rejected.result["error"]
     assert workspace.state.action_proposal.target.pose == start_pose
 
     too_large = workspace.execute_imagination(
-        "rotate_preview", axis="z", angle_deg=10.1, frame="base"
+        "rotate_preview", angle_deg=10.1
     )
     assert not too_large.ok
     assert "10" in too_large.result["error"]
 
     accepted = workspace.execute_imagination(
-        "rotate_preview", axis="z", angle_deg=-10, frame="base"
+        "rotate_preview", angle_deg=-10
     )
     assert accepted.ok
     assert accepted.result["preview"] == "updated"
 
 
-def test_gizmo_does_not_require_a_following_rotate() -> None:
+def test_removed_rotation_guide_is_not_an_imagination_function() -> None:
     workspace = ContextWorkspace(FakeContextApi(), "task", motion_backend="pyroki")
     action_id = _selected_action(workspace)
-    workspace.begin_imagination("inspect then translate", action_id)
-    gizmo = workspace.execute_imagination(
+    workspace.begin_imagination("rotate directly", action_id)
+    result = workspace.execute_imagination(
         "inspect_rotation", frame="base", axis="z"
     )
-    assert gizmo.ok
-    moved = workspace.execute_imagination(
-        "shift_preview", delta_xyz_m=[0.0, 0.0, 0.01], frame="base"
-    )
-    assert moved.ok
-    assert moved.result["preview"] == "updated"
+    assert not result.ok
+    assert "unknown imagination function" in result.result["error"]
 
 
 def test_agent_failed_imagination_is_geometry_unresolved_and_records_attempts() -> None:
@@ -1726,13 +1816,13 @@ def test_unplannable_edit_does_not_become_the_next_edit_reference() -> None:
 
     assert (
         workspace.execute_imagination(
-            "rotate_preview", axis="z", angle_deg=8.0, frame="base"
+            "rotate_preview", angle_deg=8.0
         ).result["preview"]
         == "unchanged"
     )
     assert (
         workspace.execute_imagination(
-            "rotate_preview", axis="z", angle_deg=8.0, frame="base"
+            "rotate_preview", angle_deg=8.0
         ).result["preview"]
         == "unchanged"
     )

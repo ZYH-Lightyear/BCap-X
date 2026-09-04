@@ -59,12 +59,16 @@ def test_native_provider_forwards_canonical_tools_without_prompt_rewriting(
         {"role": "user", "content": "task"},
     ]
 
-    response = OpenAIProvider(model="local/qwen3.5-27b").generate(messages, tools)
+    response = OpenAIProvider(
+        model="local/qwen3.5-27b",
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    ).generate(messages, tools)
 
     assert captured["payload"]["messages"] == messages
     assert captured["payload"]["tools"] == tools
     assert captured["payload"]["tool_choice"] == "auto"
     assert captured["payload"]["parallel_tool_calls"] is False
+    assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
     assert response.tool_calls[0].name == "detect_region"
     assert response.tool_calls[0].args == {"query": "红色杯子"}
 
@@ -124,8 +128,14 @@ def test_public_function_catalog_is_small_and_unambiguous() -> None:
 
     assert names == list(MAIN_FUNCTION_NAMES)
     assert len(names) == len(set(names))
-    assert max(len(item["function"]["description"]) for item in definitions) < 40
     assert len(json.dumps(definitions, ensure_ascii=False)) < 4_500
+    consult = next(
+        item["function"]
+        for item in definitions
+        if item["function"]["name"] == "consult_mmskill"
+    )
+    assert len(consult["description"]) < 40
+    assert "enum" not in consult["parameters"]["properties"]["skill_id"]
     assert "detection_and_sam" not in names
     assert "commit" not in names
 

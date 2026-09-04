@@ -1,0 +1,18 @@
+{
+  "seeds": [1],
+  "workers": 2,
+  "runner_args": {
+    "model": "vapi/gemini-3.7-flash",
+    "imagination_model": "vapi/gemini-3.7-flash",
+    "server_url": "http://127.0.0.1:8110/chat/completions",
+    "protocol": "native",
+    "temperature": 0,
+    "max_tokens": 4096,
+    "max_turns": 32,
+    "max_imagination_turns": 6,
+    "max_time_s": 3600,
+    "max_physical_ops": 30,
+    "motion_backend": "curobo",
+    "record_video": true
+  }
+}

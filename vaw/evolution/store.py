@@ -14,7 +14,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from vaw.evolution.domain import EvolutionSpec, GenerationManifest, SkillMutation
+from vaw.evolution.candidate import CandidatePackage
+from vaw.evolution.domain import (
+    EvolutionSpec,
+    GateDecision,
+    GateReport,
+    GenerationManifest,
+    MutationOperation,
+    SkillMutation,
+)
 
 
 def _utc_now() -> str:
@@ -244,18 +252,17 @@ class GenerationStore:
         generation_id: str,
         *,
         parent_generation: str,
-        skill_root: str | Path,
-        mutation: SkillMutation,
+        candidate: CandidatePackage | str | Path,
         created_at: str | None = None,
     ) -> GenerationManifest:
-        """创建候选快照但不改变活动 generation。"""
+        """把单项候选变更应用到父快照，但不改变活动 generation。"""
 
         self.read_manifest(parent_generation)
-        manifest = self._materialize_generation(
+        package = CandidatePackage.open(candidate.root if isinstance(candidate, CandidatePackage) else candidate)
+        manifest = self._materialize_candidate(
             generation_id=generation_id,
             parent_generation=parent_generation,
-            skill_root=Path(skill_root),
-            mutation=mutation,
+            candidate=package,
             created_at=created_at or _utc_now(),
         )
         self.ledger.append(
@@ -263,10 +270,78 @@ class GenerationStore:
             generation_id=generation_id,
             payload={
                 "parent_generation": parent_generation,
-                "mutation_id": mutation.mutation_id,
+                "mutation_id": package.mutation.mutation_id,
+                "candidate_digest": package.digest,
             },
         )
         return manifest
+
+    def approve(self, generation_id: str, gate_report: str | Path) -> None:
+        """记录人工批准；批准本身不会切换 active generation。"""
+
+        self.read_manifest(generation_id)
+        report_path = Path(gate_report).resolve()
+        report = GateReport.from_dict(_read_json(report_path))
+        if report.candidate_generation != generation_id:
+            raise ValueError("Gate report 不属于待批准 generation")
+        if report.decision is not GateDecision.PASSED:
+            raise ValueError("只有 PASSED Gate 才能获得人工批准")
+        self.ledger.append(
+            "generation_approved",
+            generation_id=generation_id,
+            payload={
+                "gate_report": str(report_path),
+                "gate_sha256": _file_digest(report_path),
+            },
+        )
+
+    def promote(
+        self,
+        generation_id: str,
+        *,
+        gate_report: str | Path,
+        candidate: CandidatePackage | str | Path,
+    ) -> None:
+        """核对 Candidate、Gate 和人工批准后原子激活 generation。"""
+
+        manifest = self.read_manifest(generation_id)
+        parent = manifest.parent_generation
+        if parent is None or parent != self.active_generation():
+            raise ValueError("待晋升 generation 的 parent 必须仍是当前 active generation")
+        report_path = Path(gate_report).resolve()
+        report = GateReport.from_dict(_read_json(report_path))
+        if report.candidate_generation != generation_id or report.baseline_generation != parent:
+            raise ValueError("Gate report 的 generation 配对与待晋升对象不一致")
+        if report.decision is not GateDecision.PASSED:
+            raise ValueError("Gate 尚未通过，不能晋升")
+        package = CandidatePackage.open(
+            candidate.root if isinstance(candidate, CandidatePackage) else candidate
+        )
+        if manifest.mutation != package.mutation:
+            raise ValueError("generation mutation 与 CandidatePackage 不一致")
+        created = [
+            event
+            for event in self.ledger.read()
+            if event.get("event") == "generation_created"
+            and event.get("generation_id") == generation_id
+        ]
+        if not created or created[-1].get("payload", {}).get("candidate_digest") != package.digest:
+            raise ValueError("generation 没有匹配的 CandidatePackage 创建记录")
+        gate_digest = _file_digest(report_path)
+        approved = any(
+            event.get("event") == "generation_approved"
+            and event.get("generation_id") == generation_id
+            and event.get("payload", {}).get("gate_sha256") == gate_digest
+            for event in self.ledger.read()
+        )
+        if not approved:
+            raise ValueError("缺少与当前 Gate report 匹配的人工批准")
+        _atomic_text(self.root / "active_generation", f"{generation_id}\n")
+        self.ledger.append(
+            "generation_promoted",
+            generation_id=generation_id,
+            payload={"previous_generation": parent, "gate_sha256": gate_digest},
+        )
 
     def rollback(self, generation_id: str) -> None:
         """只切换活动指针；历史 generation 和 manifest 均保持不变。"""
@@ -311,6 +386,75 @@ class GenerationStore:
             shutil.rmtree(staging, ignore_errors=True)
             raise
         return manifest
+
+    def _materialize_candidate(
+        self,
+        *,
+        generation_id: str,
+        parent_generation: str,
+        candidate: CandidatePackage,
+        created_at: str,
+    ) -> GenerationManifest:
+        """在父快照副本上执行唯一 mutation，并原子发布新 generation。"""
+
+        destination = self.generation_path(generation_id)
+        if destination.exists():
+            raise FileExistsError(f"generation 已存在: {generation_id}")
+        staging = Path(tempfile.mkdtemp(prefix=f".{generation_id}.", dir=self.generations_dir))
+        try:
+            skills = staging / "skills"
+            shutil.copytree(self.generation_path(parent_generation) / "skills", skills)
+            self._apply_candidate(skills, candidate)
+            digest = skill_tree_digest(skills)
+            manifest = GenerationManifest(
+                generation_id=generation_id,
+                parent_generation=parent_generation,
+                created_at=created_at,
+                skill_digest=digest,
+                mutation=candidate.mutation,
+            )
+            _write_json(staging / "manifest.json", manifest.to_dict())
+            os.rename(staging, destination)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        return manifest
+
+    @staticmethod
+    def _apply_candidate(skills: Path, candidate: CandidatePackage) -> None:
+        """只解释 mutation 的文件语义，不处理审核或晋升策略。"""
+
+        mutation = candidate.mutation
+        target = skills / mutation.skill_id
+        if mutation.operation is MutationOperation.ADD:
+            if target.exists():
+                raise ValueError(f"ADD 目标技能已存在: {mutation.skill_id}")
+            source = candidate.skill_root
+            if source is None:
+                raise RuntimeError("ADD 候选缺少已验证的 skill 目录")
+            shutil.copytree(source, target)
+            return
+        if not target.is_dir():
+            raise ValueError(f"{mutation.operation.value.upper()} 目标技能不存在: {mutation.skill_id}")
+        if mutation.operation is MutationOperation.REVISE:
+            source = candidate.skill_root
+            if source is None:
+                raise RuntimeError("REVISE 候选缺少已验证的 skill 目录")
+            shutil.rmtree(target)
+            shutil.copytree(source, target)
+            return
+        if mutation.operation is MutationOperation.RETIRE:
+            shutil.rmtree(target)
+            return
+        raise AssertionError(f"未处理的 mutation operation: {mutation.operation}")
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 __all__ = ["EvolutionLedger", "GenerationStore", "skill_tree_digest"]

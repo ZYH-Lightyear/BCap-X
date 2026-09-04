@@ -1,7 +1,7 @@
 # VAW 当前架构契约
 
-> 当前基线：Web schema 54 / `vaw-context-v54-closed-gripper-z-cue` /
-> renderer `context-web-v54-closed-gripper-z-cue` / Main 与 Focused Imagination 均固定为 `2048×1280`。
+> 当前基线：Web schema 56 / `vaw-context-v56-stable-contact-frame` /
+> renderer `context-web-v56-stable-contact-frame` / Main 与 Focused Imagination 均固定为 `2048×1280`。
 
 Context 与 Memory 的完整规范见 [`AGENTIC_CONTEXT_OS.md`](AGENTIC_CONTEXT_OS.md)。本文只描述
 当前控制架构与代码映射；历史 Milestone 文档不再作为接口依据。
@@ -27,6 +27,7 @@ Main ReAct Agent ── imagine_action(instruction, action_id?)
         │                         │ ready / failed
         ◄─────────────────────────┘
         │
+        ├─ consult one optional MMSkill
         ├─ execute/discard planned|refined spatial action
         ├─ direct delta/open/close
         └─ perception/proposal/finish
@@ -47,11 +48,13 @@ preview_pose
 preview_grasp
 imagine_action
 move_tcp_delta
+rotate_tcp_delta
 open_gripper
 close_gripper
 discard_action
 execute_action
 finish_task
+consult_mmskill
 ```
 
 Imagination：
@@ -59,7 +62,6 @@ Imagination：
 ```text
 shift_preview
 rotate_preview
-inspect_rotation
 finish_imagination
 ```
 
@@ -70,14 +72,17 @@ finish_imagination
 - `ready` 只把 Action 标记为 refined（来源记录）；`failed`/limit 回滚到进入前的 ActionProposal
   与完整 artifacts，seeds 保持有效；策略级 `reason` 为
   `geometry_unresolved | plan_unavailable | turn_limit | subagent_error`；
-- Main `move_tcp_delta/open_gripper/close_gripper` 立即执行并刷新真实 observation；
+- Main `move_tcp_delta/rotate_tcp_delta/open_gripper/close_gripper` 立即执行并刷新真实 observation；
+- Main 的 `rotate_tcp_delta` 与 Imagination 的 `rotate_preview` 共享同一语义：只绕当前 TCP 的 tool-local +Z 右手旋转；
+- `consult_mmskill` 按精确 `skill_id` 加载一个 episode-local、overwrite-only 的短文本技能，不执行动作；
+  当前内置库包含四个 `SKILL.md`，没有 embedding 检索、在线生成或晋升；
 - `execute_action` 执行当前 Action 的可执行 cached spatial plan，planned 与 refined 均可；
   无可执行计划的 `execute_action` 是 pre-dispatch 拒绝，不改变世界。
 - CuRobo 负责 `preview_grasp/preview_pose` 的初始空间规划。Imagination 不按“最后一次 edit 大小”路由，而按
   当前真实 TCP 到完整 target 的差值路由：`<=6 cm` 且 `<=20°` 使用 PyRoki，否则使用
-  CuRobo。Main 的立即 `move_tcp_delta` 仍固定使用 PyRoki。两条路径共享公共 TCP 坐标，并由 cached
+  CuRobo。Main 的立即 `move_tcp_delta/rotate_tcp_delta` 仍固定使用 PyRoki。两条路径共享公共 TCP 坐标，并由 cached
   plan 记录实际执行 backend；不做隐式 fallback。
-- Main 的 Robot Function surface 只包含当前列出的机器人与 Imagination Functions，不包含外部技能加载。
+- Main 的 Robot Function surface 只额外包含上述一个只读技能加载入口，不包含完整技能平台。
 
 ## 2.5 证据复验（世界变化验证）
 
@@ -103,6 +108,7 @@ Task
 Live References              # 当前有效 region/point/seed/action；occluded 证据带 status 标签；可知时含 source_follow_through；非零时含 imagination_attempts
 Embodied State Card          # 最新 TCP/夹爪测量、最近动作及其 recency
 Short-Term Interaction Memory # call/action 事务时间线，不推断任务语义
+Optional loaded MMSkill       # 当前视觉问题/调整原则；不是物理真值
 Function definitions         # 通过 provider tool channel 完整可见
 one current Main Canvas
 ```

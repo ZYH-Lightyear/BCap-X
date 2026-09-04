@@ -34,7 +34,6 @@ _MAIN_TRACE_ALIASES = {
 _IMAGINATION_TRACE_ALIASES = {
     "delta_move": "shift_preview",
     "rotate": "rotate_preview",
-    "show_rotation_gizmo": "inspect_rotation",
     "done": "finish_imagination",
 }
 

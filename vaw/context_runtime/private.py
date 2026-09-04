@@ -88,10 +88,6 @@ class ActionArtifacts:
     initial_target: ActionTarget | None = None
     previous_visual_edit: VisualEdit | None = None
     latest_visual_edit: VisualEdit | None = None
-    # On-demand visual aid selected by the Imagination Agent.  This is a
-    # presenter hint, not part of the physical target or planner input.
-    rotation_gizmo_frame: str | None = None
-    rotation_gizmo_axis: str | None = None
     turn_count: int = 0
 
 
@@ -216,6 +212,11 @@ class PrivateEnvContext:
     contact_camera_action_id: str | None = None
     contact_camera_signs: tuple[int, int] | None = None
     contact_camera_side_elevation_deg: float = 0.0
+    # Contact frame 是一次局部操作的视觉参考系。它跨观测 revision 保留，
+    # 使小幅平移、夹爪开合不会因 IK 姿态噪声而旋转画面；新动作或显式
+    # tool-local 旋转才会重建。
+    contact_frame_quaternion_xyzw: tuple[float, float, float, float] | None = None
+    contact_frame_source_revision: int | None = None
     opposite_scene_camera_provider: Any | None = None
     opposite_scene_camera: dict[str, Any] | None = None
     opposite_scene_camera_revision: int | None = None
@@ -225,8 +226,18 @@ class PrivateEnvContext:
     opposite_scene_center_base_xyz: tuple[float, float, float] | None = None
 
     def clear_contact_camera_lock(self) -> None:
+        """丢弃当前 RGB 渲染缓存，但保留局部操作的稳定视觉参考系。"""
+
         self.contact_camera_pair = None
         self.contact_camera_action_id = None
+
+    def reset_contact_frame(self) -> None:
+        """开始新的局部操作，并重新选择参考轴与相机观察侧。"""
+
+        self.clear_contact_camera_lock()
+        self.contact_camera_signs = None
+        self.contact_frame_quaternion_xyzw = None
+        self.contact_frame_source_revision = None
 
     def begin_revision(self, observation: dict[str, Any]) -> None:
         self.previous_observation = self.observation
@@ -247,6 +258,14 @@ class PrivateEnvContext:
 
     def begin_function_call(self) -> None:
         self.trace_diagnostics.clear()
+        if self.contact_frame_quaternion_xyzw is not None:
+            self.trace_diagnostics["contact_frame"] = {
+                "quaternion_xyzw": [
+                    round(float(value), 8)
+                    for value in self.contact_frame_quaternion_xyzw
+                ],
+                "created_revision": self.contact_frame_source_revision,
+            }
         if self.contact_camera_pair is not None:
             self.trace_diagnostics["contact_camera_selection"] = (
                 self.contact_camera_pair.selection.summary()

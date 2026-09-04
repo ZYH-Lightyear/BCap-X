@@ -5,8 +5,8 @@ VAW 是面向 LIBERO-PRO 的 Main-owned Visual ReAct Runtime。Main Agent 始终
 `imagine_action` 同步委派给一个只看 Focused Canvas 的 Imagination SubAgent。
 
 当前契约见 [`CURRENT_ARCHITECTURE.md`](CURRENT_ARCHITECTURE.md)，Context/Memory 的唯一规范见
-[`AGENTIC_CONTEXT_OS.md`](AGENTIC_CONTEXT_OS.md)。当前基线不包含外部技能或知识加载模块；后续 RSI
-设计不会作为休眠兼容代码混入在线 Main Context。
+[`AGENTIC_CONTEXT_OS.md`](AGENTIC_CONTEXT_OS.md)。当前人工 MMSkills 通过轻量索引预加载、正文
+显式加载的方式进入 Runtime；不包含检索器、自动编译、评分、晋升或 LoRA 平台。
 历史里程碑已迁入 [`archive/`](archive/README.md)。评测失败分类见
 [`EVAL_FAILURE_TAXONOMY.md`](EVAL_FAILURE_TAXONOMY.md)。
 
@@ -22,32 +22,41 @@ preview_pose(point_id, offset_xyz_m, quaternion_xyzw?)
 preview_grasp(seed_id)
 imagine_action(instruction, action_id?)
 move_tcp_delta(delta_xyz_m, frame)
+rotate_tcp_delta(angle_deg)
 open_gripper()
 close_gripper()
 discard_action(action_id)
 execute_action(action_id)
 finish_task(success)
+consult_mmskill(skill_id)
 ```
 
 Imagination（只存在于 `imagine_action` 内部）：
 
 ```text
 shift_preview(delta_xyz_m, frame)
-rotate_preview(axis, angle_deg, frame)
-inspect_rotation(frame, axis)
+rotate_preview(angle_deg)
 finish_imagination(status="ready" | "failed")
 ```
 
 `preview_grasp/preview_pose` 创建 planned 空间 Preview 并缓存规划；当 Preview 与当前视觉证据足以判断时，
 Main 可以直接 `execute_action`。`imagine_action` 是可选的局部空间推理工具，不是执行的前置条件；
 没有 planned Action 时从当前真实 TCP 懒创建再进入。
-failed 时回滚到进入前的 ActionProposal。Main 的 `move_tcp_delta/open_gripper/
+failed 时回滚到进入前的 ActionProposal。Main 的 `move_tcp_delta/rotate_tcp_delta/open_gripper/
 close_gripper` 是立即执行的简单物理控制，不经过 Imagination。Imagination 内的
-`shift_preview` 只编辑虚拟动作。
+`shift_preview/rotate_preview` 只编辑虚拟动作；两个旋转入口均固定绕 tool-local +Z。
+
+`consult_mmskill` 不执行机器人动作。技能内容作为独立用户上下文与当前 Canvas 一同提供给 Main 和
+Imagination，不写入极简 System Prompt，也不绘制到 Canvas。加载其他技能会直接替换当前正文；
+下一次真实物理动作发生后正文清除，避免旧技能继续影响新的操作状态。
+
+默认使用仓库内置技能。`--skill-root` 可以指向普通技能目录，也可以指向 Evolution 实验根目录；后者
+只会默认加载 `active_generation`。候选 generation 必须通过 `--skill-generation` 显式选择，因此在
+promotion 前不会意外成为默认 Runtime 技能库。generation ID 与技能树 digest 仅写入 trace meta。
 
 默认 `--motion-backend curobo` 使用自适应混合路由：CuRobo 负责粗 Action；Imagination 的完整 target
 相对当前真实 TCP 在 `6 cm / 20°` 内时使用 PyRoki，超过该局部范围仍使用 CuRobo。Main 的立即
-`move_tcp_delta` 固定使用 PyRoki。两者在 adapter 边界对齐同一 TCP，且 `execute_action` 精确使用 cached plan
+`move_tcp_delta/rotate_tcp_delta` 固定使用 PyRoki。两者在 adapter 边界对齐同一 TCP，且 `execute_action` 精确使用 cached plan
 的 backend，不会静默降级。Canvas 仅对 Preview 的掌部横梁/指根做淡紫半透明占用提示，其余机器人保持细线，
 这个提示不等同于 collision checking。
 
@@ -64,6 +73,7 @@ Focused Contact View 使用与夹爪闭合方向平行/正交的两台水平 MuJ
 - Main：Task、一张当前 `2048×1280` Canvas、Live References、最新
   Embodied State Card 和统一 Short-Term Interaction Memory。
 - Imagination：一张放大的 Focused Imagination Canvas、一句场景语言的局部 instruction、累计 edit summary。
+- 可选 MMSkill：显式加载后作为短文本视觉问题与调整原则进入 Main/Imagination 用户上下文。
 - 两者都不接收 transcript history、旧 rationale、solver telemetry 或旧图片。
 - Memory 只记录真实 Function transaction，并由 Registry 区分 `[call]` 与 `[action]`；它不自动写入
   抓住、放入、打开或完成等语义判断。
@@ -103,6 +113,12 @@ python -m vaw.scripts.run_context_agent \
   --trace-dir /mnt/data/zyh/BCap-X/vaw/out/context_runs/main_react_t0_s1
 ```
 
+对已物化的 Evolution 实验进行 generation 对照时额外传入：
+
+```bash
+--skill-root /path/to/evolution-experiment --skill-generation g001
+```
+
 在另一个终端启动 Agent OS Observatory。`--workspace` 会递归发现其中的
 多个 trace collection；UI 还可以通过受控 Launch API 启动完整 episode：
 
@@ -125,14 +141,15 @@ Physical Action Tape 按 Function 分段播放动作视频。实时更新来自�
 省略 `--imagination-model` 时两个角色复用同一模型配置，但 provider request、Canvas projection
 和 trace 仍互相隔离。
 
-批量评测与相位 fitness：
+批量 rollout 与终局成功率汇总：
 
 ```bash
-python -m vaw.evolution.sweep --tag baseline-v54 --seeds 1,2,3 --resume --workers 1
-python -m vaw.evolution.compare \
-  --baseline vaw/out/sweeps/gen0/sweep_summary.json \
-  --candidate vaw/out/sweeps/candidate/sweep_summary.json
+python -m vaw.evolution.sweep --tag baseline-v56 --seeds 1,2,3 --resume --workers 1
 ```
+
+汇总只读取 episode 写入的 `env_success`、终止原因和资源消耗；不从
+Function 序列推断 reach/grasp/transport/place 阶段或失败类型。语义诊断留给
+离线 Skill Evolution 流程，不作为固化 evaluator。
 
 ## 验证
 
